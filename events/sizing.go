@@ -75,7 +75,7 @@ func deref(p *int64) int64 {
 
 // RenderForPrompt renders an event as plain text (used by summarizers and debug views).
 func RenderForPrompt(ev Event) string {
-	switch e := ev.(type) {
+	switch e := AsValue(ev).(type) {
 	case TextInput:
 		return e.Content
 	case DataInput:

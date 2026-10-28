@@ -83,3 +83,8 @@ func usageReported(u events.Usage) bool {
 	}
 	return false
 }
+
+// Reported reports whether the usage carries any non-zero token count (Python
+// parity: Usage.__bool__ — an all-zero usage counts as "not reported", so no
+// UsageEvent is emitted for it). Callers that emit UsageEvents use this as the gate.
+func Reported(u events.Usage) bool { return usageReported(u) }
