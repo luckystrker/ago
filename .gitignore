@@ -1,0 +1,6 @@
+/ag2/
+*.exe
+*.test
+dist/
+.idea/
+.vscode/
