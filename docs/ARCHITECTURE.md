@@ -17,12 +17,17 @@ and the translation rules Python→Go. Every porting agent must implement agains
    Stream pub/sub is synchronous (in the caller's goroutine, under a lock); background work uses
    `go func` with panic recovery.
 4. **Errors are values.** Sentinel errors per package (`errors.Is`/`errors.As`), wrapping with `%w`.
-5. **Every package compiles + has tests.** Gate: `go build ./... && go vet ./... && go test ./...`.
+5. **Every package compiles + has tests.** Gate (from `ago/`, the framework module):
+   `go build ./... && go vet ./... && go test ./...`.
 6. Tests are table-driven, stdlib `testing` only, no testify.
 
 ## Module layout
 
-Module name: `ago` (framework name "AGo"). Go packages (dependency order, arrows = imports):
+Module name: `ago` (framework name "AGo"). The framework module lives in the `ago/`
+directory of the repository (so the repo root holds docs, examples and CI); import paths
+are unaffected (`ago/agent`, ...). Examples are a separate module (`agoexamples`) in
+`examples/` with `replace ago => ../ago`; a `go.work` at the repo root ties them together.
+Go packages (dependency order, arrows = imports):
 
 ```
 events  (leaf)                       — event vocabulary, Usage, conditions

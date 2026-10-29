@@ -6,12 +6,17 @@ relevant spec in `docs/specs/` before writing code. The Python reference is in `
 
 ## Hard rules
 
-1. **Module `ago`**, Go 1.24. Packages live in the repo root (`ago/events`, `ago/agent`, ...).
+1. **Module `ago`**, Go 1.24. The framework module lives in `ago/` (packages at
+   `ago/events`, `ago/agent`, ...; import paths are still `ago/agent` etc.). Examples
+   are a separate module in `examples/` (module `agoexamples`, `replace ago => ../ago`).
+   A `go.work` at the repo root ties them together; `go test ./...` must be run inside
+   `ago/` (from the root it fails — the root itself is not a module).
 2. **Zero external dependencies.** stdlib only. Need a dep? Stop and record a DECISIONS entry.
 3. **No import cycles.** Check the dependency graph in ARCHITECTURE.md before importing:
    `agent` never imports `network`; `config` never imports `agent`.
-4. **Gates before you finish a task:** `go build ./...`, `go vet ./...`, `go test ./...`
-   (or at minimum `go test ./<your-package>/...`) — all green, no skipped tests.
+4. **Gates before you finish a task:** from `ago/`: `go build ./...`, `go vet ./...`,
+   `go test ./...` (or at minimum `go test ./<your-package>/...`) — all green, no skipped
+   tests. For examples: from `examples/`: `go build ./...` and `go vet ./...`.
 5. Every deviation from Python parity: code comment `// AGO-DEVIATION: <reason>` + entry in
    `docs/DECISIONS.md`.
 6. Comments explain constraints, not history. No "ported from ag2/..." chatter.
