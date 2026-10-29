@@ -1,30 +1,79 @@
-# AGo — AG2, ported to Go
+<a name="readme-top"></a>
 
-AGo is a Go port of [AG2](https://github.com/ag2ai/ag2) — the event-sourced Python agent
-framework (port target: AG2 `main` at commit `fa4e0fb`, 2026-10-27). One `Agent` type, an
-event stream per conversation, tools registered as stream subscribers, middleware wrapped
-around every turn, LLM call, tool execution and human-input hop, and a hub that hosts
-multi-agent channels. The port was made against a local clone of the Python sources; the
-distilled behavior specs are in `docs/specs/` and the binding Go contracts in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Licensed Apache-2.0 like AG2 — see
-[NOTICE.md](NOTICE.md) for provenance.
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="AGo — AG2, ported to Go" width="720">
+</p>
 
-- **Zero external dependencies.** Stdlib only (`net/http`, `encoding/json`, `os/exec`,
-  `crypto/rand`). LLM providers talk raw HTTP/SSE — no vendor SDKs.
-- **Go 1.24**, module name `ago`; packages live at the repo root (`ago/agent`, `ago/tools`, …).
-- **Wire-compatible events.** JSON tags match the Python field names; every event
-  round-trips through `events.MarshalEvent`/`UnmarshalEvent` with a `@type` discriminator.
+<p align="center">
+  <a href="https://github.com/luckystrker/ago/actions/workflows/ci.yml">
+    <img src="https://github.com/luckystrker/ago/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+  <a href="https://github.com/luckystrker/ago/releases">
+    <img src="https://img.shields.io/github/v/release/luckystrker/ago?color=green&label=release" alt="Release">
+  </a>
+  <a href="https://github.com/luckystrker/ago/blob/main/ago/go.mod">
+    <img src="https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.24+">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License">
+  </a>
+  <img src="https://img.shields.io/badge/external%20deps-0-7ee787" alt="Zero dependencies">
+</p>
 
-**Status:** the core framework is ported — `go build ./...`, `go vet ./...` and
-`go test ./...` pass for every package (verified 2026-10-29). What is ported, partial,
-stubbed or deferred per package: [docs/PORT_STATUS.md](docs/PORT_STATUS.md). Every deviation
-from Python parity carries a `// AGO-DEVIATION` comment and a decision record in
-[docs/DECISIONS.md](docs/DECISIONS.md).
+<p align="center">
+  <a href="docs/GUIDE.md">📚 Guide</a> |
+  <a href="docs/MIGRATION.md">🔁 Migration from Python</a> |
+  <a href="#-examples">💡 Examples</a> |
+  <a href="docs/PORT_STATUS.md">🧭 Port status</a> |
+  <a href="docs/DECISIONS.md">🧾 Decision records</a> |
+  <a href="https://github.com/ag2ai/ag2">🐍 Original AG2</a>
+</p>
 
-## 5-minute example
+> [!IMPORTANT]
+> **Looking for `ConversableAgent`, `GroupChat`, or `initiate_chat`?** Those are the classic
+> AutoGen APIs. AGo ports the **2026 event-sourced AG2** — one `Agent` type with
+> `ask`/`run`, events on a stream, middleware, HITL hooks, and a multi-agent hub. The
+> class-by-class mapping to Python lives in [docs/MIGRATION.md](docs/MIGRATION.md).
 
-A complete agent with one tool. The LLM is a scripted test double, so it runs offline with
-no API keys — swap `TestConfig` for a real provider config and nothing else changes.
+# AGo: the AG2 agent framework, compiled
+
+AGo is an independent Go rewrite of [AG2](https://github.com/ag2ai/ag2) (port target:
+AG2 `main` at commit `fa4e0fb`, 2026-10-27). One `Agent` type, an event stream per
+conversation, tools registered as stream subscribers, middleware wrapped around every
+turn, LLM call, tool execution and human-input hop — and a hub that hosts multi-agent
+channels. **Zero external dependencies**: the framework is Go standard library only
+(`net/http`, `encoding/json`, `os/exec`, `crypto/rand`); LLM providers talk raw
+HTTP/SSE, no vendor SDKs.
+
+Every package is gated by `go build` + `go vet` + `go test`, the event vocabulary is
+wire-compatible with Python (JSON tags match field names, every event round-trips
+through a `@type`-discriminated codec), and all 13 examples run offline on scripted
+models — no API keys needed.
+
+## ✨ What's in the box
+
+| | |
+|---|---|
+| 🧠 **One `Agent` type** | blocking `Ask`, observable `Run`, continuations on the same stream, `Resume` from mid-trajectory |
+| 📡 **Event-sourced core** | every observation is an event: pub/sub stream, durable transcript, replays and usage accounting are event logs |
+| 🔧 **Tools as subscribers** | function tools with schema generation and dependency injection, toolkits, parallel execution, `final=true` tools, name precedence |
+| 🌐 **7 LLM providers** | OpenAI, Anthropic, Gemini, Ollama, Z.AI, Mistral, DashScope — full clients; xAI/Bedrock/TypeSafe as config stubs |
+| 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals |
+| 🙋 **Human-in-the-loop** | pluggable human hooks, tool approvals, timed-out asks, transcript repair for abandoned tool calls |
+| 📦 **Structured output** | JSON-schema from Go types, validated answers with automatic re-asking |
+| 🗂️ **Tasks & subtasks** | task lifecycle with checkpoints, `run_subtask`/`run_subtasks` fan-out with usage roll-up, `AsTool` delegation |
+| 🧠 **Knowledge & policies** | virtual filesystem store, context-assembly policies (sliding window, token budget, alerts) |
+| 🗜️ **Compaction & aggregation** | LLM-driven history summarization behind triggers, keeping the transcript valid for replay |
+| 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
+| 🔌 **MCP client** | JSON-RPC 2.0 over stdio and streamable HTTP, tool discovery with pagination, content mapping |
+| 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay |
+
+## 🚀 Quick start
+
+```bash
+git clone https://github.com/luckystrker/ago
+cd ago
+```
 
 ```go
 package main
@@ -73,97 +122,58 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(reply.Body()) // It is sunny, +24 C in Lisbon.
+	fmt.Println(reply.Body())
 }
 ```
 
-The agent drives the whole loop itself: model call → tool call → tool result → second model
-call → final answer. `reply.Body()` is the final text; `reply.History()` returns the durable
-event transcript and `reply.Usage()` the token report aggregated from the stream's
-`UsageEvent`s. `reply.Ask(...)` continues the same conversation.
+> The framework module lives in [`ago/`](ago/) (import paths `ago/agent`, `ago/tools`, …);
+> examples are a separate module in [`examples/`](examples/) tied by `go.work`.
+> Verify everything: `cd ago && go test ./...`.
 
-To run against a real model, replace the test double with a provider config
-(key is also read from the environment):
+## 📚 Documentation
 
-```go
-cfg := config.NewOpenAICompletions("gpt-4o-mini") // OPENAI_API_KEY
-// or: config.NewAnthropic("claude-sonnet-4-5"), config.NewGemini(key, "gemini-2.5-flash"),
-//     config.NewOllama("llama3.2"), config.NewMistral / NewDashScope / NewZAI ...
-```
-
-## Package map
-
-| Package | What it provides |
+| Document | Contents |
 |---|---|
-| `ago/events` | The event vocabulary (inputs, model messages/responses, tool calls/results, human-in-the-loop, task lifecycle, alerts), `Usage` token counters, the `Condition` predicate DSL, JSON marshaling with a `@type` discriminator |
-| `ago/stream` | `Stream`/`MemoryStream`/`SubStream` pub-sub over an event history, `Storage` (memory backend), subscriber conditions |
-| `ago/context` | Per-conversation `Context`: stream handle, prompt fragments, dependencies (DI), variables, HITL access |
-| `ago/hitl` | `HumanHook` contract and typed errors for human-input requests (no hook / failed / timeout) |
-| `ago/response` | Structured-response schemas: `Schema[T]` via reflection (`agschema` tags), raw schemas, validation errors, decision/question helpers |
-| `ago/tools` | `Tool`, `FunctionTool` (reflection argument binding, DI injection, timeout, per-tool middleware), `Toolkit`, `ClientTool`, the parallel tool `Executor`, tool-resolution precedence |
-| `ago/config` | `ModelConfig`/`LLMClient` contracts, per-provider configs and clients (see table below), shared OpenAI-compatible engine |
-| `ago/middleware` | The four-hook middleware chain (`OnTurn`, `OnLLMCall`, `OnToolExecution`, `OnHumanInput`), conditional wrapper, builtins: history/token limiters, retry, approval, logging |
-| `ago/usage` | Usage reports aggregated from `UsageEvent`s (totals, per model/provider/kind) |
-| `ago/task` | Task lifecycle (`Start`/`Progress`/`Complete`/`Fail`/`Cancel`/`Expire`), checkpoints |
-| `ago/knowledge` | `Store` protocol with memory and disk backends, locked wrapper, append-only JSONL event log |
-| `ago/policies` | Context-assembly policies: conversation filter, sliding window, token budget, working/episodic memory, alert policy |
-| `ago/compact` | Context compaction: triggers (event count / tokens), summarizing strategy, compaction middleware |
-| `ago/aggregate` | Post-turn aggregation: folds old transcript + summaries into one summary via an LLM strategy |
-| `ago/observers` | Stream observers: `LoopDetector` (repetition alerts), `TokenMonitor` (budget alerts) |
-| `ago/watch` | Composable watches (`EventWatch`, `IntervalWatch`, `AllOf`/`AnyOf`/`Sequence`) with a pull-model `Wait` |
-| `ago/agent` | The `Agent` turn loop: `Ask`/`Run`/`Resume`, `AgentReply`/`AgentRun`, HITL with history repair, structured-output retry, subtasks, `AsTool` |
-| `ago/spec` | `AgentSpec` wire format: serialize an agent / rebuild one from a spec + tool pool |
-| `ago/network` (+ `network/transport`) | Multi-agent hub: channels, envelopes (`ag2.*` wire vocabulary), passports, routing rules, transition graphs, handoff/finish, Consulting/Conversation/Discussion/Workflow adapters, clients, in-memory `LocalLink` |
-| `ago/mcp` | Minimal MCP client: JSON-RPC 2.0 over streamable HTTP or stdio, tool listing with pagination, tool calls mapped to AGo tools |
-| `agotest "ago/testing"` | Scripted model doubles: `TestConfig` (queued `ModelResponse`s + call recording), `TrackingConfig` (records calls through any real config) |
-| `ago/internal/{httpx,sse,uuid}` | Shared plumbing: HTTP with retries/Retry-After, SSE line parser, RFC 4122 UUIDs (internal, not importable) |
-| `ago/examples/…` | Runnable offline programs (see below) |
+| [docs/GUIDE.md](docs/GUIDE.md) | the full user guide: concepts, every subsystem, working snippets |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | class-by-class map: Python AG2 → AGo |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the binding package contracts |
+| [docs/PORT_STATUS.md](docs/PORT_STATUS.md) | what is ported / partial / stubbed / deferred |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 35+ decision records behind every deviation from Python |
 
-## Running the tests
+## 💡 Examples
 
-```sh
-go build ./...   # compiles everything
-go vet ./...     # static checks
-go test ./...    # full suite — stdlib testing only, no network, no external deps
-```
-
-A single package: `go test ./ago/agent/`. Provider tests use fake HTTP servers
-(`httptest`) — no API keys are needed anywhere in the suite.
-
-## Provider status
-
-| Provider | Status | Notes |
-|---|---|---|
-| `config/openai` | full | Chat Completions over raw HTTP: SSE streaming, tool-call delta merge, strict structured output, usage normalization (D-019) |
-| `config/anthropic` | full | Messages API over raw HTTP: native SSE streaming, tool use, prompt caching (`cache_control`), thinking replay (D-020) |
-| `config/gemini` | full | `generateContent` + SSE streaming, function declarations, thinking-token usage (D-022) |
-| `config/ollama` | full (non-streaming) | `/api/chat` with tools; a `Streaming=true` config refuses to create a client (D-022) |
-| `config/zai`, `config/mistral`, `config/dashscope` | full | OpenAI-compatible REST on the shared engine (D-021) |
-| `config/xai`, `config/bedrock`, `config/typesafe` | stub | Config structs exist; `Create()` reports "has no client yet" wrapping `config.ErrNotImplemented` (D-008) |
-| OpenAI Responses API | deferred | Not ported; chat completions is the supported OpenAI surface (D-008) |
-
-API keys resolve config field first, then the standard environment variable
-(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `ZAI_API_KEY`, `MISTRAL_API_KEY`,
-`DASHSCOPE_API_KEY`; Ollama needs none for a local server).
-
-## Examples
-
-All examples run offline on scripted configs — `go run ./examples/<name>`:
+All examples run offline on scripted models — clone and `go run ./examples/<name>`:
 
 | Example | Demonstrates |
 |---|---|
-| `examples/ask` | Smallest agent: two turns on one stream, history transcript, usage report |
-| `examples/tools` | Function tools with and without arguments; scripted tool-call rounds |
-| `examples/hitl` | Human-in-the-loop tool approval through the `Approval` middleware |
-| `examples/subagent` | Agent delegation: a specialist exposed to a lead via `AsTool` |
-| `examples/group` | Network hub: two participants take turns in a workflow channel under a `TransitionGraph` |
+| [`ask`](examples/ask) | basic ask, transcript, usage report |
+| [`tools`](examples/tools) | function tools, tool-call round trip |
+| [`hitl`](examples/hitl) | tool approval through a human hook |
+| [`subagent`](examples/subagent) | agent delegation via `AsTool` |
+| [`group`](examples/group) | multi-agent orchestration over the network hub |
+| [`structured_output`](examples/structured_output) | schema-validated answers with re-asking |
+| [`multi_turn`](examples/multi_turn) | multi-turn conversations on one stream |
+| [`observers`](examples/observers) | loop detection, token monitoring, alerts |
+| [`knowledge_memory`](examples/knowledge_memory) | persistent memory via the knowledge store |
+| [`policies_compact`](examples/policies_compact) | context-assembly policies and compaction |
+| [`safety_halt`](examples/safety_halt) | alert→halt safety flow |
+| [`mcp_stdio`](examples/mcp_stdio) | MCP over a stdio subprocess |
+| [`mcp_http`](examples/mcp_http) | MCP over streamable HTTP |
 
-## Documentation
+## 🧭 Status
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — binding contracts: package layout, public APIs, Python→Go rules.
-- [docs/PORT_STATUS.md](docs/PORT_STATUS.md) — per-package porting status and everything deferred.
-- [docs/DECISIONS.md](docs/DECISIONS.md) — decision records: every deviation from Python parity, with reasons.
-- [docs/specs/](docs/specs/) — behavior specs distilled from the Python reference (`core.md`, `config-llm.md`, `tools.md`, `events-network.md`).
+- **Ported and gated:** the core framework, all 7 full providers, tools, middleware,
+  HITL, tasks, knowledge, policies, compaction, observers, watches, spec, MCP client,
+  multi-agent network — `go build`/`vet`/`test` green on every package.
+- **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
+  "not implemented").
+- **Deferred:** protocol servers (a2a/acp/ag_ui/a2ui), live voice, Redis/SQLite stores,
+  WebSocket link — see [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
+- **Reviewed:** an independent port-parity review against the Python sources found and
+  fixed 20 confirmed defects; the review trail is in the git history and decision records.
 
-Working on AGo itself? Read [AGENTS.md](AGENTS.md) first — conventions, hard rules (stdlib
-only, no import cycles) and the definition of done (`go build ./... && go vet ./... && go test ./...`).
+## License
+
+Apache-2.0 — the same license as AG2. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md)
+for provenance. AGo is an independent rewrite and is not affiliated with or endorsed by
+the AG2ai maintainers.
