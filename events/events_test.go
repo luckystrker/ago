@@ -38,9 +38,10 @@ func TestMarshalRoundTripAllRegisteredTypes(t *testing.T) {
 		&BuiltinToolCallEvent{ToolCallEvent: NewToolCallEvent("web_search")},
 		&BuiltinToolResultEvent{ToolResultEvent: ToolResultEvent{ParentID: "c3", Result: NewToolResult(false, "r")}},
 		&CompactionSummary{Content: "summary"},
-		&TaskStarted{TaskID: "t", AgentName: "a"},
+		&TaskStarted{TaskID: "t", AgentName: "a", ParentToolCallID: "call-1",
+			Spec: &TaskSpec{Title: "research", Payload: map[string]any{"k": 1.0}, Capability: "search"}},
 		&TaskProgress{TaskID: "t", AgentName: "a", Payload: map[string]any{"p": 1.0}},
-		&TaskCompleted{TaskID: "t", AgentName: "a"},
+		&TaskCompleted{TaskID: "t", AgentName: "a", Usage: Usage{TotalTokens: I64(7)}},
 		&TaskFailed{TaskID: "t", AgentName: "a", Error: "e"},
 		&TaskExpired{TaskID: "t", AgentName: "a"},
 		&TaskCancelled{TaskID: "t", AgentName: "a", Reason: "r"},
@@ -215,5 +216,41 @@ func TestEstimatedTokens(t *testing.T) {
 	}
 	if got := EstimatedTokens(BinaryInput{Data: []byte("x"), MediaType: "image/png", Kind: BinaryImage}, 4); got < 1 {
 		t.Error("binary input should estimate at least 1")
+	}
+}
+
+// TestConversationalParity pins the Conversational flag to the Python default
+// (__conversational__ = True on durable events; ag2/events/base.py:255): the
+// answer, the tool-call batch and the task lifecycle are part of what compaction
+// counts and policies replay. Transient events are conversational-inert by
+// is_conversational, and UsageEvent is the one durable False (types.py:172).
+func TestConversationalParity(t *testing.T) {
+	durable := []Event{
+		&HumanMessage{ParentID: "r1", Content: "yes"},
+		&HumanInputRequest{ID: "r1", Content: "approve?"},
+		&ToolCallsEvent{Calls: []ToolCallEvent{NewToolCallEvent("search")}},
+		&TaskStarted{TaskID: "t1"},
+		&TaskCompleted{TaskID: "t1"},
+		&TaskFailed{TaskID: "t1"},
+		&TaskExpired{TaskID: "t1"},
+		&TaskCancelled{TaskID: "t1"},
+		&ModelResponse{Message: &ModelMessage{Content: "hi"}},
+	}
+	for _, ev := range durable {
+		if !ev.Conversational() {
+			t.Errorf("%s: durable event must be conversational", ev.EventType())
+		}
+	}
+	transient := []Event{
+		&ModelMessage{Content: "internal"},
+		&TaskProgress{TaskID: "t1"},
+	}
+	for _, ev := range transient {
+		if ev.Conversational() {
+			t.Errorf("%s: transient event must not count as conversational", ev.EventType())
+		}
+	}
+	if (&UsageEvent{Kind: UsageKindModelCall}).Conversational() {
+		t.Error("UsageEvent must not be conversational")
 	}
 }

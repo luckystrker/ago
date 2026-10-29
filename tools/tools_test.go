@@ -231,7 +231,7 @@ func TestDependencyInjectionViaTagsAndTypes(t *testing.T) {
 		called = fmt.Sprintf("%s|%v|%s|id=%s", a.Q, a.APIKey.Default, a.Region, cx.ToolCallID)
 		return called, nil
 	})
-	if err := ft.Register(cx, nil); err != nil {
+	if _, err := ft.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallEvent{ID: "call-1", Name: "di", Arguments: `{"q":"hi"}`}); err != nil {
@@ -262,7 +262,7 @@ func TestDIDefaultsFromNewInjectAndNewVariable(t *testing.T) {
 func TestDIMissingDependencyFails(t *testing.T) {
 	s, cx := newTestContext()
 	ft := mustFunctionTool(t, "needy", "", func(a diArgs) string { return "ok" })
-	if err := ft.Register(cx, nil); err != nil {
+	if _, err := ft.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	// A missing dependency is a tool failure, not a transport error: the call is
@@ -294,7 +294,7 @@ func TestDIVariableFromContextWinsAndSchemaExcludesDI(t *testing.T) {
 
 	got := ""
 	ft := mustFunctionTool(t, "di", "", func(a diArgs) string { got = a.Region; return got })
-	if err := ft.Register(cx, nil); err != nil {
+	if _, err := ft.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallEvent{ID: "c", Name: "di", Arguments: `{"q":"x","region":"spoofed"}`}); err != nil {
@@ -358,7 +358,7 @@ type payload struct {
 
 func callDirectly(t *testing.T, ft *FunctionTool, cx *agocontext.Context, args string) (events.Event, error) {
 	t.Helper()
-	if err := ft.Register(cx, nil); err != nil {
+	if _, err := ft.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	s := cx.Stream
@@ -567,7 +567,7 @@ func TestToolkitSchemasConcatenateAndRegisterDelegates(t *testing.T) {
 		return ""
 	})
 	tk2, _ := NewToolkit("tk2", nil, ft)
-	if err := tk2.Register(cx, nil); err != nil {
+	if _, err := tk2.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallEvent{ID: "c", Name: "member", Arguments: "{}"}); err != nil {
@@ -589,7 +589,7 @@ func TestToolkitPrependsItsMiddleware(t *testing.T) {
 		t.Fatalf("NewToolkit: %v", err)
 	}
 	_, cx := newTestContext()
-	if err := tk.Register(cx, nil); err != nil {
+	if _, err := tk.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	s := cx.Stream
@@ -649,7 +649,7 @@ func TestClientToolCallEmitsClientToolCallEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientTool: %v", err)
 	}
-	if err := ct.Register(cx, nil); err != nil {
+	if _, err := ct.Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	ch := make(chan events.Event, 4)
@@ -694,7 +694,7 @@ func TestMiddlewareLayering(t *testing.T) {
 		&recordingMW{label: "agent1", log: &order},
 	}
 	ft := mustFunctionTool(t, "layered", "", func() string { return "" }, WithMiddleware(toolMW...))
-	if err := ft.Register(cx, agentMW); err != nil {
+	if _, err := ft.Register(cx, agentMW); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallEvent{ID: "c", Name: "layered", Arguments: "{}"}); err != nil {

@@ -33,7 +33,9 @@ type AlertPolicy struct {
 // NewAlertPolicy returns an alert policy with an empty delivery record.
 func NewAlertPolicy() *AlertPolicy { return &AlertPolicy{delivered: map[alertKey]bool{}} }
 
-// Apply injects prompt lines for unseen non-fatal alerts and sends one
+// Apply injects prompt lines for unseen non-fatal alerts — all of them,
+// regardless of where a fatal alert sits among them (Python parity: the
+// non-fatal list is injected whole, not up to the first fatal) — and sends one
 // HaltEvent naming the first unseen fatal alert. The event list passes through
 // unchanged.
 func (p *AlertPolicy) Apply(prompts []string, evs []events.Event, ctx *agocontext.Context) ([]string, []events.Event, error) {
@@ -56,9 +58,12 @@ func (p *AlertPolicy) Apply(prompts []string, evs []events.Event, ctx *agocontex
 	}
 	p.mu.Unlock()
 
+	// AGO-DEVIATION: Python adds one "[FATAL ALERT]" prompt note (D-030) and a
+	// joined block instead of these per-alert lines (D-030); the split into
+	// inject-everything-non-fatal + halt-on-first-fatal is Python parity.
 	for _, a := range fresh {
 		if a.Severity == events.SeverityFatal {
-			break
+			continue // fatal alerts ride the HaltEvent below, not the prompt
 		}
 		prompts = append(prompts, fmt.Sprintf("alert(%s) from %s: %s", a.Severity, a.Source, a.Message))
 	}

@@ -575,3 +575,67 @@ func testWALReplay(t *testing.T, wal WAL) {
 		t.Fatalf("send on replayed hub: %v", err)
 	}
 }
+
+// eventTypeFailWAL fails the append for envelope records of one event type
+// (a storage outage for content) and accepts everything else, so lifecycle
+// snapshots and protocol envelopes keep working while content fails.
+type eventTypeFailWAL struct{ failOn string }
+
+var errWALDown = errors.New("wal backend down")
+
+func (w eventTypeFailWAL) Append(rec WALRecord) error {
+	if rec.Kind == "envelope" && rec.Envelope != nil && rec.Envelope.EventType == w.failOn {
+		return errWALDown
+	}
+	return nil
+}
+
+func (w eventTypeFailWAL) ReadAll() ([]WALRecord, error) { return nil, nil }
+
+// TestSendSurfacesWALAppendFailure is the regression for the swallowed WAL
+// append: recordLocked ignored every backend error, so a failed store let
+// Send report success for an envelope that would never be replayed (Python
+// surfaces the failure: post_envelope awaits _wal_append without
+// try/except). Now the send fails, the audience is never dispatched to, and
+// the in-memory log shows only accepted envelopes; lifecycle transitions keep
+// working while the backend is down for content.
+func TestSendSurfacesWALAppendFailure(t *testing.T) {
+	h := newTestHub(t, WithHubWAL(eventTypeFailWAL{failOn: EnvText}))
+	a, b := registerTwo(t, h)
+	rec := newRecorder()
+	rec.attach(h, b, true)
+
+	// Handshake envelopes and snapshots append fine: the channel comes up.
+	ch, err := h.CreateChannel(ChannelManifest{Type: TypeConsulting}, []string{a, b})
+	if err != nil {
+		t.Fatalf("create over a content-failing wal: %v", err)
+	}
+	before := len(rec.forAgent(b))
+
+	sent, err := h.Send(NewTextEnvelope(ch.ID, a, "", "question?"))
+	if err == nil {
+		t.Fatalf("send accepted despite the wal failure: %+v", sent)
+	}
+	if !errors.Is(err, errWALDown) {
+		t.Fatalf("send error = %v, want it to wrap the wal failure", err)
+	}
+	// The failed envelope was never dispatched.
+	if got := len(rec.forAgent(b)); got != before {
+		t.Fatalf("bob received %d envelopes after the failed send, want %d", got, before)
+	}
+	// The in-memory log carries only accepted envelopes.
+	wal, err := h.ReadWAL(ch.ID)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	for _, env := range wal {
+		if env.EventType == EnvText {
+			t.Fatalf("failed envelope recorded anyway: %v", eventTypes(wal))
+		}
+	}
+	// Lifecycle keeps working while the backend rejects content.
+	if err := h.CloseChannel(ch.ID, "gave_up"); err != nil {
+		t.Fatalf("close channel: %v", err)
+	}
+	waitForChannel(t, h, ch.ID, ChannelClosed)
+}

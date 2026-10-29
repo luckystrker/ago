@@ -97,7 +97,7 @@ func TestExecutorExecutesCallsAndAnswersBatch(t *testing.T) {
 		return fmt.Sprintf("%d", a.A+a.B), nil
 	})
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ft}, map[string]bool{"add": true}, nil); err != nil {
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"add": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -143,7 +143,7 @@ func TestExecutorRunsCallsInParallel(t *testing.T) {
 		return "b"
 	})
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ftA, ftB}, map[string]bool{"a": true, "b": true}, nil); err != nil {
+	if _, err := ex.Register(cx, []Tool{ftA, ftB}, map[string]bool{"a": true, "b": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	done := make(chan error, 1)
@@ -176,7 +176,7 @@ func TestExecutorToolNotFoundFallback(t *testing.T) {
 	s, cx := newTestContext()
 	rec := newCollector(s)
 	ex := NewExecutor()
-	if err := ex.Register(cx, nil, map[string]bool{"known_func": true}, nil); err != nil {
+	if _, err := ex.Register(cx, nil, map[string]bool{"known_func": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallEvent{ID: "tc_1", Name: "unknown_func", Arguments: "{}"}); err != nil {
@@ -217,7 +217,7 @@ func TestExecutorHitlFailureAbandonsBatchAndPropagates(t *testing.T) {
 		return "ok"
 	})
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ftAsk, ftSibling}, map[string]bool{"ask": true, "sibling": true}, nil); err != nil {
+	if _, err := ex.Register(cx, []Tool{ftAsk, ftSibling}, map[string]bool{"ask": true, "sibling": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -257,7 +257,7 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 			}
 		})
 		ex := NewExecutor()
-		if err := ex.Register(cx, []Tool{ft}, map[string]bool{"finisher": true}, nil); err != nil {
+		if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"finisher": true}, nil); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 		if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -289,7 +289,7 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 			}
 		})
 		ex := NewExecutor()
-		if err := ex.Register(cx, []Tool{ft}, map[string]bool{"finisher2": true}, nil); err != nil {
+		if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"finisher2": true}, nil); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 		if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -312,7 +312,7 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 			}, Final: true}
 		})
 		ex := NewExecutor()
-		if err := ex.Register(cx, []Tool{ft}, map[string]bool{"greedy": true}, nil); err != nil {
+		if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"greedy": true}, nil); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 		err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -332,7 +332,7 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 			return events.ToolResult{Parts: []events.Input{events.BinaryInput{Data: []byte{1}}}, Final: true}
 		})
 		ex := NewExecutor()
-		if err := ex.Register(cx, []Tool{ft}, map[string]bool{"weird": true}, nil); err != nil {
+		if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"weird": true}, nil); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 		err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -352,7 +352,7 @@ func TestExecutorClientToolForcedResponsePreservesCalls(t *testing.T) {
 		t.Fatalf("NewClientTool: %v", err)
 	}
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ct}, map[string]bool{"client_action": true}, nil); err != nil {
+	if _, err := ex.Register(cx, []Tool{ct}, map[string]bool{"client_action": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	vendor := map[string]any{"provider": "test"}
@@ -385,7 +385,7 @@ func TestExecutorTimeout(t *testing.T) {
 		return "late"
 	}, WithTimeout(50*time.Millisecond))
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ft}, map[string]bool{"sleepy": true}, nil); err != nil {
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"sleepy": true}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -416,7 +416,7 @@ func TestExecutorMiddlewareCanShortCircuit(t *testing.T) {
 	denied := &denyingMW{}
 	ft := mustFunctionTool(t, "secret", "", func() string { return "granted" })
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ft}, map[string]bool{"secret": true}, []middleware.Middleware{denied}); err != nil {
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"secret": true}, []middleware.Middleware{denied}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -444,7 +444,7 @@ func TestExecutorSourceStampedOnHandledCall(t *testing.T) {
 	mw := &sourceMW{capture: &gotSource, mu: &mu}
 	ft := mustFunctionTool(t, "stamped", "", func() string { return "" }, WithSource("function:app.ops:deploy:deploy"))
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ft}, map[string]bool{"stamped": true}, []middleware.Middleware{mw}); err != nil {
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"stamped": true}, []middleware.Middleware{mw}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
@@ -477,7 +477,7 @@ func TestExecutorToolErrorForMiddlewareFailure(t *testing.T) {
 	rec := newCollector(s)
 	ft := mustFunctionTool(t, "wrapped", "", func() string { return "" })
 	ex := NewExecutor()
-	if err := ex.Register(cx, []Tool{ft}, map[string]bool{"wrapped": true},
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"wrapped": true},
 		[]middleware.Middleware{&failingMW{}}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -496,4 +496,104 @@ type failingMW struct{ middleware.Base }
 
 func (f *failingMW) OnToolExecution(_ middleware.ToolExecFunc, _ *events.ToolCallEvent, _ *agocontext.Context) (events.Event, error) {
 	return nil, errors.New("mw failed")
+}
+
+// regFailTool fails its own registration; used to pin the unwind contract.
+type regFailTool struct{}
+
+func (regFailTool) Name() string         { return "reg_fail" }
+func (regFailTool) DeclaredInCode() bool { return true }
+func (regFailTool) Schemas(*agocontext.Context) ([]any, error) {
+	return []any{Schema{Name: "reg_fail"}}, nil
+}
+func (regFailTool) Register(*agocontext.Context, []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, errors.New("register failed")
+}
+
+// TestExecutorRegisterReturnsSubscriptionsForTurnTeardown pins the turn-scope
+// contract (docs/DECISIONS.md D-032): Register reports the ids of everything it
+// subscribed so the caller can tear the turn down before the next registration on
+// the same stream; without the teardown a second registration would execute every
+// call twice (stale handlers from the first registration are still live).
+func TestExecutorRegisterReturnsSubscriptionsForTurnTeardown(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	var executions int
+	ft := mustFunctionTool(t, "count", "", func() string {
+		executions++
+		return "ok"
+	})
+	ex := NewExecutor()
+
+	// Turn 1.
+	subs, err := ex.Register(cx, []Tool{ft}, map[string]bool{"count": true}, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// The batch handler, the tool's own subscription and the not-found fallback.
+	if len(subs) != 3 {
+		t.Fatalf("subscriptions = %d, want 3", len(subs))
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "count", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if executions != 1 {
+		t.Fatalf("turn 1 executions = %d, want 1", executions)
+	}
+
+	// Turn scope teardown, then the next turn re-registers on the same stream.
+	for _, id := range subs {
+		s.Unsubscribe(id)
+	}
+	executions = 0
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"count": true}, nil); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "2", Name: "count", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if executions != 1 {
+		t.Fatalf("turn 2 executions = %d, want 1 (stale handler from turn 1 fired)", executions)
+	}
+	// One settled batch per turn: the stale batch handler from turn 1 must not
+	// produce a second ToolResultsEvent for turn 2's calls.
+	results := rec.ofType(t, "ToolResultsEvent")
+	if len(results) != 2 {
+		t.Fatalf("ToolResultsEvent total = %d, want 2 (one per turn)", len(results))
+	}
+	if last := results[1].(events.ToolResultsEvent); len(last.Results) != 1 || last.Results[0].ParentID != "2" {
+		t.Fatalf("turn 2 batch = %+v, want the single result for call 2", last)
+	}
+}
+
+// TestExecutorRegisterErrorLeavesNothingSubscribed pins the unwind contract: a
+// failing tool registration removes the batch handler and any tools already
+// registered, so the stream stays silent (Python ExitStack parity).
+func TestExecutorRegisterErrorLeavesNothingSubscribed(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	ft := mustFunctionTool(t, "fine", "", func() string { return "ok" })
+	ex := NewExecutor()
+	if _, err := ex.Register(cx, []Tool{ft, regFailTool{}},
+		map[string]bool{"fine": true, "reg_fail": true}, nil); err == nil {
+		t.Fatal("Register succeeded, want the reg_fail tool's error")
+	}
+	before := len(rec.snapshot())
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "fine", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// Only the sent event itself may appear: no forwarded call, no settlement —
+	// the batch handler and the tool's subscription are gone.
+	for _, ev := range rec.snapshot()[before:] {
+		switch events.AsValue(ev).EventType() {
+		case "ToolCallEvent", "ToolResultEvent", "ToolErrorEvent", "ToolNotFoundEvent", "ToolResultsEvent":
+			t.Fatalf("failed registration left handlers live: %s flowed", events.AsValue(ev).EventType())
+		}
+	}
 }

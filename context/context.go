@@ -9,6 +9,7 @@ package context
 import (
 	stdcontext "context"
 	"errors"
+	"reflect"
 	"sync"
 	"time"
 
@@ -181,9 +182,15 @@ func (c *Context) Hook() hitl.HumanHook {
 	return c.hook
 }
 
-// Ask requests human input and waits for the answer. Errors are normalized to
-// hitl errors: no hook → NotProvidedError, hook failure → FailedError,
-// deadline → TimeoutError.
+// Ask requests human input and waits for the answer. The request goes out on the
+// stream, where a per-request interrupt subscription hands it to the hook (Python
+// parity: the wrapped hook is an interrupt subscriber; its wrapper returning None
+// stops dispatch, so the question itself is not transcribed). The answer is
+// consumed via Stream.Get on HumanMessage.parent_id == req.ID, so an external
+// participant can answer instead of the hook. req.Timeout covers both the asking
+// and the waiting. Errors are normalized to hitl errors: no hook →
+// NotProvidedError, hook failure → FailedError (even at the deadline — Python:
+// only the wait can produce a timeout), deadline → TimeoutError.
 func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (string, error) {
 	if req.ID == "" {
 		r := events.NewHumanInputRequest(req.Content, req.Timeout)
@@ -199,26 +206,130 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 		ctx, cancel = stdcontext.WithTimeout(ctx, time.Duration(req.Timeout*float64(time.Second)))
 		defer cancel()
 	}
-	msg, err := hook(ctx, req)
-	if err != nil {
-		if errors.Is(err, hitl.ErrNotProvided) {
-			return "", &hitl.NotProvidedError{Detail: err.Error()}
+
+	// The answer is consumed through the stream, so the wait must be subscribed
+	// before an answer can exist: Get subscribes on entry, hence it starts before
+	// the question goes out. A hook answering within dispatch is also handed to
+	// Ask directly — Get's subscription lives on another goroutine and could
+	// otherwise lose an instant answer (Python enters stream.get's subscription
+	// before asking, so it has no such race to close).
+	gctx, cancelGet := stdcontext.WithCancel(ctx)
+	defer cancelGet()
+	got := make(chan *events.HumanMessage, 1)
+	getErr := make(chan error, 1)
+	go func() {
+		ev, err := c.Stream.Get(gctx, answerCondition(req.ID))
+		if err != nil {
+			getErr <- err
+			return
 		}
-		if errors.Is(ctx.Err(), stdcontext.DeadlineExceeded) {
-			return "", &hitl.TimeoutError{Timeout: req.Timeout}
+		if hm, ok := ev.(*events.HumanMessage); ok {
+			got <- hm
 		}
+	}()
+
+	// Dispatch is synchronous (D-004), so the hook runs on its own goroutine: a
+	// hook that never returns must not pin the stream or outlive the deadline.
+	// Go cannot cancel a goroutine — an abandoned hook's eventual answer is
+	// discarded (AGO-DEVIATION: Python cancels the in-flight hook via
+	// asyncio.wait_for; see docs/DECISIONS.md D-032).
+	answer := make(chan *events.HumanMessage, 1)
+	hookErr := make(chan error, 1)
+	sub := c.Stream.Subscribe(func(ev events.Event) error {
+		hr, ok := humanRequest(ev)
+		if !ok || hr.ID != req.ID {
+			return nil
+		}
+		go func() {
+			msg, err := hook(ctx, hr)
+			switch {
+			case err != nil:
+				hookErr <- err
+			case msg == nil:
+				hookErr <- errors.New("hitl: hook returned no message")
+			default:
+				if msg.ParentID == "" {
+					msg.ParentID = req.ID
+				}
+				if err := c.Send(msg); err != nil {
+					hookErr <- err
+					return
+				}
+				answer <- msg
+			}
+		}()
+		// The question is swallowed: not transcribed, not shown to normal
+		// subscribers (Python parity: the interrupt wrapper returns None).
+		return stream.ErrHandled
+	}, stream.SubscribeOptions{
+		Interrupt: true,
+		Condition: events.TypeOfAny(
+			reflect.TypeOf(events.HumanInputRequest{}),
+			reflect.TypeOf(events.ToolApprovalRequest{}),
+		),
+	})
+	defer c.Stream.Unsubscribe(sub)
+
+	if err := c.Send(req); err != nil {
+		// ErrHandled is consumed inside Send; anything else is the channel
+		// failing before the hook could run (Python parity: a send failure is
+		// the channel failing → HumanInputFailedError).
 		return "", &hitl.FailedError{Cause: err}
 	}
-	if msg == nil {
-		return "", &hitl.FailedError{Cause: errors.New("hook returned no message")}
+	for {
+		select {
+		case msg := <-got:
+			return msg.Content, nil
+		case msg := <-answer:
+			return msg.Content, nil
+		case err := <-hookErr:
+			if errors.Is(err, hitl.ErrNotProvided) {
+				return "", &hitl.NotProvidedError{Detail: err.Error()}
+			}
+			// A hook surfacing the Ask-imposed cancellation is the deadline
+			// firing, not the channel failing (Python parity: wait_for cancels
+			// the in-flight hook and reports the timeout). Any other hook
+			// failure stays a failure even at the deadline.
+			if errors.Is(err, stdcontext.DeadlineExceeded) && errors.Is(ctx.Err(), stdcontext.DeadlineExceeded) {
+				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+			}
+			return "", &hitl.FailedError{Cause: err}
+		case err := <-getErr:
+			// Get only errors on cancellation of its context.
+			if errors.Is(err, stdcontext.DeadlineExceeded) {
+				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+			}
+			return "", &hitl.FailedError{Cause: err}
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), stdcontext.DeadlineExceeded) {
+				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+			}
+			return "", &hitl.FailedError{Cause: ctx.Err()}
+		}
 	}
-	if msg.ParentID == "" {
-		msg.ParentID = req.ID
+}
+
+// humanRequest extracts the request behind an event: ToolApprovalRequest embeds
+// HumanInputRequest, and Go type identity keeps the embedded value from matching
+// a direct assertion.
+func humanRequest(ev events.Event) (*events.HumanInputRequest, bool) {
+	switch t := ev.(type) {
+	case *events.HumanInputRequest:
+		return t, true
+	case *events.ToolApprovalRequest:
+		return &t.HumanInputRequest, true
 	}
-	if err := c.Send(msg); err != nil {
-		return "", &hitl.FailedError{Cause: err}
-	}
-	return msg.Content, nil
+	return nil, false
+}
+
+// answerCondition matches the HumanMessage answering a request with the given id.
+func answerCondition(parentID string) events.Condition {
+	return events.AllOf(
+		events.TypeOf[events.HumanMessage](),
+		events.Equal(func(ev events.Event) string {
+			return ev.(*events.HumanMessage).ParentID
+		}, parentID),
+	)
 }
 
 // Input asks the human a plain-text question.

@@ -38,7 +38,7 @@ type HumanMessage struct {
 
 func (HumanMessage) EventType() string    { return "HumanMessage" }
 func (HumanMessage) Transient() bool      { return false }
-func (HumanMessage) Conversational() bool { return false }
+func (HumanMessage) Conversational() bool { return true }
 
 func init() {
 	RegisterEvent(HumanInputRequest{})

@@ -96,7 +96,7 @@ func (t *remoteTool) Schemas(_ *agocontext.Context) ([]any, error) {
 // local (prefixed) name. The agent middleware (mws[0] outermost — the repo-wide
 // Chain convention) wraps the remote invocation; the result event is sent back
 // for the executor to collect.
-func (t *remoteTool) Register(cx *agocontext.Context, mw []middleware.Middleware) error {
+func (t *remoteTool) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
 	exec := t.exec
 	for i := len(mw) - 1; i >= 0; i-- {
 		m, inner := mw[i], exec
@@ -130,8 +130,8 @@ func (t *remoteTool) Register(cx *agocontext.Context, mw []middleware.Middleware
 		}
 		return cx.Send(result)
 	}
-	cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
-	return nil
+	id := cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
+	return []stream.SubID{id}, nil
 }
 
 // exec invokes the server: the call's JSON arguments go out under the remote

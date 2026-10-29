@@ -251,9 +251,12 @@ type Tool interface {
     Name() string
     DeclaredInCode() bool
     Schemas(ctx *context.Context) ([]any, error)      // []Schema or ToolSchema impls
-    Register(ctx *context.Context, mw []middleware.Middleware) error  // subscribe on stream; mw = tool-scoped
+    Register(ctx *context.Context, mw []middleware.Middleware) ([]stream.SubID, error)  // subscribe on stream; mw = tool-scoped; returns ids for the turn scope's teardown
 }
-// AGO-DEVIATION: no ExitStack — Go cleanup is via TurnScope (agent-owned); Register is idempotent per turn.
+// AGO-DEVIATION: no ExitStack — Go cleanup is agent-owned: Register returns the ids of the
+// subscriptions it created (on error nothing stays subscribed); the turn scope collects them
+// and unsubscribes on Close. The per-stream turn lock serializes turns, so per-turn
+// registration never stacks duplicates (docs/DECISIONS.md D-032).
 
 type FunctionTool struct{...}
 func NewFunctionTool(name, description string, fn any, opts ...FunctionToolOption) (*FunctionTool, error)
@@ -270,8 +273,9 @@ type SubagentTool = FunctionTool variant wrapping agent (lives in agent pkg to a
 
 type Executor struct{...}
 func NewExecutor() *Executor
-func (e *Executor) Register(ctx *context.Context, ts []Tool, known map[string]bool, mws []middleware.Middleware) error
-// subscribes: batch handler on ToolCallsEvent; per-tool handlers; fallback → ToolNotFoundEvent.
+func (e *Executor) Register(ctx *context.Context, ts []Tool, known map[string]bool, mws []middleware.Middleware) ([]stream.SubID, error)
+// subscribes: batch handler on ToolCallsEvent; per-tool handlers; fallback → ToolNotFoundEvent;
+// returns all created subscription ids for the turn scope's teardown (unsubscribed on Close).
 // Parallel execution (goroutine per call, errgroup-style); HumanInputError cancels siblings.
 // Per-call: send ToolCallEvent → tool execution (middleware chain: tool mw innermost, agent mw outermost;
 // timeout → ToolErrorEvent "Tool 'X' timed out after N seconds") → ToolResultEvent / ToolErrorEvent.

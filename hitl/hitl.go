@@ -1,10 +1,13 @@
 // Package hitl carries the human-in-the-loop contract: a HumanHook answers
 // HumanInputRequests (questions, tool approvals) on behalf of a human operator.
 //
-// Parity with Python AG2 ag2/hitl.py. AGO-DEVIATION: the hook is stored on the
-// conversation context and invoked directly (Python routes it through a stream
-// subscription); the observable behavior — one answer per request, normalized
-// errors — is identical. See docs/DECISIONS.md.
+// Parity with Python AG2 ag2/hitl.py: the installed hook is handed each question
+// through a stream subscription (Context.Ask routes HumanInputRequest events to
+// it and waits for the answer on the stream), so the observable behavior — one
+// answer per request, the answer on the transcript, normalized errors — matches.
+// AGO-DEVIATION: Python cancels an in-flight hook at the request deadline via
+// asyncio.wait_for; a Go hook cannot be cancelled, only abandoned — see
+// docs/DECISIONS.md D-032.
 package hitl
 
 import (

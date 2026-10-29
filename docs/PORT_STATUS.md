@@ -3,6 +3,7 @@
 Per-package porting status of the AG2 (Python) → AGo (Go) port, against the binding Go
 contracts in `docs/ARCHITECTURE.md`. Deviations from Python parity are marked
 `// AGO-DEVIATION` in code and recorded as D-xxx entries in `docs/DECISIONS.md`.
+For a class/function-level Python→Go API map, see [docs/MIGRATION.md](MIGRATION.md).
 
 Statuses:
 
@@ -15,11 +16,12 @@ Statuses:
 
 - `go build ./...` — success.
 - `go vet ./...` — clean.
-- `go test -count=1 ./...` — 33 packages `ok`, 0 failures, 0 skipped tests
-  (`ago/hitl`, `ago/internal/uuid` and the five `ago/examples/*` programs have no test
+- `go test -count=1 ./...` — 31 packages `ok`, 0 failures, 0 skipped tests
+  (`ago/hitl`, `ago/internal/uuid` and the thirteen `ago/examples/*` programs have no test
   files of their own; hitl behavior is exercised by the `context` and `tools` test suites).
-- `go run ./examples/{ask,tools,hitl,subagent,group}` — all five complete offline
-  (scripted configs, no API keys).
+- `go run ./examples/{ask,tools,hitl,subagent,group,knowledge_memory,mcp_http,mcp_stdio,
+  multi_turn,observers,policies_compact,safety_halt,structured_output}` — all thirteen
+  complete offline (scripted configs, no API keys).
 
 ## Packages
 
@@ -57,14 +59,14 @@ Statuses:
 | `agent.py` | `ago/agent` | ported | wave 2. `Agent`/`AgentRun`/`AgentReply`; turn loop with per-stream lock, inbox drain → tool rounds → leftover flush; middleware wiring; HITL with `CloseUnansweredToolCalls` history repair; `Resume`; `ContentAs[T]` validation retry; `PromptHook`; `Agent.Task`/`TaskConfig`; `AsTool`. Config resolution → `ErrConfigNotProvided` |
 | `spec.py` | `ago/spec` | ported | wave 3 (D-023). `AgentSpec` snake_case wire JSON, `FromAgent` (response schema not publicly readable → nil), `ToAgent` over a tool pool |
 | `network/` core (envelope, channel, identity, rule, transitions, handoff, hub core, adapters ×4, client subset, transport frames + local) | `ago/network` + `ago/network/transport` | partial | wave 3 (D-031, functional single-host subset of D-010). Envelope with the `ag2.*` wire vocabulary, channel state machine + handshake, passports, rules, TransitionGraph, Handoff/Finish recognition, Hub (send gates, TTL, WAL: memory/file/knowledge backends, Replay), Consulting/Conversation/Discussion/Workflow adapters, HubClient/AgentClient/HumanClient, Frame + LocalLink. **Deferred:** WebSocket link (`transport/ws.py`), federation (`remote.py`), view policies (`views/`), task mirror, hub expectation sweepers/arbiter, client LLM-tool set (peers/channels/tasks/context/delegate) |
-| `mcp/` | `ago/mcp` | partial | wave 3 (D-029, minimal client). JSON-RPC 2.0 over streamable HTTP (session handling, 404 rebuild) or stdio subprocess; lazy `Initialize`, paginated `ListTools`, `CallTool` with content mapping; `MCPToolkit` → `ago/tools`. **Not ported:** `input_required` answering, discovery cache, protocol-era negotiation |
+| `mcp/` | `ago/mcp` | partial | wave 3 (D-029, minimal client). JSON-RPC 2.0 over streamable HTTP (session handling, 404 rebuild) or stdio subprocess; lazy `Initialize`, paginated `ListTools`, `CallTool` with content mapping; `mcp.Tools(cl)` adapts remote tools to `ago/tools` (`DeclaredInCode=false`); 30s default HTTP timeout (D-034). **Not ported:** `input_required` answering, discovery cache, protocol-era negotiation |
 | `testing.py` | `ago/testing` (import as `agotest "ago/testing"`) | ported | wave 1 (D-018). `TestConfig` (scripted `ModelResponse`s, shared cursor, recorded call snapshots), `TrackingConfig` (recording wrapper, shared recorder across clones); Python Turn vocabulary collapsed to full-response scripts (documented deviation) |
 | `live/`, `events/voice.py` | — | deferred | Live/voice stack (realtime providers, STT, sound devices) not ported |
 | `a2a/`, `acp/`, `ag_ui/`, `a2ui/`, `mcp_ui/`, `eval/` | — | deferred | Protocol servers and the eval harness are out of scope (D-010) |
 | `streams/redis/` | — | deferred | Redis-backed stream storage needs an external client (D-003); `ago/stream` ships the memory backend (D-004) |
 | `files/`, `extensions/`, `plugin.py`, `textual.py`, `mypy.py`, `_import_utils.py`, `_telemetry_consts.py`, `types.py`, `utils.py` | — | deferred | Python infrastructure without a Go counterpart in scope (plugin loading, typing helpers, textual UI, telemetry constants) |
 | — | `ago/internal/uuid` | ported | RFC 4122 v4 from `crypto/rand` (D-003). No test files |
-| — | `ago/examples/{ask,tools,hitl,subagent,group}` | ported | wave 3. Offline runnable programs; verified 2026-10-29 with `go run` (see Gates above) |
+| — | `ago/examples/{ask,tools,hitl,subagent,group,knowledge_memory,mcp_http,mcp_stdio,multi_turn,observers,policies_compact,safety_halt,structured_output}` | ported | wave 3. Offline runnable programs (scripted configs, no API keys); all thirteen verified 2026-10-29 with `go run` (see Gates above) |
 
 ## Deferred subsystems (summary)
 

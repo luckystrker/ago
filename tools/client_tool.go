@@ -47,8 +47,9 @@ func (t *ClientTool) Schemas(_ *agocontext.Context) ([]any, error) {
 
 // Register subscribes the tool for calls matching its name; the agent middleware
 // wraps the conversion to ClientToolCallEvent (no tool middleware, no timeout: the
-// tool runs on the client).
-func (t *ClientTool) Register(cx *agocontext.Context, mw []middleware.Middleware) error {
+// tool runs on the client). The subscription id is returned for the turn scope's
+// teardown.
+func (t *ClientTool) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
 	exec := middleware.ToolExecFunc(func(ev *events.ToolCallEvent, _ *agocontext.Context) (events.Event, error) {
 		return events.ClientToolCallEvent{ID: ev.ID, Name: ev.Name, Arguments: ev.Arguments}, nil
 	})
@@ -76,6 +77,6 @@ func (t *ClientTool) Register(cx *agocontext.Context, mw []middleware.Middleware
 		}
 		return cx.Send(result)
 	}
-	cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
-	return nil
+	id := cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
+	return []stream.SubID{id}, nil
 }

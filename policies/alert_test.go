@@ -107,6 +107,54 @@ func TestAlertPolicyMixedBatch(t *testing.T) {
 	}
 }
 
+// Regression: non-fatal alerts standing after the first fatal must still be
+// injected. The delivery record marks them delivered in the same Apply, so a
+// break on the fatal would lose their content permanently — they would never
+// be injected on any later call either.
+func TestAlertPolicyNonFatalAfterFatal(t *testing.T) {
+	ctx := testContext(t)
+	p := NewAlertPolicy()
+	in := []events.Event{
+		&events.ObserverAlert{Source: "loop-detector", Severity: events.SeverityInfo, Message: "one"},
+		&events.ObserverAlert{Source: "watchdog", Severity: events.SeverityFatal, Message: "deadline"},
+		&events.ObserverAlert{Source: "watchdog", Severity: events.SeverityInfo, Message: "two"},
+	}
+
+	prompts, _, err := p.Apply(nil, in, ctx)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	want := []string{
+		"alert(info) from loop-detector: one",
+		"alert(info) from watchdog: two",
+	}
+	if len(prompts) != len(want) {
+		t.Fatalf("prompts = %q, want both non-fatal lines around the fatal", prompts)
+	}
+	for i, w := range want {
+		if prompts[i] != w {
+			t.Errorf("prompts[%d] = %q, want %q", i, prompts[i], w)
+		}
+	}
+	halts := haltEvents(t, ctx)
+	if len(halts) != 1 || halts[0].Reason != "FATAL: deadline" {
+		t.Fatalf("halts = %v, want one halt naming the first fatal", halts)
+	}
+
+	// All three alerts were delivered in that single Apply: a replay injects
+	// nothing new and does not halt again.
+	prompts2, _, err := p.Apply(nil, in, ctx)
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if len(prompts2) != 0 {
+		t.Errorf("second Apply prompts = %q, want none", prompts2)
+	}
+	if halts = haltEvents(t, ctx); len(halts) != 1 {
+		t.Errorf("stream has %d HaltEvents after replay, want 1", len(halts))
+	}
+}
+
 func haltEvents(t *testing.T, ctx *agocontext.Context) []*events.HaltEvent {
 	t.Helper()
 	hist, err := ctx.History()

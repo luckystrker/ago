@@ -115,7 +115,7 @@ type ToolCallsEvent struct {
 
 func (ToolCallsEvent) EventType() string    { return "ToolCallsEvent" }
 func (ToolCallsEvent) Transient() bool      { return false }
-func (ToolCallsEvent) Conversational() bool { return false }
+func (ToolCallsEvent) Conversational() bool { return true }
 
 // ToolResultsEvent carries the batch of results answering one ToolCallsEvent; it is
 // the event that drives the next model call.

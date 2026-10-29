@@ -586,7 +586,9 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 	h.channels[channelID] = ch
 	waiter := make(chan *ChannelHandle, 1)
 	h.waiters[channelID] = waiter
-	h.recordLocked(channelSnapshot(ch))
+	// Lifecycle snapshot: a WAL failure here must not fail the create (see
+	// recordLocked).
+	_ = h.recordLocked(channelSnapshot(ch))
 	h.mu.Unlock()
 
 	invites := participants[1:]
@@ -643,7 +645,9 @@ func (h *Hub) activate(channelID string) error {
 	}
 	ch.State = ChannelActive
 	ch.PendingAcks = nil
-	h.recordLocked(channelSnapshot(ch))
+	// Lifecycle snapshot: a WAL failure here must not fail the handshake (see
+	// recordLocked).
+	_ = h.recordLocked(channelSnapshot(ch))
 	h.mu.Unlock()
 
 	opened := Envelope{
@@ -803,7 +807,8 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 		ch.State = ChannelExpired
 		ch.ClosedAt = h.now()
 		ch.CloseReason = "ttl"
-		h.recordLocked(channelSnapshot(ch))
+		// Lifecycle snapshot on the error path: swallowed (see recordLocked).
+		_ = h.recordLocked(channelSnapshot(ch))
 		action.kind = "expire"
 		action.channel = ch.ID
 		return Envelope{}, fmt.Errorf("%w: channel %s", ErrChannelExpired, ch.ID)
@@ -850,11 +855,17 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 		return Envelope{}, err
 	}
 
-	// Stamp, persist, then decide dispatch.
+	// Stamp, persist, then decide dispatch. The WAL append is the acceptance
+	// barrier (Python parity: post_envelope awaits _wal_append before the
+	// fold): when the backend fails, the send fails and the envelope never
+	// enters the in-memory log — ReadWAL only ever shows accepted envelopes
+	// and Replay only ever sees persisted ones.
 	env.ID = h.ids.Next()
 	env.CreatedAt = h.now()
+	if err := h.recordLocked(WALRecord{Kind: "envelope", Envelope: &env}); err != nil {
+		return Envelope{}, fmt.Errorf("network: append envelope %s to wal: %w", env.ID, err)
+	}
 	h.logs[ch.ID] = append(h.logs[ch.ID], env)
-	h.recordLocked(WALRecord{Kind: "envelope", Envelope: &env})
 
 	if protocol {
 		switch env.EventType {
@@ -983,7 +994,8 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 	ch.State = target
 	ch.ClosedAt = h.now()
 	ch.CloseReason = reason
-	h.recordLocked(channelSnapshot(ch))
+	// Lifecycle snapshot: swallowed (see recordLocked).
+	_ = h.recordLocked(channelSnapshot(ch))
 
 	closeEnv := Envelope{
 		ChannelID: channelID,
@@ -998,7 +1010,12 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 	closeEnv.ID = h.ids.Next()
 	closeEnv.CreatedAt = h.now()
 	h.logs[channelID] = append(h.logs[channelID], closeEnv)
-	h.recordLocked(WALRecord{Kind: "envelope", Envelope: &closeEnv})
+	// AGO-DEVIATION: Python surfaces the close envelope's WAL append failure
+	// through close_channel; AGo's closeChannel is void and also runs as a
+	// post-send follow-up where no caller could receive the error, so the
+	// failure is swallowed (channel state is already terminal in memory; see
+	// docs/DECISIONS.md D-033).
+	_ = h.recordLocked(WALRecord{Kind: "envelope", Envelope: &closeEnv})
 
 	targets := h.resolveTargetsLocked(ch, closeEnv)
 	if w, ok := h.waiters[channelID]; ok {
@@ -1153,14 +1170,18 @@ func (h *Hub) Replay() error {
 	return nil
 }
 
-// recordLocked appends to the WAL; a WAL failure is swallowed at record
-// time for lifecycle snapshots and surfaced for envelopes (see postLocked's
-// caller contract: envelope WAL failures surface through Send).
-func (h *Hub) recordLocked(rec WALRecord) {
+// recordLocked appends to the WAL and reports the backend failure. The
+// caller decides what a failure means: envelope records posted through Send
+// must surface it — an envelope reported as sent but never persisted is lost
+// for Replay (Python parity: post_envelope awaits _wal_append without
+// try/except) — while lifecycle snapshots keep the send-path working when the
+// backend is down (the in-memory log remains the source for in-process
+// reads).
+func (h *Hub) recordLocked(rec WALRecord) error {
 	if h.wal == nil {
-		return
+		return nil
 	}
-	_ = h.wal.Append(rec) // the in-memory log remains the source for reads
+	return h.wal.Append(rec)
 }
 
 func channelSnapshot(ch *ChannelHandle) WALRecord {

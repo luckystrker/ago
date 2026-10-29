@@ -2,7 +2,9 @@
 // gated by the Approval middleware: before the tool runs, the framework asks the
 // human operator through the agent's HITL hook. The hook here is a stub — it
 // prints the question it receives and answers "y" — so the example runs offline.
-// The question and the answer both land on the transcript.
+// Only the answer lands on the transcript; the question is delivered to the hook
+// without being transcribed (Python parity: dispatch stops at the interrupt
+// subscriber).
 //
 // Run: go run ./examples/hitl
 package main
@@ -71,7 +73,7 @@ func main() {
 
 	fmt.Println("\nfinal answer:", reply.Body())
 
-	fmt.Println("\n== transcript (the question/answer are part of history) ==")
+	fmt.Println("\n== transcript (the answer is part of history; the question went to the hook) ==")
 	evs, err := reply.History().GetEvents()
 	if err != nil {
 		fmt.Println("history failed:", err)

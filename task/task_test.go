@@ -117,6 +117,84 @@ func TestStartEmitsTaskStartedAndStampsDependency(t *testing.T) {
 	}
 }
 
+// TestTaskStartedCarriesSpec pins the task-event parity: TaskStarted carries
+// the full Spec (Python task.py stamps spec=self._spec, so description, payload
+// and capability reach observers) and TaskCompleted carries the usage field on
+// the wire, else nothing downstream can see what a task does nor account for
+// its tokens.
+func TestTaskStartedCarriesSpec(t *testing.T) {
+	s, c := newTestContext(t)
+	rec := subscribe(s)
+
+	payload := map[string]any{"depth": 2}
+	tsk, err := Start(c, "agent-1", Spec{
+		Title:       "research X",
+		Description: "dig deep",
+		Payload:     payload,
+		Capability:  "search",
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	started, ok := rec.find("TaskStarted").(*events.TaskStarted)
+	if !ok {
+		t.Fatal("TaskStarted not emitted")
+	}
+	if started.Spec == nil {
+		t.Fatal("TaskStarted.Spec is nil")
+	}
+	want := events.TaskSpec{Title: "research X", Description: "dig deep",
+		Payload: map[string]any{"depth": 2}, Capability: "search"}
+	if !reflect.DeepEqual(*started.Spec, want) {
+		t.Fatalf("TaskStarted.Spec = %+v, want %+v", *started.Spec, want)
+	}
+	// The event snapshots the payload: later owner mutations must not rewrite
+	// an already-sent event.
+	payload["depth"] = 99
+	if started.Spec.Payload["depth"] != 2 {
+		t.Fatalf("TaskStarted.Spec.Payload tracks the owner map: %+v", started.Spec.Payload)
+	}
+	// The Task primitive has no parent tool call (Python leaves
+	// parent_tool_call_id None on this path).
+	if started.ParentToolCallID != "" {
+		t.Fatalf("ParentToolCallID = %q, want empty", started.ParentToolCallID)
+	}
+	data, err := events.MarshalEvent(started)
+	if err != nil {
+		t.Fatalf("marshal TaskStarted: %v", err)
+	}
+	var wireStarted map[string]any
+	if err := json.Unmarshal(data, &wireStarted); err != nil {
+		t.Fatalf("unmarshal TaskStarted: %v", err)
+	}
+	specWire, ok := wireStarted["spec"].(map[string]any)
+	if !ok || specWire["title"] != "research X" || specWire["capability"] != "search" {
+		t.Fatalf("TaskStarted wire spec = %v", wireStarted["spec"])
+	}
+	if specWire["payload"].(map[string]any)["depth"] != float64(2) {
+		t.Fatalf("TaskStarted wire spec payload = %v", specWire["payload"])
+	}
+
+	if err := tsk.Complete("done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	done, ok := rec.find("TaskCompleted").(*events.TaskCompleted)
+	if !ok {
+		t.Fatal("TaskCompleted not emitted")
+	}
+	data, err = events.MarshalEvent(done)
+	if err != nil {
+		t.Fatalf("marshal TaskCompleted: %v", err)
+	}
+	var wireDone map[string]any
+	if err := json.Unmarshal(data, &wireDone); err != nil {
+		t.Fatalf("unmarshal TaskCompleted: %v", err)
+	}
+	if _, ok := wireDone["usage"]; !ok {
+		t.Fatalf("TaskCompleted wire has no usage key: %s", data)
+	}
+}
+
 func TestProgressMergesAndEmits(t *testing.T) {
 	s, c := newTestContext(t)
 	rec := subscribe(s)

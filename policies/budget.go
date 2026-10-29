@@ -15,7 +15,7 @@ const charsPerToken = 4
 //
 // The budget is a target, not a guarantee: the newest event is always retained
 // even when it alone overshoots, and a cut that would orphan a tool result
-// widens back until the retained span contains the pair.
+// widens back until the retained span contains the whole tool round.
 type TokenBudgetPolicy struct {
 	budget int
 }

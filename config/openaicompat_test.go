@@ -775,6 +775,27 @@ func TestRunChatCompatStreamAPIError(t *testing.T) {
 	}
 }
 
+func TestRunChatCompatStreamInBandError(t *testing.T) {
+	// An {"error": ...} chunk inside a 200 stream fails the call — Python
+	// parity (the SDK iterator raises instead of returning an empty response).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"+
+			"data: {\"error\":{\"message\":\"The server is overloaded\",\"type\":\"server_error\"}}\n\n"+
+			"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Streaming: true}
+	_, err := RunChatCompat(context.Background(), p, nil, nil, CallOptions{})
+	if !errors.Is(err, ErrStreamError) {
+		t.Fatalf("in-band error chunk must fail the call, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "server_error") || !strings.Contains(err.Error(), "The server is overloaded") {
+		t.Fatalf("error must carry the API detail, got %v", err)
+	}
+}
+
 // --- core contract ------------------------------------------------------------------
 
 func TestProviderValues(t *testing.T) {

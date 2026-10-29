@@ -672,8 +672,14 @@ Deviations, marked `// AGO-DEVIATION` in code:
   `KeepRecent = 2`); Python strategies received the whole history and cut themselves
   (`_cut_for_target`). Interleaved telemetry after the cut rides along with the fresh
   range, telemetry before it is dropped. The tool-cycle boundary widening
-  (`_replay.snap`) is not ported: the brief pins a plain keepRecent cut, and provider
-  mappers already repair orphan tool results on replay (D-020).
+  (`_replay.snap`) is not ported: the brief pins a plain keepRecent cut.
+  Correction (2026-10-29): the original rationale — "provider mappers already
+  repair orphan tool results on replay (D-020)" — holds only for
+  config/anthropic; the openai-compatible, gemini and ollama mappers replay
+  tool results verbatim, so a keepRecent cut that splits a tool round still
+  reaches those wires as an orphan `role:"tool"` message. Round-closing repair
+  lives at assembly time (policies widening, D-030); a round-aware compact cut
+  remains open for providers without mapper repair.
 - **LLMStrategy is headless**: one `config.LLMClient.Call` with a nil conversation
   context (Python summarizes over a throwaway `MemoryStream` — same isolation; nil
   conv drops provider progress chunks, which nothing consumes). No stdlib context in
@@ -761,11 +767,20 @@ Package `policies` (spec events-network.md §3; Python `ag2/policies` +
   toward a window or budget. When no trim is needed the input passes through
   unchanged (Python parity), so an upstream ConversationPolicy is optional.
 - **Orphan repair is targeted widening, not full `replayable_span`**: a
-  retained span that opens with a tool result (ToolResultEvent, ToolErrorEvent,
-  ToolNotFoundEvent, BuiltinToolResultEvent) whose call lies outside the span
-  widens back until the pair closes; the span never widens past the transcript
-  start, so it grows rather than empties. Python's ProviderReplay anchor/turn
-  items do not exist in the Go event vocabulary.
+  retained span that opens with an event carrying required call ids widens
+  back until the span answers them all; the span never widens past the
+  transcript start, so it grows rather than empties. Required ids come from
+  the tool results — the flat ToolResultEvent / ToolErrorEvent /
+  ToolNotFoundEvent / BuiltinToolResultEvent and the ToolResultsEvent batch
+  container the executor actually sends — and from standalone
+  ToolCallEvent / ClientToolCallEvent, which map to nothing on the wire:
+  provider mappers replay calls only from a ModelResponse's tool_calls, so a
+  valid span holds the announcing response, not just the call event (only
+  config/anthropic additionally repairs orphan pairs on replay, D-020).
+  Builtin calls carry their own provider item and need nothing. Python's
+  ProviderReplay anchor/turn items do not exist in the Go event vocabulary;
+  where Python drops orphaned events from the tail (_replay._prune), AGo
+  widens the whole round back onto the wire instead.
 - **AlertPolicy prompt format is one `alert(<severity>) from <source>:
   <message>` line per alert** (brief) instead of Python's joined
   "[OBSERVER MONITORING ALERTS]" block. A fatal alert sends a single
@@ -859,3 +874,97 @@ in-progress edits broke the whole-repo gate mid-wave. The workflow's final gate
 (build/vet/test) ran after all agents settled and is green; those transient findings
 are considered resolved. Rule going forward: a package's status is set by the final
 whole-repo gate, not by mid-wave snapshots.
+
+## D-032 — 2026-10-29 — Tool subscriptions are per-turn; Register returns them and the agent unsubscribes on Close
+
+Review (confirmed by reproduction) found that the subscriptions created by
+`tools.Executor.Register` (batch handler, per-tool handlers, not-found fallback) were
+never removed: Register discarded the `stream.SubID`s and the agent's `Close` only
+dropped its own LLM-trigger and halt subscriptions. A turn continuing on the same
+stream (`AgentReply.ask`) therefore ran under the previous turn's still-live handlers:
+duplicate tool executions, duplicate `ToolResultsEvent`, extra model calls until the
+script/limit ran out. Python avoids this by registering through a per-turn ExitStack
+`sub_scope` (ag2/tools/executor.py) that unwinds at turn end; the Python agent
+docstring warns precisely about "duplicate tool execution" when subscriptions leak.
+
+Fix: `Tool.Register` and `Executor.Register` return the ids of the subscriptions they
+create — on error nothing stays subscribed (unwind parity with the ExitStack) — and
+the agent collects them into the run's subscription set, unsubscribed by `Close`.
+The per-stream turn lock serializes turns, so `Close` of turn N always precedes
+`Register` of turn N+1 and registration never stacks duplicates. This makes real the
+contract formerly phrased as "Go cleanup is via TurnScope (agent-owned); Register is
+idempotent per turn" — the returned ids are that turn scope's substance. No new
+deviation from Python parity: the subscription lifetime now matches the ExitStack
+semantics.
+
+## D-032 — 2026-10-29 — Ask routes questions through the stream; hooks are abandoned, not cancelled
+
+Review found Context.Ask invoking the hook directly and taking the answer from its
+return value, contradicting the ARCHITECTURE.md contract ("Ask sends
+HumanInputRequest, waits for the matching HumanMessage (parent_id == req.ID) via
+Stream.Get") and Python (ag2/context.py:186-266, ag2/hitl.py wrap_hitl). The old
+hitl package comment referenced a DECISIONS entry that did not exist. Fixed, not
+deviated:
+
+- **Routing**: Ask publishes the question on the stream and a per-request interrupt
+  subscription hands it to the installed hook; the hook's answer is sent back on
+  the stream and consumed via `Stream.Get` on `HumanMessage.parent_id`, so an
+  external participant (transport, test, replay) can answer instead of the hook.
+  The question event is swallowed (`stream.ErrHandled`) — Python parity: the
+  interrupt wrapper returns None and dispatch stops before the persistence
+  subscriber, so the question is not transcribed and normal subscribers never see
+  it. MemoryStream.Send correspondingly runs interrupters before persisting.
+- **Timeout**: `req.Timeout` covers both the asking and the waiting; the hook runs
+  on its own goroutine and Ask selects on the deadline, so a hook that never
+  returns cannot pin the stream or the turn (Python: `asyncio.wait_for`). AGO
+  cannot cancel a goroutine — an abandoned hook's eventual answer is discarded
+  (Python cancels the in-flight hook). The agent passes Ask's per-request context
+  down to the user hook; the middleware chain carries no stdlib context, so it is
+  bound into the chain head per invocation.
+- **Error classification** (Python parity): no hook → NotProvidedError; the hook
+  failing on its own → FailedError even at the deadline; a hook surfacing the
+  Ask-imposed cancellation (`ctx.Err()` → DeadlineExceeded) and the deadline
+  itself → TimeoutError; caller cancellation → FailedError carrying
+  context.Canceled.
+- **Conversational flags** (same review): HumanMessage, ToolCallsEvent and
+  TaskStarted/Completed/Failed/Expired/Cancelled are Conversational() == true,
+  matching the Python `__conversational__` default — compaction counts, policies
+  and aggregation had silently excluded them. ModelMessage stays false (transient;
+  its durable copy is ModelResponse), TaskProgress and UsageEvent stay false.
+
+## D-033 — 2026-10-29 — network: envelope WAL failures surface through Send; lifecycle records stay swallowed
+
+Review (confirmed) found `recordLocked` swallowing every WAL append error while
+its own comment promised the opposite ("surfaced for envelopes"): a failing
+backend let `Send` report success for an envelope that `Replay` would never
+see. Python parity: `post_envelope` awaits `_wal_append` without try/except
+(ag2/network/hub/core.py), so a failed store fails the send.
+
+Contract now: `recordLocked` returns the append error. The envelope record in
+`postLocked` propagates it — `Send` fails after stamping, nothing is
+dispatched, and the envelope never enters the in-memory log (the append moved
+before the log write, so `ReadWAL` shows only accepted envelopes). Lifecycle
+records (channel snapshots in create/activate/expire/close) stay swallowed so
+the send path keeps working while the backend is down for content.
+AGO-DEVIATION: Python surfaces the terminal close envelope's append failure
+through `close_channel`; AGo's `closeChannel` is void and also runs as a
+post-send follow-up where no caller could receive the error, so that one stays
+swallowed (marked in code). Regression: `TestSendSurfacesWALAppendFailure`
+(fails against the swallow behavior — verified by reverting the propagation).
+
+## D-034 — 2026-10-29 — mcp: HTTP exchanges carry a 30s default timeout, configurable via MCPServerConfig.Timeout
+
+Review (confirmed) found the HTTP transport built on `&http.Client{}`: a
+hung/silent server blocked `CallTool` forever and, through the client's
+exchange lock, every later operation and the agent turn. Python bounds the
+exchange with `connection_timeout: float = 30.0`
+(ag2/tools/toolkits/mcp_server/types.py). Fix: `MCPServerConfig.Timeout`
+(time.Duration; zero = the 30s default, negative = no cap) applied to the
+transport's `http.Client`; the stdio transport is untouched (Python's stdio
+has no timeout either). This supersedes the D-029 bullet listing
+`connection_timeout` among the dropped config fields.
+AGO-DEVIATION: `http.Client.Timeout` caps the whole exchange including reading
+an SSE response body, while httpx's timeout is per-phase (connect/read/write);
+a slow-but-steady server is cut off at the cap. Regression:
+`TestHTTPTimeout` (defaults, override, negative, hung-server fast failure
+freeing the client lock).

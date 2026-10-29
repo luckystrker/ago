@@ -69,18 +69,37 @@ func TestTokenBudgetPolicy(t *testing.T) {
 		result := &events.ToolResultEvent{ParentID: call.ID, Name: call.Name}
 		e4, _ := textIn("cccccccc") // 2 tokens
 		in := []events.Event{e1, &call, result, e4}
-		// Costs 2/1/1/2, total 6 > 3: the fitting suffix is [result, e4] (cost 3),
-		// but it orphans the result — the span widens to include the call.
+		// Costs 2/2/1/2, total 7 > 3: the fitting suffix is [result, e4] (cost 3),
+		// but it orphans the result — the span widens past the call event to the
+		// start of the transcript, because nothing inside the suffix announces
+		// the call (only a ModelResponse's tool_calls can).
 		_, got, err := NewTokenBudgetPolicy(3).Apply(nil, in, nil)
 		if err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
-		if len(got) != 3 {
-			t.Fatalf("got %d events (%v), want 3", len(got), eventTypesOf(got))
+		if len(got) != 4 {
+			t.Fatalf("got %d events (%v), want 4", len(got), eventTypesOf(got))
 		}
-		first, ok := events.AsValue(got[0]).(events.ToolCallEvent)
-		if !ok || first.ID != call.ID {
-			t.Fatalf("suffix opens with %v, want the tool call", eventTypesOf(got))
+	})
+
+	t.Run("widens the executor's ToolResultsEvent container", func(t *testing.T) {
+		in, call := toolRoundTranscript(t)
+		// Costs 1/1/2/1/1/1, total 7 > 3: the fitting suffix is
+		// [ToolResultsEvent, TextInput, ModelResponse] (cost 3), which strands
+		// the container — the span widens to the announcing ModelResponse.
+		_, got, err := NewTokenBudgetPolicy(3).Apply(nil, in, nil)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if len(got) != 5 {
+			t.Fatalf("got %d events (%v), want the whole round (5)", len(got), eventTypesOf(got))
+		}
+		first, ok := events.AsValue(got[0]).(events.ModelResponse)
+		if !ok || len(first.ToolCalls.Calls) != 1 || first.ToolCalls.Calls[0].ID != call.ID {
+			t.Fatalf("suffix opens with %v, want the announcing ModelResponse", eventTypesOf(got))
+		}
+		if results, ok := events.AsValue(got[2]).(events.ToolResultsEvent); !ok || results.Results[0].ParentID != call.ID {
+			t.Fatalf("got[2] = %v, want the ToolResultsEvent answering %s", got[2].EventType(), call.ID)
 		}
 	})
 }

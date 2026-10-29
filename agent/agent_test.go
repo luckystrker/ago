@@ -210,7 +210,9 @@ func TestHitlToolApproval(t *testing.T) {
 	if reply.Body() != "purge complete" {
 		t.Fatalf("body: %q", reply.Body())
 	}
-	// The question and the answer are both on the transcript.
+	// Only the answer is on the transcript: the question is delivered to the
+	// hook through the stream and swallowed there (Python parity: dispatch stops
+	// at the interrupt subscriber before the persistence subscriber).
 	evs, _ := reply.History().GetEvents()
 	var sawReq, sawAnswer bool
 	for _, ev := range evs {
@@ -221,8 +223,47 @@ func TestHitlToolApproval(t *testing.T) {
 			sawAnswer = e.Content == "yes, approved"
 		}
 	}
-	if !sawReq || !sawAnswer {
-		t.Fatalf("HITL transcript incomplete (req=%v answer=%v)", sawReq, sawAnswer)
+	if sawReq {
+		t.Fatal("question must not be transcribed (dispatch stops at the interrupt subscriber)")
+	}
+	if !sawAnswer {
+		t.Fatal("answer missing from the transcript")
+	}
+}
+
+// TestHitlHookReceivesRequestDeadline pins the per-request context: the user
+// hook receives the context carrying the request deadline, not the bare turn
+// context (Python parity: the timeout covers the hook — wait_for cancels it).
+func TestHitlHookReceivesRequestDeadline(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		hadDdl   bool
+		ddlCalls int
+	)
+	hook := func(ctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		ddlCalls++
+		_, ok := ctx.Deadline()
+		hadDdl = hadDdl || ok
+		return &events.HumanMessage{Content: "y"}, nil
+	}
+	sensitive := func(args struct{}, ctx *agocontext.Context) (string, error) {
+		return ctx.Input(stdcontext.Background(), "delete everything?", 30*time.Second)
+	}
+	tool, err := tools.NewFunctionTool("purge", "Purge data", sensitive)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	cfg := agotest.NewTestConfig(toolResp("purge", "{}"), textResp("purge complete"))
+	a := New("operator", "", WithConfig(cfg), WithTools(tool), WithHitlHook(hook))
+	if _, err := a.Ask(stdcontext.Background(), "clean up"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ddlCalls == 0 || !hadDdl {
+		t.Fatalf("hook asked %d times, saw a deadline: %v", ddlCalls, hadDdl)
 	}
 }
 

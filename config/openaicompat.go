@@ -620,6 +620,12 @@ type wireChunk struct {
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *map[string]any `json:"usage"`
+	// Error is the in-band error object some dialects deliver as a chunk of a
+	// 200 stream instead of a failed response; a non-nil one fails the call.
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
 }
 
 // toolAcc accumulates one streamed tool call; deltas merge by index.
@@ -643,6 +649,14 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 		var chunk wireChunk
 		if err := json.Unmarshal(data, &chunk); err != nil {
 			return fmt.Errorf("config: decoding stream chunk: %w", err)
+		}
+		if chunk.Error != nil {
+			// In-band error chunk: the call fails — Python parity (the SDK
+			// iterator raises instead of ending the stream as a success).
+			if chunk.Error.Type != "" {
+				return fmt.Errorf("%w: %s: %s", ErrStreamError, chunk.Error.Type, chunk.Error.Message)
+			}
+			return fmt.Errorf("%w: %s", ErrStreamError, chunk.Error.Message)
 		}
 		if chunk.ID != "" {
 			responseID = chunk.ID

@@ -46,50 +46,96 @@ func conversational(evs []events.Event) []events.Event {
 	return out
 }
 
-// parentCallID returns the id of the tool call ev answers ("" for non-results).
-// ToolErrorEvent and ToolNotFoundEvent embed ToolResultEvent, and
-// BuiltinToolResultEvent is the provider-hosted variant — all four carry
-// ParentID.
-func parentCallID(ev events.Event) string {
+// requiredCallIDs returns the call ids ev needs answered inside the span it
+// opens; nil when the event stands on its own. ToolErrorEvent and
+// ToolNotFoundEvent embed ToolResultEvent, and BuiltinToolResultEvent is the
+// provider-hosted variant — all four carry ParentID. ToolResultsEvent is the
+// batch container the executor actually sends (tools: executor → cx.Send),
+// so every result it carries requires its own parent. A standalone
+// ToolCallEvent or ClientToolCallEvent maps to nothing on the wire — provider
+// mappers replay calls only from a ModelResponse's tool_calls — so it requires
+// the response announcing it. A builtin call carries its own provider item and
+// needs nothing.
+func requiredCallIDs(ev events.Event) []string {
 	switch e := events.AsValue(ev).(type) {
 	case events.ToolResultEvent:
-		return e.ParentID
+		return callIDList(e.ParentID)
 	case events.ToolErrorEvent:
-		return e.ParentID
+		return callIDList(e.ParentID)
 	case events.ToolNotFoundEvent:
-		return e.ParentID
+		return callIDList(e.ParentID)
 	case events.BuiltinToolResultEvent:
-		return e.ParentID
+		return callIDList(e.ParentID)
+	case events.ToolResultsEvent:
+		var out []string
+		for _, r := range e.Results {
+			if r.ParentID != "" {
+				out = append(out, r.ParentID)
+			}
+		}
+		return out
+	case events.ToolCallEvent:
+		return callIDList(e.ID)
+	case events.ClientToolCallEvent:
+		return callIDList(e.ID)
 	}
-	return ""
+	return nil
 }
 
-// callIDs indexes every tool call declared in evs: model-requested calls,
-// provider-hosted calls and client-executed calls alike.
-func callIDs(evs []events.Event) map[string]bool {
+func callIDList(id string) []string {
+	if id == "" {
+		return nil
+	}
+	return []string{id}
+}
+
+// answerableCallIDs indexes the call ids a retained span can answer: ids its
+// ModelResponses announce in their tool_calls (what providers replay) and ids
+// of builtin calls, which replay as their own provider item. Standalone call
+// events do not qualify: they carry no replayable content, so their presence
+// cannot satisfy a requirement (Python parity: _answerable_ids).
+func answerableCallIDs(evs []events.Event) map[string]bool {
 	out := make(map[string]bool, len(evs))
 	for _, ev := range evs {
 		switch e := events.AsValue(ev).(type) {
-		case events.ToolCallEvent:
-			out[e.ID] = true
+		case events.ModelResponse:
+			for _, c := range e.ToolCalls.Calls {
+				out[c.ID] = true
+			}
 		case events.BuiltinToolCallEvent:
 			out[e.ToolCallEvent.ID] = true
-		case events.ClientToolCallEvent:
-			out[e.ID] = true
 		}
 	}
 	return out
 }
 
 // widenCut moves cut back until the retained span convs[cut:] opens with an
-// event that stands on its own: a leading tool result whose call lies outside
-// the span pulls the call back in. The span never widens past the start of the
-// transcript, so it can only grow, never empty (Python parity: replayable_span
-// widens rather than empties).
+// event that stands on its own: an opening event whose required call ids are
+// unanswered pulls its whole round back in — a leading tool result widens to
+// the ModelResponse announcing its call (and the call events between), so the
+// wire never opens with a tool answer without its assistant tool_calls. The
+// span never widens past the start of the transcript, so it can only grow,
+// never empty.
+//
+// AGO-DEVIATION: Python's replayable_span drops orphaned events from the tail
+// instead of widening (_replay._prune); AGo keeps the whole round on the wire
+// (D-030). Python's ProviderReplay anchor/turn items do not exist in the Go
+// event vocabulary.
 func widenCut(convs []events.Event, cut int) int {
 	for cut > 0 && cut < len(convs) {
-		parent := parentCallID(convs[cut])
-		if parent == "" || callIDs(convs[cut:])[parent] {
+		need := requiredCallIDs(convs[cut])
+		if len(need) == 0 {
+			break // the opening event stands on its own
+		}
+		answerable := answerableCallIDs(convs[cut:])
+		satisfied := true
+		for _, id := range need {
+			if !answerable[id] {
+				satisfied = false
+				break
+			}
+		}
+		if satisfied {
 			break
 		}
 		cut--

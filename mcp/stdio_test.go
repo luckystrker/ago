@@ -312,7 +312,7 @@ func TestStdioToolsWrapper(t *testing.T) {
 	// The registered wrapper serves a call end-to-end on a stream.
 	ms := stream.NewMemoryStream()
 	cx := agocontext.New(ms)
-	if err := got[0].Register(cx, nil); err != nil {
+	if _, err := got[0].Register(cx, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	gotText := ""

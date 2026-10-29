@@ -251,10 +251,12 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 
 type failingTool struct{ err error }
 
-func (f failingTool) Name() string                                                 { return "broken_tool" }
-func (f failingTool) DeclaredInCode() bool                                         { return true }
-func (f failingTool) Schemas(_ *context.Context) ([]any, error)                    { return nil, f.err }
-func (f failingTool) Register(_ *context.Context, _ []middleware.Middleware) error { return f.err }
+func (f failingTool) Name() string                              { return "broken_tool" }
+func (f failingTool) DeclaredInCode() bool                      { return true }
+func (f failingTool) Schemas(_ *context.Context) ([]any, error) { return nil, f.err }
+func (f failingTool) Register(_ *context.Context, _ []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, f.err
+}
 
 func sanitizeToolName(s string) string {
 	var b strings.Builder

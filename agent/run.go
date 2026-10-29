@@ -46,6 +46,7 @@ type AgentRun struct {
 	resolved  *tools.ResolvedTools
 	schema    response.Proto
 	turnCtx   stdcontext.Context
+	cancel    stdcontext.CancelFunc
 	wake      chan struct{}
 	// scanStart is the transcript length recorded before the resume trigger was
 	// sent, so the turn loop starts scanning at the right position.
@@ -69,12 +70,24 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	opts := a.opts
 	a.mu.Unlock()
 
-	r.turnCtx = ctx
+	// The turn runs on a cancellable context so Close can stop an in-flight
+	// turn (Python parity: AgentRun.__aexit__ cancels an unfinished task).
+	r.turnCtx, r.cancel = stdcontext.WithCancel(ctx)
 
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
 	// the per-stream turn lock in _turn_scope).
 	r.lock = a.turnLock(r.stream.ID())
 	r.lock.Lock()
+	// A failed scope entry releases everything the scope took, so a forgotten
+	// Close after a Start error cannot strand the stream for later asks
+	// (Python parity: the _turn_scope async-with releases the lock when the
+	// body fails).
+	opened := false
+	defer func() {
+		if !opened {
+			r.Close()
+		}
+	}()
 
 	// Model config → client (Python parity: _prepare_turn).
 	cfg := opts.cfg
@@ -88,14 +101,19 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	r.llm = client
 	r.cx.SetDependency("ago:config", cfg)
 
-	// System prompt: static fragments + dynamic hooks (Python parity: _prepare_turn).
-	r.cx.AddPrompt(opts.fragments...)
-	for _, h := range opts.promptHooks {
-		fr, err := h(r.cx)
-		if err != nil {
-			return fmt.Errorf("agent: prompt hook: %w", err)
+	// System prompt: static fragments + dynamic hooks, seeded only when the
+	// context carries no prompt yet — continuations clone the previous turn's
+	// context and re-seeding would duplicate every fragment on the wire
+	// (Python parity: _prepare_turn's `if not context.prompt`).
+	if len(r.cx.PromptLines()) == 0 {
+		r.cx.AddPrompt(opts.fragments...)
+		for _, h := range opts.promptHooks {
+			fr, err := h(r.cx)
+			if err != nil {
+				return fmt.Errorf("agent: prompt hook: %w", err)
+			}
+			r.cx.AddPrompt(fr...)
 		}
-		r.cx.AddPrompt(fr...)
 	}
 
 	// Tools: static + auto-injected subtask tools (Python parity: resolve_tools).
@@ -103,7 +121,6 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	allTools = append(allTools, r.subtaskTools(opts)...)
 	resolved, err := tools.ResolveTools(allTools, r.cx)
 	if err != nil {
-		r.lock.Unlock()
 		return fmt.Errorf("agent: resolve tools: %w", err)
 	}
 	r.resolved = resolved
@@ -115,29 +132,29 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 		r.instances[i] = f()
 	}
 
-	// HITL: wrap the user hook with on_human_input middleware; the question is
-	// transcribed before the hook answers (Python parity: wrap_hitl + interrupt
-	// subscriber; AGo invokes the hook directly — see D-013). The user hook
-	// receives the turn's context; per-request cancellation is the hook's own
-	// responsibility (AGO-DEVIATION: Go cannot interrupt a blocking hook).
+	// HITL: wrap the user hook with on_human_input middleware and install it on
+	// the context. Context.Ask routes each question through the stream, passes
+	// its per-request deadline context down to the user hook, and transcribes
+	// the answer; the question itself is not transcribed (Python parity: the
+	// wrapped hook is an interrupt subscriber whose wrapper returning None stops
+	// dispatch before persistence). A hook that ignores its context outlives the
+	// deadline — Go cannot cancel a goroutine, so Ask abandons it (AGO-DEVIATION:
+	// Python cancels the in-flight hook; see docs/DECISIONS.md D-032).
 	if opts.hitl != nil {
 		userHook := opts.hitl
-		base := func(ev *events.HumanInputRequest, cx *context.Context) (*events.HumanMessage, error) {
-			if err := cx.Send(ev); err != nil {
-				return nil, err
+		r.cx.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
+			// The middleware chain carries no stdlib context, so the per-request
+			// context is bound into the head of the chain here, per invocation.
+			call := func(ev *events.HumanInputRequest, cx *context.Context) (*events.HumanMessage, error) {
+				return userHook(hctx, ev)
 			}
-			return userHook(ctx, ev)
-		}
-		call := base
-		for i := len(r.instances) - 1; i >= 0; i-- {
-			mw, next := r.instances[i], call
-			call = func(ev *events.HumanInputRequest, cx *context.Context) (*events.HumanMessage, error) {
-				return mw.OnHumanInput(next, ev, cx)
+			for i := len(r.instances) - 1; i >= 0; i-- {
+				mw, next := r.instances[i], call
+				call = func(ev *events.HumanInputRequest, cx *context.Context) (*events.HumanMessage, error) {
+					return mw.OnHumanInput(next, ev, cx)
+				}
 			}
-		}
-		hook := call
-		r.cx.SetHitlHook(func(_ stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
-			return hook(req, r.cx)
+			return call(req, r.cx)
 		})
 	}
 
@@ -166,11 +183,17 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 		return nil
 	}, stream.SubscribeOptions{Interrupt: true, Condition: events.TypeOf[events.HaltEvent]()}))
 
-	// 3. Tool executor on ToolCallsEvent + per-tool subscriptions.
+	// 3. Tool executor on ToolCallsEvent + per-tool subscriptions. Every
+	// subscription the executor and the tools created joins r.subs, so Close
+	// tears the whole turn's wiring down; the per-stream turn lock serializes
+	// turns, which makes per-turn registration idempotent (docs/DECISIONS.md
+	// D-032; Python keeps the same lifetime with a per-turn ExitStack).
 	exec := tools.NewExecutor()
-	if err := exec.Register(r.cx, resolved.Tools, resolved.Known, r.instances); err != nil {
+	execSubs, err := exec.Register(r.cx, resolved.Tools, resolved.Known, r.instances)
+	if err != nil {
 		return fmt.Errorf("agent: register tool executor: %w", err)
 	}
+	r.subs = append(r.subs, execSubs...)
 
 	// Re-entry trigger for Resume (after subscriptions are live). The scan
 	// position is recorded before the send so the turn loop does not miss the
@@ -186,6 +209,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 		}
 	}
 
+	opened = true
 	go r.executeTurn()
 	return nil
 }
@@ -209,10 +233,18 @@ func (r *AgentRun) Enqueue(parts ...events.Input) error { return r.stream.Enqueu
 // Stream exposes the conversation stream.
 func (r *AgentRun) Stream() stream.Stream { return r.stream }
 
-// Close ends the turn scope: unsubscribes and releases the per-stream lock.
-// Safe to call multiple times; safe before Start (no-op).
+// Close ends the turn scope: cancels an in-flight turn, unsubscribes and
+// releases the per-stream lock. Safe to call multiple times; safe before Start
+// (no-op).
 func (r *AgentRun) Close() {
 	r.closeOnce.Do(func() {
+		// Stop a turn still in flight before tearing the scope down: otherwise its
+		// goroutine parks forever, Result never returns, and the lock is freed
+		// under a live turn (Python parity: AgentRun.__aexit__ cancels an
+		// unfinished task).
+		if r.cancel != nil {
+			r.cancel()
+		}
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
 		}

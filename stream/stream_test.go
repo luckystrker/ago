@@ -241,3 +241,39 @@ func TestTimestampsStampedOnSend(t *testing.T) {
 		t.Fatal("CreatedAt must be stamped on send")
 	}
 }
+
+// TestSendErrHandledSwallowsWithoutPersist pins the swallow semantics: an
+// interrupt subscriber returning ErrHandled stops delivery, Send reports success
+// and the transcript never sees the event (Python parity: an interrupter
+// returning None stops send before the persistence subscriber).
+func TestSendErrHandledSwallowsWithoutPersist(t *testing.T) {
+	s := NewMemoryStream(WithPersistAll())
+	var ran []string
+	s.Subscribe(func(ev events.Event) error { ran = append(ran, "swallower"); return ErrHandled },
+		SubscribeOptions{Interrupt: true, Condition: events.TypeOf[events.TextInput]()})
+	s.Subscribe(func(ev events.Event) error { ran = append(ran, "late-interrupt"); return nil },
+		SubscribeOptions{Interrupt: true})
+	s.Subscribe(func(ev events.Event) error { ran = append(ran, "normal"); return nil }, SubscribeOptions{})
+
+	if err := s.Send(&events.TextInput{Content: "swallowed"}); err != nil {
+		t.Fatalf("swallowed send must succeed, got %v", err)
+	}
+	if len(ran) != 1 || ran[0] != "swallower" {
+		t.Fatalf("delivery must stop at ErrHandled: %v", ran)
+	}
+	if h, _ := s.History().GetEvents(); len(h) != 0 {
+		t.Fatalf("swallowed event must not persist, got %d events", len(h))
+	}
+
+	// An event outside the swallower's condition flows: the later interrupt and
+	// normal subscribers run, and the event persists.
+	if err := s.Send(&events.ModelResponse{Message: &events.ModelMessage{Content: "delivered"}}); err != nil {
+		t.Fatalf("non-matching interrupt: %v", err)
+	}
+	if len(ran) != 3 || ran[1] != "late-interrupt" || ran[2] != "normal" {
+		t.Fatalf("delivery must continue past a non-matching interrupt: %v", ran)
+	}
+	if h, _ := s.History().GetEvents(); len(h) != 1 {
+		t.Fatalf("delivered event must persist, got %d events", len(h))
+	}
+}

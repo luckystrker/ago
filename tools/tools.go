@@ -15,6 +15,7 @@ import (
 
 	agocontext "ago/context"
 	"ago/middleware"
+	"ago/stream"
 )
 
 // Schema is the function-tool schema handed to providers (Python parity:
@@ -52,8 +53,12 @@ type Tool interface {
 	Schemas(ctx *agocontext.Context) ([]any, error)
 	// Register subscribes the tool on ctx.Stream for its calls. mw carries the
 	// agent's middleware instances for this turn (OnToolExecution layers around the
-	// tool's own execution); implementations must treat it as read-only.
-	Register(ctx *agocontext.Context, mw []middleware.Middleware) error
+	// tool's own execution); implementations must treat it as read-only. The
+	// returned ids are the stream subscriptions created; the turn scope owns them
+	// and must unsubscribe before the next turn registers on the same stream
+	// (AGO-DEVIATION: no ExitStack — Go cleanup is agent-owned, see
+	// docs/DECISIONS.md D-032). On error nothing may remain subscribed.
+	Register(ctx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error)
 }
 
 // Errors reported by the package. Match with errors.Is.

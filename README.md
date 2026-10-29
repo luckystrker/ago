@@ -138,7 +138,7 @@ A single package: `go test ./ago/agent/`. Provider tests use fake HTTP servers
 | `config/gemini` | full | `generateContent` + SSE streaming, function declarations, thinking-token usage (D-022) |
 | `config/ollama` | full (non-streaming) | `/api/chat` with tools; a `Streaming=true` config refuses to create a client (D-022) |
 | `config/zai`, `config/mistral`, `config/dashscope` | full | OpenAI-compatible REST on the shared engine (D-021) |
-| `config/xai`, `config/bedrock`, `config/typesafe` | stub | Config structs exist; `Create()` reports "not yet implemented" (D-008) |
+| `config/xai`, `config/bedrock`, `config/typesafe` | stub | Config structs exist; `Create()` reports "has no client yet" wrapping `config.ErrNotImplemented` (D-008) |
 | OpenAI Responses API | deferred | Not ported; chat completions is the supported OpenAI surface (D-008) |
 
 API keys resolve config field first, then the standard environment variable

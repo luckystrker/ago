@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"ago/internal/sse"
 )
@@ -36,6 +37,12 @@ func parseAbsoluteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// defaultExchangeTimeout caps one HTTP exchange when the config sets no
+// Timeout (Python parity: MCPServerConfig.connection_timeout = 30.0 — a hung
+// server must fail the call, not block the client's lock and the agent turn
+// forever).
+const defaultExchangeTimeout = 30 * time.Second
+
 // newHTTPTransport validates the config and builds the header set: custom headers
 // first, then the derived Bearer token when no Authorization entry exists
 // (Python parity: _resolve_config).
@@ -53,7 +60,18 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	if cfg.AuthorizationToken != "" && !hasAuthorizationHeader(headers) {
 		headers["Authorization"] = "Bearer " + cfg.AuthorizationToken
 	}
-	return &httpTransport{url: cfg.URL, headers: headers, client: &http.Client{}}, nil
+	timeout := defaultExchangeTimeout
+	switch {
+	case cfg.Timeout > 0:
+		timeout = cfg.Timeout
+	case cfg.Timeout < 0:
+		timeout = 0 // http.Client: no cap
+	}
+	// AGO-DEVIATION: http.Client.Timeout caps the whole exchange (including
+	// reading an SSE response body), while Python's httpx timeout is per-phase
+	// (connect/read/write); a server answering slowly but steadily is cut off
+	// at the cap here.
+	return &httpTransport{url: cfg.URL, headers: headers, client: &http.Client{Timeout: timeout}}, nil
 }
 
 func hasAuthorizationHeader(headers map[string]string) bool {

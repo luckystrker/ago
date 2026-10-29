@@ -7,6 +7,7 @@ import (
 
 	agocontext "ago/context"
 	"ago/middleware"
+	"ago/stream"
 )
 
 type hostedSchema struct{ typ string }
@@ -69,7 +70,9 @@ func (h *hostedTool) DeclaredInCode() bool { return true }
 func (h *hostedTool) Schemas(*agocontext.Context) ([]any, error) {
 	return []any{hostedSchema{typ: h.typ}}, nil
 }
-func (h *hostedTool) Register(*agocontext.Context, []middleware.Middleware) error { return nil }
+func (h *hostedTool) Register(*agocontext.Context, []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
+}
 
 type failingTool struct{}
 
@@ -78,7 +81,9 @@ func (failingTool) DeclaredInCode() bool { return true }
 func (failingTool) Schemas(*agocontext.Context) ([]any, error) {
 	return nil, fmt.Errorf("discovery failed: %w", ErrResolution)
 }
-func (failingTool) Register(*agocontext.Context, []middleware.Middleware) error { return nil }
+func (failingTool) Register(*agocontext.Context, []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
+}
 
 type junkSchemaTool struct{}
 
@@ -87,7 +92,9 @@ func (junkSchemaTool) DeclaredInCode() bool { return true }
 func (junkSchemaTool) Schemas(*agocontext.Context) ([]any, error) {
 	return []any{42}, nil
 }
-func (junkSchemaTool) Register(*agocontext.Context, []middleware.Middleware) error { return nil }
+func (junkSchemaTool) Register(*agocontext.Context, []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
+}
 
 func TestResolveToolsNoTools(t *testing.T) {
 	_, cx := newTestContext()

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	agocontext "ago/context"
 	"ago/events"
@@ -635,11 +636,11 @@ func TestRemoteToolOnStream(t *testing.T) {
 		known[tl.Name()] = true
 	}
 	for _, tl := range remote {
-		if err := tl.Register(cx, nil); err != nil {
+		if _, err := tl.Register(cx, nil); err != nil {
 			t.Fatalf("Register %s: %v", tl.Name(), err)
 		}
 	}
-	if err := exec.Register(cx, remote, known, []middleware.Middleware{}); err != nil {
+	if _, err := exec.Register(cx, remote, known, []middleware.Middleware{}); err != nil {
 		t.Fatalf("Executor.Register: %v", err)
 	}
 
@@ -709,5 +710,131 @@ func TestRemoteToolOnStream(t *testing.T) {
 	}
 	if argsJSON != `{"msg":"hi"}` {
 		t.Errorf("outbound arguments = %s, want {\"msg\":\"hi\"}", argsJSON)
+	}
+}
+
+// --- exchange timeout ------------------------------------------------------------
+
+// TestHTTPTimeout is the regression for the timeout-less HTTP transport: a
+// hung server blocked CallTool — and, under the client lock, every later
+// operation and the whole agent turn — forever (Python gets an error after
+// connection_timeout=30s).
+func TestHTTPTimeout(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		tr, err := newHTTPTransport(&MCPServerConfig{URL: "http://127.0.0.1:1/mcp"})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.client.Timeout != 30*time.Second {
+			t.Fatalf("default timeout = %v, want 30s", tr.client.Timeout)
+		}
+	})
+	t.Run("configured", func(t *testing.T) {
+		tr, err := newHTTPTransport(&MCPServerConfig{URL: "http://127.0.0.1:1/mcp", Timeout: 250 * time.Millisecond})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.client.Timeout != 250*time.Millisecond {
+			t.Fatalf("timeout = %v, want 250ms", tr.client.Timeout)
+		}
+	})
+	t.Run("negative disables the cap", func(t *testing.T) {
+		tr, err := newHTTPTransport(&MCPServerConfig{URL: "http://127.0.0.1:1/mcp", Timeout: -1})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.client.Timeout != 0 {
+			t.Fatalf("timeout = %v, want 0 (no cap)", tr.client.Timeout)
+		}
+	})
+	t.Run("hung server fails the call and frees the client", func(t *testing.T) {
+		hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(300 * time.Millisecond)
+		}))
+		defer hung.Close()
+		cl, err := New(&MCPServerConfig{URL: hung.URL, Timeout: 25 * time.Millisecond})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { cl.Close() })
+
+		start := time.Now()
+		if _, err := cl.CallTool("echo", nil); err == nil {
+			t.Fatal("CallTool on a hung server returned no error")
+		} else {
+			var te interface{ Timeout() bool }
+			if !errors.As(err, &te) || !te.Timeout() {
+				t.Errorf("error = %v, want a timeout error", err)
+			}
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("CallTool took %v, want a fast timeout failure", elapsed)
+		}
+		// The failed exchange released the client lock: a follow-up call fails
+		// the same fast way instead of queueing behind the dead request.
+		start = time.Now()
+		if _, err := cl.CallTool("echo", nil); err == nil {
+			t.Fatal("follow-up CallTool on a hung server returned no error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("follow-up CallTool took %v, want a fast timeout failure", elapsed)
+		}
+	})
+}
+
+// --- per-turn subscription lifetime ----------------------------------------------
+
+// TestRemoteToolSubscriptionLifecycle is the mcp-side regression for the
+// per-turn subscription leak: the ids Register returns are live subscriptions,
+// and once the turn scope unsubscribes them (what AgentRun.Close does between
+// turns on a shared stream) a matching call no longer reaches the server.
+// Before the fix Register discarded the ids, so handlers outlived their turn
+// and re-executed every call.
+func TestRemoteToolSubscriptionLifecycle(t *testing.T) {
+	cl, srv := newHTTPClient(t, nil)
+	remote, err := Tools(cl)
+	if err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+	var echo tools.Tool
+	for _, tl := range remote {
+		if tl.Name() == "echo" {
+			echo = tl
+		}
+	}
+	if echo == nil {
+		t.Fatalf("no echo tool listed: %v", remote)
+	}
+
+	ms := stream.NewMemoryStream()
+	cx := agocontext.New(ms)
+	ids, err := echo.Register(cx, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Fatal("Register returned no subscription ids")
+	}
+
+	calls := func() int { return srv.countByMethod("tools/call") }
+	if err := ms.Send(events.ToolCallEvent{ID: "c1", Name: "echo", Arguments: `{"msg":"hi"}`}); err != nil {
+		t.Fatalf("send call 1: %v", err)
+	}
+	// The harness scripts one session expiry into the first call (404 + one
+	// retry), so the baseline is the wire count for one logical invocation.
+	afterFirst := calls()
+	if afterFirst == 0 {
+		t.Fatal("the subscribed send never reached the server")
+	}
+
+	// Turn teardown: the ids the tool returned unsubscribe its handler.
+	for _, id := range ids {
+		ms.Unsubscribe(id)
+	}
+	if err := ms.Send(events.ToolCallEvent{ID: "c2", Name: "echo", Arguments: `{"msg":"again"}`}); err != nil {
+		t.Fatalf("send call 2: %v", err)
+	}
+	if got := calls(); got != afterFirst {
+		t.Fatalf("tools/call after unsubscribe = %d, want %d (the stale handler still fired)", got, afterFirst)
 	}
 }

@@ -290,3 +290,53 @@ func TestPostJSONStreamOnEventErrorStops(t *testing.T) {
 		t.Fatalf("stream should stop at the second event, saw %d", seen)
 	}
 }
+
+func TestPostJSONStreamIgnoresTimeout(t *testing.T) {
+	// Timeout caps only non-streaming requests: a long generation streamed
+	// past the cap must arrive whole (http.Client.Timeout would otherwise kill
+	// the whole body read mid-stream).
+	const events = 10
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		for i := 0; i < events; i++ {
+			fmt.Fprintf(w, "data: {\"n\":%d}\n\n", i)
+			flusher.Flush()
+			time.Sleep(30 * time.Millisecond) // ~300ms total, well past Timeout
+		}
+	}))
+	defer srv.Close()
+
+	var got []int
+	c := &Client{Timeout: 50 * time.Millisecond}
+	err := c.PostJSONStream(context.Background(), srv.URL, nil, map[string]any{}, func(data []byte) error {
+		var m struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(data, &m); err != nil {
+			return err
+		}
+		got = append(got, m.N)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stream must survive the client Timeout, got: %v", err)
+	}
+	if len(got) != events {
+		t.Fatalf("want all %d events delivered, got %d: %v", events, len(got), got)
+	}
+}
+
+func TestPostJSONTimeoutCapsNonStreaming(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	c := &Client{Timeout: 30 * time.Millisecond} // single try: MaxRetries 0
+	if _, _, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{}); err == nil {
+		t.Fatal("the client Timeout must still cap a non-streaming request")
+	}
+}

@@ -105,8 +105,11 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 // do performs one POST of payload. headers may be nil; Content-Type is set to
-// application/json unless the caller overrides it, accept governs the Accept header.
-func (c *Client) do(ctx context.Context, url string, headers map[string]string, payload []byte, accept string) (*http.Response, error) {
+// application/json unless the caller overrides it, accept governs the Accept
+// header. stream must reflect the caller's path: a default client carries
+// Timeout only for non-streaming requests — a stream may be long-lived and
+// http.Client.Timeout would kill the whole body read (cancel via ctx).
+func (c *Client) do(ctx context.Context, url string, headers map[string]string, payload []byte, accept string, stream bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("httpx: bad request: %w", err)
@@ -118,7 +121,10 @@ func (c *Client) do(ctx context.Context, url string, headers map[string]string, 
 	}
 	client := c.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: c.Timeout}
+		client = &http.Client{}
+		if !stream {
+			client.Timeout = c.Timeout
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -137,7 +143,7 @@ func (c *Client) PostJSON(ctx context.Context, url string, headers map[string]st
 		return 0, nil, fmt.Errorf("httpx: encoding request body: %w", err)
 	}
 	for attempt := 0; ; attempt++ {
-		resp, err := c.do(ctx, url, headers, payload, "application/json")
+		resp, err := c.do(ctx, url, headers, payload, "application/json", false)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return 0, nil, ctxErr
@@ -184,7 +190,7 @@ func (c *Client) PostJSONStream(ctx context.Context, url string, headers map[str
 		return fmt.Errorf("httpx: encoding request body: %w", err)
 	}
 	for attempt := 0; ; attempt++ {
-		resp, err := c.do(ctx, url, headers, payload, "text/event-stream")
+		resp, err := c.do(ctx, url, headers, payload, "text/event-stream", true)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr

@@ -1,5 +1,7 @@
 package mcp
 
+import "time"
+
 // Configs for reaching an MCP server: over streamable HTTP (MCPServerConfig) or a
 // local subprocess speaking newline-delimited JSON-RPC on its stdio pipes
 // (MCPStdioConfig). Parity with Python ag2/tools/toolkits/mcp_server/types.py,
@@ -26,6 +28,10 @@ type MCPServerConfig struct {
 	// exposing the same generic name do not collide. The server never sees it:
 	// filters and the outbound call use the server's own names.
 	ToolNamePrefix string
+	// Timeout bounds one HTTP exchange — connect, request, and reading the
+	// response (Python parity: connection_timeout, default 30s). Zero means
+	// the default; a negative value removes the cap.
+	Timeout time.Duration
 }
 
 // MCPStdioConfig launches a local MCP server as a subprocess and speaks

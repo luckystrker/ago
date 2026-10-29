@@ -5,6 +5,7 @@ import (
 
 	agocontext "ago/context"
 	"ago/middleware"
+	"ago/stream"
 )
 
 // Toolkit groups tools under one name (Python parity: ag2/tools/final/toolkit.py).
@@ -74,13 +75,22 @@ func (tk *Toolkit) Schemas(cx *agocontext.Context) ([]any, error) {
 	return schemas, nil
 }
 
-func (tk *Toolkit) Register(cx *agocontext.Context, mw []middleware.Middleware) error {
+// Register subscribes every member and returns the union of their subscription
+// ids for the turn scope's teardown. A failing member unwinds the members already
+// subscribed (nothing is left behind), Python ExitStack parity.
+func (tk *Toolkit) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
+	var subs []stream.SubID
 	for _, t := range tk.Tools() {
-		if err := t.Register(cx, mw); err != nil {
-			return err
+		ids, err := t.Register(cx, mw)
+		if err != nil {
+			for _, id := range subs {
+				cx.Stream.Unsubscribe(id)
+			}
+			return nil, err
 		}
+		subs = append(subs, ids...)
 	}
-	return nil
+	return subs, nil
 }
 
 // --- internal hooks for ResolveTools (Python: Toolkit._snapshot/_tools) --------

@@ -349,8 +349,9 @@ func (t *FunctionTool) Schemas(_ *agocontext.Context) ([]any, error) {
 // Register subscribes the tool on the conversation stream for calls matching its
 // name. The execution chain (agent middleware outermost, tool middleware innermost,
 // timeout and the function at the core) runs inside the subscriber; its result event
-// is sent back on the stream for the executor to collect.
-func (t *FunctionTool) Register(cx *agocontext.Context, mw []middleware.Middleware) error {
+// is sent back on the stream for the executor to collect. The subscription id is
+// returned for the turn scope's teardown.
+func (t *FunctionTool) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
 	exec := t.buildChain(mw)
 	cond := events.Equal(func(ev events.Event) string {
 		if call, ok := events.AsValue(ev).(events.ToolCallEvent); ok {
@@ -379,8 +380,8 @@ func (t *FunctionTool) Register(cx *agocontext.Context, mw []middleware.Middlewa
 		}
 		return cx.Send(result)
 	}
-	cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
-	return nil
+	id := cx.Stream.Subscribe(handler, stream.SubscribeOptions{Condition: cond})
+	return []stream.SubID{id}, nil
 }
 
 // buildChain wires the execution onion: agent middleware (mws[0] outermost — the

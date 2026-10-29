@@ -9,8 +9,9 @@ import (
 // ones (Python parity: sliding_window.py over _replay.replayable_span).
 //
 // The window is a target, not a guarantee: a cut that would orphan a tool
-// result — its call retained nowhere — widens back until the retained span
-// contains the pair, so the model never sees an answer without its call.
+// result — its announcing response retained nowhere — widens back until the
+// retained span contains the whole round, so the model never sees an answer
+// without the assistant tool_calls that requested it.
 type SlidingWindowPolicy struct {
 	n int
 }

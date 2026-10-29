@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -10,10 +11,16 @@ import (
 	"ago/internal/uuid"
 )
 
-// Subscriber handles one event. An interrupt subscriber returning a non-nil error
-// stops delivery of the event to everyone (Python parity: interrupt subscribers may
-// swallow an event; a raised exception does the same).
+// Subscriber handles one event. An interrupt subscriber returning ErrHandled
+// swallows the event (delivery stops, the transcript does not see it); any other
+// non-nil error stops delivery of the event to everyone and surfaces from Send
+// (Python parity: an interrupter returning None stops send before the persistence
+// subscriber, a raised exception does the same).
 type Subscriber func(ev events.Event) error
+
+// ErrHandled is returned by an interrupt subscriber that consumed the event:
+// delivery stops silently and the event is not persisted.
+var ErrHandled = errors.New("stream: event handled by interrupt subscriber")
 
 // SubID identifies a subscription for Unsubscribe.
 type SubID uint64
@@ -91,30 +98,39 @@ func NewMemoryStream(opts ...MemoryOption) *MemoryStream {
 
 func newStreamID() string { return "s-" + uuid.New() }
 
-// Send stamps, persists and dispatches the event. Dispatch happens without holding the
-// lock so subscribers may send further events (reentrant, depth-first like the Python
-// await chain). Interrupt subscribers run first; an error from one stops delivery and is
-// returned. Errors from normal subscribers are logged and do not stop delivery.
+// Send stamps and dispatches the event, then persists it. Dispatch happens without
+// holding the lock so subscribers may send further events (reentrant, depth-first
+// like the Python await chain). Interrupt subscribers run first: ErrHandled from
+// one swallows the event — delivery stops and nothing is persisted (Python parity:
+// the persistence subscriber is a normal subscriber, so a swallowed event never
+// reaches it); another error stops delivery and is returned. Errors from normal
+// subscribers are logged and do not stop delivery.
 func (m *MemoryStream) Send(ev events.Event) error {
 	if s, ok := ev.(interface{ StampNow(time.Time) }); ok {
 		s.StampNow(time.Now())
-	}
-	if err := m.persist(ev); err != nil {
-		return err
 	}
 	m.mu.Lock()
 	subs := make([]subEntry, len(m.subs))
 	copy(subs, m.subs)
 	m.mu.Unlock()
 
-	// Interrupt subscribers first: a returned error swallows the event.
+	// Interrupt subscribers first: ErrHandled swallows, another error surfaces.
 	for _, se := range subs {
 		if !se.opt.Interrupt || !matches(se.opt.Condition, ev) {
 			continue
 		}
 		if err := se.fn(ev); err != nil {
+			if errors.Is(err, ErrHandled) {
+				return nil
+			}
 			return err
 		}
+	}
+	// A swallowed event never reaches the transcript; everything else persists
+	// before the normal subscribers see it (Python parity: persistence is the
+	// first-registered normal subscriber, after the interrupters).
+	if err := m.persist(ev); err != nil {
+		return err
 	}
 	var firstErr error
 	for _, se := range subs {

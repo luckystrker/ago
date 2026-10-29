@@ -218,6 +218,12 @@ type streamEvent struct {
 
 	// message_delta
 	Usage *wireUsage `json:"usage"`
+
+	// error (in-band: e.g. an overloaded_error delivered mid-stream)
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // toolAcc accumulates one streamed tool_use block between its
@@ -231,7 +237,8 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 		content      strings.Builder
 		calls        []events.ToolCallEvent
 		accs         = map[int]*toolAcc{}
-		usage        events.Usage
+		startUsage   *wireUsage // message_start: input side + an output_tokens placeholder
+		deltaUsage   *wireUsage // message_delta: the final output side
 		finishReason string
 		responseID   string
 		resolved     string
@@ -247,7 +254,8 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				responseID = ev.Message.ID
 				resolved = ev.Message.Model
 				if ev.Message.Usage != nil {
-					usage = NormalizeUsage(*ev.Message.Usage)
+					u := *ev.Message.Usage
+					startUsage = &u
 				}
 			}
 		case "content_block_start":
@@ -289,10 +297,23 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				finishReason = MapStopReason(ev.Delta.StopReason)
 			}
 			if ev.Usage != nil {
-				// output_tokens arrives here (message_start reported the input
-				// side); the merge keeps both.
-				usage = usage.Add(NormalizeUsage(*ev.Usage))
+				// The delta reports the final output side; it replaces the
+				// message_start fields (whose output_tokens:1 placeholder must
+				// not accumulate) — the merge happens once, after the stream.
+				u := *ev.Usage
+				deltaUsage = &u
 			}
+		case "error":
+			// An in-band error fails the call — Python parity: the SDK's
+			// stream iterator raises the typed exception instead of ending
+			// the stream as a successful empty response.
+			if ev.Error == nil {
+				return config.ErrStreamError
+			}
+			if ev.Error.Type != "" {
+				return fmt.Errorf("%w: %s: %s", config.ErrStreamError, ev.Error.Type, ev.Error.Message)
+			}
+			return fmt.Errorf("%w: %s", config.ErrStreamError, ev.Error.Message)
 		default:
 			// ping / message_stop / unknown: no state.
 		}
@@ -303,7 +324,7 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 	}
 
 	resp := &events.ModelResponse{
-		Usage:        usage,
+		Usage:        mergeStreamUsage(startUsage, deltaUsage),
 		Model:        resolved,
 		Provider:     string(config.ProviderAnthropic),
 		FinishReason: finishReason,
@@ -318,6 +339,52 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 	}
 	resp.ToolCalls = events.ToolCallsEvent{Calls: calls}
 	return resp, nil
+}
+
+// mergeStreamUsage assembles the call's usage the way the final message of a
+// Messages-API stream reports it: message_start carries the input side with an
+// output_tokens placeholder, message_delta the final output side. The delta's
+// output fields replace the start's (never add to them); the input side comes
+// from the start, with a delta-reported field filling a gap. TotalTokens is
+// recomputed from the merged sides.
+func mergeStreamUsage(start, delta *wireUsage) events.Usage {
+	switch {
+	case start == nil && delta == nil:
+		return events.Usage{}
+	case start == nil:
+		return NormalizeUsage(*delta)
+	case delta == nil:
+		return NormalizeUsage(*start)
+	}
+	u := NormalizeUsage(*start)
+	d := NormalizeUsage(*delta)
+	if d.CompletionTokens != nil {
+		u.CompletionTokens = d.CompletionTokens
+	}
+	if d.ThinkingTokens != nil {
+		u.ThinkingTokens = d.ThinkingTokens
+	}
+	if u.PromptTokens == nil {
+		u.PromptTokens = d.PromptTokens
+	}
+	if u.CacheReadInputTokens == nil {
+		u.CacheReadInputTokens = d.CacheReadInputTokens
+	}
+	if u.CacheCreationInputTokens == nil {
+		u.CacheCreationInputTokens = d.CacheCreationInputTokens
+	}
+	u.TotalTokens = nil
+	if u.PromptTokens != nil || u.CompletionTokens != nil {
+		total := int64(0)
+		if u.PromptTokens != nil {
+			total += *u.PromptTokens
+		}
+		if u.CompletionTokens != nil {
+			total += *u.CompletionTokens
+		}
+		u.TotalTokens = &total
+	}
+	return u
 }
 
 // sendEvent publishes a progress event on the conversation stream; a nil conv

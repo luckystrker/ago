@@ -25,17 +25,29 @@ func NewExecutor() *Executor { return &Executor{} }
 
 // Register wires the executor for one turn: the batch handler for ToolCallsEvent,
 // then each tool's own subscription (with the agent's middleware instances), then the
-// fallback that answers unknown names with ToolNotFoundEvent.
-func (e *Executor) Register(cx *agocontext.Context, ts []Tool, known map[string]bool, mws []middleware.Middleware) error {
+// fallback that answers unknown names with ToolNotFoundEvent. The ids of every
+// subscription created are returned for the turn scope's teardown: the turn scope
+// must unsubscribe them before the next turn registers on the same stream, otherwise
+// the previous turn's handlers execute its calls again (Python keeps this lifetime
+// with an ExitStack sub-scope per turn; AGo has no ExitStack and the agent owns the
+// cleanup — see docs/DECISIONS.md D-032). On error every subscription made so far is
+// removed.
+func (e *Executor) Register(cx *agocontext.Context, ts []Tool, known map[string]bool, mws []middleware.Middleware) ([]stream.SubID, error) {
 	s := cx.Stream
-	s.Subscribe(e.batchHandler(cx), stream.SubscribeOptions{Condition: events.TypeOf[events.ToolCallsEvent]()})
+	var subs []stream.SubID
+	subs = append(subs, s.Subscribe(e.batchHandler(cx), stream.SubscribeOptions{Condition: events.TypeOf[events.ToolCallsEvent]()}))
 	for _, t := range ts {
-		if err := t.Register(cx, mws); err != nil {
-			return fmt.Errorf("tools: register tool %s: %w", t.Name(), err)
+		ids, err := t.Register(cx, mws)
+		if err != nil {
+			for _, id := range subs {
+				s.Unsubscribe(id)
+			}
+			return nil, fmt.Errorf("tools: register tool %s: %w", t.Name(), err)
 		}
+		subs = append(subs, ids...)
 	}
-	s.Subscribe(notFoundHandler(cx, known), stream.SubscribeOptions{Condition: events.TypeOf[events.ToolCallEvent]()})
-	return nil
+	subs = append(subs, s.Subscribe(notFoundHandler(cx, known), stream.SubscribeOptions{Condition: events.TypeOf[events.ToolCallEvent]()}))
+	return subs, nil
 }
 
 func (e *Executor) batchHandler(cx *agocontext.Context) stream.Subscriber {

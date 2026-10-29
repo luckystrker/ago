@@ -464,7 +464,7 @@ type fakeToolSchema struct{ schemaType string }
 func (f fakeToolSchema) SchemaType() string { return f.schemaType }
 
 const sseStream = `event: message_start
-data: {"type":"message_start","message":{"id":"msg_s","model":"claude-sonnet-4","role":"assistant","content":[],"usage":{"input_tokens":10}}}
+data: {"type":"message_start","message":{"id":"msg_s","model":"claude-sonnet-4","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}
 
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
@@ -546,6 +546,62 @@ func TestCallStream(t *testing.T) {
 	}
 	if len(chunks) != 2 || chunks[0] != "Hello" || chunks[1] != " world" {
 		t.Fatalf("chunks = %v", chunks)
+	}
+}
+
+func TestCallStreamUsageFinalShape(t *testing.T) {
+	// Real stream shape (Python fixture parity): message_start carries the
+	// input side with an output_tokens:1 placeholder, message_delta the final
+	// output side. The final usage replaces the output fields — accumulating
+	// them would double-count the placeholder (input 100, output 300 must not
+	// read 301).
+	srv, _ := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: message_start\n"+
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-sonnet-4\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"output_tokens_details\":{\"thinking_tokens\":0}}}}\n\n"+
+			"event: message_delta\n"+
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":300,\"output_tokens_details\":{\"thinking_tokens\":50}}}\n\n"+
+			"event: message_stop\n"+
+			"data: {\"type\":\"message_stop\"}\n\n")
+	})
+	cl := newTestClient(srv, func(c *AnthropicConfig) { c.Streaming = true })
+
+	resp, err := cl.Call(context.Background(), nil, nil, config.CallOptions{})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	u := resp.Usage
+	if u.PromptTokens == nil || *u.PromptTokens != 100 ||
+		u.CompletionTokens == nil || *u.CompletionTokens != 300 ||
+		u.TotalTokens == nil || *u.TotalTokens != 400 {
+		t.Fatalf("usage = %+v, want 100/300/400", u)
+	}
+	if u.ThinkingTokens == nil || *u.ThinkingTokens != 50 {
+		t.Fatalf("thinking tokens = %v, want 50 (the delta replaces the start's placeholder)", u.ThinkingTokens)
+	}
+}
+
+func TestCallStreamInBandError(t *testing.T) {
+	// An `error` event mid-stream (e.g. overloaded_error) fails the call —
+	// Python parity: the SDK iterator raises instead of returning an empty
+	// response.
+	srv, _ := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: message_start\n"+
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"model\":\"claude-sonnet-4\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"+
+			"event: content_block_delta\n"+
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"+
+			"event: error\n"+
+			"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+	})
+	cl := newTestClient(srv, func(c *AnthropicConfig) { c.Streaming = true })
+
+	_, err := cl.Call(context.Background(), nil, nil, config.CallOptions{})
+	if !errors.Is(err, config.ErrStreamError) {
+		t.Fatalf("in-band error event must fail the call, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "overloaded_error") || !strings.Contains(err.Error(), "Overloaded") {
+		t.Fatalf("error must carry the API detail, got %v", err)
 	}
 }
 

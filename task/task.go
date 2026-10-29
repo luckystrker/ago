@@ -338,12 +338,30 @@ func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*T
 		TaskID:    t.md.TaskID,
 		AgentName: owner,
 		Objective: spec.Title,
+		Spec:      specEvent(spec),
 		ExpiresAt: isoOrEmpty(t.md.ExpiresAt),
 	}); err != nil {
 		t.restoreDep()
 		return nil, fmt.Errorf("task: send TaskStarted: %w", err)
 	}
 	return t, nil
+}
+
+// specEvent mirrors the owner's Spec onto the TaskStarted wire shape. The
+// payload map is shallow-copied so later owner mutations cannot rewrite an
+// already-sent event, and a nil payload serialises as the empty dict Python's
+// default_factory produces.
+func specEvent(spec Spec) *events.TaskSpec {
+	payload := make(map[string]any, len(spec.Payload))
+	for k, v := range spec.Payload {
+		payload[k] = v
+	}
+	return &events.TaskSpec{
+		Title:       spec.Title,
+		Description: spec.Description,
+		Payload:     payload,
+		Capability:  spec.Capability,
+	}
 }
 
 func expiry(ttl time.Duration, now time.Time) time.Time {
