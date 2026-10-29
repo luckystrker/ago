@@ -485,3 +485,377 @@ Wave-1 provider brief for gemini + ollama implemented over raw HTTP (`config/gem
   without retry logic; MaxRetries 0). Callers cancel via ctx.
 - **gemini UrlInput → fileData** with a MIME guessed from the URL extension, and
   BinaryInput → inlineData for every binary kind (Python parity).
+
+## D-023 — 2026-10-29 — spec: AgentSpec serialization (FromAgent / ToAgent)
+
+Package `spec` (wire copy of Python `ag2/spec.py`). Deviations, marked
+`// AGO-DEVIATION` in code:
+
+- **FromAgent leaves ResponseSchema nil**: the AGo Agent does not expose its
+  response schema publicly (no getter; the field is private in `agent.options`),
+  so the schema Python reads from `agent._response_schema` cannot be captured.
+  To wire a schema back, pass `agent.WithResponseSchema(...)` to ToAgent.
+- **ToAgent does not rebuild the response schema**: Python's `to_agent` applies
+  the spec's schema unless an explicit argument overrides it. AGo options are
+  opaque funcs, so "explicit argument wins over the spec" is unobservable —
+  applying the spec's schema unconditionally could clobber a caller's explicit
+  `WithResponseSchema`. The field stays wire data; reconstruction is the
+  caller's choice.
+- **No UnknownSpecFieldWarning**: Python warns (non-fatally) on unknown spec
+  keys; a Go library cannot warn, so unknown JSON keys are dropped silently by
+  encoding/json (same load result, no diagnostic).
+- **available pool is a flat map, no toolkit flattening**: Python's `to_agent`
+  walks `Toolkit` members while building its name index. The AGo pool is
+  already a name→tool index supplied by the caller, so flattening is the
+  caller's job (a Toolkit under its own name resolves only as that name).
+- **Prompt joins with "\n"** into a single `agent.New` prompt string; the
+  fragments keep their order and re-enter the turn as one static fragment.
+
+## D-024 — 2026-10-29 — watch: pull-model Wait replaces the push arm/disarm protocol
+
+Package `watch` ports `ag2/watch.py` minus the cron variants (CronWatch and the
+CadenceWatch size-or-time batching are deferred — no consumer needs them yet and
+the cron parser is its own chunk of work). Deviations, marked `// AGO-DEVIATION`
+in `watch/`:
+
+- **Push → pull**: Python arms a watch on a stream with a callback and disarms it
+  later; the AGo `Watch.Wait(ctx) (events.Event, error)` contract
+  (ARCHITECTURE.md) makes one Wait call one armed watch. There is no
+  `id`/`is_armed`/`disarm` surface — repeated or concurrent Waits are
+  independent, so the implementations stay stateless and concurrency-safe.
+- **Signal semantics**: time-based watches report the tick as `(nil, nil)` — the
+  event is nil, the tick itself is the payload (Python invokes the callback with
+  an empty batch). Composites report the **last non-nil** event across their
+  sub-watches (Python passes the combined batches; one Wait carries one event).
+- **EventWatch** subscribes for the duration of one Wait only (subscribe →
+  channel → unsubscribe on every return path; no leak) and sees only
+  post-subscription events (Python parity: fires after arming, no history
+  replay).
+- **DelayWatch** is stateless: Python disarms itself forever after its single
+  fire; here each Wait arms a fresh single-shot delay. IntervalWatch(0) and
+  DelayWatch(≤0) fire immediately.
+- **Composite edge cases**: empty AllOf/Sequence fire immediately with
+  (nil, nil) (AllOf parity: 0 of 0 fired; Python's empty Sequence never fires —
+  a Wait that could never return is a deadlock trap, so it completes instead);
+  empty AnyOf can never fire and blocks until ctx is done. AnyOf cancels the
+  losing waits and abandons a sub-watch that ignores cancellation (its result is
+  discarded; the goroutine ends when it returns on its own). AllOf/AnyOf/Sequence
+  reject nil sub-watches with the `ErrNilWatch` sentinel instead of panicking
+  inside a spawned goroutine.
+
+## D-025 — 2026-10-29 — observers: direct stream subscription, contract-pinned built-ins
+
+Package `observers` ports `ag2/observers/` to the brief's AGo contract. Deviations,
+marked `// AGO-DEVIATION` in `observers/`:
+
+- **No ExitStack, no Watch**: Python registers observers under a caller-owned
+  ExitStack (`register(stack, context)`) and the BaseObserver family buffers
+  events through an armed Watch. The AGo `Observer` interface is
+  `Name() string; Register(ctx) error` — one direct `Stream.Subscribe` per
+  observer, events processed inline in the dispatching Send, subscription lives
+  with the stream. ObserverStarted/ObserverCompleted lifecycle events stay the
+  agent's job (Python parity: emitted by `_observer_lifecycle` in agent.py).
+- **LoopDetector keys on ModelResponse text**, not ToolCallEvent `(name,
+  arguments)` pairs, per the AGo contract. Consecutive identical normalized
+  contents (whitespace collapsed, `strings.Fields` join) fire once; the dedup
+  set persists until `Reset()` (Python `_flagged` parity). A clamp
+  `repeats < 2 → 2` replaces Python's unvalidated threshold. Responses whose
+  normalized text is empty are not counted: tool-call rounds legitimately emit
+  contentless ModelResponses back to back, which would false-positive.
+- **TokenMonitor has one budget → one error alert**, not Python's
+  warn/critical threshold pair, per the AGo contract; the comparison is strict
+  (`total > budget`, contract wording) where Python uses `>=`. Billable count is
+  `TotalTokens` when reported, else prompt+completion: Python's
+  `_billable_tokens` takes `max(total, prompt+completion)` — the max is dropped,
+  the unset-total fallback is kept so hand-assembled usage cannot silently read
+  zero.
+- **`TypeOf[T]` value-form conditions** (`TypeOf[events.ModelResponse]()` not
+  `TypeOf[*events.ModelResponse]()`): the events arrive pointer-wrapped from the
+  agent but `TypeOf[*T]()` compiles to a pointer-only matcher, while value-form
+  `T` matches both value and pointer events (`events.AsValue` normalizes in the
+  handler).
+- **StreamObserver callback has no error result** (`func(events.Event)`, brief
+  shape) and is wrapped into a `stream.Subscriber` that always returns nil;
+  only the built-ins that send alerts surface send errors to the dispatcher.
+
+
+## D-026 — 2026-10-29 — aggregate: aggregation collapses to transcript merging (brief-driven)
+
+The porting brief redefines aggregation against Python (`ag2/aggregate.py` writes
+knowledge-store files from raw events and never touches the transcript). AGo (`aggregate/`)
+reduces it to transcript shaping: after a successful turn, the aggregation middleware
+(`New(trigger, strategy)`) folds every `CompactionSummary` plus the conversational events
+older than the keepRecent=2 tail into ONE new `CompactionSummary` via the Strategy,
+replacing the history, bracketed by transient
+`AggregationStarted`/`AggregationCompleted`/`AggregationFailed`. Choices:
+
+- Triggers are constructor funcs returning `Trigger` (`SummaryCountTrigger(n)`,
+  `UsageTrigger(total)`), matching the brief's notation and the middleware-builtin style.
+  The usage handed to a trigger is `usage.FromEvents(history).Total` — the tokens reported
+  on the stream, which already include the finished turn's `model_call` UsageEvent.
+- `LLMStrategy{Client}` makes one LLM call per aggregation and reports its tokens as
+  `UsageEvent(kind="aggregation")` on the conversation stream (Python parity:
+  `_emit_aggregation_usage` — without it the aggregation call's tokens would never reach
+  the usage report). `AggregationCompleted.Usage`/`LLMCalls` come from an optional
+  unexported seam (`usageSource`); hand-written strategies report zero.
+- A strategy failure emits `AggregationFailed`, leaves the history untouched (Replace
+  happens only after success) and does NOT fail the turn — `OnTurn` returns the turn's own
+  result. A summarization failure must not kill the conversation.
+- Non-conversational persisted events (`UsageEvent` and the like) in the superseded span
+  are preserved verbatim ahead of the merged summary: usage reports read the history
+  (`AgentReply.Usage`), so dropping them would silently lose telemetry.
+- Summaries are collected from the whole history (that is what `SummaryCountTrigger`
+  counts); conversational events only from before the keepRecent tail, which stays
+  verbatim even if it itself contains a summary.
+- `aggregate` imports `middleware` for the `middleware.Factory` return type the brief
+  pins. The ARCHITECTURE dep-graph line names only `events, context`; the Factory contract
+  requires the type, and `middleware` sits strictly below `aggregate`, so the import stays
+  acyclic.
+
+## D-027 — 2026-10-29 — knowledge: virtual Store with memory/disk backends, brief-shaped EventLogWriter
+
+Parity with `ag2/knowledge/` (base/memory/disk/locked/log); deviations marked
+`// AGO-DEVIATION` in `knowledge/`:
+
+- **Store error surface is Go-idiomatic**: Python returns `None`/`""`/raises;
+  AGo `Read` returns `ErrNotFound` (wrapped with the path), `ReadRange` returns
+  empty with no error for a missing file, `Delete` of a missing path is a no-op,
+  `List` of a missing directory is empty — each mirroring its Python counterpart
+  where one exists.
+- **`Append` drops the Python byte-offset return** (the brief pins
+  `Append(path, data) error`); the WAL cursor use case is served by replaying the
+  whole file via `Replay`, so no consumer needs the offset. `ReadRange` takes
+  `(off, n)` instead of Python's `(start, end)`: `n <= 0` reads to EOF.
+- **`OnChange(fn)` is a global callback list**, not Python's per-path
+  subscription with a closable handle: the brief's signature carries no path and
+  no subscription object. Callbacks run synchronously in the mutating goroutine
+  after the store's internal lock is released — re-entering the store itself is
+  safe; re-entering a `LockedStore` wrapper is not (documented deadlock, Python
+  has the same hazard inside its named write lock).
+- **DiskStore.OnChange observes only in-process mutations** through the same
+  store instance: the stdlib has no filesystem watcher and external deps are
+  forbidden (D-003). Python's watchdog backend is replaced by the same fallback
+  path Python itself ships for capability-less backends (polling by the caller).
+- **LockedStore is one RWMutex** (mutations exclusive, reads shared) instead of
+  Python's per-path named async locks with a 30s TTL; it also closes the
+  read-modify-write window the per-path locks leave open.
+- **DiskStore works on every platform** (the tests run on Windows); Python
+  declares macOS/Linux-only and guards filesystem-illegal characters. AGo passes
+  path bytes through — framework-controlled paths (`/memory/...`, `/logs/...`)
+  are always legal. Traversal protection is `filepath.Rel` against the absolute
+  root after cleaning (`..`, and anything resolving outside root → ErrTraversal).
+- **EventLogWriter lines are bare `MarshalEvent` JSON**, not Python's
+  `{"type", "data"}` envelope: `events.MarshalEvent/UnmarshalEvent` already carry
+  the `@type` discriminator, so a second envelope would be redundant. Log path is
+  `logs/<streamID>.jsonl` (brief) vs Python's `/log/<streamID>.jsonl`. Broken
+  lines are skipped on replay (brief); unknown event types still decode to
+  `events.UnknownEvent` (Python parity). The Python persist/persist_dropped
+  segment machinery (compaction snapshots) is not in the brief; `Streams()` lists
+  logged stream ids instead.
+
+## D-028 — 2026-10-29 — compact: brief-shaped triggers/strategy, spend carried through the rewrite
+
+Wave-3 brief implemented (`compact/`: trigger.go, strategy.go, compact.go) against
+core.md §3.7 and the Python `_CompactionMiddleware` (ag2/agent.py) + `compact.py`.
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **Constructor functions, not structs**: `EventCountTrigger(n)` / `TokenTrigger(budget)`
+  return the `Trigger` interface (the `middleware.HistoryLimiter(n)` precedent); the
+  impls are unexported. n/budget <= 0 disables (Python 0 = disabled parity) — a Go
+  constructor has no error return.
+- **Trigger's usage argument** is the usage summed over the `ModelResponse` events of
+  the history snapshot (the conversation's reported spend); both built-ins ignore it
+  (count / `events.EstimatedTokens` over conversational events only) — it exists for
+  custom spend-budget triggers. Python's `CompactTrigger` had no usage input at all.
+- **The cut lives in the middleware**: `Strategy.Summarize` receives only the old
+  conversational span (all conversational events before the first of the last
+  `KeepRecent = 2`); Python strategies received the whole history and cut themselves
+  (`_cut_for_target`). Interleaved telemetry after the cut rides along with the fresh
+  range, telemetry before it is dropped. The tool-cycle boundary widening
+  (`_replay.snap`) is not ported: the brief pins a plain keepRecent cut, and provider
+  mappers already repair orphan tool results on replay (D-020).
+- **LLMStrategy is headless**: one `config.LLMClient.Call` with a nil conversation
+  context (Python summarizes over a throwaway `MemoryStream` — same isolation; nil
+  conv drops provider progress chunks, which nothing consumes). No stdlib context in
+  middleware hooks → `context.Background()` (same limitation as middleware.Retry,
+  D-013). Its spend is reported as a live `UsageEvent(kind=compaction)` on the
+  conversation stream (Python `_summarize` parity, same as aggregate's LLMStrategy).
+- **Summarization-window spend survives the rewrite**: the middleware subscribes a
+  collector for the duration of `Summarize` and appends the collected `UsageEvent`s
+  after the fresh range in the `History.Replace` payload; `CompactionCompleted.Usage`
+  is their field-wise sum and `LLMCalls` their count (Python: `spent_during` +
+  `strategy.last_usage`). AGO-DEVIATION: Python's `_with_usage_events` additionally
+  re-attaches every UsageEvent from before the compaction, so spend outside the
+  retained window stays reportable on `AgentReply.usage()`; the brief's contract
+  replaces history with the summary plus the fresh range only, so those records are
+  dropped — bounding that belongs with the ADR-0014-style decision, not here.
+- **No double-compaction guard**: Python's `_last_compact_event_count` per-instance
+  counter is omitted — a Factory builds a fresh instance per turn (at most one
+  compaction per turn by construction) and the trigger itself governs refiring.
+- **Replace and lifecycle-send errors fail the turn** (Python parity: those awaits
+  sit outside the try/suppress blocks); only the strategy's own failure is
+  swallowed into `CompactionFailed` with the history untouched. `error_type` /
+  `strategy` labels come from `reflect` type names (`type(exc).__name__` parity;
+  anonymous types fall back to the full reflect string).
+
+## D-029 — 2026-10-29 — mcp: minimal client over one persistent session
+
+Wave-3 brief implemented as `mcp/` (config.go, jsonrpc.go, transport.go, http.go,
+stdio.go, client.go, content.go, tools.go). JSON-RPC 2.0 over streamable HTTP
+(POST per message, `Accept: application/json, text/event-stream`, answers parsed
+from either content type, `Mcp-Session-Id` honored, 404 → session rebuilt with one
+retry) or over a subprocess's newline-delimited stdio. Deviations, marked
+`// AGO-DEVIATION` in code:
+
+- **One persistent session per Client**: the Python proxy opens a fresh
+  short-lived session per tool call because its sessions are async context
+  managers; the brief's contract (`Initialize`/`ListTools`/`CallTool` on one
+  Client) implies the Client owns its process/connection. Initialize is
+  idempotent, the first operation initializes lazily, and a lost HTTP session is
+  re-established transparently with a single retry.
+- **No context.Context on the exported operations**: the brief pins
+  `Initialize()`/`ListTools()`/`CallTool(name, args)` signatures; they run on
+  `context.Background()`. Operations serialize under the Client lock (one
+  exchange in flight), which also keeps the stdio read loop single-owner.
+- **MCPStdioConfig carries the filter fields** (`AllowedTools`, `BlockedTools`,
+  `ToolNamePrefix`) beyond the brief's struct sketch: `Tools()` must filter both
+  transports, and Python's `MCPStdioServerConfig` has them.
+- **Embedded resource → TextInput carrying the block's JSON** (brief-pinned);
+  Python maps text contents to `TextInput(text)` and blobs to `BinaryInput`.
+  Image **and audio** blocks decode base64 into `BinaryInput` (the ARCHITECTURE
+  contract names both; the brief named only image). Unknown future blocks are
+  preserved as JSON text, never dropped.
+- **Pagination bound 100 pages** (brief) vs Python's `_MAX_TOOL_PAGES=1000`;
+  the repeated-cursor abort is kept.
+- **`input_required` answering (spec §5.5) not ported** and **no discovery cache
+  keyed by resolved config** (spec §5.3): the brief omits both, and AGo configs
+  are plain values without `Variable` indirection — one Client is one resolved
+  config.
+- **No protocol-era negotiation**: the client offers `2024-11-05` and records
+  whatever version a server that answered reports; `protocol_mode`, proxy,
+  verify, connection_timeout, encoding, server_label and description fields from
+  Python's configs are dropped (the brief's structs omit them).
+- **Tool call failures vs tool errors**: transport/JSON-RPC failures wrap
+  `ErrProtocol`; a result the server flagged `isError` wraps `ErrToolCall` with
+  the server's text blocks as the message. Both become `ToolErrorEvent`s at the
+  `remoteTool` boundary (the executor records them as results); a success maps
+  through `events.NewToolResult`.
+- **Garbled stdio lines are skipped**, not fatal: a chatty banner must not kill
+  the session, and the awaited reply may still follow (HTTP/SSE notifications are
+  skipped the same way; server-initiated requests are never answered — the
+  minimum client declares no client capabilities).
+
+## D-030 — 2026-10-29 — policies: assembly over the Conversational flag, brief-pinned formats
+
+Package `policies` (spec events-network.md §3; Python `ag2/policies` +
+`ag2/_replay.py`). Deviations, marked `// AGO-DEVIATION` in code:
+
+- **ConversationPolicy filters on `Conversational()`**, not on a type list:
+  the Go event vocabulary already encodes replay-worthiness. CompactionSummary
+  is conversational in AGo (events/lifecycle.go), matching Python's explicit
+  inclusion; the ToolCallsEvent batch container drops out while the individual
+  ToolCallEvent and the results carry the pair.
+- **Reductions (sliding window, token budget) operate on the conversational
+  subset** (brief: "последние n разговорных событий"): the agent hands the full
+  stream history to every LLM call (agent/turn.go), so telemetry must not count
+  toward a window or budget. When no trim is needed the input passes through
+  unchanged (Python parity), so an upstream ConversationPolicy is optional.
+- **Orphan repair is targeted widening, not full `replayable_span`**: a
+  retained span that opens with a tool result (ToolResultEvent, ToolErrorEvent,
+  ToolNotFoundEvent, BuiltinToolResultEvent) whose call lies outside the span
+  widens back until the pair closes; the span never widens past the transcript
+  start, so it grows rather than empties. Python's ProviderReplay anchor/turn
+  items do not exist in the Go event vocabulary.
+- **AlertPolicy prompt format is one `alert(<severity>) from <source>:
+  <message>` line per alert** (brief) instead of Python's joined
+  "[OBSERVER MONITORING ALERTS]" block. A fatal alert sends a single
+  HaltEvent with reason `FATAL: <message>` (Python's `source`/`alerts` fields
+  do not exist on the Go HaltEvent) and adds no prompt line (Python added a
+  "[FATAL ALERT]" note).
+- **Memory policies take the knowledge.Store in the constructor** (brief) where
+  Python resolves it from context dependencies; the episodic directory is
+  `conversations/` (brief) vs Python's `/memory/conversations/`, and the
+  episodic transparency-note fragment is dropped (the brief names one fragment).
+- **`validate_order` is not ported**: it exists to warn Python users about
+  policy ordering. The recommended order (filters and injections first,
+  reductions last) is documented in the package doc; the Python `name`
+  attribute and the transparency options go with it.
+
+## D-031 — 2026-10-29 — network: functional single-host subset, hub/adapters/clients in Go
+
+Wave-3 network brief implemented (`network/` + `network/transport/`): Envelope/Channel/
+Passport/Rule/Transitions/Handoff, Hub (registries, pending→invite→ack→opened handshake,
+send gates, WAL + Replay), Consulting/Conversation/Discussion/Workflow adapters,
+HubClient/AgentClient/HumanClient, Frame vocabulary + LocalLink. WebSocket links,
+federation (RemoteAgentProxy), view policies, expectation sweepers, task mirror and the
+client LLM-tool set (peers/channels/tasks/context/delegate) are out of the subset (D-010).
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **Envelope shape is brief-driven, not Python-wire**: single-id `Audience` ("" =
+  broadcast) instead of a list, `Payload []byte` (raw JSON) instead of the `event_data`
+  dict, `Priority` int, hub-stamped `ID`/`CreatedAt`. The `ag2.*` event-type vocabulary
+  is kept verbatim (D-010); the ack type is `ag2.channel.ack` per the brief (Python:
+  `ag2.channel.invite.ack`), and `ag2.channel.invite.reject` / `ag2.channel.expired` are
+  added beyond the brief's constant list because the all-or-nothing handshake and TTL
+  need them. Lifecycle broadcasts (opened/closed/expired) address the full participant
+  list in Python; with a single-id audience the self-inclusion resolves at dispatch.
+- **WAL seam + binding**: the brief pins `knowledge.EventLogWriter`, but knowledge
+  landed mid-wave, so the Hub speaks a local `WAL` interface (channel snapshots +
+  envelope records) with `MemoryWAL`/`FileWAL` backends and `KnowledgeWAL` binding
+  `knowledge.EventLogWriter` (records travel as DataInput events, one log stream).
+  Replay restores channels + adapter fold state; it does NOT restore passports
+  (identities re-register with fresh ids after a restart).
+- **Adapter interface collapsed to the brief's four methods**:
+  `validate_create/validate_send/fold/on_accepted/initial_state` merge into
+  `ValidateCreate` + `OnEnvelope` (validate-then-fold, state untouched on error) +
+  `InitialState`. The brief's `ch *ChannelState` parameter is the hub's channel-state
+  record (`*ChannelHandle`); the literal `ChannelState` type is the lifecycle enum. An
+  optional `StateInitializer` extension seeds discussion rotation / workflow graph from
+  the channel record — the brief's zero-arg `InitialState()` cannot see it.
+- **Transitions are simplified per the brief**: no per-transition priorities (list
+  order decides), no `default_target` (fall-through terminates with `no_transition`),
+  no `ContextEquals` condition, and no (de)serialization registries — a fixed
+  name-based `ToDict`/`GraphFromDict` covers the built-ins for channel knobs.
+  `(state, envelope)` becomes `*TurnContext`; terminating targets write `CloseReason`
+  and return "".
+- **Agent integration is callback-based**: the brief forbids `network → agent`, so
+  `AgentClient` bridges through `MessageFunc func(msg string) (string, error)`
+  / `EnvelopeFunc` / `RoundFunc` instead of calling `Agent.ask` (the spec's default
+  notify handler). No view-policy projection — the inbound text is the rendered
+  envelope (packets: handoff signal line + body).
+- **Hub dispatch is synchronous notifier calls** (D-004 style): invites are acked
+  inline so `CreateChannel`'s handshake completes deterministically; substantive
+  envelopes go through each client's buffered mailbox + pump goroutine (overflow
+  drops). Adapter-requested closes run after dispatch (Python order); trailing replies
+  racing the close are rejected by the hub gates (terminal state / workflow
+  `expected == ""` after termination), never invented.
+- **Handoff/Finish recognition** covers typed DataInput values (a live Go tool
+  returning `*Handoff`/`*Finish`) and JSON text/marked-map encodings
+  (`{"handoff": {...}}` / `{"finish": {...}}`) for results that crossed a wire;
+  `RoundFromEvents` scans ToolResultsEvent/ToolResultEvent with Finish winning over
+  Handoff. Handoff targets resolve Passport name → agent id at post time (Python:
+  packet-finalize).
+- **Lazy TTL**: no background sweeper — the first send past the channel `ExpiresAt`
+  (knob `ttl_seconds`) expires the channel and broadcasts `ag2.channel.expired`;
+  per-envelope TTL is sender-asserted (checked only when the sender supplied
+  `CreatedAt`).
+- **LocalLink** is an address-addressed switchboard (`Dial(addr)` + `Accept` for
+  server loops, delivery by `Frame.To`) with bounded inboxes (`ErrLinkOverflow`)
+  instead of Python's unbounded asyncio queues.
+
+## D-030 — 2026-10-29 — Agent.Task always runs on a private stream
+
+Python's `agent.task(...)` accepted a `context=` argument letting observers watch the
+task's stream. The AGo signature `Agent.Task(ctx, title, opts...)` has no context
+parameter, so the task always runs on a private `*agocontext.Context` over a fresh
+stream seeded with the agent's dependencies. An unexported `taskStreamProbe` seam
+(tests only) provides the observer window in tests. Recorded by the orchestrator on
+behalf of the wave-3 agent (D-030 replaces the agent's placeholder numbering).
+
+## D-031 — 2026-10-29 — Wave gate policy: final gate decides, transient conflicts are resolved
+
+During wave 3, parallel package agents reported "partial" because sibling agents'
+in-progress edits broke the whole-repo gate mid-wave. The workflow's final gate
+(build/vet/test) ran after all agents settled and is green; those transient findings
+are considered resolved. Rule going forward: a package's status is set by the final
+whole-repo gate, not by mid-wave snapshots.
