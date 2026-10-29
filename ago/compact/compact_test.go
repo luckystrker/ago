@@ -165,7 +165,7 @@ func TestLLMStrategySummarize(t *testing.T) {
 		// Parts survive the recorder's JSON round trip as pointer inputs; render
 		// instead of asserting a concrete part type.
 		text := events.RenderForPrompt(req.Parts[0])
-		want := "PROMPT\n\nhello\nhi there"
+		want := "PROMPT\n\nUser: hello\nAssistant: hi there"
 		if text != want {
 			t.Fatalf("prompt text = %q, want %q", text, want)
 		}
@@ -252,9 +252,9 @@ func TestCompactionReplacesHistory(t *testing.T) {
 	}
 	want := []string{
 		"CompactionSummary:[Summary of earlier conversation]\nold stuff summarized",
-		"ModelRequest:u6",
+		"ModelRequest:User: u6",
 		"UsageEvent:",
-		"ModelResponse:done",
+		"ModelResponse:Assistant: done",
 	}
 	if !equalStrs(fingerprint(evs), want) {
 		t.Fatalf("history = %v, want %v", fingerprint(evs), want)
@@ -262,7 +262,7 @@ func TestCompactionReplacesHistory(t *testing.T) {
 
 	// The strategy saw exactly the old conversational span — telemetry (ue1)
 	// excluded, the fresh range (u6, the response) excluded.
-	if !equalStrs(summarized, []string{"u0", "u1", "u2", "u3", "u4", "u5"}) {
+	if !equalStrs(summarized, []string{"User: u0", "User: u1", "User: u2", "User: u3", "User: u4", "User: u5"}) {
 		t.Fatalf("summarized = %v", summarized)
 	}
 
@@ -375,7 +375,7 @@ func TestCompactionFailureKeepsHistory(t *testing.T) {
 		t.Fatalf("GetEvents: %v", err)
 	}
 	wantBefore := fingerprint(before)
-	wantBefore = append(wantBefore, "ModelResponse:done")
+	wantBefore = append(wantBefore, "ModelResponse:Assistant: done")
 	if !equalStrs(fingerprint(after), wantBefore) {
 		t.Fatalf("history after failure = %v, want %v", fingerprint(after), wantBefore)
 	}

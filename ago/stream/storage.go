@@ -113,6 +113,11 @@ func (h *History) Drop() error {
 // StreamID returns the owning stream id.
 func (h *History) StreamID() string { return h.streamID }
 
+// Storage returns the backing transcript storage (delegation parity: a sub-task
+// stream is built over the parent's storage, so both transcripts land in one
+// place under their own stream ids).
+func (h *History) Storage() Storage { return h.storage }
+
 // CloseUnanswered appends sentinel results for tool calls left unanswered by a
 // killed turn (parity: history.close_unanswered_tool_calls).
 func (h *History) CloseUnanswered() (int, error) {

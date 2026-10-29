@@ -968,3 +968,125 @@ an SSE response body, while httpx's timeout is per-phase (connect/read/write);
 a slow-but-steady server is cut off at the cap. Regression:
 `TestHTTPTimeout` (defaults, override, negative, hung-server fast failure
 freeing the client lock).
+
+## D-035 — 2026-10-30 — config/gemini: presence/frequency penalties, seed and thinking reach Clone and generationConfig
+
+The Gemini config accepted only model/api_key/base_url/sampling/stop/streaming;
+`presence_penalty`, `frequency_penalty`, `seed`, `thinking_level` and
+`thinking_budget` were silently dropped by `Clone` and never reached the
+request body. Python parity: `GeminiBaseConfig`
+(ag2/ag2/config/gemini/config.py) and `_resolve_thinking_config` — penalties
+and seed pass through to the generation config; the two thinking knobs
+collapse into one object (`thinkingConfig.thinkingLevel` / `thinkingBudget` on
+the REST wire, one or both). Fields are `*float64`/`*int64`/`*string`, set via
+`WithPresencePenalty`/`WithFrequencyPenalty`/`WithSeed`/`WithThinkingLevel`/
+`WithThinkingBudget`, deep-copied in `Clone`, nil clears. `cached_content`,
+`response_modalities`, `image_config` and the raw `thinking_config` SDK object
+stay out of the port's scope (SDK-typed in Python).
+AGO-DEVIATION: `Clone` rejects a `thinking_level` outside
+"low"/"medium"/"high"; Python's `ThinkingLevel` literal is compile-time only
+and accepts any string at runtime. Regression: `TestGeminiClonePenaltiesSeedThinking`,
+`TestGeminiPenaltiesSeedThinkingInRequest`, `TestGeminiThinkingConfigResolution`.
+
+## D-036 — 2026-10-30 — tools: fast_depends `Depends` (factory-valued tool parameters) is not ported
+
+Python re-exports `Depends` from fast_depends (`ag2/ag2/__init__.py`) for tool
+signatures: a `Depends(fn)` parameter is excluded from the model-facing JSON schema
+and its value is computed by calling `fn` right before the tool body, memoized per
+call; `fn` itself may declare `Inject`/`Variable`/`Depends`. Porting it to Go is not
+mechanical: reflection does not yield parameter names, so a factory parameter needs a
+new convention (an `agdepends`-style tag plus a registry), a schema-exclusion rule
+and per-call memoization — a new API surface of 150+ lines. The resolved-value cases
+it covers are already served by the AGo DI dictionary (`tools.Inject`/`tools.Variable`
+and the `*agocontext.Context` parameter, D-016). Its Python consumers — a2ui
+actions/server_action, mcp tools/apps, skills runtime — are themselves deferred
+subsystems (migration map §5).
+Decision: do not port. Compute the factory value in Go before the call, or wrap the
+factory as a separate tool. Revisit together with the deferred subsystems that
+consume it.
+
+## D-037 — 2026-10-30 — agent: per-call ask(dependencies=, variables=, prompt=) overrides are not ported
+
+Python `ask`/`run` accept per-call `dependencies=`, `variables=` and `prompt=`
+(ag2/ag2/agent.py:272-294, applied as `_ContextOverrides` on top of the agent's own
+state). AGo `Ask`/`Run` take only `(ctx, msgs...)` (agent/agent.go); dependencies,
+variables and prompt fragments are constructor options
+(`WithDependencies`/`WithVariables`/`WithPromptFragments`). A caller-built
+`*agocontext.Context` cannot be handed into a run either — `newRunOn` is unexported.
+Replacement: vary at construction (a fresh `agent.New` per variant — the struct is
+cheap) or mutate the shared context between turns. Revisit if a consumer needs
+call-scoped overrides.
+
+## D-038 — 2026-10-30 — context: reserved "ag:"/"a2a:" variable prefixes are convention only; no wire stripping
+
+Python reserves the variable prefixes `ag:`/`a2a:` for control-plane state (the
+approval bypass key `ag:approval_required:always`, A2A bookkeeping, `a2a:tenant`)
+and enforces it with `strip_reserved_variables` (ag2/ag2/context.py:289-316): every
+wire-originated merge drops reserved keys so a remote peer cannot author them —
+writing the bypass key would pre-approve a gated tool and the human would never be
+asked. AGo declares the same prefixes reserved but ships no stripping code: variables
+never leave the process today (variables sync is part of the deferred federation
+surface, D-010/D-031), so there is no wire to strip at, and Python's safety goal
+cannot arise. The one crossing that exists is deliberate and filters by key, not by
+prefix: a sub-task inheriting the parent's variables drops exactly the approval
+bypass key (`agent/subtask.go` `bypassKey`; run_task parity). Gate: introduce
+stripping when a transport that forwards variables lands.
+
+## D-039 — 2026-10-30 — agent: TaskConfig.IncludeTools changed from bool to []string
+
+`IncludeTools` was a bool ("child inherits the parent's tools, minus
+ExcludeTools"); it is now `[]string`, matching Python's
+`include_tools: list[str] | None` (`_filter_subtask_tools` shape): nil (the zero
+value) inherits all parent user tools — Python's `include_tools=None` default; an
+empty slice inherits none; otherwise it is a name allowlist, and `ExcludeTools`
+applies after it. Breaking against earlier AGo builds, where the zero value
+(`false`) gave the child no parent tools while the new zero value (`nil`) gives all
+of them; accepted before v1.0. Regression: `TestSubtaskToolFilters`
+(nil / empty allowlist / allowlist / exclude-after-allowlist).
+
+## D-040 — 2026-10-30 — agent: the default AsTool tool name is task_<name>, not ask_<name>
+
+Python parity: subagent_tool.py `tool_name = name or f"task_{agent.name}"`. The
+default name generated by `Agent.AsTool()` changed from `ask_<name>` to
+`task_<name>`; an explicit `WithToolName` override is untouched (the subagent
+example pins `ask_specialist` and keeps working). Regression: `TestAsToolSurface`
+(name and schema).
+
+## D-041 — 2026-10-30 — delegation AGO-DEVIATION: a forwarded HITL question is transcribed on the parent stream
+
+When a sub-task without its own hook asks through the parent's hook, the bridge
+sends a copy of the question — stamped with the task id — to the parent stream
+before invoking the hook (`agent/subtask.go`); the answer still lands only in the
+child's transcript. Python swallows the forwarded question with a per-turn
+interrupter; AGo subscribers receive events only (no context), so per-turn wiring
+cannot be replicated on a stream another agent owns (D-013, D-032 — Ask routes
+questions through the stream, and the answer is matched by the original request id,
+which the stamped copy keeps). Observers of the parent conversation therefore see
+the delegation asking. Without a hook on either side the child's question fails
+with `hitl.NotProvidedError`, carried through the tool layer as a turn-ending hitl
+error (Python parity: run_task re-raises HumanInputError). The AGO-DEVIATION comment
+at the bridge cites "D-040" — the number this decision held when the fix landed;
+numbering shifted after D-035 was taken by the gemini entry. Regressions:
+`TestSubtaskBridgesHitlToParent`, `TestSubtaskHitlRefusedWithoutHook`.
+
+## D-042 — 2026-10-30 — stream: SubStream.Send forwards unconditionally — a filtered view filters reading, not writing
+
+`SubStream.Send` dropped events that did not match the view's condition (silently,
+returning nil). Python parity: stream.py `SubStream.send` is a bare `parent.send` —
+the view's condition filters what the view shows (`Subscribe`/`Get`), never what a
+caller pushes through it. Behavior change against earlier AGo builds: an event sent
+through a filtered view now reaches the parent stream (its subscribers and
+transcript) even when it does not match the view condition. Regression:
+`TestSubStreamSubscribeAndSend`.
+
+## D-043 — 2026-10-30 — events: the sentinel tool result is Python's human-readable sentence, not the constant name
+
+`SentinelToolResult` — the content appended for tool calls abandoned by an
+unanswerable human-input request — carried the literal string
+`"HUMAN_INPUT_ABANDONED_TOOL_RESULT"`; it now carries the Python sentence itself
+(ag2/ag2/history.py:64): "This tool call was not completed: the turn ended because
+a human-input request could not be answered." Behavior change against earlier AGo
+builds: that sentence is what the model reads on the next call, so transcripts and
+provider replays differ from earlier builds and now match Python. Regressions:
+the events suite pins the sentence verbatim;
+`TestHitlMissingHookRepairsHistory` exercises the repair path end to end.

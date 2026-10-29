@@ -124,7 +124,7 @@ func EnsureRequest(msgs []any) *ModelRequest
 // factories: ImageInput/DocumentInput/AudioInput/VideoInput (from URL, file path, or data+mediaType)
 
 // History-repair helper (used by agent on HumanInputError):
-func CloseUnansweredToolCalls(...) // sentinel result "HUMAN_INPUT_ABANDONED_TOOL_RESULT"
+func CloseUnansweredToolCalls(...) // sentinel result: Python's human-readable abandoned-call sentence (events.SentinelToolResult, D-043)
 func EstimatedTokens(ev Event, charsPerToken int) int  // text len/4; image/audio 1000, video/doc 2000
 ```
 
@@ -473,8 +473,8 @@ func (r *AgentReply) Usage(ctx context.Context) *usage.Report
 func (r *AgentReply) Ask(ctx context.Context, msgs ...Sendable) (*AgentReply, error)  // continuation, same stream
 func (r *AgentReply) Run(ctx context.Context, msgs ...Sendable) (*AgentRun, error)
 
-// TaskConfig { Config config.ModelConfig; Prompt string; IncludeTools bool; ExcludeTools []string;
-//              ExtraTools []tools.Tool; MaxConcurrency int }
+// TaskConfig { Config config.ModelConfig; Prompt string; IncludeTools []string; ExcludeTools []string;
+//              ExtraTools []tools.Tool; MaxConcurrency int }  // IncludeTools: nil = all parent tools (Python None), empty = none, else allowlist (D-039)
 ```
 
 Turn loop (agent/turn.go) — parity with core.md §3: per-stream turn lock (sync.Map[streamID]*sync.Mutex);

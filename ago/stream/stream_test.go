@@ -131,7 +131,16 @@ func TestReentrantSendNoDeadlock(t *testing.T) {
 }
 
 func TestSubStreamSubscribeAndSend(t *testing.T) {
-	s := NewMemoryStream()
+	// WithPersistAll: the forwarded event below is a ModelMessage (transient by
+	// default), and the test asserts it reaches the shared transcript.
+	s := NewMemoryStream(WithPersistAll())
+	// Unconditional recorder on the parent: a send through the filtered view
+	// must still reach it (Python parity: stream.py SubStream.send forwards).
+	var parentGot []string
+	s.Subscribe(func(ev events.Event) error {
+		parentGot = append(parentGot, ev.EventType())
+		return nil
+	}, SubscribeOptions{})
 	toolView := s.Where(events.TypeOf[events.ToolCallEvent]())
 	var got []string
 	toolView.Subscribe(func(ev events.Event) error {
@@ -145,12 +154,27 @@ func TestSubStreamSubscribeAndSend(t *testing.T) {
 	if len(got) != 1 || got[0] != "search" {
 		t.Fatalf("tool view saw %v", got)
 	}
-	// Send through the view: matching events pass, others are ignored.
-	if err := toolView.Send(&events.ModelMessage{Content: "ignored"}); err != nil {
-		t.Fatalf("filtered send: %v", err)
+	// Send through the view forwards unconditionally to the parent: the parent
+	// dispatches to all subscribers and persists the event; only this view's
+	// own filtered subscription ignores non-matching events.
+	if err := toolView.Send(&events.ModelMessage{Content: "not a call"}); err != nil {
+		t.Fatalf("view send: %v", err)
+	}
+	if len(parentGot) != 3 || parentGot[2] != "ModelMessage" {
+		t.Fatalf("parent must receive non-matching view sends: %v", parentGot)
 	}
 	if len(got) != 1 {
-		t.Fatal("view must ignore non-matching sends")
+		t.Fatal("filtered subscription must still ignore non-matching sends")
+	}
+	h, _ := s.History().GetEvents()
+	persisted := false
+	for _, ev := range h {
+		if ev.EventType() == "ModelMessage" {
+			persisted = true
+		}
+	}
+	if !persisted {
+		t.Fatal("event sent through the view must persist on the shared transcript")
 	}
 	nested := events.NewToolCallEvent("calc")
 	if err := toolView.Send(&nested); err != nil {
@@ -158,6 +182,9 @@ func TestSubStreamSubscribeAndSend(t *testing.T) {
 	}
 	if len(got) != 2 || got[1] != "calc" {
 		t.Fatalf("view send should deliver: %v", got)
+	}
+	if len(parentGot) != 4 {
+		t.Fatalf("parent saw %v", parentGot)
 	}
 }
 

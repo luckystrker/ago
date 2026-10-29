@@ -103,6 +103,31 @@ func (c *Context) MustDependency(id string) (any, error) {
 	return nil, errors.New("context: missing dependency " + id)
 }
 
+// DependenciesSnapshot returns a shallow copy of the dependencies map, taken
+// under the lock (Python parity: ctx.dependencies.copy() — the copy handed to a
+// sub-task so the child cannot mutate the parent's map and vice versa).
+func (c *Context) DependenciesSnapshot() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]any, len(c.Dependencies))
+	for k, v := range c.Dependencies {
+		out[k] = v
+	}
+	return out
+}
+
+// VariablesSnapshot returns a shallow copy of the variables map, taken under
+// the lock (Python parity: ctx.variables.copy()).
+func (c *Context) VariablesSnapshot() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]any, len(c.Variables))
+	for k, v := range c.Variables {
+		out[k] = v
+	}
+	return out
+}
+
 func (c *Context) Variable(name string) (any, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

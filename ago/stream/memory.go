@@ -64,6 +64,9 @@ type MemoryStream struct {
 	nextSub SubID
 	pending []*events.ModelRequest
 	history *History
+	// storageOpt carries the WithStorage argument until the stream id is final
+	// and the History can be built (see WithStorage).
+	storageOpt Storage
 
 	bgWG sync.WaitGroup
 }
@@ -71,8 +74,12 @@ type MemoryStream struct {
 type MemoryOption func(*MemoryStream)
 
 // WithStorage replaces the transcript storage.
+//
+// The storage is remembered on the stream and wired into the History after the
+// options ran, so the stream id is already final when the History is built:
+// WithStorage alone must not key the transcript under the empty id.
 func WithStorage(s Storage) MemoryOption {
-	return func(m *MemoryStream) { m.history = NewHistory(m.id, s) }
+	return func(m *MemoryStream) { m.storageOpt = s }
 }
 
 // WithStreamID sets the stream id (otherwise a fresh uuid).
@@ -86,12 +93,18 @@ func WithLogger(l *slog.Logger) MemoryOption { return func(m *MemoryStream) { m.
 
 func NewMemoryStream(opts ...MemoryOption) *MemoryStream {
 	m := &MemoryStream{logger: slog.Default()}
-	m.history = NewHistory(m.id, NewMemoryStorage())
 	for _, o := range opts {
 		o(m)
 	}
 	if m.id == "" {
 		m.id = newStreamID()
+	}
+	if m.history == nil {
+		storage := m.storageOpt
+		if storage == nil {
+			storage = NewMemoryStorage()
+		}
+		m.history = NewHistory(m.id, storage)
 	}
 	return m
 }
@@ -280,10 +293,10 @@ func (s *SubStream) SpawnBackground(ctx context.Context, fn func(context.Context
 }
 func (s *SubStream) WaitBackground() { s.parent.WaitBackground() }
 
+// Send forwards unconditionally to the parent: the view's condition filters what
+// this stream shows (Subscribe/Get), never what a caller pushes through it
+// (Python parity: stream.py SubStream.send is a bare parent.send).
 func (s *SubStream) Send(ev events.Event) error {
-	if !matches(s.cond, ev) {
-		return nil
-	}
 	return s.parent.Send(ev)
 }
 

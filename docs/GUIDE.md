@@ -5,7 +5,7 @@ conversation, tools registered as stream subscribers, middleware wrapped around 
 turn, model call, tool execution and human-input hop, and a hub that hosts multi-agent
 channels. It is a port of AG2 (Python) with zero external dependencies — stdlib only,
 module `ago`, Go 1.24; add the repo and import `"ago/..."` (no `go get`). Every snippet
-below was compile-checked against the tree as of 2026-10-29.
+below was compile-checked against the tree as of 2026-10-30.
 
 Sections: [Concepts](#concepts) · [Agents](#agents) · [Tools](#tools) ·
 [Model providers](#model-providers) · [Middleware](#middleware) ·
@@ -218,27 +218,48 @@ _ = t.Complete(report)
 ```
 
 `WithTasks` instead gives the *model* delegation tools: `run_subtask` spawns a bare
-child agent for one objective, `run_subtasks` runs several in parallel. Children never
-receive the subtask tools, so delegation cannot recurse:
+child agent for one objective, `run_subtasks` runs several — concurrently by default
+(`parallel: false` runs them sequentially). Children never receive the subtask tools,
+so delegation cannot recurse:
 
 ```go
 a := agent.New("lead", "Delegate research to subtasks.", agent.WithConfig(cfg),
 	agent.WithTasks(agent.TaskConfig{
-		Config:         cfg, // nil → the parent's config
-		Prompt:         "You are a careful researcher.",
-		IncludeTools:   true, // child inherits parent tools…
+		Config: cfg, // nil → the parent's config
+		Prompt: "You are a careful researcher.",
+		// IncludeTools: nil (the default) → child inherits all parent tools;
+		// []string{} → none; a list of names → allowlist.
+		// ExcludeTools is applied after the allowlist.
 		ExcludeTools:   []string{"deploy"},
 		MaxConcurrency: 4,
 	}))
 ```
 
-Each subtask's spend is rolled up onto the parent stream as one
-`UsageEvent{Kind: "subtask"}`; `reply.Usage().ByKind["subtask"]` reports it.
+Every delegation is reported on the caller's stream: `TaskStarted` before the child
+turn, `TaskCompleted`/`TaskFailed` after, and the child's spend as one rolled-up
+`UsageEvent{Kind: "subtask"}` — `reply.Usage().ByKind["subtask"]` reports it. The
+child starts from a copy of the caller's dependencies and variables (the approval
+bypass key `ag:approval_required:always` is dropped, so tool approvals are not
+inherited) and its variable mutations stay scoped to the child run. A failed sub-task
+comes back as `Error: …` text in the tool result, so the model can react;
+`run_subtasks` joins the answers as `## <task>` sections.
+
+If the child has no HITL hook of its own, its questions are bridged to the parent's
+hook: a copy of the request stamped with the task id is sent to the parent stream (the
+one delegation event that *is* transcribed there), and only the answer lands in the
+child's transcript. With no hook on either side, the calling turn ends with a
+`*hitl.NotProvidedError`.
 
 ### Agents as tools
 
-`AsTool` exposes an agent as a callable tool for another agent. The delegation opens a
-fresh ask on the child's own stream; the child's final text is the tool result:
+`AsTool` exposes an agent as a callable tool for another agent. It delegates through
+the same machinery as `WithTasks`: the tool takes an `objective` (plus optional
+`context`), the caller's stream gets `TaskStarted`/`TaskCompleted`/`TaskFailed` and
+the rolled-up subtask usage, and the child runs on its own stream persisted into the
+caller's storage. The child's final text is the tool result; a failed sub-task is the
+text `Sub-task '<name>' failed: …`. The default tool name is `task_<name>`
+(`WithToolName` overrides it; Python parity — it was `ask_<name>` in earlier AGo
+builds):
 
 ```go
 specialist := agent.New("specialist", "You are a database specialist.",
@@ -444,7 +465,7 @@ Semantics (`ago/hitl`, `context/context.go`):
 
 - The question is delivered to the hook **without being transcribed** (an interrupt subscriber swallows it). An external participant may answer instead of the hook: send a `HumanMessage` with `ParentID` = the request's id and `Stream.Get` picks it up.
 - `req.Timeout` (seconds) covers asking and waiting; expiry is `*hitl.TimeoutError`.
-- Failures are normalized: no hook → `*hitl.NotProvidedError` (wraps `hitl.ErrNotProvided`); hook failure → `*hitl.FailedError`; deadline → `*hitl.TimeoutError`. A tool calling `cx.Input(ctx, "...", d)` without a hook fails the same way — the error travels up, unanswered tool calls in the history are repaired with the sentinel result `HUMAN_INPUT_ABANDONED_TOOL_RESULT`, and the next model call stays valid.
+- Failures are normalized: no hook → `*hitl.NotProvidedError` (wraps `hitl.ErrNotProvided`); hook failure → `*hitl.FailedError`; deadline → `*hitl.TimeoutError`. A tool calling `cx.Input(ctx, "...", d)` without a hook fails the same way — the error travels up, unanswered tool calls in the history are repaired with the sentinel result (`events.SentinelToolResult`: "This tool call was not completed: the turn ended because a human-input request could not be answered."), and the next model call stays valid.
 - `middleware.Approval()` asks on every call. Answers `y`/`yes`/`approve` pass; `always` grants the tool's source for the rest of the turn; anything else returns a `ToolErrorEvent("denied by human")` the model can see and react to.
 - Unlike Python, a running Go hook cannot be cancelled — at the deadline it is abandoned and a late answer is discarded.
 

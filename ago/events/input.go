@@ -3,6 +3,7 @@ package events
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -252,57 +253,77 @@ func MediaTypeForPath(path string) string {
 
 type mediaSpec struct {
 	url       string
+	fileID    string
 	path      string
 	data      []byte
 	mediaType string
+	filename  string
 }
 
 func buildBinary(kind BinaryType, spec mediaSpec) (Input, error) {
 	sources := 0
-	if spec.url != "" {
-		sources++
-	}
-	if spec.path != "" {
-		sources++
-	}
-	if spec.data != nil {
-		sources++
+	for _, set := range []bool{spec.url != "", spec.fileID != "", spec.path != "", spec.data != nil} {
+		if set {
+			sources++
+		}
 	}
 	if sources != 1 {
-		return nil, fmt.Errorf("events: %s input requires exactly one of url, path or data", kind)
+		return nil, fmt.Errorf("events: %s input requires exactly one of url, file_id, path or data", kind)
 	}
-	if spec.url != "" {
+	switch {
+	case spec.url != "":
 		return &UrlInput{URL: spec.url, Kind: kind}, nil
-	}
-	if spec.data != nil {
+	case spec.fileID != "":
+		return &FileIdInput{FileID: spec.fileID, Filename: spec.filename}, nil
+	case spec.path != "":
+		mt := spec.mediaType
+		if mt == "" {
+			mt = MediaTypeForPath(spec.path)
+		}
+		if mt == "" {
+			return nil, fmt.Errorf("events: cannot infer %s media type from extension '%s'. Provide media_type explicitly",
+				kind, strings.ToLower(filepath.Ext(spec.path)))
+		}
+		// The bytes travel with the request: provider APIs take URLs or uploaded
+		// ids, not local paths (Python parity: input_events.py p.read_bytes()).
+		b, err := os.ReadFile(spec.path)
+		if err != nil {
+			return nil, fmt.Errorf("events: %s input: %w", kind, err)
+		}
+		return &BinaryInput{
+			Data:           b,
+			MediaType:      mt,
+			Kind:           kind,
+			VendorMetadata: map[string]any{"filename": filepath.Base(spec.path)},
+		}, nil
+	default:
 		mt := spec.mediaType
 		if mt == "" {
 			return nil, fmt.Errorf("events: %s input from data requires a media type", kind)
 		}
 		return &BinaryInput{Data: spec.data, MediaType: mt, Kind: kind}, nil
 	}
-	mt := spec.mediaType
-	if mt == "" {
-		mt = MediaTypeForPath(spec.path)
-	}
-	// A path is a provider-side reference; represent it as a file-scheme URL.
-	return &UrlInput{URL: "file://" + filepath.ToSlash(spec.path), Kind: kind}, nil
 }
 
-func ImageInput(url, path string, data []byte, mediaType string) (Input, error) {
-	return buildBinary(BinaryImage, mediaSpec{url, path, data, mediaType})
+// The media factories take exactly one source: url, fileID, path or data (with a
+// mandatory mediaType). A path is read eagerly; its base name rides in
+// VendorMetadata["filename"], and an unknown extension fails — pass mediaType
+// explicitly. A named file_id has no positional slot: build FileIdInput directly.
+
+func ImageInput(url, path string, data []byte, mediaType, fileID string) (Input, error) {
+	return buildBinary(BinaryImage, mediaSpec{url: url, path: path, data: data, mediaType: mediaType, fileID: fileID})
 }
 
-func DocumentInput(url, path string, data []byte, mediaType string) (Input, error) {
-	return buildBinary(BinaryDocument, mediaSpec{url, path, data, mediaType})
+func DocumentInput(url, path string, data []byte, mediaType, fileID string) (Input, error) {
+	return buildBinary(BinaryDocument, mediaSpec{url: url, path: path, data: data, mediaType: mediaType, fileID: fileID})
 }
 
-func AudioInput(url, path string, data []byte, mediaType string) (Input, error) {
-	return buildBinary(BinaryAudio, mediaSpec{url, path, data, mediaType})
+func AudioInput(url, path string, data []byte, mediaType, fileID string) (Input, error) {
+	return buildBinary(BinaryAudio, mediaSpec{url: url, path: path, data: data, mediaType: mediaType, fileID: fileID})
 }
 
-func VideoInput(url, path string, data []byte, mediaType string) (Input, error) {
-	return buildBinary(BinaryVideo, mediaSpec{url, path, data, mediaType})
+func VideoInput(url, path string, data []byte, mediaType, fileID string) (Input, error) {
+	return buildBinary(BinaryVideo, mediaSpec{url: url, path: path, data: data, mediaType: mediaType, fileID: fileID})
 }
 
 func init() {

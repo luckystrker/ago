@@ -2,6 +2,9 @@ package events
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -166,6 +169,10 @@ func TestRepairUnansweredToolCalls(t *testing.T) {
 	if fixes[0].Result.Parts[0].(TextInput).Content != SentinelToolResult {
 		t.Errorf("sentinel content wrong: %v", fixes[0].Result.Parts)
 	}
+	// Pin the phrase itself so a value drift cannot hide behind the constant.
+	if got := fixes[0].Result.Parts[0].(TextInput).Content; got != "This tool call was not completed: the turn ended because a human-input request could not be answered." {
+		t.Errorf("sentinel drifted from the Python phrase: %q", got)
+	}
 	if len(UnansweredToolCalls(append(append([]Event{}, evs...), fixes[0]))) != 0 {
 		t.Error("repair did not answer the call")
 	}
@@ -189,19 +196,56 @@ func TestEnsureInputAndRequest(t *testing.T) {
 }
 
 func TestMediaFactories(t *testing.T) {
-	if _, err := ImageInput("https://x/y.png", "", nil, ""); err != nil {
+	if _, err := ImageInput("https://x/y.png", "", nil, "", ""); err != nil {
 		t.Errorf("url input: %v", err)
 	}
-	if _, err := ImageInput("", "x/y.png", nil, ""); err != nil {
-		t.Errorf("path input: %v", err)
+	// A file_id is its own source (exactly one of url|file_id|path|data).
+	in, err := ImageInput("", "", nil, "", "file-123")
+	if err != nil {
+		t.Fatalf("file_id input: %v", err)
 	}
-	if _, err := ImageInput("", "", []byte{1}, "image/png"); err != nil {
+	fid, ok := in.(*FileIdInput)
+	if !ok || fid.FileID != "file-123" {
+		t.Fatalf("file_id input = %#v, want *FileIdInput", in)
+	}
+	// A path is read eagerly: bytes, media type and filename travel with the part.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "pic.png")
+	if err := os.WriteFile(p, []byte("pngbytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in, err = ImageInput("", p, nil, "", "")
+	if err != nil {
+		t.Fatalf("path input: %v", err)
+	}
+	bin, ok := in.(*BinaryInput)
+	if !ok {
+		t.Fatalf("path input = %T, want *BinaryInput", in)
+	}
+	if string(bin.Data) != "pngbytes" || bin.MediaType != "image/png" || bin.Kind != BinaryImage {
+		t.Errorf("path input = %+v", bin)
+	}
+	if bin.VendorMetadata["filename"] != "pic.png" {
+		t.Errorf("vendor metadata = %v, want filename \"pic.png\"", bin.VendorMetadata)
+	}
+	// An explicit media type wins over the extension.
+	in, err = ImageInput("", p, nil, "application/custom", "")
+	if err != nil || in.(*BinaryInput).MediaType != "application/custom" {
+		t.Errorf("explicit media type: %v, %+v", err, in)
+	}
+	// An unknown extension fails at the extension check, before any read.
+	if _, err := ImageInput("", filepath.Join(dir, "blob.xyz"), nil, "", ""); err == nil {
+		t.Error("unknown extension should fail")
+	} else if !strings.Contains(err.Error(), "cannot infer image media type") {
+		t.Errorf("error = %v, want an inference hint", err)
+	}
+	if _, err := ImageInput("", "", []byte{1}, "image/png", ""); err != nil {
 		t.Errorf("data input: %v", err)
 	}
-	if _, err := ImageInput("", "", []byte{1}, ""); err == nil {
+	if _, err := ImageInput("", "", []byte{1}, "", ""); err == nil {
 		t.Error("data without media type should fail")
 	}
-	if _, err := ImageInput("u", "p", nil, ""); err == nil {
+	if _, err := ImageInput("u", "p", nil, "", ""); err == nil {
 		t.Error("two sources should fail")
 	}
 }
@@ -216,6 +260,64 @@ func TestEstimatedTokens(t *testing.T) {
 	}
 	if got := EstimatedTokens(BinaryInput{Data: []byte("x"), MediaType: "image/png", Kind: BinaryImage}, 4); got < 1 {
 		t.Error("binary input should estimate at least 1")
+	}
+}
+
+// TestEstimatedTokensContainersAndTelemetry pins sizing parity fixes: the
+// ToolResultsEvent container (the executor's main result carrier) must count its
+// contents instead of flooring to 1, telemetry must size to 0 (not the 1 floor),
+// and DrainedModelRequest must size like ModelRequest despite the Go type switch
+// not reaching the embedded struct (Python isinstance covers the subclass).
+func TestEstimatedTokensContainersAndTelemetry(t *testing.T) {
+	call := NewToolCallEvent("search")
+	res := ToolResultsEvent{Results: []ToolResultEvent{
+		FromResultCall(call, NewToolResult(false, strings.Repeat("x", 80))), // 20 tokens
+	}}
+	if got := EstimatedTokens(res, 4); got < 20 {
+		t.Errorf("ToolResultsEvent = %d, want >= 20 (the result text alone)", got)
+	}
+	ue := &UsageEvent{Usage: Usage{TotalTokens: I64(500)}, Kind: UsageKindModelCall}
+	if got := EstimatedTokens(ue, 4); got != 0 {
+		t.Errorf("UsageEvent = %d, want 0 (telemetry occupies no budget)", got)
+	}
+	parts := []Input{TextInput{Content: "abcdefgh"}}
+	base := EstimatedTokens(ModelRequest{Parts: parts}, 4)
+	drained := EstimatedTokens(DrainedModelRequest{ModelRequest{Parts: parts}}, 4)
+	if base == 0 || base != drained {
+		t.Errorf("DrainedModelRequest = %d, ModelRequest = %d, want equal non-zero", drained, base)
+	}
+}
+
+func TestEstimatedTokensModelResponseExtras(t *testing.T) {
+	resp := ModelResponse{
+		ToolCalls: ToolCallsEvent{Calls: []ToolCallEvent{{ID: "c1", Name: "get_weather", Arguments: `{"city":"Paris"}`}}},
+		Files:     []BinaryResult{{Data: []byte{1}}},
+	}
+	// content 0 + usage 0 + "get_weather({...})" = 29 chars / 4 = 7 + one flat media budget.
+	if got, want := EstimatedTokens(resp, 4), 7+binaryMediaTokens; got != want {
+		t.Errorf("ModelResponse with call+file = %d, want %d", got, want)
+	}
+}
+
+// TestRenderForPromptLabels pins the role labels and the telemetry gate (Python
+// parity: sizing.py render_for_prompt).
+func TestRenderForPromptLabels(t *testing.T) {
+	if got := RenderForPrompt(&ModelRequest{Parts: []Input{TextInput{Content: "hi"}}}); got != "User: hi" {
+		t.Errorf("request render = %q", got)
+	}
+	if got := RenderForPrompt(DrainedModelRequest{ModelRequest{Parts: []Input{TextInput{Content: "hi"}}}}); got != "User: hi" {
+		t.Errorf("drained render = %q", got)
+	}
+	if got := RenderForPrompt(&ModelResponse{Message: &ModelMessage{Content: "hey"}}); got != "Assistant: hey" {
+		t.Errorf("response render = %q", got)
+	}
+	call := NewToolCallEvent("search")
+	res := ToolResultsEvent{Results: []ToolResultEvent{FromResultCall(call, NewToolResult(false, "found"))}}
+	if got := RenderForPrompt(res); got != "Tool: found" {
+		t.Errorf("results render = %q", got)
+	}
+	if got := RenderForPrompt(&UsageEvent{Kind: UsageKindModelCall}); got != "" {
+		t.Errorf("telemetry render = %q, want empty", got)
 	}
 }
 

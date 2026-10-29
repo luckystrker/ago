@@ -213,10 +213,14 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 	return run.Result(ctx)
 }
 
-// AsTool exposes this agent as a tool for another agent (Python parity:
-// agent.as_tool / SubagentTool). The child shares nothing with the caller's turn
-// except the conversation it is given: the call opens a fresh ask on the agent's
-// own stream base.
+// AsTool exposes this agent as a delegation tool for another agent (Python
+// parity: agent.as_tool / subagent_tool.subagent_tool). Each call runs this
+// agent as a sub-task through the shared delegation machinery (runTaskOn):
+// TaskStarted/TaskCompleted/TaskFailed and one rolled-up subtask UsageEvent on
+// the caller's stream, a copy of the caller's dependencies and variables, and
+// the HITL bridge when this agent has no hook of its own. The agent's own
+// stream base (WithStreamBase) stays the delegation's stream — every
+// delegation opens a fresh stream otherwise.
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	var o asToolOptions
 	for _, f := range opts {
@@ -224,23 +228,32 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	}
 	name := o.name
 	if name == "" {
-		name = "ask_" + sanitizeToolName(a.name)
+		// Python parity: subagent_tool.py `name or f"task_{agent.name}"`.
+		name = "task_" + sanitizeToolName(a.name)
 	}
 	desc := o.description
 	if desc == "" {
 		desc = "Delegate to the agent " + a.name + "."
 	}
 	type subArgs struct {
-		Message string `json:"message" agschema:"description=The message to send to the agent,required"`
+		Objective string `json:"objective" agschema:"description=The objective for the subtask agent,required"`
+		Context   string `json:"context" agschema:"description=Optional additional context for the subtask agent"`
 	}
-	fn := func(args subArgs, _ *context.Context) (string, error) {
+	fn := func(args subArgs, cx *context.Context) (string, error) {
 		// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-		// child turn cannot be cancelled through the parent's tool call.
-		reply, err := a.Ask(stdcontext.Background(), args.Message)
+		// delegation cannot be cancelled through the caller's tool call.
+		res, err := runTaskOn(stdcontext.Background(), cx, a, args.Objective, args.Context)
 		if err != nil {
+			// hitl: not a tool result — it ends the calling turn (Python parity:
+			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
 		}
-		return reply.Body(), nil
+		if !res.completed {
+			// Python parity: subagent_tool.py
+			// f"Sub-task '{agent.name}' failed: {result.error}".
+			return fmt.Sprintf("Sub-task '%s' failed: %s", a.name, res.err.Error()), nil
+		}
+		return res.result, nil
 	}
 	ft, err := tools.NewFunctionTool(name, desc, fn)
 	if err != nil {
