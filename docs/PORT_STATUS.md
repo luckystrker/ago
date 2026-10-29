@@ -12,30 +12,32 @@ Statuses:
 - **stub** — config/type surface only; the real implementation reports "not implemented".
 - **deferred** — deliberately not ported (decision references given).
 
-**Gates, verified 2026-10-29 on the whole repo** (fresh run, `-count=1`):
+**Gates, verified 2026-10-30 on the whole repo** (fresh run, `-count=1`, from the repo
+root):
 
-- `go build ./...` — success.
-- `go vet ./...` — clean.
-- `go test -count=1 ./...` — 31 packages `ok`, 0 failures, 0 skipped tests
-  (`ago/hitl`, `ago/internal/uuid` and the thirteen `ago/examples/*` programs have no test
-  files of their own; hitl behavior is exercised by the `context` and `tools` test suites).
-- `go run ./examples/{ask,tools,hitl,subagent,group,knowledge_memory,mcp_http,mcp_stdio,
-  multi_turn,observers,policies_compact,safety_halt,structured_output}` — all thirteen
-  complete offline (scripted configs, no API keys).
+- `go -C ago build ./...` — success.
+- `go -C ago vet ./...` — clean.
+- `go -C ago test -count=1 ./...` — 34 packages `ok`, 0 failures, 0 skipped tests
+  (`ago/internal/uuid` and the thirteen `ago/examples/*` programs have no test files of
+  their own; `ago/hitl` now ships its own suite, `hitl_test.go`).
+- `go -C examples build ./...` and `go -C examples vet ./...` — clean; from inside
+  `examples/`, `go run` of `./{ask,tools,hitl,subagent,group,knowledge_memory,mcp_http,
+  mcp_stdio,multi_turn,observers,policies_compact,safety_halt,structured_output}` — all
+  thirteen complete offline (scripted configs, no API keys).
 
 ## Packages
 
 | Python (ag2/) | Go package | Status | Notes |
 |---|---|---|---|
-| `events/` (alert, base, conditions, input_events, lifecycle, sizing, task_events, tool_events, types) | `ago/events` | ported | wave 0. Full event vocabulary, `Usage` with `*int64` fields (D-006), Condition DSL as predicates (D-005), `@type` marshal registry — JSON round-trip losslessness is tested. `events/voice.py` not ported (live/voice is deferred) |
-| `stream.py`, `history.py` | `ago/stream` | ported | wave 0. `Stream`/`MemoryStream`/`SubStream`/`History`, `Storage` (memory backend), synchronous dispatch in the caller's goroutine (D-004) |
+| `events/` (alert, base, conditions, input_events, lifecycle, sizing, task_events, tool_events, types) | `ago/events` | ported | wave 0. Full event vocabulary, `Usage` with `*int64` fields (D-006), Condition DSL as predicates (D-005), `@type` marshal registry — JSON round-trip losslessness is tested; the repair sentinel is Python's human-readable sentence (D-043). `events/voice.py` not ported (live/voice is deferred) |
+| `stream.py`, `history.py` | `ago/stream` | ported | wave 0. `Stream`/`MemoryStream`/`SubStream`/`History`, `Storage` (memory backend), synchronous dispatch in the caller's goroutine (D-004); `SubStream.Send` forwards unconditionally — a view's condition filters reading, not writing (D-042) |
 | `context.py` | `ago/context` | ported | wave 0. Stream handle, prompt fragments, dependencies (DI), variables, HITL `Ask`/`Input`, background spawn, `Clone` |
-| `hitl.py` | `ago/hitl` | ported | wave 1. `HumanHook`, `DefaultHook`→`ErrNotProvided`, typed NotProvided/Failed/Timeout errors. No test files of its own — covered indirectly by `context` and `tools` executor tests |
+| `hitl.py` | `ago/hitl` | ported | wave 1. `HumanHook`, `DefaultHook`→`ErrNotProvided`, typed NotProvided/Failed/Timeout errors, `IsError` classifier shared with the tool layer; own test suite since 2026-10-30 |
 | `exceptions.py` | per-package sentinel errors | ported | shape change: `errors.New` sentinels, `%w` wrapping, `errors.Is`/`As` on consumption; no exception hierarchy |
 | `annotations.py` | `ago/response` + `ago/tools` struct tags | ported | folded into `agschema:"…"`, `aginject:"…"`, `agvariable:"…"`, `agdefault:"…"` tags (D-009, D-015, D-016) |
 | `response/` | `ago/response` | ported | wave 1 (D-015). `Schema[T]` via reflection, `RawSchema`, `PromptedSchema`, decision/question helpers, strict stdlib-json validation with a required/enum pre-walk |
 | `tools/` framework (tool.py, executor.py, precedence.py, schemas.py, toolkits, types.py) | `ago/tools` | ported | wave 1 (D-016). `Schema`/`ToolSchema`, `FunctionTool` (reflection binding, DI, timeout, middleware), `Toolkit`, `ClientTool`, parallel `Executor` (hitl abandon, `final=true`), `ResolveTools` precedence |
-| `tools/subagents/` | `ago/agent` (`AsTool`, subtask tools) | ported | wave 2. Agent-as-tool plus `run_subtask`/`run_subtasks` with rolled-up `UsageEvent(kind=subtask)` |
+| `tools/subagents/` | `ago/agent` (`AsTool`, subtask tools) | ported | wave 2 + delegation-parity pass. `runTaskOn` reports `TaskStarted/Completed/Failed` on the caller's stream, rolls up one `UsageEvent(kind=subtask)` (single-pair attribution, nested rollups flattened), starts the child from a copy of the caller's dependencies/variables (approval bypass key dropped), bridges HITL to the parent's hook — the forwarded question is transcribed on the parent stream (D-041). `IncludeTools []string` (D-039); default `AsTool` name `task_<name>` (D-040) |
 | `tools/builtin/` (web_search, code_execution, shell, file_search, image_generation, …) | — | deferred | Hosted/builtin tool *implementations* not ported; the `ToolSchema` interface, `BuiltinToolCallEvent`/`BuiltinToolResultEvent` events and hosted-type precedence exist so they can be added |
 | `tools/{code,sandbox,shell,dynamic,final,search,skills}/` | — | deferred | Python-side tool content (code sandboxes, shell tool, dynamic agents, search/skill packs) out of the port scope |
 | `config/{config.py,client.py,input_acceptance.py}` | `ago/config` + `ago/internal/httpx`, `ago/internal/sse` | ported | wave 1 (D-017). `Provider`/`ModelConfig`/`LLMClient`/`CallOptions`, sentinels, shared OpenAI-compatible engine (messages/tools/schema/usage, SSE streaming with tool-call delta merge), HTTP retries with Retry-After |
@@ -56,7 +58,7 @@ Statuses:
 | `aggregate.py` | `ago/aggregate` | ported | wave 3 (D-026, brief redefines it as transcript merging). SummaryCount/Usage triggers, LLM strategy, AggregationMiddleware folding old transcript + summaries into one CompactionSummary |
 | `observers/` | `ago/observers` | ported | wave 3 (D-025). Observer protocol on direct stream subscription, StreamObserver, CompositeObserver, LoopDetector, TokenMonitor |
 | `watch.py` | `ago/watch` | partial | wave 3 (D-024). Pull-model `Wait`: EventWatch, IntervalWatch, DelayWatch, AllOf/AnyOf/Sequence composites. **CronWatch/CadenceWatch deferred** |
-| `agent.py` | `ago/agent` | ported | wave 2. `Agent`/`AgentRun`/`AgentReply`; turn loop with per-stream lock, inbox drain → tool rounds → leftover flush; middleware wiring; HITL with `CloseUnansweredToolCalls` history repair; `Resume`; `ContentAs[T]` validation retry; `PromptHook`; `Agent.Task`/`TaskConfig`; `AsTool`. Config resolution → `ErrConfigNotProvided` |
+| `agent.py` | `ago/agent` | ported | wave 2. `Agent`/`AgentRun`/`AgentReply`; turn loop with per-stream lock, inbox drain → tool rounds → leftover flush; middleware wiring; HITL with `CloseUnansweredToolCalls` history repair; `Resume`; `ContentAs[T]` validation retry; `PromptHook`; `Agent.Task`/`TaskConfig` (`IncludeTools` is `[]string` — D-039); `AsTool` (delegation machinery, `task_<name>` — D-040/D-041). Config resolution → `ErrConfigNotProvided` |
 | `spec.py` | `ago/spec` | ported | wave 3 (D-023). `AgentSpec` snake_case wire JSON, `FromAgent` (response schema not publicly readable → nil), `ToAgent` over a tool pool |
 | `network/` core (envelope, channel, identity, rule, transitions, handoff, hub core, adapters ×4, client subset, transport frames + local) | `ago/network` + `ago/network/transport` | partial | wave 3 (D-031, functional single-host subset of D-010). Envelope with the `ag2.*` wire vocabulary, channel state machine + handshake, passports, rules, TransitionGraph, Handoff/Finish recognition, Hub (send gates, TTL, WAL: memory/file/knowledge backends, Replay), Consulting/Conversation/Discussion/Workflow adapters, HubClient/AgentClient/HumanClient, Frame + LocalLink. **Deferred:** WebSocket link (`transport/ws.py`), federation (`remote.py`), view policies (`views/`), task mirror, hub expectation sweepers/arbiter, client LLM-tool set (peers/channels/tasks/context/delegate) |
 | `mcp/` | `ago/mcp` | partial | wave 3 (D-029, minimal client). JSON-RPC 2.0 over streamable HTTP (session handling, 404 rebuild) or stdio subprocess; lazy `Initialize`, paginated `ListTools`, `CallTool` with content mapping; `mcp.Tools(cl)` adapts remote tools to `ago/tools` (`DeclaredInCode=false`); 30s default HTTP timeout (D-034). **Not ported:** `input_required` answering, discovery cache, protocol-era negotiation |

@@ -219,6 +219,127 @@ func TestGeminiClone(t *testing.T) {
 	}
 }
 
+func TestGeminiClonePenaltiesSeedThinking(t *testing.T) {
+	base := NewGemini("k", "m",
+		WithPresencePenalty(0.1), WithFrequencyPenalty(0.2), WithSeed(7),
+		WithThinkingLevel("low"), WithThinkingBudget(512),
+	)
+	cc, err := base.Clone(map[string]any{
+		"presence_penalty":  f64(0.5),
+		"frequency_penalty": f64(-0.5),
+		"seed":              i64(99),
+		"thinking_level":    "high",
+		"thinking_budget":   4096,
+	})
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	got := cc.(*GeminiConfig)
+	if got.presencePenalty == nil || *got.presencePenalty != 0.5 ||
+		got.frequencyPenalty == nil || *got.frequencyPenalty != -0.5 ||
+		got.seed == nil || *got.seed != 99 ||
+		got.thinkingLevel == nil || *got.thinkingLevel != "high" ||
+		got.thinkingBudget == nil || *got.thinkingBudget != 4096 {
+		t.Fatalf("overrides not applied: %+v", got)
+	}
+	// The base config stays untouched (deep copy).
+	if *base.presencePenalty != 0.1 || *base.seed != 7 || *base.thinkingLevel != "low" || *base.thinkingBudget != 512 {
+		t.Fatalf("base mutated: %+v", base)
+	}
+	// nil clears an optional field.
+	cc2, err := base.Clone(map[string]any{
+		"presence_penalty": nil, "frequency_penalty": nil, "seed": nil,
+		"thinking_level": nil, "thinking_budget": nil,
+	})
+	if err != nil {
+		t.Fatalf("clone nil: %v", err)
+	}
+	got2 := cc2.(*GeminiConfig)
+	if got2.presencePenalty != nil || got2.frequencyPenalty != nil || got2.seed != nil ||
+		got2.thinkingLevel != nil || got2.thinkingBudget != nil {
+		t.Fatalf("nil overrides must clear the fields: %+v", got2)
+	}
+	// Wrong value types fail.
+	for key, bad := range map[string]any{
+		"presence_penalty":  "high",
+		"frequency_penalty": 1,
+		"seed":              "x",
+		"thinking_level":    3,
+		"thinking_budget":   "many",
+	} {
+		if _, err := base.Clone(map[string]any{key: bad}); err == nil {
+			t.Fatalf("type-mismatched override %q must fail", key)
+		}
+	}
+	// A value outside the thinking-level vocabulary fails.
+	if _, err := base.Clone(map[string]any{"thinking_level": "ultra"}); err == nil {
+		t.Fatal("invalid thinking_level must fail")
+	}
+}
+
+// generationConfigOf builds a client from the options and returns its
+// generationConfig block (no network involved).
+func generationConfigOf(t *testing.T, opts ...Option) map[string]any {
+	t.Helper()
+	cl := startClient(t, newTestConfig("http://unused", opts...))
+	gen := cl.generationConfig(nil)
+	if gen == nil {
+		t.Fatal("generationConfig must not be nil")
+	}
+	return gen
+}
+
+func TestGeminiPenaltiesSeedThinkingInRequest(t *testing.T) {
+	srv, cap := captureServer(t, 200, `{"candidates":[]}`)
+	cl := startClient(t, newTestConfig(srv.URL,
+		WithPresencePenalty(0.2), WithFrequencyPenalty(-0.1), WithSeed(42),
+		WithThinkingLevel("high"), WithThinkingBudget(1024),
+	))
+	if _, err := cl.Call(context.Background(), nil, nil, config.CallOptions{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	gen := cap.JSON(t)["generationConfig"].(map[string]any)
+	if gen["presencePenalty"] != 0.2 || gen["frequencyPenalty"] != -0.1 || gen["seed"] != float64(42) {
+		t.Fatalf("penalties/seed must reach the request body: %v", gen)
+	}
+	// level + budget together resolve into one thinkingConfig object.
+	tc, ok := gen["thinkingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinkingConfig must be a single object: %v", gen)
+	}
+	if tc["thinkingLevel"] != "high" || tc["thinkingBudget"] != float64(1024) {
+		t.Fatalf("thinkingConfig: %v", tc)
+	}
+}
+
+func TestGeminiThinkingConfigResolution(t *testing.T) {
+	// Unset by default: none of the new fields may appear in the body.
+	gen := generationConfigOf(t)
+	for _, key := range []string{"presencePenalty", "frequencyPenalty", "seed", "thinkingConfig"} {
+		if _, ok := gen[key]; ok {
+			t.Fatalf("%s must be omitted when unset: %v", key, gen)
+		}
+	}
+	// Level only.
+	gen = generationConfigOf(t, WithThinkingLevel("medium"))
+	tc := gen["thinkingConfig"].(map[string]any)
+	if tc["thinkingLevel"] != "medium" {
+		t.Fatalf("level only: %v", tc)
+	}
+	if _, ok := tc["thinkingBudget"]; ok {
+		t.Fatalf("level only must not set a budget: %v", tc)
+	}
+	// Budget only.
+	gen = generationConfigOf(t, WithThinkingBudget(64))
+	tc = gen["thinkingConfig"].(map[string]any)
+	if tc["thinkingBudget"] != int64(64) {
+		t.Fatalf("budget only: %v", tc)
+	}
+	if _, ok := tc["thinkingLevel"]; ok {
+		t.Fatalf("budget only must not set a level: %v", tc)
+	}
+}
+
 // --- request shape --------------------------------------------------------------
 
 func TestGeminiRequestShape(t *testing.T) {

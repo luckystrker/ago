@@ -36,7 +36,7 @@ func main() {
 		&events.ModelResponse{
 			ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{
 				{ID: "call-1", Name: "ask_specialist",
-					Arguments: `{"message":"How does Postgres handle concurrent writes?"}`},
+					Arguments: `{"objective":"How does Postgres handle concurrent writes?"}`},
 			}},
 			Usage: events.Usage{PromptTokens: events.I64(20), CompletionTokens: events.I64(8), TotalTokens: events.I64(28)},
 		},

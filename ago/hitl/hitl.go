@@ -28,6 +28,23 @@ func DefaultHook(ctx context.Context, req *events.HumanInputRequest) (*events.Hu
 
 var ErrNotProvided = errors.New("hitl: no human input hook provided")
 
+// IsError reports whether err is a human-in-the-loop failure (Python parity:
+// HumanInputError and its subclasses). Such errors never become tool results:
+// the tool layer lets them end the turn so the asking agent can bridge or
+// re-raise them.
+func IsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNotProvided) {
+		return true
+	}
+	var notProvided *NotProvidedError
+	var failed *FailedError
+	var timeout *TimeoutError
+	return errors.As(err, &notProvided) || errors.As(err, &failed) || errors.As(err, &timeout)
+}
+
 // NotProvidedError reports that no human input is possible for this conversation.
 type NotProvidedError struct{ Detail string }
 

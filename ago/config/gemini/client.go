@@ -84,6 +84,27 @@ func (c *client) generationConfig(schema response.Proto) map[string]any {
 	if len(c.cfg.stopSequences) > 0 {
 		gen["stopSequences"] = c.cfg.stopSequences
 	}
+	if c.cfg.presencePenalty != nil {
+		gen["presencePenalty"] = *c.cfg.presencePenalty
+	}
+	if c.cfg.frequencyPenalty != nil {
+		gen["frequencyPenalty"] = *c.cfg.frequencyPenalty
+	}
+	if c.cfg.seed != nil {
+		gen["seed"] = *c.cfg.seed
+	}
+	// Both thinking knobs resolve into one thinkingConfig object (Python
+	// parity: _resolve_thinking_config — level, budget or both).
+	if c.cfg.thinkingLevel != nil || c.cfg.thinkingBudget != nil {
+		thinking := map[string]any{}
+		if c.cfg.thinkingLevel != nil {
+			thinking["thinkingLevel"] = *c.cfg.thinkingLevel
+		}
+		if c.cfg.thinkingBudget != nil {
+			thinking["thinkingBudget"] = *c.cfg.thinkingBudget
+		}
+		gen["thinkingConfig"] = thinking
+	}
 	if schema != nil {
 		if js := schema.JSONSchema(); len(js) > 0 {
 			gen["responseMimeType"] = "application/json"

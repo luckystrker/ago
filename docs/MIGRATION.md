@@ -23,7 +23,7 @@ Reading conventions:
 | Python | Go | Differences |
 |---|---|---|
 | `Agent(name, prompt=..., config=..., hitl_hook=..., tools=..., middleware=..., dependencies=..., variables=..., response_schema=..., tasks=..., stream=...)` | `agent.New(name, prompt string, opts ...agent.Option)` | Dataclass kwargs → option funcs: `WithConfig`, `WithHitlHook`, `WithTools`, `WithMiddleware`, `WithResponseSchema`, `WithDependencies`, `WithVariables`, `WithStreamBase`, `WithTasks`, `WithPromptFragments`, `WithPromptHook`. Static prompt is one string; extra fragments via `WithPromptFragments`. No `plugins`/`observers`/`knowledge`/`assembly` kwargs (see §5) |
-| `await agent.ask(*msg, ...)` | `a.Ask(ctx, msgs ...agent.Sendable) (*AgentReply, error)` | Blocking convenience wrapper over `Run`. `Sendable = any` (string, `events.Input`, JSON value) replaces `*msg` variadic inputs |
+| `await agent.ask(*msg, ...)` | `a.Ask(ctx, msgs ...agent.Sendable) (*AgentReply, error)` | Blocking convenience wrapper over `Run`. `Sendable = any` (string, `events.Input`, JSON value) replaces `*msg` variadic inputs; no per-call dependencies/variables/prompt overrides (D-037) — set `WithDependencies`/`WithVariables`/`WithPromptFragments` at construction |
 | `async with agent.run(...) as run: reply = await run.result()` | `run, _ := a.Run(ctx, msgs...); run.Start(ctx); defer run.Close(); reply, err := run.Result(ctx)` | Python async context manager → explicit `Start`/`Result`/`Close`; `Close` ends the turn scope (unsubscribe, release per-stream lock) |
 | `run.enqueue(*msg)`, `run.stream` | `run.Enqueue(parts ...events.Input)`, `run.Stream() stream.Stream` | Mid-turn inbox parity |
 | `AgentReply.body` | `reply.Body() string` | `""` when the model returned no text (Python `None`) |
@@ -31,8 +31,8 @@ Reading conventions:
 | `reply.files`, `reply.history`, `await reply.usage()` | `reply.Files()`, `reply.History() *stream.History`, `reply.Usage() *usage.Report` | `Usage()` is a synchronous aggregation of the stream's `UsageEvent`s — no await |
 | `reply.ask(...)` / `reply.run(...)` | `reply.Ask(ctx, ...)` / `reply.Run(ctx, ...)` | Continuation on the same stream/context |
 | `resume(*events, ...)` | `a.Resume(ctx, evs ...events.Event) (*AgentReply, error)` | All but last event seed history; last is the re-entry trigger |
-| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName`/`WithToolDescription`; wraps the agent as a `FunctionTool` (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
-| `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards |
+| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed` plus one rolled-up subtask `UsageEvent` on the caller's stream, child state = copy of the caller's dependencies/variables (approval bypass key dropped), HITL bridge to the parent's hook (the forwarded question is transcribed on the parent stream — D-041). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
+| `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards; the task always opens its own private stream (D-030) |
 | `PromptHook` (async prompt hook), `update_system_message` | `agent.WithPromptHook(fn agent.PromptHook)`, `agent.WithPromptFragments(...)` | `PromptHook func(*agocontext.Context) ([]string, error)` |
 | `AgentReply.response` | `reply.Response() *events.ModelResponse` | Accessor instead of attribute |
 | `ConfigNotProvidedError` on missing config | `agent.ErrConfigNotProvided` | Sentinel; `errors.Is` |
@@ -49,7 +49,7 @@ Reading conventions:
 | `stream.subscribe(..., interrupt=, condition=, timeout=)` | `Subscribe(fn stream.Subscriber, opts stream.SubscribeOptions) stream.SubID` | `Subscriber func(events.Event) error` (no context arg); `SubscribeOptions{Interrupt, Condition, Timeout}` |
 | `stream.where(cond)`, `stream.get(cond)`, `stream.join()` | `Where(c events.Condition) Stream`, `Get(c events.Condition) (events.Event, error)` | `Get` scans history + incoming; `join` has no direct equivalent — use `watch.EventWatch` (§5) |
 | `Storage` Protocol (`save_event/get_history/...`) | `stream.Storage` interface | Only `MemoryStorage` ships; Redis backend deferred (D-003/D-004). Durable logs go through `knowledge.EventLogWriter` |
-| `History.get_events()/replace()`, `unanswered_tool_calls`, `close_unanswered_tool_calls` | `stream.History.GetEvents()/Replace()`, `events.UnansweredToolCalls(evs)`, `events.CloseUnansweredToolCalls(evs)` | Repair helpers live in `events`, sentinel result `"HUMAN_INPUT_ABANDONED_TOOL_RESULT"` preserved |
+| `History.get_events()/replace()`, `unanswered_tool_calls`, `close_unanswered_tool_calls` | `stream.History.GetEvents()/Replace()`, `events.UnansweredToolCalls(evs)`, `events.CloseUnansweredToolCalls(evs)` | Repair helpers live in `events`, human-readable repair sentence preserved verbatim (Python HUMAN_INPUT_ABANDONED_TOOL_RESULT) |
 | `EstimatedTokens(event, chars_per_token=4)` | `events.EstimatedTokens(ev, charsPerToken)` | Same flat weights (image/audio 1000, video/document 2000) |
 | async dispatch, `sync_to_thread` | Synchronous dispatch in the caller's goroutine | D-004: no thread offloading; background work via `SpawnBackground` (goroutine + panic recovery) |
 
@@ -70,7 +70,7 @@ Reading conventions:
 |---|---|---|
 | `UsageReport` / `UsageRecord` / `Usage.from_events` (`ag2/usage.py`) | `usage.Report` / `usage.Record` / `usage.FromEvents(evs)` | Totals + `ByModel`/`ByProvider`/`ByKind` buckets; only `UsageEvent`s with reported tokens count (`usage.Reported`) |
 | `TaskState`, `TaskSpec`, `TaskMetadata`, `CheckpointStore`, `Task` async CM (`ag2/task.py`) | `task.State`, `task.Spec`, `task.Metadata`, `task.CheckpointStore`, `task.MemoryCheckpointStore`, `task.Task` | Python's async context manager (auto-complete/auto-fail) → explicit terminal calls `Complete/Fail/Cancel/Expire` (each returns `error`); `task.Start(ctx, owner, spec, opts...)` opens; `task.DepKey = "ag:task"` dependency key preserved |
-| `TaskConfig` (`ag2/agent.py`) | `agent.TaskConfig` + `agent.WithTasks(cfg)` | Fields `Config`, `Prompt`, `IncludeTools`, `ExcludeTools`, `ExtraTools`, `MaxConcurrency` |
+| `TaskConfig` (`ag2/agent.py`) | `agent.TaskConfig` + `agent.WithTasks(cfg)` | Fields `Config`, `Prompt`, `IncludeTools`, `ExcludeTools`, `ExtraTools`, `MaxConcurrency`; `IncludeTools []string` — nil = all parent tools (Python `include_tools=None` default), empty slice = none, allowlist of names otherwise (`ExcludeTools` applies after it). Breaking vs earlier AGo builds where `IncludeTools bool` defaulted to "no parent tools" |
 | `AgentSpec.from_agent() / to_agent()` (`ag2/spec.py`) | `spec.FromAgent(a)`, `(*spec.AgentSpec).ToAgent(available map[string]tools.Tool, opts ...agent.Option)` | Wire keys stay snake_case (`tool_names`, `response_schema`); missing tool → `tools.ErrResolution` |
 | `TestConfig` / `TrackingConfig` (`ag2/testing.py`) | `agotest.NewTestConfig(responses ...*events.ModelResponse)`, `agotest.NewTrackingConfig(inner config.ModelConfig)` | Import alias `agotest "ago/testing"`; scripted full responses with a shared cursor and recorded call snapshots (Python's partial-turn vocabulary collapsed — D-018) |
 | `exceptions.py` hierarchy (`AG2Error`, `ConfigNotProvidedError`, `HumanInputError`, `ToolConflictError`, …) | Per-package sentinels: `agent.ErrConfigNotProvided`, `hitl.ErrNotProvided` (+ typed errors), `config.ErrNotProvided/ErrUnsupportedInput/ErrUnsupportedTool`, `tools.ErrConflict/ErrNotFound/ErrResolution`, `stream.ErrHandled`, `response.ErrInvalidResponse` | Exceptions → `errors.New` sentinels + `%w` wrapping + `errors.Is/As` (no exception classes) |
@@ -85,7 +85,7 @@ Reading conventions:
 |---|---|---|
 | `Tool` ABC (`schemas()`, `register(stack, context)`) | `tools.Tool` interface: `Name()`, `DeclaredInCode()`, `Schemas(*agocontext.Context) ([]any, error)`, `Register(*agocontext.Context, []middleware.Middleware) ([]stream.SubID, error)` | No `ExitStack`: `Register` returns the subscription ids it created; the turn scope unsubscribes them on `Close` (D-032) |
 | `@tool` decorator / `FunctionTool` | `tools.NewFunctionTool(name, description string, fn any, opts ...FunctionToolOption)` | `fn` is a plain func; parameters bound by reflection from the model's JSON arguments (argument fields = one struct). Options: `WithTimeout`, `WithMiddleware`, `WithSource`, `WithToolSchema` (explicit parameters schema) |
-| `fast_depends` + pydantic schema generation | `response.SchemaOf(reflect.Type)` | stdlib reflection + `json`/`agschema` tags; no-arg → `{"type":"object","properties":{}}` (parity) |
+| `fast_depends` + pydantic schema generation | `response.SchemaOf(reflect.Type)` | stdlib reflection + `json`/`agschema` tags; no-arg → `{"type":"object","properties":{}}` (parity). `fast_depends.Depends` factory-valued parameters are not ported (D-036) |
 | `Inject(real_name, default=...)`, `Variable(name, default=...)` (`annotations.py`) | `tools.NewInject(id, def ...any)`, `tools.NewVariable(name, def ...any)`; struct tags `aginject:"id"`, `agvariable:"name"`, `agdefault:"..."` | Marker params resolved from `ctx.Dependencies` / `ctx.Variables` at call time (D-009/D-016) |
 | `Context` annotation (inject conversation context) | Parameter of type `*agocontext.Context` (any param name) | `ToolCallID` stamped during execution |
 | `Toolkit(*tools, name=, middleware=)` | `tools.NewToolkit(name string, mws []middleware.Middleware, ts ...Tool)` | Duplicate name → `tools.ErrConflict` |
@@ -95,7 +95,7 @@ Reading conventions:
 | `ToolExecutor(serializer)` | `tools.NewExecutor()`, `(*Executor).Register(ctx, ts, known, mws)` | Parallel goroutine per call; `HumanInputError` cancels siblings; `final=true` forces a `ModelResponse{ResponseForce: true}`; timeout → `ToolErrorEvent` (same message text) |
 | `resolve_tools(all_tools, context)` | `tools.ResolveTools(all []Tool, cx *agocontext.Context) (*tools.ResolvedTools, error)` | Same precedence: declared-in-code wins in declaration order; runtime tools never override; remote-vs-remote first wins; losing toolkit members pruned for the turn |
 | `SubagentTool` (`tools/subagents/`) | `agent.AsTool` + `agent` subtask tools | Lives in `agent` to avoid an import cycle (`tools` cannot import `agent`) |
-| `MCPToolkit` (`tools/toolkits/mcp_server/`) | `mcp.New(config) (*mcp.Client, ...)` + `mcp.Tools(cl) ([]tools.Tool, error)` | No `Toolkit` subtype — a helper converts remote tools to `tools.Tool` with `DeclaredInCode=false`; stdio + streamable HTTP, paginated `ListTools`, content mapping (D-029, D-034) |
+| `MCPToolkit` (`tools/toolkits/mcp_server/`) | `mcp.New(config) (*mcp.Client, ...)` + `mcp.Tools(cl) ([]tools.Tool, error)` | No `Toolkit` subtype — a helper converts remote tools to `tools.Tool` with `DeclaredInCode=false`; stdio + streamable HTTP, paginated `ListTools`, content mapping (D-029, D-034). Python's `mcp_tool` `Variable` indirection (and `Depends`/`Inject` parameters) is not ported — remote tools map their declared schemas directly (D-029, D-036) |
 | `ToolSearchTool`, builtin/hosted tools (`tools/builtin/`, `search/`, `sandbox/`, `shell/`, `skills/`, `dynamic/`) | — | Deferred; the seams exist (`tools.ToolSchema`, `events.BuiltinToolCallEvent/BuiltinToolResultEvent`, hosted-type precedence) — see §5 |
 
 ### Middleware (`ag2/middleware/` → `ago/middleware`)
@@ -209,6 +209,7 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 | Protocol servers/clients: `a2a/`, `acp/`, `ag_ui/`, `a2ui/`, `mcp_ui/`, `eval/` | Deferred (D-010) |
 | `CronWatch` / `CadenceWatch` (`ag2/watch.py`) | Deferred (D-024); `EventWatch`/`IntervalWatch`/`DelayWatch`/`AllOf`/`AnyOf`/`Sequence` are ported |
 | `MetricsMiddleware`, `TelemetryMiddleware` (OTEL) | Deferred (D-013) |
+| `fast_depends.Depends` (factory-valued tool parameters; re-exported by `ag2`) | Not ported (D-036) — compute the factory value in Go before the call or wrap it as a separate tool; the DI dictionary (`Inject`/`Variable`/context parameter, D-016) covers the resolved-value cases |
 | `textual.py`, `plugin.py`, `mypy.py`, `_import_utils.py`, `_telemetry_consts.py`, `types.py`, `utils.py` | Python infrastructure without a Go counterpart (textual UI, plugin loading, typing helpers, telemetry constants); `utils.build_model` → `response.SchemaOf` |
 
 ## 6. Semantics cheat-sheet (things that look different but are parity)
@@ -227,12 +228,16 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 
 ## 7. Verification status
 
-Gates re-run for this document on 2026-10-29 (whole repo, fresh `-count=1`):
+Gates re-run for this document on 2026-10-30 (whole repo, fresh `-count=1`, from the
+repo root — the root itself is not a module):
 
-- `go build ./...` — success; `go vet ./...` — clean.
-- `go test -count=1 ./...` — 31 packages `ok`, 0 failures, 0 skipped; no test files in
-  `ago/hitl`, `ago/internal/uuid` and the 13 example programs.
-- `go run ./examples/{ask,tools,hitl,subagent,group,knowledge_memory,mcp_http,mcp_stdio,multi_turn,observers,policies_compact,safety_halt,structured_output}` — all 13 exit 0 offline.
+- `go -C ago build ./...` — success; `go -C ago vet ./...` — clean.
+- `go -C ago test -count=1 ./...` — 34 packages `ok`, 0 failures, 0 skipped; no test files in
+  `ago/internal/uuid` and the 13 example programs (`ago/hitl` now ships its own suite).
+- `go -C examples build ./...` and `go -C examples vet ./...` — clean;
+  `go run` of the thirteen examples (`ask`, `tools`, `hitl`, `subagent`, `group`,
+  `knowledge_memory`, `mcp_http`, `mcp_stdio`, `multi_turn`, `observers`,
+  `policies_compact`, `safety_halt`, `structured_output`) — every one exits 0 offline.
 
 Symbol columns above were checked against `go doc` output of the actual packages, not from
 memory of the specs.

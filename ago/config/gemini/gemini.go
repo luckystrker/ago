@@ -28,15 +28,20 @@ const EnvAPIKey = "GEMINI_API_KEY"
 // the same name on one type. Fields are unexported and set through NewGemini
 // and the Option funcs.
 type GeminiConfig struct {
-	model           string
-	apiKey          string
-	baseURL         string
-	temperature     *float64
-	topP            *float64
-	topK            *int64
-	maxOutputTokens *int64
-	stopSequences   []string
-	streaming       bool
+	model            string
+	apiKey           string
+	baseURL          string
+	temperature      *float64
+	topP             *float64
+	topK             *int64
+	maxOutputTokens  *int64
+	stopSequences    []string
+	streaming        bool
+	presencePenalty  *float64
+	frequencyPenalty *float64
+	seed             *int64
+	thinkingLevel    *string
+	thinkingBudget   *int64
 }
 
 // Option sets one field of a GeminiConfig at construction time.
@@ -67,6 +72,22 @@ func WithStopSequences(v ...string) Option {
 
 // WithStreaming toggles the streaming transport (streamGenerateContent?alt=sse).
 func WithStreaming(v bool) Option { return func(c *GeminiConfig) { c.streaming = v } }
+
+// WithPresencePenalty sets the presence penalty.
+func WithPresencePenalty(v float64) Option { return func(c *GeminiConfig) { c.presencePenalty = &v } }
+
+// WithFrequencyPenalty sets the frequency penalty.
+func WithFrequencyPenalty(v float64) Option { return func(c *GeminiConfig) { c.frequencyPenalty = &v } }
+
+// WithSeed pins the sampling seed.
+func WithSeed(v int64) Option { return func(c *GeminiConfig) { c.seed = &v } }
+
+// WithThinkingLevel sets the reasoning-effort level; one of "low", "medium",
+// "high" (Python parity: the ThinkingLevel literal).
+func WithThinkingLevel(v string) Option { return func(c *GeminiConfig) { c.thinkingLevel = &v } }
+
+// WithThinkingBudget caps the thinking token budget.
+func WithThinkingBudget(v int64) Option { return func(c *GeminiConfig) { c.thinkingBudget = &v } }
 
 // NewGemini builds a config for one Gemini model.
 func NewGemini(apiKey, model string, opts ...Option) *GeminiConfig {
@@ -121,6 +142,11 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 	cc.topP = cloneFloat(c.topP)
 	cc.topK = cloneInt(c.topK)
 	cc.maxOutputTokens = cloneInt(c.maxOutputTokens)
+	cc.presencePenalty = cloneFloat(c.presencePenalty)
+	cc.frequencyPenalty = cloneFloat(c.frequencyPenalty)
+	cc.seed = cloneInt(c.seed)
+	cc.thinkingLevel = cloneString(c.thinkingLevel)
+	cc.thinkingBudget = cloneInt(c.thinkingBudget)
 	for k, v := range overrides {
 		switch k {
 		case "model":
@@ -177,6 +203,46 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 				return nil, err
 			}
 			cc.streaming = b
+		case "presence_penalty":
+			f, err := floatOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.presencePenalty = f
+		case "frequency_penalty":
+			f, err := floatOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.frequencyPenalty = f
+		case "seed":
+			i, err := intOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.seed = i
+		case "thinking_level":
+			// AGO-DEVIATION: Python enforces the ThinkingLevel literal
+			// statically; the dynamic Clone boundary checks the value instead
+			// (D-035). A nil clears the field.
+			if v == nil {
+				cc.thinkingLevel = nil
+			} else {
+				s, err := stringOverride(k, v)
+				if err != nil {
+					return nil, err
+				}
+				if !validThinkingLevel(s) {
+					return nil, fmt.Errorf("gemini: override %q must be one of \"low\", \"medium\", \"high\", got %q", k, s)
+				}
+				cc.thinkingLevel = &s
+			}
+		case "thinking_budget":
+			i, err := intOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.thinkingBudget = i
 		default:
 			return nil, fmt.Errorf("gemini: unknown config override %q", k)
 		}
@@ -266,4 +332,18 @@ func cloneInt(v *int64) *int64 {
 	}
 	c := *v
 	return &c
+}
+
+func cloneString(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	return &c
+}
+
+// validThinkingLevel reports whether level is an accepted thinking level
+// (Python parity: ThinkingLevel = Literal["low", "medium", "high"]).
+func validThinkingLevel(level string) bool {
+	return level == "low" || level == "medium" || level == "high"
 }

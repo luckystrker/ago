@@ -5,8 +5,9 @@ package events
 // calls without results; replaying such a transcript to a provider is invalid, so the
 // agent appends sentinel results before the next call.
 
-// SentinelToolResult is the content of the repair result for abandoned tool calls.
-const SentinelToolResult = "HUMAN_INPUT_ABANDONED_TOOL_RESULT"
+// SentinelToolResult is the content of the repair result for abandoned tool calls —
+// the sentence the model reads (Python parity: history.py HUMAN_INPUT_ABANDONED_TOOL_RESULT).
+const SentinelToolResult = "This tool call was not completed: the turn ended because a human-input request could not be answered."
 
 // UnansweredToolCalls returns calls that have no ToolResultEvent, ToolErrorEvent or
 // ClientToolCallEvent answer in evs.

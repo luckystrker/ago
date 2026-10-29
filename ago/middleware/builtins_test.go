@@ -124,10 +124,13 @@ func TestTokenLimiterKeepsSuffix(t *testing.T) {
 			want:   []string{"bbbb"},
 		},
 		{
+			// Transient events size to 0 (sizing parity: is_conversational → 0),
+			// so they fit any budget and ride along in the suffix — the limiter
+			// never filters them out, it only counts.
 			name:   "transient events are sized, not filtered",
 			budget: 1,
-			in:     []events.Event{events.ModelMessageChunk{Content: "aaaa"}, textEv("bbbb")},
-			want:   []string{"bbbb"},
+			in:     []events.Event{events.ModelMessageChunk{Content: "aaaa"}, textEv("bbbb")}, // 0 + 1 tokens
+			want:   []string{"aaaa", "bbbb"},
 		},
 	}
 	for _, tt := range tests {
@@ -139,11 +142,16 @@ func TestTokenLimiterKeepsSuffix(t *testing.T) {
 			}
 			var got []string
 			for _, ev := range saw {
-				txt, ok := ev.(events.TextInput)
-				if !ok {
+				var txt string
+				switch e := ev.(type) {
+				case events.TextInput:
+					txt = e.Content
+				case events.ModelMessageChunk:
+					txt = e.Content
+				default:
 					t.Fatalf("unexpected event type %T in result", ev)
 				}
-				got = append(got, txt.Content)
+				got = append(got, txt)
 			}
 			if strings.Join(got, "|") != strings.Join(tt.want, "|") {
 				t.Fatalf("got %v, want %v", got, tt.want)

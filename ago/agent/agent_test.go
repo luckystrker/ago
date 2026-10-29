@@ -431,7 +431,7 @@ func TestContentAsWithRetry(t *testing.T) {
 func TestSubtaskRollsUp(t *testing.T) {
 	// Parent's client sees: 1) tool call run_subtask, 3) final wrap.
 	parentCfg := agotest.NewTestConfig(
-		toolResp("run_subtask", `{"objective":"count to two"}`),
+		toolResp("run_subtask", `{"task":"count to two"}`),
 		textResp("parent done"),
 	)
 	// Child's client sees: 2) plain answer.
@@ -467,7 +467,7 @@ func TestAsToolDelegation(t *testing.T) {
 	child := New("specialist", "You are a specialist.", WithConfig(agotest.NewTestConfig(textResp("specialist answer"))))
 	parentTool := child.AsTool(WithToolName("ask_specialist"))
 	parent := New("lead", "", WithConfig(agotest.NewTestConfig(
-		toolResp("ask_specialist", `{"message":"what do you know?"}`),
+		toolResp("ask_specialist", `{"objective":"what do you know?"}`),
 		textResp("lead done"),
 	)), WithTools(parentTool))
 	reply, err := parent.Ask(stdcontext.Background(), "consult the specialist")

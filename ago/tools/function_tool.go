@@ -485,17 +485,6 @@ func (t *FunctionTool) withPrependedMiddleware(mws []middleware.Middleware) *Fun
 	return &cp
 }
 
-// isHitlError reports whether err is a human-in-the-loop failure (Python parity:
-// HumanInputError and its subclasses). Such errors never become tool results.
-func isHitlError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, hitl.ErrNotProvided) {
-		return true
-	}
-	var notProvided *hitl.NotProvidedError
-	var failed *hitl.FailedError
-	var timeout *hitl.TimeoutError
-	return errors.As(err, &notProvided) || errors.As(err, &failed) || errors.As(err, &timeout)
-}
+// isHitlError is a local alias kept for the call sites below; the logic lives in
+// hitl.IsError so the delegation code (agent package) shares one definition.
+func isHitlError(err error) bool { return hitl.IsError(err) }
