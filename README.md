@@ -4,9 +4,10 @@ AGo is a Go port of [AG2](https://github.com/ag2ai/ag2) — the event-sourced Py
 framework (port target: AG2 `main` at commit `fa4e0fb`, 2026-10-27). One `Agent` type, an
 event stream per conversation, tools registered as stream subscribers, middleware wrapped
 around every turn, LLM call, tool execution and human-input hop, and a hub that hosts
-multi-agent channels. The Python reference clone lives in `ag2/` (read-only); the distilled
-behavior specs are in `docs/specs/` and the binding Go contracts in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+multi-agent channels. The port was made against a local clone of the Python sources; the
+distilled behavior specs are in `docs/specs/` and the binding Go contracts in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Licensed Apache-2.0 like AG2 — see
+[NOTICE.md](NOTICE.md) for provenance.
 
 - **Zero external dependencies.** Stdlib only (`net/http`, `encoding/json`, `os/exec`,
   `crypto/rand`). LLM providers talk raw HTTP/SSE — no vendor SDKs.
