@@ -42,25 +42,32 @@ type Participant struct {
 }
 
 // ChannelManifest describes what a channel is: the adapter dispatch key, the
-// participants and adapter knobs.
+// participants, adapter knobs and the declared protocol-shape expectations
+// (evaluated by the expectation sweeper, see expectations.go).
 //
 // AGO-DEVIATION vs Python: Version is a string (brief pins it; Python uses
-// an int) and there is no participant-schema/expectations declaration —
-// Expectation stays a data type for the vocabulary, evaluated by nothing in
-// this subset.
+// an int) and there is no participant-schema declaration. Expectations
+// carry the Python name/on_violation/params shape (applies_to carried,
+// ignored by the built-in evaluators — Python parity).
 type ChannelManifest struct {
 	Type         string         `json:"type"`
 	Version      string         `json:"version,omitempty"`
 	Participants []string       `json:"participants,omitempty"`
+	Expectations []Expectation  `json:"expectations,omitempty"`
 	Knobs        map[string]any `json:"knobs,omitempty"`
 }
 
 // Expectation is a protocol-shape contract (Python: acks_within /
-// reply_within / max_silence). Data-only in this subset: the hub carries it
-// on manifests but runs no expectation sweepers (D-010 scope).
+// reply_within / max_silence). Kind selects a built-in evaluator;
+// OnViolation selects a built-in violation handler ("audit" |
+// "notify_channel" | "auto_close" — unknown values are silently ignored,
+// Python parity). Evaluated by the hub's expectation sweeper
+// (Hub.SweepExpectations / ExpectationSweeper), not by the send path.
 type Expectation struct {
-	Kind   string         `json:"kind"`
-	Params map[string]any `json:"params,omitempty"`
+	Kind        string         `json:"kind"`
+	OnViolation string         `json:"on_violation,omitempty"`
+	Params      map[string]any `json:"params,omitempty"`
+	AppliesTo   []string       `json:"applies_to,omitempty"` // role names or agent ids; empty = all
 }
 
 // isProtocolEvent reports whether an event type is channel-machine

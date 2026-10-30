@@ -8,12 +8,21 @@ import (
 // JSON-RPC 2.0 envelope for the AGo a2a package. Kept local (not shared with
 // ago/mcp) so the two protocols stay independently changeable.
 
-// Method names of the JSON-RPC surface served by Server.
+// Method names of the JSON-RPC surface served by Server. The push-config
+// names are the wire spellings of the v0.3 surface (a2a-sdk
+// src/a2a/compat/v0_3/jsonrpc_adapter.py:60-63), kept consistent with the
+// message/send-style names this package already serves; the 1.x dispatcher
+// renames them to the gRPC-derived CreateTaskPushNotificationConfig family.
 const (
 	MethodMessageSend   = "message/send"
 	MethodMessageStream = "message/stream"
 	MethodTasksGet      = "tasks/get"
 	MethodTasksCancel   = "tasks/cancel"
+
+	MethodPushSet    = "tasks/pushNotificationConfig/set"
+	MethodPushGet    = "tasks/pushNotificationConfig/get"
+	MethodPushList   = "tasks/pushNotificationConfig/list"
+	MethodPushDelete = "tasks/pushNotificationConfig/delete"
 )
 
 // JSON-RPC error codes. -32700..-32603 are the JSON-RPC 2.0 standard codes;

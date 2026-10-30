@@ -10,7 +10,10 @@
 // (TelemetryMiddleware → in-memory exporter → span→Trace). AGo builds the
 // Trace directly from the stream's event log — the same event-sourced
 // substrate the framework already persists — with no OTEL dependency.
-// Deferred with it: OTEL/Tempo/OTLP trace sources, the attribution scorer,
-// the @scorer DI decorator, run repeats/variants/budgets and eval lifecycle
-// events (docs/DECISIONS.md D-051).
+// Deferred with it: OTEL/Tempo/OTLP trace sources, run repeats/variants/
+// per-task model configs/budget thresholds and eval lifecycle events
+// (docs/DECISIONS.md D-051). Since D-061 the package also carries the failure
+// attribution scorer, the scorer registry (the @scorer DI stand-in), Suite
+// JSONL loading, RunDiff regression diffing, Wilson/kappa stats and parallel
+// case execution.
 package eval

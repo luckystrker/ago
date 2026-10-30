@@ -32,7 +32,13 @@ var (
 )
 
 // TaskStore persists Task records server-side so tasks/get and tasks/cancel
-// can resolve them. Implementations must be safe for concurrent use.
+// can resolve them. Implementations must be safe for concurrent use: each
+// call is atomic on its own. A read-modify-write cycle spanning a Get and a
+// later Save is NOT — Get hands out a copy, Save replaces the record, so two
+// overlapping cycles on one id silently lose whichever writes first. State
+// transitions (a turn committing its outcome, tasks/cancel) must go through
+// TaskUpdater when the store supports it; the server falls back to per-task
+// locking otherwise.
 type TaskStore interface {
 	// Save stores task, replacing any previous record with the same ID.
 	Save(ctx context.Context, task *Task) error
@@ -43,6 +49,26 @@ type TaskStore interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// TaskUpdater is the optional TaskStore extension for atomic state
+// transitions. A turn's commit and a tasks/cancel are read-modify-write
+// cycles whose read and write must not interleave with another writer of the
+// same record (two continuations resuming one parked task, a cancel racing a
+// finishing turn); a plain Get→Save pair cannot guarantee that. Stores that
+// can make the whole cycle atomic under their own lock implement Update; the
+// server detects them by assertion and otherwise serializes the cycle itself
+// with a per-task mutex.
+type TaskUpdater interface {
+	// Update applies mutate to the stored record for id atomically: it
+	// re-reads the current record under the store's write lock, hands a copy
+	// to mutate, and replaces the stored record with what mutate returns —
+	// no Save or Update on the same id can interleave between the read and
+	// the write. The copy mutate receives is owned by it; editing it in
+	// place and returning it is the intended use. Update returns the record
+	// as now stored, by deep copy, or ErrTaskNotFound when absent; a mutate
+	// error aborts the write and is returned verbatim.
+	Update(ctx context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error)
+}
+
 // MemoryTaskStore is the in-memory TaskStore. Safe for concurrent use. Tasks
 // are stored by deep copy and returned by deep copy, so callers never share
 // mutable state with the store.
@@ -50,6 +76,8 @@ type MemoryTaskStore struct {
 	mu    sync.RWMutex
 	tasks map[string]*Task
 }
+
+var _ TaskUpdater = (*MemoryTaskStore)(nil)
 
 // NewMemoryTaskStore builds an empty in-memory TaskStore (parity: the a2a-sdk
 // InMemoryTaskStore that AG2's server defaults to).
@@ -84,6 +112,50 @@ func (s *MemoryTaskStore) Get(_ context.Context, id string) (*Task, error) {
 		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	return cloneTask(stored)
+}
+
+// Update implements TaskUpdater: the re-read, the mutate call and the write
+// all happen under one Lock hold, so overlapping Updates on the same id
+// serialize and every mutate sees the previous one's result.
+func (s *MemoryTaskStore) Update(_ context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error) {
+	if id == "" {
+		return nil, fmt.Errorf("%w: task with empty id", ErrWire)
+	}
+	if mutate == nil {
+		return nil, fmt.Errorf("%w: nil mutate", ErrWire)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.tasks[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	current, err := cloneTask(stored)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := mutate(current)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		return nil, fmt.Errorf("%w: update of task %s produced no record", ErrWire, id)
+	}
+	clone, err := cloneTask(updated)
+	if err != nil {
+		return nil, err
+	}
+	if s.tasks == nil {
+		s.tasks = make(map[string]*Task)
+	}
+	s.tasks[id] = clone
+	// Return a fresh copy: the caller owns the result and must not share
+	// mutable state with the stored record (the same invariant Get keeps).
+	fresh, err := cloneTask(clone)
+	if err != nil {
+		return nil, err
+	}
+	return fresh, nil
 }
 
 // Delete implements TaskStore.

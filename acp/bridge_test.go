@@ -21,6 +21,12 @@ const (
 	roleEnv      = "AGO_ACP_TEST_ROLE"
 	roleAgent    = "acp-fake-agent"
 	roleDenyProb = "acp-deny-probe-agent"
+	roleCancel   = "acp-cancel-agent"
+	roleLoad     = "acp-load-agent"
+	roleFS       = "acp-fs-probe-agent"
+	roleTerm     = "acp-term-probe-agent"
+	roleTermEcho = "acp-term-echo"
+	roleMCPServe = "acp-fake-mcp-server"
 )
 
 func TestMain(m *testing.M) {
@@ -29,6 +35,20 @@ func TestMain(m *testing.M) {
 		runFakeAgent(os.Stdin, os.Stdout)
 	case roleDenyProb:
 		runDenyProbeAgent(os.Stdin, os.Stdout)
+	case roleCancel:
+		runCancelAgent(os.Stdin, os.Stdout)
+	case roleLoad:
+		runLoadAgent(os.Stdin, os.Stdout)
+	case roleFS:
+		runFSProbeAgent(os.Stdin, os.Stdout)
+	case roleTerm:
+		runTermProbeAgent(os.Stdin, os.Stdout)
+	case roleTermEcho:
+		// A one-shot terminal payload: print and exit 0.
+		fmt.Fprint(os.Stdout, "term-ok\n")
+		os.Exit(0)
+	case roleMCPServe:
+		runFakeMCPServer(os.Stdin, os.Stdout)
 	default:
 		os.Exit(m.Run())
 	}

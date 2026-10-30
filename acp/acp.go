@@ -12,10 +12,11 @@
 //     handshake, opens sessions and collects the agent_message_chunk text of
 //     each prompt.
 //
-// Python parity: the serving half is ag2/ag2/acp/agent.py (ACPAgent) with its
-// executor; the consuming half is ag2/acp/bridge.py + client.py. The subset is
-// functional on purpose — what is left out and why is recorded in
-// docs/DECISIONS.md (D-052).
+// Python parity: the serving half is ag2/ag2/acp/agent.py + executor.py +
+// session.py + mappers.py; the consuming half is ag2/acp/bridge.py +
+// client.py; auth.py and tool_gateway.py have their own files here. The
+// subset is functional on purpose — what is left out and why is recorded in
+// docs/DECISIONS.md (D-052, extended by D-066).
 package acp
 
 import (
@@ -46,11 +47,12 @@ const (
 
 // JSON-RPC error codes this package puts on the wire.
 const (
-	codeInvalidRequest  = -32600 // a session method before initialize
-	codeMethodNotFound  = -32601 // a method outside the subset
-	codeInvalidParams   = -32602
-	codeInternalError   = -32603 // a handler failure (Python parity: internal_error with the reason)
-	codeSessionNotFound = -32002 // server-error range, implementation-defined
+	codeInvalidRequest   = -32600 // a session method before initialize
+	codeMethodNotFound   = -32601 // a method outside the subset (a capability-gated method never advertised)
+	codeInvalidParams    = -32602
+	codeInternalError    = -32603 // a handler failure (Python parity: internal_error with the reason)
+	codeAuthRequired     = -32000 // ACP: Authentication required
+	codeResourceNotFound = -32002 // ACP: Resource not found (an unknown session, an unreadable file)
 )
 
 // Package-level sentinels. Match with errors.Is.
@@ -158,41 +160,238 @@ func blocksText(blocks []contentBlock) string {
 
 // --- session/update -----------------------------------------------------------
 
-// sessionUpdate is one "session/update" payload. The subset emits only
-// agent_message_chunk; anything else received is dropped.
+// Stop reasons a session/prompt answer may carry. The subset reports the two
+// it can know truthfully (Python parity: executor.py STOP_END_TURN /
+// STOP_CANCELLED); max_tokens, max_turn_requests and refusal are protocol
+// names for signals a turn carries no unambiguous mark of.
+const (
+	StopEndTurn   = "end_turn"
+	StopCancelled = "cancelled"
+)
+
+// Tool call status values (Python parity: the acp schema ToolCallStatus).
+const (
+	StatusPending    = "pending"
+	StatusInProgress = "in_progress"
+	StatusCompleted  = "completed"
+	StatusFailed     = "failed"
+)
+
+// Tool call kinds. AG2 tool events carry no kind, and guessing one from a
+// tool's name would be wrong more often than useful — every update this
+// package emits uses KindOther (mappers.py DEFAULT_TOOL_KIND).
+const (
+	KindRead       = "read"
+	KindEdit       = "edit"
+	KindDelete     = "delete"
+	KindMove       = "move"
+	KindSearch     = "search"
+	KindExecute    = "execute"
+	KindThink      = "think"
+	KindFetch      = "fetch"
+	KindSwitchMode = "switch_mode"
+	KindOther      = "other"
+)
+
+// Plan entry status and priority values (Python parity: the acp schema
+// PlanEntryStatus / PlanEntryPriority).
+const (
+	PlanPending    = "pending"
+	PlanInProgress = "in_progress"
+	PlanCompleted  = "completed"
+
+	PriorityHigh   = "high"
+	PriorityMedium = "medium"
+	PriorityLow    = "low"
+)
+
+// Update is one "session/update" payload — the whole vocabulary this subset
+// speaks, not just the message chunk. Exported because it crosses the boundary
+// in both directions: the serve role emits it (Emitter) and the Bridge hands
+// every received update to OnUpdate.
 //
-// The block is emitted under "content" — the field the Python SDK
-// serializes (mappers.py: block_text(update.content)); the "contentBlock"
-// spelling of the earlier revision of this package is still accepted on
-// input, so a peer speaking that dialect is understood. See
-// docs/DECISIONS.md D-052.
-type sessionUpdate struct {
-	SessionUpdate string        `json:"sessionUpdate"`
-	ContentBlock  *contentBlock `json:"contentBlock,omitempty"` // legacy input dialect, never emitted
-	Content       *contentBlock `json:"content,omitempty"`
+// Chunks carry Text (and MessageID on a replay); tool_call / tool_call_update
+// carry ToolCallID, Title, ToolKind, Status, RawInput and ContentText; plan
+// carries Entries; usage_update carries Used, Size and Cost. Marshalling puts
+// each kind's fields under the keys the Python SDK serializes (schema.py
+// aliases: sessionUpdate, messageId, toolCallId, rawInput, used, size, cost),
+// with the earlier revision's "contentBlock" spelling still accepted on input.
+type Update struct {
+	Kind string `json:"sessionUpdate"`
+
+	// chunk kinds: user_message_chunk / agent_message_chunk / agent_thought_chunk
+	MessageID string `json:"messageId,omitempty"`
+	Text      string `json:"-"`
+
+	// tool_call / tool_call_update
+	ToolCallID  string          `json:"-"`
+	Title       string          `json:"-"`
+	ToolKind    string          `json:"-"`
+	Status      string          `json:"-"`
+	RawInput    json.RawMessage `json:"-"`
+	ContentText string          `json:"-"`
+
+	// plan
+	Entries []PlanEntry `json:"-"`
+
+	// usage_update
+	Used int64      `json:"-"`
+	Size int64      `json:"-"`
+	Cost *UsageCost `json:"-"`
 }
 
-// agentMessageChunk builds the one update kind this subset emits (Python
-// parity: acp.update_agent_message_text).
-func agentMessageChunk(text string) sessionUpdate {
-	blk := textBlock(text)
-	return sessionUpdate{SessionUpdate: "agent_message_chunk", Content: &blk}
+// chunkKinds are the updates whose payload is one content block.
+var chunkKinds = map[string]bool{
+	"user_message_chunk":  true,
+	"agent_message_chunk": true,
+	"agent_thought_chunk": true,
+}
+
+func (u Update) isChunk() bool { return chunkKinds[u.Kind] }
+
+// MarshalJSON emits the union: per kind, exactly the fields that kind carries.
+func (u Update) MarshalJSON() ([]byte, error) {
+	m := map[string]any{"sessionUpdate": u.Kind}
+	switch {
+	case u.isChunk():
+		blk := textBlock(u.Text)
+		m["content"] = blk
+		if u.MessageID != "" {
+			m["messageId"] = u.MessageID
+		}
+	case u.Kind == "tool_call" || u.Kind == "tool_call_update":
+		m["toolCallId"] = u.ToolCallID
+		if u.Title != "" {
+			m["title"] = u.Title
+		}
+		if u.ToolKind != "" {
+			m["kind"] = u.ToolKind
+		}
+		if u.Status != "" {
+			m["status"] = u.Status
+		}
+		if len(u.RawInput) > 0 {
+			m["rawInput"] = u.RawInput
+		}
+		if u.ContentText != "" {
+			m["content"] = []map[string]any{{"type": "content", "content": textBlock(u.ContentText)}}
+		}
+	case u.Kind == "plan":
+		if u.Entries == nil {
+			u.Entries = []PlanEntry{}
+		}
+		m["entries"] = u.Entries
+	case u.Kind == "usage_update":
+		m["used"] = u.Used
+		m["size"] = u.Size
+		if u.Cost != nil {
+			m["cost"] = u.Cost
+		}
+	default:
+		return nil, fmt.Errorf("acp: unknown session/update kind %q", u.Kind)
+	}
+	return json.Marshal(m)
+}
+
+// updateWire is the decode shape: one struct for every field any kind carries,
+// with the legacy "contentBlock" spelling of the earlier revision of this
+// package still accepted. "content" is a single block on the chunk kinds and a
+// list on the tool-call kinds, so it arrives raw and is decoded per kind.
+type updateWire struct {
+	SessionUpdate string          `json:"sessionUpdate"`
+	MessageID     string          `json:"messageId"`
+	ContentBlock  *contentBlock   `json:"contentBlock"` // legacy input dialect, never emitted
+	ContentRaw    json.RawMessage `json:"content"`
+	ToolCallID    string          `json:"toolCallId"`
+	Title         string          `json:"title"`
+	ToolKind      string          `json:"kind"`
+	Status        string          `json:"status"`
+	RawInput      json.RawMessage `json:"rawInput"`
+	Entries       []PlanEntry     `json:"entries"`
+	Used          *int64          `json:"used"`
+	Size          *int64          `json:"size"`
+	Cost          *UsageCost      `json:"cost"`
+}
+
+// toolContentItem is one item of a tool call's content list (Python parity:
+// the acp schema ContentToolCallContent — {"type": "content", "content": block}).
+type toolContentItem struct {
+	Type    string        `json:"type"`
+	Content *contentBlock `json:"content"`
+}
+
+// UnmarshalJSON decodes every kind this subset knows. A kind outside the
+// subset decodes to an Update the emitters can never produce — the Bridge
+// hands it to OnUpdate (kind name intact, payload dropped) so a peer's richer
+// vocabulary stays visible instead of vanishing.
+func (u *Update) UnmarshalJSON(data []byte) error {
+	var w updateWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	u.Kind = w.SessionUpdate
+	u.MessageID = w.MessageID
+	switch {
+	case u.isChunk():
+		blk := w.ContentBlock // legacy dialect first: "content" below overrides
+		if err := json.Unmarshal(w.ContentRaw, &blk); err != nil {
+			blk = w.ContentBlock
+		}
+		if blk != nil {
+			u.Text = blk.Text
+		}
+	case u.Kind == "tool_call" || u.Kind == "tool_call_update":
+		u.ToolCallID, u.Title, u.ToolKind, u.Status = w.ToolCallID, w.Title, w.ToolKind, w.Status
+		u.RawInput = w.RawInput
+		var items []toolContentItem
+		if err := json.Unmarshal(w.ContentRaw, &items); err == nil {
+			for _, item := range items {
+				if item.Content != nil {
+					u.ContentText += item.Content.Text
+				}
+			}
+		}
+	case u.Kind == "plan":
+		u.Entries = w.Entries
+	case u.Kind == "usage_update":
+		if w.Used != nil {
+			u.Used = *w.Used
+		}
+		if w.Size != nil {
+			u.Size = *w.Size
+		}
+		u.Cost = w.Cost
+	}
+	return nil
 }
 
 // text returns the chunk's text, whichever block field carried it.
-func (u *sessionUpdate) text() string {
-	switch {
-	case u.ContentBlock != nil:
-		return u.ContentBlock.Text
-	case u.Content != nil:
-		return u.Content.Text
-	}
-	return ""
+func (u *Update) text() string { return u.Text }
+
+// agentMessageChunk builds the message-chunk update (Python parity:
+// acp.update_agent_message_text).
+func agentMessageChunk(text string) Update {
+	return Update{Kind: "agent_message_chunk", Text: text}
+}
+
+// PlanEntry is one entry of a plan update (Python parity: the acp schema
+// PlanEntry — content, priority, status).
+type PlanEntry struct {
+	Content  string `json:"content"`
+	Priority string `json:"priority,omitempty"`
+	Status   string `json:"status"`
+}
+
+// UsageCost is the optional cost block of a usage_update (Python parity: the
+// acp schema Cost).
+type UsageCost struct {
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
 }
 
 type updateParams struct {
-	SessionID string        `json:"sessionId"`
-	Update    sessionUpdate `json:"update"`
+	SessionID string `json:"sessionId"`
+	Update    Update `json:"update"`
 }
 
 // decodeUpdate parses one session/update notification's params, or nil when
@@ -202,7 +401,7 @@ func decodeUpdate(params json.RawMessage) *updateParams {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil
 	}
-	if p.Update.SessionUpdate == "" {
+	if p.Update.Kind == "" {
 		return nil
 	}
 	return &p

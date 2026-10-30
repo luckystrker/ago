@@ -1,14 +1,18 @@
 // Package a2a implements a functional subset of the A2A (Agent-to-Agent)
 // protocol: an HTTP server that exposes a Go agent over JSON-RPC 2.0 with
-// agent-card discovery, and a matching client. It is the Go counterpart of
-// ag2/ag2/a2a on the a2a-sdk wire shapes, stdlib only.
+// agent-card discovery, a REST twin of the core methods, and a matching
+// client. It is the Go counterpart of ag2/ag2/a2a on the a2a-sdk wire
+// shapes, stdlib only.
 //
-// Scope (D-049): protocol types, agent-card discovery, message/send,
+// Scope: protocol types, agent-card discovery, message/send,
 // message/stream (server SSE), tasks/get, tasks/cancel, an in-memory task
-// store. The LLMClient turn machinery (history shipping, context-variable
-// sync, client-tools extension, HITL over the wire, reconnect/resubscribe),
-// the REST/gRPC transports, push notifications and card signing/verification
-// are deferred there.
+// store (D-049); push-notification configs with server dispatch and a
+// webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
+// execution drivers, context-variable sync and HITL-over-the-wire on
+// Message.metadata, the REST transport routes, and the declarative security
+// schemes of security.py (D-056). Still deferred: the conversational A2AClient
+// turn machinery (full history shipping, reconnect/resubscribe), gRPC and
+// card JWS signing/verification (D-056).
 package a2a
 
 import (
@@ -61,23 +65,45 @@ type AgentInterface struct {
 // (ProtocolVersion, SupportedInterfaces — parity: ag2/ag2/a2a/card.py
 // build_card, which always emits supported_interfaces stamped with the
 // current protocol version); a card built by hand is served verbatim.
+//
+// SecuritySchemes/Security carry the declarative auth requirements built by
+// the security.go helpers (parity: ag2/ag2/a2a/security.py attaching
+// Requirement/Scheme output to the card; wire fields follow the a2a-sdk
+// AgentCard proto — security_schemes/security_requirements → camelCase).
 type AgentCard struct {
-	Name                string            `json:"name"`
-	Description         string            `json:"description,omitempty"`
-	URL                 string            `json:"url,omitempty"`
-	Version             string            `json:"version,omitempty"`
-	ProtocolVersion     string            `json:"protocolVersion,omitempty"`
-	SupportedInterfaces []AgentInterface  `json:"supportedInterfaces,omitempty"`
-	Capabilities        AgentCapabilities `json:"capabilities"`
-	DefaultInputModes   []string          `json:"defaultInputModes,omitempty"`
-	DefaultOutputModes  []string          `json:"defaultOutputModes,omitempty"`
-	Skills              []AgentSkill      `json:"skills,omitempty"`
+	Name                string                     `json:"name"`
+	Description         string                     `json:"description,omitempty"`
+	URL                 string                     `json:"url,omitempty"`
+	Version             string                     `json:"version,omitempty"`
+	ProtocolVersion     string                     `json:"protocolVersion,omitempty"`
+	SupportedInterfaces []AgentInterface           `json:"supportedInterfaces,omitempty"`
+	Capabilities        AgentCapabilities          `json:"capabilities"`
+	DefaultInputModes   []string                   `json:"defaultInputModes,omitempty"`
+	DefaultOutputModes  []string                   `json:"defaultOutputModes,omitempty"`
+	Skills              []AgentSkill               `json:"skills,omitempty"`
+	SecuritySchemes     map[string]*SecurityScheme `json:"securitySchemes,omitempty"`
+	Security            []SecurityRequirement      `json:"securityRequirements,omitempty"`
 }
 
-// AgentCapabilities declares what the served endpoints support.
+// AgentCapabilities declares what the served endpoints support. Extensions
+// carries the protocol extensions advertised on the card (parity:
+// a2a-sdk AgentCapabilities.extensions / AgentExtension); a server card
+// advertising urn:ag2:client-tools:v1 must list it here, and
+// ValidateExtensionActivation checks both directions against it.
 type AgentCapabilities struct {
-	Streaming         bool `json:"streaming"`
-	PushNotifications bool `json:"pushNotifications"`
+	Streaming         bool             `json:"streaming"`
+	PushNotifications bool             `json:"pushNotifications"`
+	ExtendedAgentCard bool             `json:"extendedAgentCard,omitempty"`
+	Extensions        []AgentExtension `json:"extensions,omitempty"`
+}
+
+// AgentExtension is one protocol extension advertised on the card
+// (parity: a2a-sdk AgentExtension — uri, description, required, params).
+type AgentExtension struct {
+	URI         string         `json:"uri"`
+	Description string         `json:"description,omitempty"`
+	Required    bool           `json:"required,omitempty"`
+	Params      map[string]any `json:"params,omitempty"`
 }
 
 // AgentSkill describes one capability listed on an AgentCard.
@@ -116,9 +142,14 @@ func (p TextPart) MarshalJSON() ([]byte, error) {
 	}{Kind: PartKindText, plain: plain(p)})
 }
 
-// DataPart carries an arbitrary JSON value.
+// DataPart carries an arbitrary JSON value. MimeType selects an extension
+// payload riding on the data part (the urn:ag2:client-tools:v1 parts are
+// data parts with a vnd.ag2.* media type — extension.go); Metadata is the
+// part-level free-form map of the A2A part shape.
 type DataPart struct {
-	Data any `json:"data"`
+	Data     any            `json:"data"`
+	MimeType string         `json:"mediaType,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // NewDataPart builds a DataPart.
@@ -198,13 +229,18 @@ func decodePart(data []byte) (Part, error) {
 }
 
 // Message is one wire message: the unit exchanged by message/send and carried
-// in Task history and status. Role is RoleUser or RoleAgent.
+// in Task history and status. Role is RoleUser or RoleAgent. Extensions lists
+// activated protocol extension URIs (the A2A-Extensions header is the
+// transport-level twin — extension.go); Metadata is the free-form map the
+// context-variable sync rides on under ContextUpdateKey (contextwire.go).
 type Message struct {
-	Role      string `json:"role"`
-	Parts     []Part `json:"parts"`
-	MessageID string `json:"messageId,omitempty"`
-	ContextID string `json:"contextId,omitempty"`
-	TaskID    string `json:"taskId,omitempty"`
+	Role       string         `json:"role"`
+	Parts      []Part         `json:"parts"`
+	MessageID  string         `json:"messageId,omitempty"`
+	ContextID  string         `json:"contextId,omitempty"`
+	TaskID     string         `json:"taskId,omitempty"`
+	Extensions []string       `json:"extensions,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
 // NewMessage builds a Message with a fresh MessageID. Role defaults to
@@ -219,16 +255,19 @@ func NewMessage(role string, parts ...Part) *Message {
 // UnmarshalJSON decodes parts by their "kind" discriminator.
 func (m *Message) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Role      string            `json:"role"`
-		Parts     []json.RawMessage `json:"parts"`
-		MessageID string            `json:"messageId"`
-		ContextID string            `json:"contextId"`
-		TaskID    string            `json:"taskId"`
+		Role       string            `json:"role"`
+		Parts      []json.RawMessage `json:"parts"`
+		MessageID  string            `json:"messageId"`
+		ContextID  string            `json:"contextId"`
+		TaskID     string            `json:"taskId"`
+		Extensions []string          `json:"extensions"`
+		Metadata   map[string]any    `json:"metadata"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	m.Role, m.MessageID, m.ContextID, m.TaskID = wire.Role, wire.MessageID, wire.ContextID, wire.TaskID
+	m.Extensions, m.Metadata = wire.Extensions, wire.Metadata
 	m.Parts = nil
 	for _, raw := range wire.Parts {
 		p, err := decodePart(raw)
@@ -242,17 +281,22 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // TaskState enumerates the task lifecycle states of this subset.
 //
-// AGO-DEVIATION: the richer A2A state machine (input-required, auth-required,
-// rejected, unknown) is not modeled (D-049).
+// AGO-DEVIATION: the richer A2A state machine still omits auth-required,
+// rejected and unknown (D-049); input-required joined in the second wave
+// because the urn:ag2:client-tools:v1 extension and HITL-over-the-wire are
+// meaningless without a state that says "answer pending on the caller" —
+// Python transitions to TASK_STATE_INPUT_REQUIRED for exactly that
+// (executor.py updater.requires_input).
 type TaskState string
 
 // Task states.
 const (
-	TaskStateSubmitted TaskState = "submitted"
-	TaskStateWorking   TaskState = "working"
-	TaskStateCompleted TaskState = "completed"
-	TaskStateFailed    TaskState = "failed"
-	TaskStateCanceled  TaskState = "canceled"
+	TaskStateSubmitted     TaskState = "submitted"
+	TaskStateWorking       TaskState = "working"
+	TaskStateInputRequired TaskState = "input-required"
+	TaskStateCompleted     TaskState = "completed"
+	TaskStateFailed        TaskState = "failed"
+	TaskStateCanceled      TaskState = "canceled"
 )
 
 // terminalTaskState reports whether state closes the task: a terminal task

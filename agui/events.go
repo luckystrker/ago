@@ -38,10 +38,13 @@ const (
 )
 
 // Error codes this server puts on a RUN_ERROR (Python parity: interrupts.py).
-// The interrupt-refusal codes (INTERRUPT_NOT_COVERED and friends) ride on the
-// deferred held-turn machinery and are not defined here.
+// The interrupt-refusal codes name a resume this server will not honour; the
+// run that carries the refusal never starts.
 const (
 	CodeUnsupportedProtocolVersion = "UNSUPPORTED_PROTOCOL_VERSION"
+	CodeInterruptNotCovered        = "INTERRUPT_NOT_COVERED"
+	CodeInterruptPayloadRefused    = "INTERRUPT_PAYLOAD_REFUSED"
+	CodeInterruptNotProven         = "INTERRUPT_NOT_PROVEN"
 )
 
 // Event is one AG-UI protocol event. The marker is unexported, so events are
@@ -79,8 +82,7 @@ type TokenUsage struct {
 	CacheWriteInputTokens *int64 `json:"cacheWriteInputTokens,omitempty"`
 }
 
-// Outcome is why a run ended. The interrupt outcome — RUN_FINISHED pausing on a
-// question — rides on the deferred held-turn machinery and is not modeled.
+// Outcome is why a run ended.
 type Outcome interface {
 	outcomeType() string
 }
@@ -112,6 +114,36 @@ func (CancelledOutcome) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type string `json:"type"`
 	}{"cancelled"})
+}
+
+// Interrupt is one thing a paused run waits for (Python parity: ag_ui.core
+// Interrupt). A resume entry answers it by ID.
+type Interrupt struct {
+	SubagentRunID  string         `json:"subagentRunId,omitempty"`
+	ID             string         `json:"id"`
+	Reason         string         `json:"reason"`
+	Message        string         `json:"message,omitempty"`
+	ToolCallID     string         `json:"toolCallId,omitempty"`
+	ResponseSchema map[string]any `json:"responseSchema,omitempty"`
+	ExpiresAt      string         `json:"expiresAt,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+}
+
+// InterruptOutcome closes a run paused waiting for something outside it (Python
+// parity: RunFinishedInterruptOutcome). Resuming means a new run on the same
+// thread whose resume entries answer the interrupts.
+type InterruptOutcome struct {
+	Interrupts []Interrupt `json:"interrupts"`
+}
+
+func (InterruptOutcome) outcomeType() string { return "interrupt" }
+
+// MarshalJSON adds the outcome's "type" discriminator.
+func (o InterruptOutcome) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type       string      `json:"type"`
+		Interrupts []Interrupt `json:"interrupts"`
+	}{"interrupt", o.Interrupts})
 }
 
 // --- run lifecycle -----------------------------------------------------------
@@ -147,8 +179,7 @@ type RunFinishedEvent struct {
 
 func (RunFinishedEvent) eventType() EventType { return EventRunFinished }
 
-// UnmarshalJSON reads the outcome by its own "type" discriminator; the interrupt
-// outcome of the deferred held-turn machinery decodes as nil.
+// UnmarshalJSON reads the outcome by its own "type" discriminator.
 func (e *RunFinishedEvent) UnmarshalJSON(data []byte) error {
 	type alias RunFinishedEvent
 	var w struct {
@@ -169,6 +200,12 @@ func (e *RunFinishedEvent) UnmarshalJSON(data []byte) error {
 		switch head.Type {
 		case "success":
 			var o SuccessOutcome
+			if err := json.Unmarshal(w.Outcome, &o); err != nil {
+				return err
+			}
+			e.Outcome = o
+		case "interrupt":
+			var o InterruptOutcome
 			if err := json.Unmarshal(w.Outcome, &o); err != nil {
 				return err
 			}

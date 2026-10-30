@@ -174,11 +174,11 @@ func TestServeInitializeSessionPrompt(t *testing.T) {
 			bag.capture(s)
 			capturedID = s.ID
 		},
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			handleRuns++
 			_ = bag.get(sessionID)
-			emit("Hel")
-			emit("lo")
+			emit.Message("Hel")
+			emit.Message("lo")
 			return "Hello", nil // already on the wire: no extra chunk
 		},
 	}
@@ -215,6 +215,9 @@ func TestServeInitializeSessionPrompt(t *testing.T) {
 	promptCaps, _ := init.AgentCapabilities["promptCapabilities"].(map[string]any)
 	if promptCaps == nil || promptCaps["image"] != false || promptCaps["audio"] != false {
 		t.Errorf("promptCapabilities = %v, want image/audio/embeddedContext all false (text-only)", promptCaps)
+	}
+	if init.AgentCapabilities["loadSession"] != true {
+		t.Errorf("agentCapabilities.loadSession = %v, want true", init.AgentCapabilities["loadSession"])
 	}
 	if len(fc.updates) != 0 || len(fc.requests) != 0 {
 		t.Errorf("initialize produced %d updates / %d requests, want none",
@@ -261,8 +264,8 @@ func TestServeInitializeSessionPrompt(t *testing.T) {
 		if u.SessionID != created.SessionID {
 			t.Errorf("update session = %q, want %q", u.SessionID, created.SessionID)
 		}
-		if u.Update.SessionUpdate != "agent_message_chunk" {
-			t.Errorf("update kind = %q, want agent_message_chunk", u.Update.SessionUpdate)
+		if u.Update.Kind != "agent_message_chunk" {
+			t.Errorf("update kind = %q, want agent_message_chunk", u.Update.Kind)
 		}
 	}
 
@@ -272,14 +275,15 @@ func TestServeInitializeSessionPrompt(t *testing.T) {
 		"sessionId": "nope",
 		"prompt":    []map[string]any{{"type": "text", "text": "x"}},
 	})
-	if rpcErr == nil || rpcErr.Code != codeSessionNotFound || !strings.Contains(rpcErr.Message, "nope") {
-		t.Errorf("unknown session = %v, want code %d naming nope", rpcErr, codeSessionNotFound)
+	if rpcErr == nil || rpcErr.Code != codeResourceNotFound || !strings.Contains(rpcErr.Message, "nope") {
+		t.Errorf("unknown session = %v, want code %d naming nope", rpcErr, codeResourceNotFound)
 	}
 
-	// A method outside the subset is method-not-found.
-	_, rpcErr = fc.call("session/load", map[string]any{})
-	if rpcErr == nil || rpcErr.Code != codeMethodNotFound {
-		t.Errorf("session/load = %v, want code %d", rpcErr, codeMethodNotFound)
+	// session/load of a session this connection never issued is
+	// resource_not_found (Python parity: an id with no history).
+	_, rpcErr = fc.call("session/load", map[string]any{"sessionId": "nope", "cwd": "."})
+	if rpcErr == nil || rpcErr.Code != codeResourceNotFound {
+		t.Errorf("session/load = %v, want code %d", rpcErr, codeResourceNotFound)
 	}
 
 	// A second prompt on the same session runs Handle again.
@@ -299,10 +303,10 @@ func TestServeInitializeSessionPrompt(t *testing.T) {
 // it streamed is not sent twice (executor parity: _send_final_text).
 func TestServeFinalTextEmittedOnce(t *testing.T) {
 	cfg := ServeConfig{
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			if userText == "stream" {
-				emit("par")
-				emit("tial")
+				emit.Message("par")
+				emit.Message("tial")
 				return "partial", nil
 			}
 			return "done", nil // no streaming: Serve must emit it
@@ -345,7 +349,7 @@ func TestServeFinalTextEmittedOnce(t *testing.T) {
 // connection keeps serving.
 func TestServeHandleError(t *testing.T) {
 	cfg := ServeConfig{
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			return "", fmt.Errorf("model exploded")
 		},
 	}
@@ -377,7 +381,7 @@ func TestServePermissionPolicyDeny(t *testing.T) {
 	var gotErr error
 	cfg := ServeConfig{
 		OnSession: bag.capture,
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			s := bag.get(sessionID)
 			got, gotErr = s.RequestPermission(context.Background(), "write_file", "README.md")
 			return "ok", nil
@@ -422,7 +426,7 @@ func TestServePermissionClientDecides(t *testing.T) {
 		Permission: func(toolCall, input string) bool {
 			return toolCall == "write_file" && input == "README.md"
 		},
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			prompt++
 			d, err := bag.get(sessionID).RequestPermission(context.Background(), "write_file", "README.md")
 			if err != nil {
@@ -496,7 +500,7 @@ func TestServePermissionCancelled(t *testing.T) {
 		Permission: func(toolCall, input string) bool {
 			return true
 		},
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			d, err := bag.get(sessionID).RequestPermission(context.Background(), "write_file", "README.md")
 			if err != nil {
 				return "", err
@@ -549,7 +553,7 @@ func TestServeElicit(t *testing.T) {
 			asked = message
 			return prompt > 1
 		},
-		Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
 			answer, ok, err := bag.get(sessionID).Elicit(context.Background(), "Deploy to prod?")
 			if err != nil {
 				return "", err

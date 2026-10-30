@@ -112,6 +112,34 @@ type AgentClient struct {
 
 	errMu   sync.Mutex
 	lastErr error
+
+	suppressMu sync.Mutex
+	suppress   map[string]bool // channel id → the pump skips its envelopes
+}
+
+// SuppressHandler stops the pump from running the configured handler on
+// envelopes of channelID (the delegate tool owns the channel's lifecycle
+// for the duration of its consult). ResumeHandler undoes it.
+func (a *AgentClient) SuppressHandler(channelID string) {
+	a.suppressMu.Lock()
+	defer a.suppressMu.Unlock()
+	if a.suppress == nil {
+		a.suppress = make(map[string]bool)
+	}
+	a.suppress[channelID] = true
+}
+
+// ResumeHandler lifts a SuppressHandler. Unknown ids are a no-op.
+func (a *AgentClient) ResumeHandler(channelID string) {
+	a.suppressMu.Lock()
+	defer a.suppressMu.Unlock()
+	delete(a.suppress, channelID)
+}
+
+func (a *AgentClient) suppressed(channelID string) bool {
+	a.suppressMu.Lock()
+	defer a.suppressMu.Unlock()
+	return a.suppress[channelID]
 }
 
 // Register stamps a passport, binds delivery and starts the client pump.
@@ -244,6 +272,9 @@ func (a *AgentClient) deliver(env Envelope) {
 		return
 	}
 	if isTaskEvent(env.EventType) {
+		return
+	}
+	if a.suppressed(env.ChannelID) {
 		return
 	}
 	select {

@@ -1,13 +1,15 @@
-// Package openai is the Chat Completions provider for the OpenAI API and any
-// endpoint speaking the same protocol: the typed config, its client factory
-// and the strict JSON-schema coercion used for structured output.
+// Package openai is the OpenAI provider: the Chat Completions config (and any
+// endpoint speaking the same protocol), the Responses API config and client
+// (responses.go — the surface that carries hosted tools), the Decisions API
+// config and client (decisions.go), the Files API client and the strict
+// JSON-schema coercion used for structured output.
 //
-// Parity with Python AG2 ag2/config/openai/config.py (OpenAICompletionsConfig)
-// and openai_client.py. The wire protocol itself — history→messages, tool
-// schemas, SSE streaming with tool-call delta merge, usage normalization — is
-// the shared engine in ago/config (config.RunChatCompat); this package
-// supplies the provider identity, auth, headers and the OpenAI-specific
-// schema rules.
+// Chat Completions parity with Python AG2 ag2/config/openai/config.py
+// (OpenAICompletionsConfig) and openai_client.py. The chat wire protocol
+// itself — history→messages, tool schemas, SSE streaming with tool-call delta
+// merge, usage normalization — is the shared engine in ago/config
+// (config.RunChatCompat); this package supplies the provider identity, auth,
+// headers and the OpenAI-specific schema rules.
 package openai
 
 import (
