@@ -1,4 +1,6 @@
 /ag2/
+.venv-bench/
+__pycache__/
 *.exe
 *.test
 dist/

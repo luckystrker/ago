@@ -1,0 +1,142 @@
+{
+  "framework": "ag2",
+  "framework_version": "1.2.2",
+  "python": "3.12.10",
+  "os": "Windows-11-10.0.26200-SP0",
+  "p95_method": "nearest-rank: sorted[ceil(0.95*n)-1]",
+  "timed_region": "fresh agent + scripted config + all turns of the conversation; verification runs after the clock stops",
+  "scenarios": {
+    "plain_chat": {
+      "params": {
+        "turns": 3,
+        "tool_rounds": 0,
+        "chunks_per_turn": 0,
+        "conversations": 1
+      },
+      "warmup": 3,
+      "runs": 15,
+      "unit": "ms",
+      "times_ms": [
+        9.2363,
+        9.802,
+        8.3046,
+        8.6716,
+        9.0618,
+        23.7286,
+        8.0872,
+        9.4386,
+        10.2819,
+        8.3332,
+        9.1604,
+        8.9322,
+        9.82,
+        10.9805,
+        9.983
+      ],
+      "median_ms": 9.2363,
+      "p95_ms": 23.7286,
+      "min_ms": 8.0872,
+      "max_ms": 23.7286,
+      "memNote": "tracemalloc peak 200737 bytes (single iteration, untimed run)"
+    },
+    "tool_roundtrip": {
+      "params": {
+        "turns": 1,
+        "tool_rounds": 5,
+        "chunks_per_turn": 0,
+        "conversations": 1
+      },
+      "warmup": 3,
+      "runs": 15,
+      "unit": "ms",
+      "times_ms": [
+        16.0313,
+        17.4631,
+        16.7401,
+        15.8939,
+        15.6687,
+        16.7969,
+        16.0115,
+        16.5518,
+        16.1165,
+        16.3893,
+        15.7692,
+        16.3929,
+        15.8371,
+        15.6943,
+        16.1068
+      ],
+      "median_ms": 16.1068,
+      "p95_ms": 17.4631,
+      "min_ms": 15.6687,
+      "max_ms": 17.4631,
+      "memNote": "tracemalloc peak 229375 bytes (single iteration, untimed run)"
+    },
+    "streaming": {
+      "params": {
+        "turns": 2,
+        "tool_rounds": 0,
+        "chunks_per_turn": 20,
+        "conversations": 1
+      },
+      "warmup": 3,
+      "runs": 15,
+      "unit": "ms",
+      "times_ms": [
+        12.8042,
+        12.9283,
+        13.3364,
+        14.0929,
+        12.989,
+        12.7913,
+        13.5538,
+        13.2613,
+        13.5325,
+        13.4221,
+        12.9366,
+        13.3184,
+        13.0338,
+        12.6924,
+        13.9421
+      ],
+      "median_ms": 13.2613,
+      "p95_ms": 14.0929,
+      "min_ms": 12.6924,
+      "max_ms": 14.0929,
+      "memNote": "tracemalloc peak 189523 bytes (single iteration, untimed run)"
+    },
+    "concurrent": {
+      "params": {
+        "turns": 2,
+        "tool_rounds": 0,
+        "chunks_per_turn": 0,
+        "conversations": 50
+      },
+      "warmup": 3,
+      "runs": 15,
+      "unit": "ms",
+      "times_ms": [
+        252.5818,
+        312.6362,
+        262.6559,
+        270.9264,
+        260.1631,
+        291.9581,
+        279.2452,
+        263.3149,
+        293.0472,
+        256.4104,
+        284.4176,
+        250.8469,
+        289.1444,
+        274.1391,
+        265.5777
+      ],
+      "median_ms": 270.9264,
+      "p95_ms": 312.6362,
+      "min_ms": 250.8469,
+      "max_ms": 312.6362,
+      "memNote": "tracemalloc peak 7942702 bytes (single iteration, untimed run)"
+    }
+  }
+}
