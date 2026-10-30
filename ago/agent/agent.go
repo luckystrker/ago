@@ -15,6 +15,7 @@ import (
 	"ago/events"
 	"ago/hitl"
 	"ago/middleware"
+	"ago/plugin"
 	"ago/response"
 	"ago/stream"
 	"ago/tools"
@@ -64,6 +65,32 @@ func WithPromptFragments(fr ...string) Option {
 	return func(o *options) { o.fragments = append(o.fragments, fr...) }
 }
 func WithTasks(cfg TaskConfig) Option { return func(o *options) { t := cfg; o.tasks = &t } }
+
+// WithPlugin applies a plugin's contributions at construction: its tools,
+// middleware, static fragments and prompt hooks join the agent's own, in that
+// order, exactly as the matching With* options would (Python parity:
+// PluginTarget._apply_plugin appends — so plugin middleware lands innermost
+// relative to the agent's own, and plugin fragments/hooks extend the prompt
+// collectors). A nil Plugin contributes nothing.
+//
+// AGO-DEVIATION: Python applies plugins turn-scoped and removes them when the
+// turn ends (identity-preserving markers, PluginTarget._apply_plugin /
+// _remove_plugin); AGo applies plugins once at agent construction, which
+// covers statically attached plugins. Dynamic attach/detach mid-conversation
+// is deferred — see docs/DECISIONS.md D-044.
+func WithPlugin(p plugin.Plugin) Option {
+	return func(o *options) {
+		if p == nil {
+			return
+		}
+		o.tools = append(o.tools, p.Tools()...)
+		o.middleware = append(o.middleware, p.Middleware()...)
+		o.fragments = append(o.fragments, p.PromptFragments()...)
+		for _, h := range p.PromptHooks() {
+			o.promptHooks = append(o.promptHooks, PromptHook(h))
+		}
+	}
+}
 
 // Agent is a conversable LLM agent. A bare New(name, prompt, WithConfig(...)) is a
 // plain LLM loop; every harness feature is opt-in (Python parity: agent.py docstring).

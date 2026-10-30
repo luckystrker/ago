@@ -202,11 +202,19 @@ func parseCallArguments(arguments string) (map[string]any, error) {
 // --- tool schemas ---------------------------------------------------------------
 
 // buildTools renders the call's tool schemas as Gemini tools: function schemas
-// become one functionDeclarations block; hosted tools fail fast
-// (config.ErrUnsupportedTool) — this port speaks only the function-calling
-// dialect of the API.
+// become one functionDeclarations block; the hosted types the ported Gemini
+// client can carry (web_search, web_fetch, code_execution, file_search) become
+// one server-side tool block each, after the function declarations (Python
+// parity: build_tools). Everything else fails fast (config.ErrUnsupportedTool).
+//
+// AGO-DEVIATION: Python also builds a ToolConfig for mixed requests
+// (build_tool_config: include_server_side_tool_invocations) and replays the
+// server-side invocations from the response (GeminiServerToolCallEvent); the
+// AGo client does not parse grounding metadata, so no ToolConfig is emitted and
+// grounding travels only as ordinary response text (see docs/DECISIONS.md).
 func buildTools(schemas []any) ([]map[string]any, error) {
 	declarations := make([]map[string]any, 0, len(schemas))
+	var extras []map[string]any
 	for _, schema := range schemas {
 		switch t := schema.(type) {
 		case tools.Schema:
@@ -217,15 +225,107 @@ func buildTools(schemas []any) ([]map[string]any, error) {
 			}
 			declarations = append(declarations, functionDeclaration(*t))
 		case tools.ToolSchema:
-			return nil, fmt.Errorf("%w: hosted tool %q for the generateContent API", config.ErrUnsupportedTool, t.SchemaType())
+			entries, err := hostedToolsToAPI(t)
+			if err != nil {
+				return nil, err
+			}
+			extras = append(extras, entries...)
 		default:
 			return nil, fmt.Errorf("%w: unsupported schema type %T", config.ErrUnsupportedTool, schema)
 		}
 	}
-	if len(declarations) == 0 {
+	if len(declarations) == 0 && len(extras) == 0 {
 		return nil, nil
 	}
-	return []map[string]any{{"functionDeclarations": declarations}}, nil
+	out := make([]map[string]any, 0, 1+len(extras))
+	if len(declarations) > 0 {
+		out = append(out, map[string]any{"functionDeclarations": declarations})
+	}
+	return append(out, extras...), nil
+}
+
+// hostedToolsToAPI renders one hosted schema as the Gemini tools[] entries it
+// maps to (zero or one). Wire keys follow the google-genai SDK's camelCase REST
+// aliases — the shape the ported Python client actually puts on the wire.
+func hostedToolsToAPI(t tools.ToolSchema) ([]map[string]any, error) {
+	switch s := t.(type) {
+	case tools.WebSearchToolSchema:
+		return []map[string]any{{"googleSearch": googleSearch(s)}}, nil
+	case *tools.WebSearchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.WebSearchToolName)
+		}
+		return []map[string]any{{"googleSearch": googleSearch(*s)}}, nil
+
+	case tools.WebFetchToolSchema:
+		// Gemini ignores every web_fetch field and enables its url_context tool
+		// (Python parity).
+		return []map[string]any{{"urlContext": map[string]any{}}}, nil
+	case *tools.WebFetchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.WebFetchToolName)
+		}
+		return []map[string]any{{"urlContext": map[string]any{}}}, nil
+
+	case tools.CodeExecutionToolSchema:
+		return []map[string]any{{"codeExecution": map[string]any{}}}, nil
+	case *tools.CodeExecutionToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.CodeExecutionToolName)
+		}
+		return []map[string]any{{"codeExecution": map[string]any{}}}, nil
+
+	case tools.FileSearchToolSchema:
+		w, err := fileSearchToAPI(s)
+		if err != nil {
+			return nil, err
+		}
+		return []map[string]any{{"fileSearch": w}}, nil
+	case *tools.FileSearchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.FileSearchToolName)
+		}
+		w, err := fileSearchToAPI(*s)
+		if err != nil {
+			return nil, err
+		}
+		return []map[string]any{{"fileSearch": w}}, nil
+	}
+	return nil, fmt.Errorf("%w: hosted tool %q for the generateContent API", config.ErrUnsupportedTool, t.SchemaType())
+}
+
+// googleSearch maps the web_search fields Gemini honours: only the blocked
+// domains travel, as excludeDomains (Python parity: exclude_domains=blocked or
+// None — an empty list is not sent).
+func googleSearch(t tools.WebSearchToolSchema) map[string]any {
+	g := map[string]any{}
+	if len(t.BlockedDomains) > 0 {
+		g["excludeDomains"] = t.BlockedDomains
+	}
+	return g
+}
+
+// fileSearchToAPI maps file_search over the Gemini file-search stores.
+// vector_store_ids / filters are OpenAI-only and rejected here (Python parity:
+// UnsupportedToolError without store_names).
+func fileSearchToAPI(t tools.FileSearchToolSchema) (map[string]any, error) {
+	if len(t.StoreNames) == 0 {
+		return nil, fmt.Errorf("%w: hosted tool %q for the generateContent API requires store_names "+
+			"(vector_store_ids and filters are OpenAI-only)", config.ErrUnsupportedTool, t.SchemaType())
+	}
+	w := map[string]any{"fileSearchStoreNames": t.StoreNames}
+	if t.MaxNumResults != nil {
+		w["topK"] = *t.MaxNumResults
+	}
+	if t.MetadataFilter != "" {
+		w["metadataFilter"] = t.MetadataFilter
+	}
+	return w, nil
+}
+
+// nilSchemaErr is the fail-fast for a typed nil hosted-schema pointer.
+func nilSchemaErr(typeName string) error {
+	return fmt.Errorf("%w: nil %s schema", config.ErrUnsupportedTool, typeName)
 }
 
 func functionDeclaration(t tools.Schema) map[string]any {

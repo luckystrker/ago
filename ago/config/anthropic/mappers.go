@@ -355,8 +355,10 @@ func decodeCallInput(arguments string) (any, error) {
 // --- tool schemas --------------------------------------------------------------
 
 // ConvertTools maps the per-call tool schemas to the Messages-API tools array:
-// function schemas become {"name","description","input_schema"}; hosted tools
-// and anything else fail fast with config.ErrUnsupportedTool.
+// function schemas become {"name","description","input_schema"}; the hosted
+// types the ported Anthropic client can carry (web_search, code_execution,
+// web_fetch, memory, mcp_server, tool_search) become their server-tool blocks;
+// everything else fails fast with config.ErrUnsupportedTool.
 func ConvertTools(tools []any) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(tools))
 	for _, t := range tools {
@@ -366,7 +368,38 @@ func ConvertTools(tools []any) ([]map[string]any, error) {
 		}
 		out = append(out, w)
 	}
+	// A web_fetch url_sources filter resolves its tool names against this
+	// request's tools[] — checked against the mapped entries, so "declared"
+	// means exactly what goes on the wire (Python parity: tools_to_api).
+	if err := rejectUnknownURLSourceTools(tools, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// ExtractMCPServers renders the request's mcp_servers parameter from the hosted
+// MCPServerToolSchema entries (Python parity: extract_mcp_servers; the Python
+// client ships it as extra_body {"mcp_servers": [...]}). The tools[] mcp_toolset
+// block produced by toolToAPI references the server by name, so a request with
+// an MCP server needs both.
+func ExtractMCPServers(schemas []any) []map[string]any {
+	var servers []map[string]any
+	for _, s := range schemas {
+		t, ok := s.(tools.MCPServerToolSchema)
+		if !ok {
+			if p, isPtr := s.(*tools.MCPServerToolSchema); isPtr && p != nil {
+				t = *p
+			} else {
+				continue
+			}
+		}
+		server := map[string]any{"type": "url", "url": t.ServerURL, "name": t.ServerLabel}
+		if t.AuthorizationToken != "" {
+			server["authorization_token"] = t.AuthorizationToken
+		}
+		servers = append(servers, server)
+	}
+	return servers
 }
 
 func toolToAPI(tool any) (map[string]any, error) {
@@ -379,12 +412,350 @@ func toolToAPI(tool any) (map[string]any, error) {
 		}
 		return functionToolToAPI(*t)
 	case tools.ToolSchema:
-		// Hosted/builtin schemas (web_search, code_execution, ...) have no AGo
-		// port yet; fail fast instead of silently dropping, Python parity.
-		return nil, fmt.Errorf("%w: hosted tool %q for the messages API", config.ErrUnsupportedTool, t.SchemaType())
+		return hostedToolToAPI(t)
 	default:
 		return nil, fmt.Errorf("%w: unsupported schema type %T", config.ErrUnsupportedTool, tool)
 	}
+}
+
+// hostedToolToAPI maps one hosted schema to its tools[] entry. Supported here:
+// web_search, code_execution, web_fetch, memory, mcp_server and tool_search
+// (Python parity: tool_to_api). file_search and image_generation are OpenAI
+// Responses-only and fall through to the generic rejection; shell is rejected
+// with the client-side explanation.
+func hostedToolToAPI(t tools.ToolSchema) (map[string]any, error) {
+	switch s := t.(type) {
+	case tools.WebSearchToolSchema:
+		return webSearchToolToAPI(s), nil
+	case *tools.WebSearchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.WebSearchToolName)
+		}
+		return webSearchToolToAPI(*s), nil
+
+	case tools.CodeExecutionToolSchema:
+		return codeExecutionToAPI(s.Version), nil
+	case *tools.CodeExecutionToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.CodeExecutionToolName)
+		}
+		return codeExecutionToAPI(s.Version), nil
+
+	case tools.WebFetchToolSchema:
+		return webFetchToolToAPI(s)
+	case *tools.WebFetchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.WebFetchToolName)
+		}
+		return webFetchToolToAPI(*s)
+
+	case tools.MemoryToolSchema:
+		// https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
+		return memoryToAPI(s.Version), nil
+	case *tools.MemoryToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.MemoryToolName)
+		}
+		return memoryToAPI(s.Version), nil
+
+	case tools.MCPServerToolSchema:
+		// https://platform.claude.com/docs/en/docs/agents-and-tools/mcp-connector
+		// The one entry built by hand: the API ships no param type for an
+		// mcp_toolset, so there is nothing to check this shape against. The
+		// server definition itself travels in the request's mcp_servers
+		// parameter (ExtractMCPServers).
+		return mcpToolsetToAPI(s), nil
+	case *tools.MCPServerToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.MCPServerToolName)
+		}
+		return mcpToolsetToAPI(*s), nil
+
+	case tools.ToolSearchToolSchema:
+		return toolSearchToolToAPI(s), nil
+	case *tools.ToolSearchToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.ToolSearchToolName)
+		}
+		return toolSearchToolToAPI(*s), nil
+
+	case tools.ShellToolSchema:
+		return nil, shellRejected(t.SchemaType())
+	case *tools.ShellToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.ShellToolName)
+		}
+		return nil, shellRejected(s.SchemaType())
+	}
+	return nil, fmt.Errorf("%w: hosted tool %q for the messages API", config.ErrUnsupportedTool, t.SchemaType())
+}
+
+// shellRejected explains why a hosted shell schema cannot map to the Messages
+// API (Python parity: the ShellToolSchema branch of tool_to_api): Anthropic's
+// bash tool is client-side, the application executes the command.
+func shellRejected(typeName string) error {
+	return fmt.Errorf("%w: hosted tool %q for the messages API: Anthropic's bash tool is "+
+		"client-side; run commands in the application (a sandboxed shell tool) and return the result",
+		config.ErrUnsupportedTool, typeName)
+}
+
+// nilSchemaErr is the fail-fast for a typed nil hosted-schema pointer.
+func nilSchemaErr(typeName string) error {
+	return fmt.Errorf("%w: nil %s schema", config.ErrUnsupportedTool, typeName)
+}
+
+// codeExecutionToAPI builds the code_execution entry; an empty version resolves
+// to the Python dataclass default (the Go zero value stands in for the default
+// instance).
+func codeExecutionToAPI(version string) map[string]any {
+	if version == "" {
+		version = tools.DefaultCodeExecutionVersion
+	}
+	// https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
+	return map[string]any{"type": version, "name": "code_execution"}
+}
+
+// memoryToAPI builds the memory entry; an empty version resolves to the Python
+// dataclass default (see codeExecutionToAPI).
+func memoryToAPI(version string) map[string]any {
+	if version == "" {
+		version = tools.MemoryVersion
+	}
+	// https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
+	return map[string]any{"type": version, "name": tools.MemoryToolName}
+}
+
+// webSearchToolToAPI builds the web_search entry. SearchContextSize is
+// deliberately not sent: the Anthropic mapper ignores it (Python parity). The
+// version literal replaces the newest param's on the way out. An empty version
+// means the Go zero value, which stands in for the Python dataclass's default
+// instance, so it resolves to the Python default literal.
+func webSearchToolToAPI(t tools.WebSearchToolSchema) map[string]any {
+	version := t.WebSearchVersion
+	if version == "" {
+		version = tools.DefaultWebSearchVersion
+	}
+	w := map[string]any{"type": version, "name": tools.WebSearchToolName}
+	if t.MaxUses != nil {
+		w["max_uses"] = *t.MaxUses
+	}
+	if t.UserLocation != nil {
+		w["user_location"] = userLocationToAPI(t.UserLocation)
+	}
+	if t.AllowedDomains != nil {
+		w["allowed_domains"] = t.AllowedDomains
+	}
+	if t.BlockedDomains != nil {
+		w["blocked_domains"] = t.BlockedDomains
+	}
+	return w
+}
+
+// userLocationToAPI tags the location the way the API discriminates it; only
+// the fields that were set travel.
+func userLocationToAPI(l *tools.UserLocation) map[string]any {
+	loc := map[string]any{"type": "approximate"}
+	if l.City != nil {
+		loc["city"] = *l.City
+	}
+	if l.Region != nil {
+		loc["region"] = *l.Region
+	}
+	if l.Country != nil {
+		loc["country"] = *l.Country
+	}
+	if l.Timezone != nil {
+		loc["timezone"] = *l.Timezone
+	}
+	return loc
+}
+
+// Version literals an option first arrived in (Python parity:
+// WEB_FETCH_USE_CACHE_SINCE / WEB_FETCH_RESPONSE_INCLUSION_SINCE; the literal
+// formats compare lexicographically).
+const (
+	webFetchUseCacheSince          = "web_fetch_20260309"
+	webFetchResponseInclusionSince = "web_fetch_20260318"
+)
+
+// webFetchToolToAPI builds the web_fetch entry, refusing an option the selected
+// version predates (Python parity: _reject_unsupported_web_fetch_options) — a
+// silently ignored option turns a caching or payload decision into a no-op. An
+// empty version resolves to the Python dataclass default (the Go zero value
+// stands in for the default instance).
+func webFetchToolToAPI(t tools.WebFetchToolSchema) (map[string]any, error) {
+	if t.WebFetchVersion == "" {
+		t.WebFetchVersion = tools.DefaultWebFetchVersion
+	}
+	if t.UseCache != nil && t.WebFetchVersion < webFetchUseCacheSince {
+		return nil, fmt.Errorf("%w: web_fetch option `use_cache` is not available on `%s`: it arrived in "+
+			"`%s`. Pass version `%s` or later, or drop the option",
+			config.ErrUnsupportedTool, t.WebFetchVersion, webFetchUseCacheSince, webFetchUseCacheSince)
+	}
+	if t.ResponseInclusion != "" && t.WebFetchVersion < webFetchResponseInclusionSince {
+		return nil, fmt.Errorf("%w: web_fetch option `response_inclusion` is not available on `%s`: it arrived in "+
+			"`%s`. Pass version `%s` or later, or drop the option",
+			config.ErrUnsupportedTool, t.WebFetchVersion, webFetchResponseInclusionSince, webFetchResponseInclusionSince)
+	}
+	w := map[string]any{"type": t.WebFetchVersion, "name": tools.WebFetchToolName}
+	if t.MaxUses != nil {
+		w["max_uses"] = *t.MaxUses
+	}
+	if t.AllowedDomains != nil {
+		w["allowed_domains"] = t.AllowedDomains
+	}
+	if t.BlockedDomains != nil {
+		w["blocked_domains"] = t.BlockedDomains
+	}
+	if t.Citations != nil {
+		w["citations"] = map[string]any{"enabled": *t.Citations}
+	}
+	if t.MaxContentTokens != nil {
+		w["max_content_tokens"] = *t.MaxContentTokens
+	}
+	if t.Strict != nil {
+		w["strict"] = *t.Strict
+	}
+	if t.UseCache != nil {
+		w["use_cache"] = *t.UseCache
+	}
+	if t.ResponseInclusion != "" {
+		w["response_inclusion"] = t.ResponseInclusion
+	}
+	if t.UrlSources != nil {
+		if sources := urlSourcesToAPI(t.UrlSources); len(sources) > 0 {
+			w["url_sources"] = sources
+		}
+	}
+	return w, nil
+}
+
+// urlSourcesToAPI maps the sources that were set; a source left unset is the
+// API's default, not a decision to send (Python parity: _url_sources_to_api).
+func urlSourcesToAPI(u *tools.UrlSources) map[string]any {
+	out := map[string]any{}
+	if u.UserInput != "" {
+		out["user_input"] = unfilteredSourceToAPI(u.UserInput)
+	}
+	if u.ClientToolResults != nil {
+		out["client_tool_results"] = toolSourceToAPI(u.ClientToolResults)
+	}
+	if u.ServerToolResults != nil {
+		out["server_tool_results"] = toolSourceToAPI(u.ServerToolResults)
+	}
+	return out
+}
+
+// unfilteredSourceToAPI tags a source that names no tools. A value outside the
+// all/none pair is sent as written: this is a policy control, and a 400 naming
+// the typo beats quietly substituting the closed policy (Python parity).
+func unfilteredSourceToAPI(source string) map[string]any {
+	return map[string]any{"type": source}
+}
+
+// toolSourceToAPI tags one url_sources entry the way the API discriminates it;
+// a named filter refers to its tools as tool_reference entries.
+func toolSourceToAPI(s *tools.ToolSources) map[string]any {
+	w := map[string]any{"type": s.Kind}
+	if len(s.Tools) > 0 {
+		refs := make([]map[string]any, 0, len(s.Tools))
+		for _, n := range s.Tools {
+			refs = append(refs, map[string]any{"type": "tool_reference", "name": n})
+		}
+		w["tools"] = refs
+	}
+	return w
+}
+
+// mcpToolsetToAPI builds the tools[] mcp_toolset entry: the label names the
+// server (defined in the request's mcp_servers parameter), and allowed/blocked
+// tools become per-tool enable flags (Python parity).
+func mcpToolsetToAPI(t tools.MCPServerToolSchema) map[string]any {
+	w := map[string]any{"type": "mcp_toolset", "mcp_server_name": t.ServerLabel}
+	if t.AllowedTools != nil {
+		w["default_config"] = map[string]any{"enabled": false}
+		configs := map[string]any{}
+		for _, n := range t.AllowedTools {
+			configs[n] = map[string]any{"enabled": true}
+		}
+		w["configs"] = configs
+	}
+	if t.BlockedTools != nil {
+		configs, _ := w["configs"].(map[string]any)
+		if configs == nil {
+			configs = map[string]any{}
+		}
+		for _, n := range t.BlockedTools {
+			configs[n] = map[string]any{"enabled": false}
+		}
+		w["configs"] = configs
+	}
+	return w
+}
+
+// toolSearchToolToAPI builds the tool_search entry from the variant's own param:
+// the name is the variant id (the API rejects a generic "tool_search" and this
+// is the name it puts on the server_tool_use block it sends back). A mode other
+// than bm25 maps to the regex variant (Python parity).
+func toolSearchToolToAPI(t tools.ToolSearchToolSchema) map[string]any {
+	if t.Mode == "bm25" {
+		return map[string]any{"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}
+	}
+	return map[string]any{"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+}
+
+// rejectUnknownURLSourceTools refuses a web_fetch url_sources filter naming a
+// tool this request does not declare (Python parity:
+// _reject_unknown_url_source_tools): the API resolves those names against this
+// request's tools[], so an absent name is a policy that silently covers nothing.
+func rejectUnknownURLSourceTools(schemas []any, mapped []map[string]any) error {
+	declared := declaredToolNames(mapped)
+	for _, s := range schemas {
+		t, ok := s.(tools.WebFetchToolSchema)
+		if !ok {
+			if p, isPtr := s.(*tools.WebFetchToolSchema); isPtr && p != nil {
+				t = *p
+			} else {
+				continue
+			}
+		}
+		if t.UrlSources == nil {
+			continue
+		}
+		for _, source := range []*tools.ToolSources{t.UrlSources.ClientToolResults, t.UrlSources.ServerToolResults} {
+			if source == nil || (source.Kind != "only" && source.Kind != "except") {
+				continue
+			}
+			for _, name := range source.Tools {
+				if !declared[name] {
+					return fmt.Errorf("%w: web_fetch `url_sources` names `%s`, which this request does not "+
+						"declare. Give the agent that tool, or drop the name from `url_sources`",
+						config.ErrUnsupportedTool, name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// declaredToolNames collects every tool name the mapped request puts on the
+// wire: tools[] entries carry "name"; an mcp_toolset carries no name of its own
+// but names the tools its configs switch on (Python parity:
+// _declared_tool_names).
+func declaredToolNames(mapped []map[string]any) map[string]bool {
+	names := map[string]bool{}
+	for _, entry := range mapped {
+		if n, ok := entry["name"].(string); ok {
+			names[n] = true
+		}
+		configs, _ := entry["configs"].(map[string]any)
+		for n, c := range configs {
+			if enabled, ok := c.(map[string]any)["enabled"].(bool); ok && enabled {
+				names[n] = true
+			}
+		}
+	}
+	return names
 }
 
 func functionToolToAPI(t tools.Schema) (map[string]any, error) {

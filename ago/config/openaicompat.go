@@ -369,7 +369,14 @@ func ToolToAPI(tool any) (map[string]any, error) {
 		}
 		return functionToolToAPI(*t)
 	case tools.ToolSchema:
-		return nil, fmt.Errorf("%w: hosted tool %q for the chat-completions API", ErrUnsupportedTool, t.SchemaType())
+		// Hosted/builtin tools (web_search, file_search, image_generation,
+		// shell, ...) are mapped only by the Responses API (Python
+		// tool_to_responses_api in ag2/config/openai/mappers.py); the Chat
+		// Completions dialect this engine speaks rejects them the same way
+		// (Python tool_to_api: UnsupportedToolError for every hosted schema).
+		// This port carries Completions only, so hosted tools fail fast here.
+		return nil, fmt.Errorf("%w: hosted tool %q for the chat-completions API "+
+			"(hosted tools need the Responses API, which is not ported)", ErrUnsupportedTool, t.SchemaType())
 	default:
 		return nil, fmt.Errorf("%w: unsupported schema type %T", ErrUnsupportedTool, tool)
 	}

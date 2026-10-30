@@ -8,7 +8,8 @@ module `ago`, Go 1.24; add the repo and import `"ago/..."` (no `go get`). Every 
 below was compile-checked against the tree as of 2026-10-30.
 
 Sections: [Concepts](#concepts) · [Agents](#agents) · [Tools](#tools) ·
-[Model providers](#model-providers) · [Middleware](#middleware) ·
+[Plugins](#plugins) · [Model providers](#model-providers) ·
+[Files API](#files-api) · [Middleware](#middleware) ·
 [Human-in-the-loop](#human-in-the-loop) ·
 [Observers, watches, alerts and halts](#observers-watches-alerts-and-halts) ·
 [Knowledge, policies, compaction, aggregation](#knowledge-policies-compaction-aggregation) ·
@@ -53,7 +54,7 @@ the type name travels on the wire as `@type` and round-trips through
 |---|---|
 | inputs | `TextInput`, `DataInput`, `BinaryInput`, `UrlInput`, `FileIdInput`, `ModelRequest` |
 | model | `ModelMessageChunk`, `ModelReasoning` (transient), `ModelResponse` (durable) |
-| tools | `ToolCallsEvent`, `ToolResultsEvent`, `ToolResultEvent`, `ToolErrorEvent`, `ToolNotFoundEvent`, `ClientToolCallEvent` |
+| tools | `ToolCallsEvent`, `ToolResultsEvent`, `ToolResultEvent`, `ToolErrorEvent`, `ToolNotFoundEvent`, `ClientToolCallEvent`, `BuiltinToolCallEvent`, `BuiltinToolResultEvent` |
 | human | `HumanInputRequest`, `ToolApprovalRequest`, `HumanMessage` |
 | usage | `UsageEvent` (kinds `model_call`, `subtask`, `compaction`, `aggregation`) |
 | tasks | `TaskStarted/Progress/Completed/Failed/Expired/Cancelled` |
@@ -353,6 +354,40 @@ tk, err := tools.NewToolkit("weather",
 agent.WithTools(tk) // the toolkit contributes all member schemas
 ```
 
+### Hosted (builtin) tools
+
+Some capabilities run **at the provider**, server-side. Their `ago/tools` constructors
+(`tools/hosted.go`) build schema carriers: the schema joins the model request (translated
+by the provider's mapper) and the provider executes — `Register` subscribes nothing, so
+there is no local function to run and no local result event:
+
+```go
+country := "US"
+a := agent.New("researcher", "...", agent.WithConfig(cfg),
+	agent.WithTools(
+		tools.NewWebSearch(tools.WithWebSearchMaxUses(3),
+			tools.WithUserLocation(tools.UserLocation{Country: &country})),
+		tools.NewCodeExecution(),
+	))
+
+// tool_search defers member tools: their schemas travel with defer_loading and
+// the model discovers them through the provider's search tool on demand.
+finder, err := tools.NewToolSearch("regex", deepResearch, crunchNumbers)
+```
+
+Constructors mirror the Python builtin kwargs — also `NewWebFetch`, `NewFileSearch`,
+`NewImageGeneration`, `NewShell`, `NewMemory` and `NewMCPServer(url, label, opts...)`
+(a remote MCP server the *provider* connects to; to connect to one yourself, use the
+[MCP client](#mcp-model-context-protocol)). Which types a provider actually carries is
+what the ported Python clients carry; anything else fails the call fast with
+`config.ErrUnsupportedTool`:
+
+| Provider | Carries | Rejects (`config.ErrUnsupportedTool`) |
+|---|---|---|
+| `config/anthropic` | web_search, web_fetch, code_execution, memory, mcp_server (incl. the request's `mcp_servers` parameter), tool_search | file_search, image_generation, shell |
+| `config/gemini` | web_search (`googleSearch`), web_fetch (`urlContext`), code_execution, file_search (requires `WithFileSearchStoreNames`) | memory, mcp_server, tool_search, shell, image_generation |
+| chat-completions (`config/openai`, zai, mistral, dashscope) and `config/ollama` | — | every hosted type (hosted mappings need the OpenAI Responses API, which is not ported) |
+
 ### Executor semantics
 
 The agent registers a `tools.Executor` for every turn. What it guarantees
@@ -364,6 +399,39 @@ The agent registers a `tools.Executor` for every turn. What it guarantees
 - **Not found.** A call whose name no registered tool owns is answered with `ToolNotFoundEvent` (error text `` Tool `X` not found ``). Hosted/builtin schemas (non-`function` `SchemaType`) are excluded — the provider settles those calls.
 - **HITL first.** A human-input failure inside a tool (or approval middleware) is never recorded as a tool result: it abandons the batch and ends the turn with a `*hitl` error.
 - **Client tools.** `tools.NewClientTool(map[string]any{...})` declares a tool the remote client executes itself — the argument is the flat wire schema (`"name"` required, plus `"description"`, `"parameters"`, `"defer_loading"`); the call becomes a `ClientToolCallEvent` replayed to the model as a forced `ModelResponse` for the client to answer.
+
+## Plugins
+
+A plugin bundles an agent's cross-cutting contributions — tools, middleware and
+system-prompt material — behind one named value (`ago/plugin`). Build a
+`plugin.Bundle`, then hand it to `agent.WithPlugin`; the bundle expands into the very
+options the agent already accepts, once, at construction (`agent/agent.go` `WithPlugin`):
+
+```go
+bundle := plugin.NewBundle("research-rules").
+	WithTool(searchTool).
+	WithMiddleware(mwFactory).                                    // any middleware.Factory (see Middleware below)
+	WithPrompt("Cite sources for every claim.").
+	WithPromptHook(func(cx *agocontext.Context) ([]string, error) {   // dynamic fragment, per fresh turn
+		return []string{"Today is " + time.Now().Format("2006-01-02") + "."}, nil
+	})
+
+a := agent.New("researcher", "...", agent.WithConfig(cfg), agent.WithPlugin(bundle.Plugin()))
+```
+
+Ordering is exactly the plain options': plugin tools append after the agent's own
+tools, plugin middleware appends after the agent's own factories (which places it
+**innermost**, closest to the model), fragments extend the collectors, and hooks run
+like `agent.WithPromptHook` hooks — seeded into the system prompt per fresh turn, not
+re-run on continuation clones. A zero or nil plugin contributes nothing, so bundles are
+safe to apply conditionally.
+
+Plugins apply at construction only (D-044): there is no attach/detach
+mid-conversation (Python's turn-scoped `additional_plugins` is not ported). The legs
+Python plugins also collect — HITL hooks, dependencies, variables, observers and
+assembly policies — are not carried, because the agent surface has no slot for them;
+compose those from `WithHitlHook`, `WithDependencies`, `WithVariables`, `observers`
+and middleware directly.
 
 ## Model providers
 
@@ -396,6 +464,35 @@ hot, err := cfg.Clone(map[string]any{"Temperature": &temp}) // Go field name or 
 ```
 
 **Structured output** is provider-transparent: with `WithResponseSchema` the OpenAI engine sends a strict `json_schema` response format; Anthropic/Gemini/Ollama embed the schema in the system prompt and validate on return. **Offline testing**: swap the config for `agotest.NewTestConfig(...)` (see [Testing](#testing)) — nothing else changes.
+
+## Files API
+
+`ago/files` is the provider-agnostic Files API (Python parity: `FilesAPI`).
+`files.Client` is the contract every provider implements — `Upload`/`Read`/`List`/
+`Delete` — and `files.NewAPI` wraps one provider's client with the argument checks
+Python's wrapper performs. A provider's client is built from its model config, so the
+API key resolves the same way `Create()` resolves it (config field, then the standard
+environment variable):
+
+```go
+fc, err := openai.NewOpenAICompletions("gpt-4o-mini").CreateFilesClient() // OPENAI_API_KEY fallback
+api := files.NewAPI(fc)
+
+up, err := api.Upload(ctx, pdfBytes, "report.pdf", "assistants") // empty purpose → "assistants" (OpenAI)
+content, err := api.Read(ctx, up.ID)      // files.FileContent: Data, Filename, Provider, Raw
+stored, err := api.List(ctx)              // every file; the client walks the provider's pagination
+err = api.Delete(ctx, up.ID)
+```
+
+`anthropic.NewAnthropic(model).CreateFilesClient()` returns the Anthropic variant
+(`/v1/files` under the `files-api-2025-04-14` beta header; upload sends no purpose
+field, list pages by `next_page`, and an unset timeout becomes 600s). Errors:
+`api.Upload` rejects nil data (`files.ErrNoData`) and an empty filename
+(`files.ErrFilenameRequired`); a non-2xx provider answer wraps the per-provider
+`ErrFilesAPI` (`openai.ErrFilesAPI` / `anthropic.ErrFilesAPI`) — match with
+`errors.Is`. Uploaded values are metadata; `Raw` carries the provider's decoded
+response verbatim. Handing a file reference into a *message* is not supported —
+`events.FileIdInput` still fails fast with `config.ErrUnsupportedInput`.
 
 ## Middleware
 
@@ -609,6 +706,31 @@ a := agent.New("client", "...", agent.WithConfig(cfg), agent.WithTools(remote...
 Remote tools are `DeclaredInCode() == false`, so a code-declared tool keeps name
 precedence. MCP content maps back to inputs: text → `TextInput`, image/audio →
 `BinaryInput`, resource links → `UrlInput`; `isError` results become tool errors.
+
+**MCP UI.** `ago/mcpui` builds the data side of MCP Apps — no connection of its own: a
+UI resource is a block a tool result hands to an MCP-UI-capable host (which renders
+HTML, an iframe URL or a Remote-DOM script from it), and a UI action is the JSON an
+in-frame button posts back to the host:
+
+```go
+res, err := mcpui.RawHTML("ui://shop/item", "<b>Item A</b>",
+	mcpui.WithUIMetadata(map[string]any{"target": "panel"})) // uri must start with ui://
+
+result := events.NewToolResult(false, "Pick an item.")
+result = mcpui.WithUIResource(result, res) // UI blocks ride in the tool result's parts
+
+// The postMessage payload an in-frame button emits (html-attribute-safe):
+action := mcpui.ToolCall("buy_item", map[string]any{"sku": "A-1"})
+html := `<button onclick="` + mcpui.PostMessage(action) + `">Buy</button>`
+```
+
+Builders: `RawHTML` (inline HTML), `ExternalURL` (rendered in an iframe),
+`RemoteDOM` (script; framework via `mcpui.WithFramework` — `mcpui.FrameworkReact`
+(default) or `mcpui.FrameworkWebComponents`), each with
+`mcpui.WithEncoding(mcpui.EncodingBlob)` for base64 transport. Actions:
+`mcpui.ToolCall`, `Prompt`, `Link`, `Intent`, `Notify`. Resource URIs must start
+`ui://`; `mcpui.Marshal(res)` renders the byte-exact wire JSON (plain `json.Marshal`
+is shape-equivalent but HTML-escapes).
 
 ## Multi-agent network
 

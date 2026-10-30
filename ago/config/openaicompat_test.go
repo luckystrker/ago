@@ -321,6 +321,11 @@ func TestToolToAPIUnsupported(t *testing.T) {
 	if _, err := ToolToAPI(hosted); !errors.Is(err, ErrUnsupportedTool) {
 		t.Fatalf("hosted tools must fail fast, got %v", err)
 	}
+	// A real carrier fails the same way: chat completions has no hosted mapping
+	// (the Responses API, which this port does not carry, is their only host).
+	if _, err := ToolToAPI(tools.FileSearchToolSchema{StoreNames: []string{"s"}}); !errors.Is(err, ErrUnsupportedTool) {
+		t.Fatalf("real hosted carriers must fail fast, got %v", err)
+	}
 	if _, err := ToolToAPI(42); !errors.Is(err, ErrUnsupportedTool) {
 		t.Fatalf("unsupported schema kinds must fail fast, got %v", err)
 	}
