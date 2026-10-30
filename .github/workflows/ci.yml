@@ -7,11 +7,8 @@ on:
 
 jobs:
   framework:
-    name: Framework (ago/)
+    name: Framework
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ago
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +37,6 @@ jobs:
   examples:
     name: Examples
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: examples
     steps:
       - uses: actions/checkout@v4
 
@@ -52,13 +46,13 @@ jobs:
           check-latest: true
 
       - name: Build
-        run: go build ./...
+        run: go build ./examples/...
 
       - name: Vet
-        run: go vet ./...
+        run: go vet ./examples/...
 
       - name: Smoke (run three examples end-to-end)
         run: |
-          go run ./ask          > /dev/null
-          go run ./tools        > /dev/null
-          go run ./structured_output > /dev/null
+          go run ./examples/ask          > /dev/null
+          go run ./examples/tools        > /dev/null
+          go run ./examples/structured_output > /dev/null

@@ -25,11 +25,11 @@ import (
 	"net/http"
 	"sync"
 
-	"ago/agent"
-	"ago/events"
-	"ago/mcp"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/mcp"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 func main() {

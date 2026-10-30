@@ -6,17 +6,16 @@ relevant spec in `docs/specs/` before writing code. The Python reference is in `
 
 ## Hard rules
 
-1. **Module `ago`**, Go 1.24. The framework module lives in `ago/` (packages at
-   `ago/events`, `ago/agent`, ...; import paths are still `ago/agent` etc.). Examples
-   are a separate module in `examples/` (module `agoexamples`, `replace ago => ../ago`).
-   A `go.work` at the repo root ties them together; `go test ./...` must be run inside
-   `ago/` (from the root it fails — the root itself is not a module).
+1. **Module `github.com/luckystrker/ago`**, Go 1.24. `go.mod` sits at the repository root and
+   every framework package is a directory at the root (`events/`, `agent/`, ...; import paths
+   are `github.com/luckystrker/ago/agent` etc.). Examples are part of the same module, in
+   `examples/`; there is no `go.work`. All gates run from the repo root.
 2. **Zero external dependencies.** stdlib only. Need a dep? Stop and record a DECISIONS entry.
 3. **No import cycles.** Check the dependency graph in ARCHITECTURE.md before importing:
    `agent` never imports `network`; `config` never imports `agent`.
-4. **Gates before you finish a task:** from `ago/`: `go build ./...`, `go vet ./...`,
+4. **Gates before you finish a task:** from the repo root: `go build ./...`, `go vet ./...`,
    `go test ./...` (or at minimum `go test ./<your-package>/...`) — all green, no skipped
-   tests. For examples: from `examples/`: `go build ./...` and `go vet ./...`.
+   tests. For examples: `go build ./examples/...` and `go vet ./examples/...`.
 5. Every deviation from Python parity: code comment `// AGO-DEVIATION: <reason>` + entry in
    `docs/DECISIONS.md`.
 6. Comments explain constraints, not history. No "ported from ag2/..." chatter.
@@ -48,10 +47,11 @@ relevant spec in `docs/specs/` before writing code. The Python reference is in `
 
 ## Where things live (quick map)
 
-- Event vocabulary: `ago/events/` (one file per Python module: input.go, model.go, tool.go, task.go, lifecycle.go, alert.go, base.go, condition.go, marshal.go, sizing.go)
-- Conversation plumbing: `ago/stream/`, `ago/context/`, `ago/hitl/`
-- LLM: `ago/config/` (core), `ago/config/<provider>/`, `ago/internal/httpx`, `ago/internal/sse`, `ago/internal/uuid`
-- Tools: `ago/tools/`
-- Turn loop: `ago/agent/`
+- Event vocabulary: `events/` (one file per Python module: input.go, model.go, tool.go, task.go, lifecycle.go, alert.go, base.go, condition.go, marshal.go, sizing.go)
+- Conversation plumbing: `stream/`, `context/`, `hitl/`
+- LLM: `config/` (core), `config/<provider>/`, `internal/httpx`, `internal/sse`, `internal/uuid`
+- Tools: `tools/`
+- Turn loop: `agent/`
+- CLI helper: `cmd/ago/` (`ago version` / `doctor` / `demo`)
 - Reference specs: `docs/specs/{core,config-llm,tools,events-network}.md`
 - Status tracker: `docs/PORT_STATUS.md` — update when your package reaches green.

@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"strings"
 
-	"ago/agent"
-	"ago/events"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 // turns is the user's side of the dialogue, one entry per turn (Python parity

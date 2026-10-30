@@ -13,11 +13,11 @@ import (
 	"context"
 	"fmt"
 
-	"ago/agent"
-	"ago/events"
-	"ago/middleware"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/middleware"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 func main() {

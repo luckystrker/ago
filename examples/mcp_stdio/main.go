@@ -21,10 +21,10 @@ import (
 	"os"
 	"strings"
 
-	"ago/agent"
-	"ago/events"
-	"ago/mcp"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/mcp"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 // serverModeArg marks the child process. The parent re-executes its own binary

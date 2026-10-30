@@ -1,7 +1,7 @@
 # Migration map: Python AG2 → AGo
 
 This is the class/function-level map for moving code from AG2 (Python, commit `fa4e0fb`,
-2026-10-27) to AGo (Go, module `ago`). The behavioral source of truth is the Python reference
+2026-10-27) to AGo (Go, module `github.com/luckystrker/ago`). The behavioral source of truth is the Python reference
 in `ag2/` and its distilled specs in `docs/specs/`; the Go contracts are in
 `docs/ARCHITECTURE.md`. Per-package completeness lives in [docs/PORT_STATUS.md](PORT_STATUS.md);
 every deliberate deviation carries a decision record in [docs/DECISIONS.md](DECISIONS.md)
@@ -12,13 +12,13 @@ Reading conventions:
 - **Python column** names the 2026 AG2 API (classic `ConversableAgent`/`GroupChat` API is gone
   in AG2 itself; see §5).
 - **Go column** gives the exact exported symbol, verified against the packages in this repo.
-- `*agocontext.Context` is `ago/context` — the alias exists because it collides with stdlib
+- `*agocontext.Context` is `github.com/luckystrker/ago/context` — the alias exists because it collides with stdlib
   `context`. Cancellable operations take a `context.Context` as first parameter where Python
   was `async`.
 
 ## 1. Core API
 
-### Agent and turn lifecycle (`ag2/agent.py` → `ago/agent`)
+### Agent and turn lifecycle (`ag2/agent.py` → `github.com/luckystrker/ago/agent`)
 
 | Python | Go | Differences |
 |---|---|---|
@@ -42,7 +42,7 @@ Reading conventions:
 
 | Python | Go | Differences |
 |---|---|---|
-| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, copies maps |
+| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `github.com/luckystrker/ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, copies maps |
 | `context.enqueue/input/ask/send/spawn_background` | `Enqueue/Pending/Drain`, `Input(ctx, msg, timeout)`, `Ask(ctx, req)`, `Send`, `SpawnBackground` | `Drain()` returns and clears pending input (Python drains implicitly in the turn loop) |
 | `dependency_provider` / DI annotations `Inject`, `Variable`, `Context` | `Dependency(id)`, `MustDependency(id)`, `SetDependency`; tool-side: `tools.NewInject`, `tools.NewVariable`, a `*agocontext.Context` parameter (§2) | DI values keyed by string id (Python keys are arbitrary objects) |
 | `hitl_hook: HumanHook`, `default_hitl_hook` | `hitl.HumanHook`, `hitl.DefaultHook` (`→ hitl.ErrNotProvided`), `ctx.SetHitlHook(h)` | `HumanHook func(ctx context.Context, req *events.HumanInputRequest) (*events.HumanMessage, error)`; typed errors `NotProvidedError`/`FailedError`/`TimeoutError` match the Python `HumanInputError` family |
@@ -54,7 +54,7 @@ Reading conventions:
 | `EstimatedTokens(event, chars_per_token=4)` | `events.EstimatedTokens(ev, charsPerToken)` | Same flat weights (image/audio 1000, video/document 2000) |
 | async dispatch, `sync_to_thread` | Synchronous dispatch in the caller's goroutine | D-004: no thread offloading; background work via `SpawnBackground` (goroutine + panic recovery) |
 
-### Response schemas (`ag2/response/` → `ago/response`)
+### Response schemas (`ag2/response/` → `github.com/luckystrker/ago/response`)
 
 | Python | Go | Differences |
 |---|---|---|
@@ -73,14 +73,14 @@ Reading conventions:
 | `TaskState`, `TaskSpec`, `TaskMetadata`, `CheckpointStore`, `Task` async CM (`ag2/task.py`) | `task.State`, `task.Spec`, `task.Metadata`, `task.CheckpointStore`, `task.MemoryCheckpointStore`, `task.Task` | Python's async context manager (auto-complete/auto-fail) → explicit terminal calls `Complete/Fail/Cancel/Expire` (each returns `error`); `task.Start(ctx, owner, spec, opts...)` opens; `task.DepKey = "ag:task"` dependency key preserved |
 | `TaskConfig` (`ag2/agent.py`) | `agent.TaskConfig` + `agent.WithTasks(cfg)` | Fields `Config`, `Prompt`, `IncludeTools`, `ExcludeTools`, `ExtraTools`, `MaxConcurrency`; `IncludeTools []string` — nil = all parent tools (Python `include_tools=None` default), empty slice = none, allowlist of names otherwise (`ExcludeTools` applies after it). Breaking vs earlier AGo builds where `IncludeTools bool` defaulted to "no parent tools" |
 | `AgentSpec.from_agent() / to_agent()` (`ag2/spec.py`) | `spec.FromAgent(a)`, `(*spec.AgentSpec).ToAgent(available map[string]tools.Tool, opts ...agent.Option)` | Wire keys stay snake_case (`tool_names`, `response_schema`); missing tool → `tools.ErrResolution` |
-| `TestConfig` / `TrackingConfig` (`ag2/testing.py`) | `agotest.NewTestConfig(responses ...*events.ModelResponse)`, `agotest.NewTrackingConfig(inner config.ModelConfig)` | Import alias `agotest "ago/testing"`; scripted full responses with a shared cursor and recorded call snapshots (Python's partial-turn vocabulary collapsed — D-018) |
+| `TestConfig` / `TrackingConfig` (`ag2/testing.py`) | `agotest.NewTestConfig(responses ...*events.ModelResponse)`, `agotest.NewTrackingConfig(inner config.ModelConfig)` | Import alias `agotest "github.com/luckystrker/ago/testing"`; scripted full responses with a shared cursor and recorded call snapshots (Python's partial-turn vocabulary collapsed — D-018) |
 | `exceptions.py` hierarchy (`AG2Error`, `ConfigNotProvidedError`, `HumanInputError`, `ToolConflictError`, …) | Per-package sentinels: `agent.ErrConfigNotProvided`, `hitl.ErrNotProvided` (+ typed errors), `config.ErrNotProvided/ErrUnsupportedInput/ErrUnsupportedTool`, `tools.ErrConflict/ErrNotFound/ErrResolution`, `stream.ErrHandled`, `response.ErrInvalidResponse` | Exceptions → `errors.New` sentinels + `%w` wrapping + `errors.Is/As` (no exception classes) |
 | `SendableMessage` (`ag2/types.py`) | `agent.Sendable = any` | JSON-decodable value, `events.Input`, or string |
 | `MediaInput` factories (`ImageInput/DocumentInput/...`) | `events.ImageInput/DocumentInput/AudioInput/VideoInput(url, path, data, mediaType)` | One function per modality covering url/file/data sources; `events.MediaTypeForPath` for extension inference |
 
 ## 2. Tools and middleware
 
-### Tools (`ag2/tools/` → `ago/tools`)
+### Tools (`ag2/tools/` → `github.com/luckystrker/ago/tools`)
 
 | Python | Go | Differences |
 |---|---|---|
@@ -97,9 +97,9 @@ Reading conventions:
 | `resolve_tools(all_tools, context)` | `tools.ResolveTools(all []Tool, cx *agocontext.Context) (*tools.ResolvedTools, error)` | Same precedence: declared-in-code wins in declaration order; runtime tools never override; remote-vs-remote first wins; losing toolkit members pruned for the turn |
 | `SubagentTool` (`tools/subagents/`) | `agent.AsTool` + `agent` subtask tools | Lives in `agent` to avoid an import cycle (`tools` cannot import `agent`) |
 | `MCPToolkit` (`tools/toolkits/mcp_server/`) | `mcp.New(config) (*mcp.Client, ...)` + `mcp.Tools(cl) ([]tools.Tool, error)` | No `Toolkit` subtype — a helper converts remote tools to `tools.Tool` with `DeclaredInCode=false`; stdio + streamable HTTP, paginated `ListTools`, content mapping (D-029, D-034). Python's `mcp_tool` `Variable` indirection (and `Depends`/`Inject` parameters) is not ported — remote tools map their declared schemas directly (D-029, D-036) |
-| Builtin/hosted tools (`tools/builtin/`: `web_search`, `web_fetch`, `code_execution`, `file_search`, `image_generation`, `shell`, `memory`, `mcp_server`, `tool_search`) | `tools.NewWebSearch` / `NewWebFetch` / `NewCodeExecution` / `NewFileSearch` / `NewImageGeneration` / `NewShell` / `NewMemory` / `NewMCPServer(url, label, …)` / `NewToolSearch(mode, tools…)` (`ago/tools`, `hosted.go`) | Schema carriers (D-047): constructor options = Python kwargs, `Schemas` return the provider-neutral `ToolSchema` (Python wire field names), `Register` subscribes nothing (provider executes). `NewToolSearch` defers member schemas with `defer_loading` and registers the members (their calls are answered client-side). Provider mappers map what the ported Python clients map — anthropic: web_search/web_fetch/code_execution/memory/mcp_server/tool_search; gemini: googleSearch/urlContext/codeExecution/fileSearch; every other combination fails fast with `config.ErrUnsupportedTool`. The `search/sandbox/shell/skills/dynamic` tool **content** packages stay deferred (§5) |
+| Builtin/hosted tools (`tools/builtin/`: `web_search`, `web_fetch`, `code_execution`, `file_search`, `image_generation`, `shell`, `memory`, `mcp_server`, `tool_search`) | `tools.NewWebSearch` / `NewWebFetch` / `NewCodeExecution` / `NewFileSearch` / `NewImageGeneration` / `NewShell` / `NewMemory` / `NewMCPServer(url, label, …)` / `NewToolSearch(mode, tools…)` (`github.com/luckystrker/ago/tools`, `hosted.go`) | Schema carriers (D-047): constructor options = Python kwargs, `Schemas` return the provider-neutral `ToolSchema` (Python wire field names), `Register` subscribes nothing (provider executes). `NewToolSearch` defers member schemas with `defer_loading` and registers the members (their calls are answered client-side). Provider mappers map what the ported Python clients map — anthropic: web_search/web_fetch/code_execution/memory/mcp_server/tool_search; gemini: googleSearch/urlContext/codeExecution/fileSearch; every other combination fails fast with `config.ErrUnsupportedTool`. The `search/sandbox/shell/skills/dynamic` tool **content** packages stay deferred (§5) |
 
-### Middleware (`ag2/middleware/` → `ago/middleware`)
+### Middleware (`ag2/middleware/` → `github.com/luckystrker/ago/middleware`)
 
 | Python | Go | Differences |
 |---|---|---|
@@ -116,11 +116,11 @@ Reading conventions:
 
 ## 3. Provider configs
 
-All Go configs live in `ago/config/<provider>` and implement `config.ModelConfig`
+All Go configs live in `github.com/luckystrker/ago/config/<provider>` and implement `config.ModelConfig`
 (`Provider()`, `Model()`, `Create() (LLMClient, error)`, `Clone(overrides)`). Clients implement
 `config.LLMClient.Call(ctx, messages, conv, opts)`. Missing model/key →
 `config.ErrNotProvided` (parity with `ConfigNotProvidedError`). No SDKs: every provider is raw
-HTTP/SSE over `ago/internal/httpx` + `ago/internal/sse` (D-003, D-017).
+HTTP/SSE over `github.com/luckystrker/ago/internal/httpx` + `github.com/luckystrker/ago/internal/sse` (D-003, D-017).
 
 | Python config | Go config (constructor) | Status | Notes / what is narrower |
 |---|---|---|---|
@@ -128,7 +128,7 @@ HTTP/SSE over `ago/internal/httpx` + `ago/internal/sse` (D-003, D-017).
 | `OpenAICompletionsConfig` (and deprecated alias `OpenAIConfig`) | `config/openai.OpenAICompletionsConfig` — `NewOpenAICompletions(model)` | **full** | Chat Completions: SSE streaming with tool-call delta merge, tools, strict structured output (`openai.StrictifySchema`, `openai.ResponseFormat`), usage incl. cached/reasoning tokens; env `OPENAI_API_KEY`. Sampling/verbosity fields subset |
 | `OpenAIResponsesConfig` | — | deferred (D-008) | Responses API not ported; `defer_loading` tool schemas fail fast |
 | `OpenAIDecisionsConfig` | — | deferred (D-008) | |
-| `ag2/files/` (`FilesAPI`, `FilesClient` protocol), `config/openai/files.py`, `config/anthropic/files.py` | `ago/files`: `files.NewAPI(client files.Client) *files.API`, types `UploadedFile`/`FileContent`/`FileProvider`; provider clients via `(*openai.OpenAICompletionsConfig).CreateFilesClient()` and `(*anthropic.AnthropicConfig).CreateFilesClient()` | **full** (D-046) | `API` delegates `Upload/Read/List/Delete` and keeps Python's two upload validations (`files.ErrNoData`, `files.ErrFilenameRequired`); OpenAI: multipart upload (empty purpose → `assistants`), `has_more`/`after` pagination; Anthropic: `/v1/files` under `files-api-2025-04-14`, no purpose on upload, `next_page`/`page` pagination, 600s default timeout; non-2xx → per-provider `ErrFilesAPI`. Python's `created_at`/`media_type` survive in `Raw`. `containers.py` deferred; a file reference as a *message input* still fails fast (`events.FileIdInput` → `config.ErrUnsupportedInput`, D-017/D-020) |
+| `ag2/files/` (`FilesAPI`, `FilesClient` protocol), `config/openai/files.py`, `config/anthropic/files.py` | `github.com/luckystrker/ago/files`: `files.NewAPI(client files.Client) *files.API`, types `UploadedFile`/`FileContent`/`FileProvider`; provider clients via `(*openai.OpenAICompletionsConfig).CreateFilesClient()` and `(*anthropic.AnthropicConfig).CreateFilesClient()` | **full** (D-046) | `API` delegates `Upload/Read/List/Delete` and keeps Python's two upload validations (`files.ErrNoData`, `files.ErrFilenameRequired`); OpenAI: multipart upload (empty purpose → `assistants`), `has_more`/`after` pagination; Anthropic: `/v1/files` under `files-api-2025-04-14`, no purpose on upload, `next_page`/`page` pagination, 600s default timeout; non-2xx → per-provider `ErrFilesAPI`. Python's `created_at`/`media_type` survive in `Raw`. `containers.py` deferred; a file reference as a *message input* still fails fast (`events.FileIdInput` → `config.ErrUnsupportedInput`, D-017/D-020) |
 | `AnthropicConfig` | `config/anthropic.AnthropicConfig` — `NewAnthropic(model)` | **full** | Messages API over raw HTTP/SSE: `tool_use`/`tool_result` replay with orphan repair, prompt caching (`cache_control` injection), thinking blocks + redacted-thinking handling, usage incl. cache tokens; env `ANTHROPIC_API_KEY` |
 | `GeminiConfig` | `config/gemini.GeminiConfig` — `NewGemini(apiKey, model, opts...)` | **full** | `generateContent` + SSE streaming, function declarations, `usageMetadata` normalization (tool-use prompt tokens, thinking tokens); env `GEMINI_API_KEY` |
 | `VertexAIConfig` | — (only the `ProviderVertexAI` enum value) | deferred (D-022) | Google auth chain not ported |
@@ -149,7 +149,7 @@ openai/zai/mistral/dashscope), `config.BuildMessages`, `config.ToolToAPI`,
 
 ## 4. Events
 
-`ag2/events/*` → `ago/events` (one Go file per Python module). Base contract: embed
+`ag2/events/*` → `github.com/luckystrker/ago/events` (one Go file per Python module). Base contract: embed
 `events.Base` + implement `Event` (`EventType()`, `CreatedAt()`, `Transient()`,
 `Conversational()`). Python's `Field()` descriptors and condition DSL become plain structs plus
 predicate combinators (D-005): `events.Condition`, `AllOf/AnyOf/Not/TypeOf/Equal/TypeOfAny`.
@@ -176,7 +176,7 @@ predicate combinators (D-005): `events.Condition`, `AllOf/AnyOf/Not/TypeOf/Equal
 | `CompactionSummary` | `events.CompactionSummary` | `[Summary of earlier conversation]` replay text preserved |
 | `TaskStarted/Progress/Completed/Failed/Expired/Cancelled`, `TaskSpec` | `events.TaskStarted` … `events.TaskCancelled`, `events.TaskSpec` | `TaskProgress` transient |
 | `Severity`, `ObserverAlert`, `HaltEvent` | `events.Severity` (`info…fatal`) / `events.ObserverAlert` / `events.HaltEvent` | Halt → synthetic `"HALTED: <reason>"` response in the agent |
-| Lifecycle: `ObserverStarted/Completed`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent` | same names in `ago/events` | All transient |
+| Lifecycle: `ObserverStarted/Completed`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent` | same names in `github.com/luckystrker/ago/events` | All transient |
 | `ProviderReplay` mixin + provider events (`OpenAIReasoningEvent`, `AnthropicRedactedThinkingEvent`) | — | Not separate events: provider-native replay state is handled inside each provider client's mapping |
 | Condition DSL (`Event.field == x`, `A \| B`, `~c`) | `events.Condition` + `AllOf/AnyOf/Not/TypeOf[T]/Equal/TypeOfAny` | Predicate functions instead of operator overloading (D-005) |
 | `events/voice.py` | — | Deferred (live/voice stack not ported) |
@@ -188,7 +188,7 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 | Python AG2 | AGo answer |
 |---|---|
 | Classic API: `ConversableAgent`, `initiate_chat`, `generate_reply` | Already removed in the 2026 AG2 rewrite itself; AGo ports the replacement: `agent.Agent`, `Ask`/`Run` (D-002) |
-| `GroupChat` / `GroupChatManager` | `ago/network`: `Hub` + channel adapters — `WorkflowAdapter` (declarative `TransitionGraph`), `DiscussionAdapter` (round-robin), `ConversationAdapter`, `ConsultingAdapter`; `Agent.AsTool` for delegation |
+| `GroupChat` / `GroupChatManager` | `github.com/luckystrker/ago/network`: `Hub` + channel adapters — `WorkflowAdapter` (declarative `TransitionGraph`), `DiscussionAdapter` (round-robin), `ConversationAdapter`, `ConsultingAdapter`; `Agent.AsTool` for delegation |
 | `register_reply` (reply-function chain) | `middleware.Factory` list on the agent — the four-hook onion (`OnTurn`/`OnLLMCall`/`OnToolExecution`/`OnHumanInput`) |
 | `human_input_mode` | `agent.WithHitlHook(h hitl.HumanHook)` |
 | `update_system_message`, `register_hook` | `WithPromptHook`/`WithPromptFragments`; cross-cutting hooks → middleware or `observers.Observer` |
@@ -199,24 +199,24 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 | `Agent(..., observers=[...])` wiring | No agent option: observers subscribe directly on the conversation stream — `observers.Observer.Register(ctx)` (D-025) |
 | `Agent(..., assembly=[...])` (`AssemblerMiddleware`) | No built-in assembler: wrap `policies.AssemblyPolicy` transforms in a `middleware.Factory` yourself (pattern in `examples/policies_compact`) |
 | `Agent(..., knowledge=KnowledgeConfig)` | No agent option: pass `knowledge.Store` to `policies.NewWorkingMemoryPolicy`/`NewEpisodicMemoryPolicy` and wire via middleware (pattern in `examples/knowledge_memory`) |
-| `FilesAPI` / `FilesClient` (`ag2/files/`) | Ported (D-046): `ago/files` (`files.NewAPI` over any `files.Client`), provider clients via `CreateFilesClient()` on `config/openai` / `config/anthropic` (map in §3). File references as message inputs still fail fast with `config.ErrUnsupportedInput` (D-017/D-020) |
+| `FilesAPI` / `FilesClient` (`ag2/files/`) | Ported (D-046): `github.com/luckystrker/ago/files` (`files.NewAPI` over any `files.Client`), provider clients via `CreateFilesClient()` on `config/openai` / `config/anthropic` (map in §3). File references as message inputs still fail fast with `config.ErrUnsupportedInput` (D-017/D-020) |
 | OpenAI Responses API, Decisions API | Deferred (D-008) — Chat Completions is the supported OpenAI surface |
-| Hosted/builtin tools: `web_search`, `web_fetch`, `code_execution`, `file_search`, `image_generation`, `shell`, `memory`, `mcp_server`, `tool_search` | Carriers ported (D-047, map in §2): `ago/tools` `hosted.go`, mapped by anthropic and gemini; chat-completions + ollama reject every hosted schema (`config.ErrUnsupportedTool`). Still deferred: the OpenAI **Responses** mappings (`tool_to_responses_api` — file_search, image_generation, shell, MCP, tool_search), Gemini grounding/server-tool replay events, and the `search/`/`sandbox/`/`shell/`/`skills/`/`dynamic/` tool content packages |
-| `ag2/mcp` server product (`MCPServer`, `mcp_tool`, sampling, elicitation) | Deferred — only the minimal MCP **client** is ported (`ago/mcp`, D-029); `input_required` answering, discovery cache, protocol-era negotiation not ported (D-034 covers timeouts) |
+| Hosted/builtin tools: `web_search`, `web_fetch`, `code_execution`, `file_search`, `image_generation`, `shell`, `memory`, `mcp_server`, `tool_search` | Carriers ported (D-047, map in §2): `github.com/luckystrker/ago/tools` `hosted.go`, mapped by anthropic and gemini; chat-completions + ollama reject every hosted schema (`config.ErrUnsupportedTool`). Still deferred: the OpenAI **Responses** mappings (`tool_to_responses_api` — file_search, image_generation, shell, MCP, tool_search), Gemini grounding/server-tool replay events, and the `search/`/`sandbox/`/`shell/`/`skills/`/`dynamic/` tool content packages |
+| `ag2/mcp` server product (`MCPServer`, `mcp_tool`, sampling, elicitation) | Deferred — only the minimal MCP **client** is ported (`github.com/luckystrker/ago/mcp`, D-029); `input_required` answering, discovery cache, protocol-era negotiation not ported (D-034 covers timeouts) |
 | Network: WebSocket link (`transport/ws.py`), federation (`remote.py`), view policies (`views/`: FullTranscript, WindowedSummary, NamedTranscript, NamedWindowedSummary), task mirror, hub expectation sweepers/arbiter, client LLM tools (`peers`/`channels`/`tasks`/`context`/`delegate`) | Deferred (D-010/D-031) — the ported subset is single-host: envelope vocabulary (`ag2.*`), channel state machine, passports, rules, `TransitionGraph`, handoff/finish, `Hub`, four adapters, `HubClient`/`AgentClient`/`HumanClient`, WAL (memory/file/knowledge) with `Replay`, `transport.LocalLink` |
 | Knowledge: `SqliteKnowledgeStore`, `RedisKnowledgeStore`, `bootstrap.py`, `polling.py` | Deferred (D-003/D-011 — external deps are forbidden); `MemoryStore`, `DiskStore`, `LockedStore`, `EventLogWriter` (JSONL) ship |
 | `streams/redis/` | Deferred (D-003/D-004); `stream.MemoryStorage` ships |
 | Live/voice (`ag2/live/`, `events/voice.py`) | Not ported — realtime audio stack out of scope |
-| `a2a/` — `A2AServer` (`server.py:38`), `build_card` (`card.py:31`), `AgentExecutor` (`executor.py`), the JSON-RPC transport (`transports/`), `A2AClient(LLMClient)` (`client.py:159`), task records (`tasks.py`) | Ported transport-level subset (D-049/D-050, superseding the D-010 deferral for this slice): `ago/a2a` — `NewServer(ServerConfig{Card, Handle, Store})` + `Handler()` (card discovery at `/.well-known/agent-card.json` + legacy `agent.json`; JSON-RPC 2.0 `message/send`, two-event SSE `message/stream`, `tasks/get` with `historyLength` trimming, `tasks/cancel`), `TaskStore` interface + `NewMemoryTaskStore`, protocol types with camelCase tags and the `kind` part discriminator (`NewTextPart`/`NewDataPart`/`NewFilePart`); client `NewClient(baseURL, opts...)` — `AgentCard`/`SendMessage`/`TasksGet`/`TasksCancel`. Not ported: the conversational `A2AClient` turn machinery (an `LLMClient` shipping full history, streaming/polling to a terminal task, context-variable sync, `urn:ag2:client-tools:v1` client tools, HITL over the wire, reconnect/resubscribe), REST/gRPC transports, push notifications, card signing, cluster mode, tenants, the extended task-state machine |
-| `acp/` — `ACPAgent` (`agent.py:118`) + executor, `ACPBridge` (`bridge.py:259`) + `make_bridge`, `ACPClient` (`client.py:77`), `permissions.py`, `elicitation.py` | Ported (D-052, superseding the D-010 deferral for this slice): `ago/acp` — both roles over newline-delimited JSON-RPC 2.0 stdio. Serve: `Serve(ServeConfig)` / `ServeAgent(a, cfg)` (`initialize` with min-version + truthful text-only capabilities, `session/new`, `session/prompt` running `Handle(sessionID, userText, emit)` with per-emit `agent_message_chunk` updates and final-text-once dedup; `Session.RequestPermission` / `Session.Elicit` gated by the config's policies — a deny is synthesized locally, never on the wire). Client: `NewBridge(cmd, args, env)` + `SessionNew`/`Prompt`/`Close` with inline policy answers (allow picks the agent's first `allow_once`/`allow_always` option). Wire dialect follows the Python SDK (`content` blocks, nested `{"outcome": {"outcome", "optionId"}}` permission answers with `selected`/`cancelled`; deny selects a reject option the agent offered); the earlier `contentBlock`/flat spellings are still accepted on input (D-052). Text-only elicitation. Not ported: `session/cancel` + the `cancelled` stop reason, `session/load` replay, the multi-session store (LRU/TTL/queues), auth, thought/plan/tool-call/usage updates, mediated `fs`/`terminal`/`tool_gateway.py`, `guard.py`, model pickers, remote transports |
-| `ag_ui/` — `AGUIStream` (`stream.py:118`), `build_asgi` (`asgi.py:22`), `run_input.py` (`read_run_input`), `capabilities.py` (`served_capabilities`), `events.py` (`AGUIEvent`) | Ported (D-053, superseding the D-010 deferral for this slice): `ago/agui` — AG-UI 1.0 serving over `net/http`: `ServeAgent(a) http.Handler` and `Handler(HandlerConfig)` (GET capabilities, POST → SSE, 400 before any stream on an unparseable body, protocol-major refusal, cancelled outcome), the event projection `NewStream(emit)` + `Handle` (chunks → TEXT_MESSAGE_*, reasoning spans → REASONING_*, tool calls closed before execution, TOOL_CALL_RESULT, client hand-offs, task lifecycle → SUBAGENT_*, per-(provider,model) usage, `TakeUsage`/`SuccessOutcome`), `ReadRunInput` (unknown-role strip, base64 refusal), `CapabilitiesFor`, typed events + `UnmarshalEvent` + `Raw` catch-all, `AGUIEvent` carrying protocol events on an ago stream. Not ported: the held-turn interrupt machinery (`interrupts.py` — a question fails the run as RUN_ERROR), REASONING_ENCRYPTED_VALUE, STATE_SNAPSHOT emission from `ServeAgent`, prompt-level inputs as per-run fragments, snake_case input parsing |
-| `eval/` — `runtime/runner.py` (`run_agent`), `runtime/evaluate.py` (`evaluate_traces`), `trace.py` (`Trace`), `scorer.py` (`Scorer`, the `@scorer` decorator), `scorers/` (correctness, cost, threshold, tools, judge, pairwise_judge, attribution), `pairwise.py` (`PairwiseComparator`, `WinRate`), `results/` (`RunResult`, `store.dump`) | Ported produce-then-grade subset (D-051, superseding the D-010 deferral for this slice): `ago/eval` — `Run(ctx, agent, Suite)` over `Case{Name, Input, Expected, Scorers}`, `BuildTrace(evs)` reconstructing `Trace` **from the stream's event log — no OTEL** (the core deviation; `LLMCalls` paired with the preceding `model_call` `UsageEvent`, `ToolCalls` matched by call id, `Tokens()` via `ago/usage`), scorers `Correctness` (exact/casefold/contains), `TokenBudget`, `ToolsCalled` (any/all), `Threshold`, `LLMJudge` (one headless client call, JSON verdict, clamped), `Pairwise` (dual-order swap, flip → tie), `ScoreWith` (scorer error → failing score, never an abort), `RunResult.SaveJSON`/`LoadJSON` (events round-trip through `@type`) + `Compare` (win rate, ties 0.5). Deferred: OTEL/Tempo/OTLP trace sources and `evaluate_traces`, the `@scorer` DI decorator, the attribution scorer, repeats/per-task configs/`BudgetThresholds`/lifecycle events, case concurrency (sequential in AGo), `RunDiff`, `Suite.from_jsonl`/tags/metadata, pairwise single-order mode, Wilson CI, Cohen's kappa |
+| `a2a/` — `A2AServer` (`server.py:38`), `build_card` (`card.py:31`), `AgentExecutor` (`executor.py`), the JSON-RPC transport (`transports/`), `A2AClient(LLMClient)` (`client.py:159`), task records (`tasks.py`) | Ported transport-level subset (D-049/D-050, superseding the D-010 deferral for this slice): `github.com/luckystrker/ago/a2a` — `NewServer(ServerConfig{Card, Handle, Store})` + `Handler()` (card discovery at `/.well-known/agent-card.json` + legacy `agent.json`; JSON-RPC 2.0 `message/send`, two-event SSE `message/stream`, `tasks/get` with `historyLength` trimming, `tasks/cancel`), `TaskStore` interface + `NewMemoryTaskStore`, protocol types with camelCase tags and the `kind` part discriminator (`NewTextPart`/`NewDataPart`/`NewFilePart`); client `NewClient(baseURL, opts...)` — `AgentCard`/`SendMessage`/`TasksGet`/`TasksCancel`. Not ported: the conversational `A2AClient` turn machinery (an `LLMClient` shipping full history, streaming/polling to a terminal task, context-variable sync, `urn:ag2:client-tools:v1` client tools, HITL over the wire, reconnect/resubscribe), REST/gRPC transports, push notifications, card signing, cluster mode, tenants, the extended task-state machine |
+| `acp/` — `ACPAgent` (`agent.py:118`) + executor, `ACPBridge` (`bridge.py:259`) + `make_bridge`, `ACPClient` (`client.py:77`), `permissions.py`, `elicitation.py` | Ported (D-052, superseding the D-010 deferral for this slice): `github.com/luckystrker/ago/acp` — both roles over newline-delimited JSON-RPC 2.0 stdio. Serve: `Serve(ServeConfig)` / `ServeAgent(a, cfg)` (`initialize` with min-version + truthful text-only capabilities, `session/new`, `session/prompt` running `Handle(sessionID, userText, emit)` with per-emit `agent_message_chunk` updates and final-text-once dedup; `Session.RequestPermission` / `Session.Elicit` gated by the config's policies — a deny is synthesized locally, never on the wire). Client: `NewBridge(cmd, args, env)` + `SessionNew`/`Prompt`/`Close` with inline policy answers (allow picks the agent's first `allow_once`/`allow_always` option). Wire dialect follows the Python SDK (`content` blocks, nested `{"outcome": {"outcome", "optionId"}}` permission answers with `selected`/`cancelled`; deny selects a reject option the agent offered); the earlier `contentBlock`/flat spellings are still accepted on input (D-052). Text-only elicitation. Not ported: `session/cancel` + the `cancelled` stop reason, `session/load` replay, the multi-session store (LRU/TTL/queues), auth, thought/plan/tool-call/usage updates, mediated `fs`/`terminal`/`tool_gateway.py`, `guard.py`, model pickers, remote transports |
+| `ag_ui/` — `AGUIStream` (`stream.py:118`), `build_asgi` (`asgi.py:22`), `run_input.py` (`read_run_input`), `capabilities.py` (`served_capabilities`), `events.py` (`AGUIEvent`) | Ported (D-053, superseding the D-010 deferral for this slice): `github.com/luckystrker/ago/agui` — AG-UI 1.0 serving over `net/http`: `ServeAgent(a) http.Handler` and `Handler(HandlerConfig)` (GET capabilities, POST → SSE, 400 before any stream on an unparseable body, protocol-major refusal, cancelled outcome), the event projection `NewStream(emit)` + `Handle` (chunks → TEXT_MESSAGE_*, reasoning spans → REASONING_*, tool calls closed before execution, TOOL_CALL_RESULT, client hand-offs, task lifecycle → SUBAGENT_*, per-(provider,model) usage, `TakeUsage`/`SuccessOutcome`), `ReadRunInput` (unknown-role strip, base64 refusal), `CapabilitiesFor`, typed events + `UnmarshalEvent` + `Raw` catch-all, `AGUIEvent` carrying protocol events on an ago stream. Not ported: the held-turn interrupt machinery (`interrupts.py` — a question fails the run as RUN_ERROR), REASONING_ENCRYPTED_VALUE, STATE_SNAPSHOT emission from `ServeAgent`, prompt-level inputs as per-run fragments, snake_case input parsing |
+| `eval/` — `runtime/runner.py` (`run_agent`), `runtime/evaluate.py` (`evaluate_traces`), `trace.py` (`Trace`), `scorer.py` (`Scorer`, the `@scorer` decorator), `scorers/` (correctness, cost, threshold, tools, judge, pairwise_judge, attribution), `pairwise.py` (`PairwiseComparator`, `WinRate`), `results/` (`RunResult`, `store.dump`) | Ported produce-then-grade subset (D-051, superseding the D-010 deferral for this slice): `github.com/luckystrker/ago/eval` — `Run(ctx, agent, Suite)` over `Case{Name, Input, Expected, Scorers}`, `BuildTrace(evs)` reconstructing `Trace` **from the stream's event log — no OTEL** (the core deviation; `LLMCalls` paired with the preceding `model_call` `UsageEvent`, `ToolCalls` matched by call id, `Tokens()` via `github.com/luckystrker/ago/usage`), scorers `Correctness` (exact/casefold/contains), `TokenBudget`, `ToolsCalled` (any/all), `Threshold`, `LLMJudge` (one headless client call, JSON verdict, clamped), `Pairwise` (dual-order swap, flip → tie), `ScoreWith` (scorer error → failing score, never an abort), `RunResult.SaveJSON`/`LoadJSON` (events round-trip through `@type`) + `Compare` (win rate, ties 0.5). Deferred: OTEL/Tempo/OTLP trace sources and `evaluate_traces`, the `@scorer` DI decorator, the attribution scorer, repeats/per-task configs/`BudgetThresholds`/lifecycle events, case concurrency (sequential in AGo), `RunDiff`, `Suite.from_jsonl`/tags/metadata, pairwise single-order mode, Wilson CI, Cohen's kappa |
 | `a2ui/` | Deferred (D-010) — protocol server out of scope |
-| `mcp_ui/` (`resources.py`, `actions.py`) | Ported (D-045, supersedes the D-010 deferral for this slice): `ago/mcpui` — UI resources `RawHTML`/`ExternalURL`/`RemoteDOM` (text/blob encoding, `ui://` guard, `_meta` merge), UI actions `ToolCall`/`Prompt`/`Link`/`Intent`/`Notify`, `PostMessage` (json.dumps + html.escape byte parity), `mcpui.Marshal` for exact wire bytes, `WithUIResource` attaching blocks to `events.ToolResult.Parts` |
+| `mcp_ui/` (`resources.py`, `actions.py`) | Ported (D-045, supersedes the D-010 deferral for this slice): `github.com/luckystrker/ago/mcpui` — UI resources `RawHTML`/`ExternalURL`/`RemoteDOM` (text/blob encoding, `ui://` guard, `_meta` merge), UI actions `ToolCall`/`Prompt`/`Link`/`Intent`/`Notify`, `PostMessage` (json.dumps + html.escape byte parity), `mcpui.Marshal` for exact wire bytes, `WithUIResource` attaching blocks to `events.ToolResult.Parts` |
 | `CronWatch` / `CadenceWatch` (`ag2/watch.py`) | Deferred (D-024); `EventWatch`/`IntervalWatch`/`DelayWatch`/`AllOf`/`AnyOf`/`Sequence` are ported |
 | `MetricsMiddleware`, `TelemetryMiddleware` (OTEL) | Deferred (D-013) |
 | `fast_depends.Depends` (factory-valued tool parameters; re-exported by `ag2`) | Not ported (D-036) — compute the factory value in Go before the call or wrap it as a separate tool; the DI dictionary (`Inject`/`Variable`/context parameter, D-016) covers the resolved-value cases |
-| `textual.py`, `mypy.py`, `_import_utils.py`, `_telemetry_consts.py`, `types.py`, `utils.py` | Python infrastructure without a Go counterpart (textual UI, typing helpers, telemetry constants); `utils.build_model` → `response.SchemaOf`. `plugin.py` has a counterpart since D-044 (`ago/plugin`) |
+| `textual.py`, `mypy.py`, `_import_utils.py`, `_telemetry_consts.py`, `types.py`, `utils.py` | Python infrastructure without a Go counterpart (textual UI, typing helpers, telemetry constants); `utils.build_model` → `response.SchemaOf`. `plugin.py` has a counterpart since D-044 (`github.com/luckystrker/ago/plugin`) |
 
 ## 6. Semantics cheat-sheet (things that look different but are parity)
 
@@ -234,17 +234,18 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 
 ## 7. Verification status
 
-Gates re-run for this document on 2026-10-30, after the a2a/acp/ag_ui/eval wave landed
-(whole repo, fresh `-count=1`, from the repo root — the root itself is not a module):
+Gates re-run for this document on 2026-10-30, after the move to the canonical module path
+`github.com/luckystrker/ago` landed (whole module, fresh `-count=1`, from the repo root —
+`go.mod` sits there and `examples/` is part of the same module):
 
-- `go -C ago build ./...` — success; `go -C ago vet ./...` — clean; `gofmt -l ago` — empty.
-- `go -C ago test -count=1 ./...` — 41 packages `ok`, 0 failures, 0 skipped; no test files
-  in `ago/internal/uuid` (the 13 example programs live in the separate examples module).
-- `go -C examples build ./...` and `go -C examples vet ./...` — clean;
-  `go run` of the thirteen examples (`ask`, `tools`, `hitl`, `subagent`, `group`,
-  `knowledge_memory`, `mcp_http`, `mcp_stdio`, `multi_turn`, `observers`,
+- `go build ./...` — success; `go vet ./...` — clean; `gofmt -l .` — empty.
+- `go test -count=1 ./...` — 42 packages `ok`, 0 failures, 0 skipped; no test files
+  in `github.com/luckystrker/ago/internal/uuid` and the thirteen example programs.
+- `go build ./examples/...` and `go vet ./examples/...` — clean;
+  `go run ./examples/<name>` of the thirteen examples (`ask`, `tools`, `hitl`, `subagent`,
+  `group`, `knowledge_memory`, `mcp_http`, `mcp_stdio`, `multi_turn`, `observers`,
   `policies_compact`, `safety_halt`, `structured_output`) — every one exits 0 offline.
 
 Symbol columns above were checked against `go doc` output of the actual packages, not from
-memory of the specs; the §5 rows for `ago/a2a`, `ago/acp`, `ago/agui` and `ago/eval` were
+memory of the specs; the §5 rows for `github.com/luckystrker/ago/a2a`, `github.com/luckystrker/ago/acp`, `github.com/luckystrker/ago/agui` and `github.com/luckystrker/ago/eval` were
 re-checked the same way during this sweep.

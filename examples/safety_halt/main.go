@@ -36,15 +36,15 @@ import (
 	"strings"
 	"sync"
 
-	"ago/agent"
-	agocontext "ago/context"
-	"ago/events"
-	"ago/middleware"
-	"ago/observers"
-	"ago/policies"
-	"ago/stream"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	agocontext "github.com/luckystrker/ago/context"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/observers"
+	"github.com/luckystrker/ago/policies"
+	"github.com/luckystrker/ago/stream"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 func main() {
