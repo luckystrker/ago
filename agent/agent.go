@@ -14,6 +14,7 @@ import (
 	"github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/hitl"
+	"github.com/luckystrker/ago/knowledge"
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/plugin"
 	"github.com/luckystrker/ago/response"
@@ -43,6 +44,7 @@ type options struct {
 	promptHooks  []PromptHook
 	fragments    []string
 	tasks        *TaskConfig
+	knowledge    *knowledge.Config
 }
 
 // Option configures an Agent at construction.
@@ -99,6 +101,11 @@ type Agent struct {
 	mu    sync.Mutex
 	opts  options
 	locks sync.Map // stream id -> *sync.Mutex: serializes concurrent asks on one stream
+
+	// knowledge bootstraps once per agent (Python parity: _KnowledgeContext's
+	// bootstrapped flag + lock).
+	knowledgeMu           sync.Mutex
+	knowledgeBootstrapped bool
 }
 
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
@@ -108,6 +115,10 @@ func New(name string, prompt string, opts ...Option) *Agent {
 	for _, o := range opts {
 		o(&a.opts)
 	}
+	// Knowledge compaction/aggregation middlewares land after every option
+	// (Python parity: added at the end of the constructor's knowledge block,
+	// innermost relative to the user middleware list).
+	a.opts.applyKnowledgeMiddleware(name)
 	return a
 }
 

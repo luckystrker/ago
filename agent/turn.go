@@ -33,9 +33,14 @@ func (r *AgentRun) executeTurn() {
 				r.err = errors.Join(err, fmt.Errorf("agent: repair history: %w", rerr))
 			}
 		}
+		// The event log persists on failed turns too (Python parity: the
+		// post-yield write in _KnowledgeContext.enter runs on the way out of the
+		// scope, whatever the turn's outcome).
+		r.persistEventLog()
 		return
 	}
 	r.reply = &AgentReply{agent: r.agent, resp: resp, cx: r.cx, schema: r.schema}
+	r.persistEventLog()
 }
 
 // isHitlFailure reports whether err is (or wraps) a hitl refusal, timeout or failure.

@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -9,16 +10,49 @@ import (
 // MemoryStore is the in-process Store: development default and test backend.
 //
 // Backed by a flat map keyed by normalized virtual path; directories are inferred
-// from stored paths via prefix matching. Safe for concurrent use.
+// from stored paths via prefix matching. Safe for concurrent use. It also
+// implements VersionSource: a store-wide counter is bumped on every mutation, so
+// PollingWatcher can diff snapshots (Python parity: sqlite.py's per-write
+// monotonic version — exactly one key's version changes per write).
 type MemoryStore struct {
-	mu   sync.RWMutex
-	data map[string][]byte
-	ch   watchers
+	mu       sync.RWMutex
+	data     map[string][]byte
+	versions map[string]uint64
+	seq      uint64
+	ch       watchers
 }
 
 // NewMemoryStore returns an empty in-memory store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{data: map[string][]byte{}}
+	return &MemoryStore{
+		data:     map[string][]byte{},
+		versions: map[string]uint64{},
+	}
+}
+
+// bump records a new version for path under the write lock.
+func (m *MemoryStore) bump(path string) {
+	m.seq++
+	m.versions[path] = m.seq
+}
+
+// VersionsUnder returns {path: version} for every stored path equal to prefix
+// or under it. Deleted paths drop out of the snapshot, which is how a watcher
+// sees a deletion (Python parity: SqliteKnowledgeStore.list_versions_under /
+// redis.py:162-167).
+func (m *MemoryStore) VersionsUnder(prefix string) (map[string]string, error) {
+	norm := normalizePath(prefix)
+	scope := strings.TrimSuffix(norm, "/") + "/"
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]string, len(m.versions))
+	for path, v := range m.versions {
+		if path != norm && !strings.HasPrefix(path, scope) {
+			continue
+		}
+		out[path] = strconv.FormatUint(v, 10)
+	}
+	return out, nil
 }
 
 // Read returns the content at path, or ErrNotFound.
@@ -34,13 +68,15 @@ func (m *MemoryStore) Read(path string) ([]byte, error) {
 	return out, nil
 }
 
-// Write stores data at path (directories are implicit) and notifies watchers.
+// Write stores data at path (directories are implicit), bumps the path's
+// version and notifies watchers.
 func (m *MemoryStore) Write(path string, data []byte) error {
 	norm := normalizePath(path)
 	stored := make([]byte, len(data))
 	copy(stored, data)
 	m.mu.Lock()
 	m.data[norm] = stored
+	m.bump(norm)
 	m.mu.Unlock()
 	m.ch.notify(norm)
 	return nil
@@ -75,8 +111,8 @@ func (m *MemoryStore) List(dir string) ([]string, error) {
 	return out, nil
 }
 
-// Delete removes path and everything under it, notifying once per removed path.
-// Deleting a missing path is a no-op.
+// Delete removes path and everything under it, dropping their versions and
+// notifying once per removed path. Deleting a missing path is a no-op.
 func (m *MemoryStore) Delete(path string) error {
 	norm := normalizePath(path)
 	prefix := strings.TrimSuffix(norm, "/") + "/"
@@ -84,11 +120,13 @@ func (m *MemoryStore) Delete(path string) error {
 	var affected []string
 	if _, ok := m.data[norm]; ok {
 		delete(m.data, norm)
+		delete(m.versions, norm)
 		affected = append(affected, norm)
 	}
 	for key := range m.data {
 		if strings.HasPrefix(key, prefix) {
 			delete(m.data, key)
+			delete(m.versions, key)
 			affected = append(affected, key)
 		}
 	}
@@ -117,7 +155,8 @@ func (m *MemoryStore) Exists(path string) bool {
 }
 
 // Append appends data to the file at path under the store lock (appends from
-// concurrent goroutines interleave at whole-call granularity, never mid-call).
+// concurrent goroutines interleave at whole-call granularity, never mid-call)
+// and bumps the path's version.
 func (m *MemoryStore) Append(path string, data []byte) error {
 	norm := normalizePath(path)
 	m.mu.Lock()
@@ -125,6 +164,7 @@ func (m *MemoryStore) Append(path string, data []byte) error {
 	combined = append(combined, m.data[norm]...)
 	combined = append(combined, data...)
 	m.data[norm] = combined
+	m.bump(norm)
 	m.mu.Unlock()
 	m.ch.notify(norm)
 	return nil

@@ -82,6 +82,10 @@ ag_ui/a2ui/mcp_ui/live/eval: interfaces + stubs, deferred.
 
 `Store` protocol + MemoryStore + DiskStore (filesystem) + Locked wrapper + EventLogWriter
 (JSONL). SQLite/Redis backends deferred (would need external deps).
+Closed 2026-10-30: nothing in D-011 remains deferred — the SQLite/Redis backends ported as
+the optional contrib modules (D-059), and `bootstrap.py`/`polling.py`/`config.py` closed by
+D-075 (`StoreBootstrap`/`DefaultBootstrap`, `PollingWatcher`/`VersionSource`,
+`Config`/`agent.WithKnowledgeConfig`).
 
 ## D-012 — 2026-10-28 — Porting is wave-based with dynamic workflows
 
@@ -2713,3 +2717,174 @@ agent turn (a lock held across the whole `Handle` call would also stall
 AGO-DEVIATION: the cancel-wins-over-a-running-turn ordering has no Python
 counterpart — the single-threaded loop makes the race unrepresentable there
 (D-050 covers the related store-before-answer deviation).
+
+## D-075 — 2026-10-30 — knowledge: bootstrap/polling/config ported; agent option WithKnowledgeConfig
+
+Closes the D-011 deferral of `knowledge/{bootstrap,polling,config}.py`. New in
+`knowledge/`: `StoreBootstrap` + `DefaultBootstrap` (bootstrap.py texts verbatim),
+`BootstrapOnce` (the `/.initialized` sentinel, written before the layout, holding
+the actor name — the `_KnowledgeContext.enter` order), `PollingWatcher` over a new
+`VersionSource` capability, and `Config` with `NewConfig` carrying the Python
+defaults (`ExposeTool=true`, `WriteEventLog=true`; the Go zero value disables both).
+`agent.WithKnowledgeConfig` attaches a store: the store lands in the conversation
+dependencies under `knowledge.DepKey`, the `knowledge` tool joins the agent's tools
+when `ExposeTool`, the bootstrap runs once per agent at turn-scope open
+(`AgentRun.open`, Python `_drive_scope`), and the event log is rewritten at turn end
+(`AgentRun.executeTurn`, both outcome paths — Python's post-yield write), failures
+emitting transient `EventLogFailed` (subscribers only, not the transcript).
+
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **The bootstrap's log-directory SKILL.md lives at `/logs/`, not `/log/`** — the
+  AGo event log writes there (`knowledge.LogsDir`, the D-027 brief pin), and the
+  root SKILL.md directory listing names `/logs/` so the model is pointed at the
+  directory the framework actually fills. All other texts and paths are
+  bootstrap.py verbatim.
+- **`VersionsUnder` exists only on `MemoryStore`** (brief): a store-wide monotonic
+  counter bumped per mutation, `{path: version}` as strings, deleted paths dropping
+  out of the snapshot; Python's sqlite/redis backends keep the same contract. The
+  contrib stores stay version-less — their owners can adopt `VersionSource` later.
+- **`EventLogWriter.Persist` rewrites `logs/<streamID>.jsonl` per ask** (Python
+  `persist` parity) alongside the brief-shaped `AppendEvent`; the whole-history
+  rewrite is what keeps a continuation's log complete without per-stream
+  bookkeeping in the agent.
+- **The dependency key is the string `"ag:knowledge"`** (framework-reserved prefix,
+  `task.DepKey` convention): Python keys dependencies by the `KnowledgeStore` type.
+  The AGo memory policies still take the store in their constructors (D-030), so no
+  policy reads the key yet — it exists for `tools.Inject` consumers and future
+  policies, mirroring Python's `dependencies[KnowledgeStore]` registration.
+- **`PollingWatcher` fires callbacks sorted by path and recovers panics**: Python's
+  dict order is insertion order and its `_safe_fire` swallows exceptions; Go map
+  order is random and a panic would kill the goroutine.
+
+Correction (2026-10-31): this record described the `Config` as complete when the
+`compact`/`compact_trigger`/`aggregate`/`aggregate_trigger` fields and the constructor
+middleware wiring they drive were still missing — that omission was caught in review and
+landed as D-077; this record's Config coverage is the store/tool/log/bootstrap slice.
+
+## D-077 — 2026-10-31 — knowledge: Config carries compact/aggregate; WithKnowledgeConfig wires the middlewares
+
+Closes the gap D-075 left open. Python `KnowledgeConfig` (config.py:47-50) carries
+`compact`/`compact_trigger`/`aggregate`/`aggregate_trigger`, and the agent constructor
+wires `_CompactionMiddlewareFactory` / `_AggregationMiddlewareFactory` from them
+(agent.py:845-851) — those fields and that wiring were absent, while D-075 claimed
+config.py closed without recording the omission (rule 5). `knowledge.Config` now carries
+`Compact compact.Strategy`, `CompactTrigger compact.Trigger`, `Aggregate
+aggregate.Strategy`, `AggregateTrigger aggregate.Trigger` (Python's None defaults = Go's
+nil). The wiring lives in `options.applyKnowledgeMiddleware`, run by `agent.New` after
+every option has applied — the option funcs see no agent name (`compact.WithAgent(name)`
+stamps the lifecycle events), and the post-pass pins the position Python gives these
+middlewares: appended after the user middleware list, compaction before aggregation
+(Python's add order). Compaction wires when a strategy is set; aggregation wires when
+both strategy and trigger are set.
+
+Deviations, marked `// AGO-DEVIATION` in `knowledge/config.go`:
+
+- **The strategies stay the transcript-shaped ones of D-026/D-028.** Python's
+  store-aware protocols — `compact(events, context, store)` persisting dropped segments
+  via `EventLogWriter.persist_dropped`, `aggregate(events, context, store)` writing
+  knowledge files — are not ported; the AGo middleware cuts and replaces the history
+  itself and no store-aware strategy type exists yet (open work). The store still reaches
+  the middleware chain only through the `knowledge.DepKey` dependency.
+- **A nil `CompactTrigger` leaves the wired compaction middleware a pass-through no-op**
+  (`compact.New`'s documented nil handling): Python wires on the strategy alone and
+  crashes reading `trigger.max_events` at turn time.
+- **Aggregation wiring requires both halves non-nil.** Python arms the middleware off the
+  trigger's numeric conditions (`every_n_turns` / `every_n_events` / `on_end`) and
+  reports a nil strategy as `AggregationFailed` at fire time; the AGo `Trigger` is an
+  interface without inspectable conditions, so the check is non-nil-ness and a
+  never-firing trigger is the caller's business.
+
+`knowledge` now imports `compact` and `aggregate` (the Config field types — Python's
+config.py imports both the same way). Acyclic: neither imports `knowledge` (verified
+against the tree); the ARCHITECTURE dep-graph line is updated accordingly.
+
+Gates `go build ./...`, `go vet ./...`, `go test ./...`, `go build ./examples/...` green
+2026-10-31. New tests: `TestKnowledgeMiddlewareOptionsWiring` (the six construction
+shapes), `TestKnowledgeCompactWiring` / `TestKnowledgeAggregateWiring` (two scripted
+turns through the wired middlewares: lifecycle events with the agent name, the stub
+strategies' inputs, the rewritten history), `TestKnowledgeMiddlewareOff` (store-only and
+trigger-less shapes leave the history untouched), and the nil-strategy defaults in
+`knowledge.TestNewConfigDefaults`.
+
+## D-076 — 2026-10-30 — a2ui: the v1.0 subset ported; v0.9/v0.9.1, A2A transport and Starlette-specific middleware deferred
+
+Supersedes the `a2ui/` deferral in D-010 for this slice (owner directive). New package
+`github.com/luckystrker/ago/a2ui`, protocol version v1.0 only:
+
+- **Wire types** (`message.go`): the full `ServerToClientMessage` union — createSurface /
+  updateComponents / updateDataModel / deleteSurface / callRendererFunction /
+  agentFunctionResponse — with the single-key envelope enforced both directions, and the
+  flat `Component` (envelope fields + free-form `Props`) so the camelCase v1.0 wire forms
+  stay verbatim (golden-tested).
+- **Parser** (`parser.go`): `<a2ui-json>`/`</a2ui-json>` tag extraction, prose split,
+  markdown-fence stripping (the Python lookahead regex hand-rolled), JSON array/object/JSONL
+  blocks, the exactly-one-payload-key envelope check, the root-component and
+  agentFunctionResponse-forbidden spec rules, and `FormatValidationError` for LLM
+  self-correction.
+- **Schema validation** (`schema.go`, `validator.go`): the four v1.0 spec documents vendored
+  byte-identical under `a2ui/spec/v1_0/` and `//go:embed`-ed; registry keyed by
+  surface-catalog id (only the basic catalog exists — custom catalogs deferred with this
+  entry). The JSON Schema engine is a hand-rolled **subset**: $ref, allOf/anyOf/oneOf (with
+  the diagnostics.py const-tag narrowing), not, type, const, enum, required, properties,
+  additionalProperties:false, items, minItems. Everything else
+  (patternProperties, propertyNames, format, unevaluatedProperties, if/then/else) is treated
+  as always-pass — an honest false-negative surface, not a false-positive one. Diagnostics are
+  abbreviated: `Component '<id>' (<kind>): <issue>` / `<issue> (at /path)` rendering is
+  verbatim, the leaf message wordings are this port's own (only the `unknown <tag> <value>`
+  narrowing message is Python-verbatim, golden-tested).
+- **Actions** (`actions.go`): `ActionFunc func(ctx, params map[string]any) (any, error)` +
+  a concurrency-safe registry; the click→wire mapping (`MessagesOf`, version stamping) and the
+  callAgentFunction answers (UNKNOWN_FUNCTION / INVALID_FUNCTION_CALL / FUNCTION_FAILED,
+  response correlated by functionCallId, handler messages emitted ahead of the response).
+- **Server** (`server.go`): `http.Handler` on the rest.py request contract
+  (`messages`/`variables`/`a2ui`, the request.py error strings verbatim, 400/405 mapping),
+  SSE and NDJSON encodings with serialize.py's canonical `ToJSONL` (compact, ensure_ascii,
+  Python-escaped), registered clicks answered server-side, every callAgentFunction answered,
+  everything else (unregistered clicks — `ActionToPrompt`'s exact format, client errors,
+  rendererFunctionResponse, trailing user text) handed to the `PromptHandler` seam. A
+  no-input turn after handled server interactions skips the seam, like dispatch.py.
+
+Deferrals (with this record): v0_9/v0_9_1 (different schemas, catalog ids and message
+shapes); the A2A transport (`a2a/` submodule — the protocol rides AGo's `a2a` package
+instead); `transports/` Starlette wiring and `A2UIServer` as an ASGI app (net/http replaces
+it); `events.py`/`middleware.py` stream-event integration (`A2UIMessageEvent`,
+`A2UIInboundMiddleware` — Starlette/dispatch-internal); `capabilities.py` renderer-capability
+negotiation; custom catalogs (`_restrict_catalog_references` surgery); `dispatch.py`'s
+agent-turn execution (`stream_turn` runs an ag2 Agent — the Go `PromptHandler` seam is the
+extension point); SSE error/`done` frames match rest.py, but response streaming needs no
+lifespan handling here.
+
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **The subset validator accepts forms Python's full engine rejects**: propertyNames
+  patterns on `DynamicValue` objects and the `unevaluatedProperties` closures are not
+  enforced, so e.g. an object with an unknown `@weird` key inside a DynamicValue slot
+  validates. The agent-caller policy Python implements through catalog-reference surgery is
+  enforced directly instead: an agent-initiated `callRendererFunction` naming a
+  rendererOnly catalog function (every basic-catalog function is rendererOnly — verified
+  against Python) is rejected with the `unknown @call '<name>'` message; `@index` stays
+  agent-acceptable where Python rejects it.
+- **Prompt JSON is rendered with sorted object keys** (Go maps are unordered; Python relies
+  on dict insertion order). Goldens captured from Python with `sort_keys=True` agree.
+  Whole-number floats render as integers — a float64 cannot recover Python's int/float
+  split, so a Python `2.0` would render `2`.
+- **`callRendererFunction` validation against the basic catalog accepts `@index`** (see
+  above); Python rejects it for the agent.
+- **Diagnostic leaf messages are abbreviated** — only the component-naming render, the path
+  suffix and the unknown-tag message are Python-shaped; jsonschema's leaf wordings are not
+  reproduced.
+- **The parse-error line of `FormatValidationError` carries the Go decoder's message**, not
+  Python's (`Invalid JSON: <detail>` — the prefix matches, the detail is engine-specific).
+- **The server takes trailing user messages and rewritten prompts as one joined prompt**
+  (Python feeds them as separate turn inputs to one agent run); a request with no inputs and
+  no handled interactions answers what it has instead of fabricating a blank agent turn.
+- **Non-string scalars in incoming envelope fields** (Python coerces with `str()`) are
+  treated as absent.
+- **`Action.ExampleContext` must be given explicitly** — Python derives a placeholder from
+  the handler's parameter schema via fast_depends; a Go func signature has no schema.
+
+Evidence: goldens captured from the working Python (`.venv-bench`, ag2 editable, jsonschema
+installed into that venv as the brief allows) in `a2ui/testdata/golden.json` via
+`a2ui/testdata/capture_golden.py`; gates `go build ./...`, `go vet ./...`, `go test ./...`,
+`go build ./examples/...` all green 2026-10-30.

@@ -40,7 +40,7 @@ config  → events, tools, response    — Provider, ModelConfig, LLMClient, per
 middleware → events, context         — 4-hook onion chain, Conditional, builtins
 usage   → events                     — Report aggregation from UsageEvents
 task    → stream, events             — Task lifecycle, CheckpointStore
-knowledge → events                   — KnowledgeStore protocol, memory/disk backends, EventLog
+knowledge → events, compact, aggregate — KnowledgeStore protocol, memory/disk backends, EventLog, Config strategy fields
 policies → events, context, knowledge — assembly policies
 compact/aggregate → events, context  — triggers/strategies + middlewares
 observers → events, stream, context  — Observer protocol, LoopDetector, TokenMonitor
