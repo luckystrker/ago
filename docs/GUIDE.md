@@ -743,6 +743,21 @@ or cancelled.
 log of any stream's events (`AppendEvent(streamID, ev)`, `Replay(streamID)`,
 `Streams()`) — the durability primitive behind network WALs and resume.
 
+**Knowledge on an agent.** `agent.WithKnowledgeConfig(knowledge.NewConfig(store))`
+attaches a store: it registers it in the conversation dependencies under
+`knowledge.DepKey`, injects the `knowledge` tool the model can call (`read`,
+`write`, `list`, `delete` on store paths), rewrites `logs/<streamID>.jsonl` at the
+end of every turn (`WriteEventLog`; a failure emits a transient `EventLogFailed`
+and the reply still lands), and bootstraps the layout once per store. The
+bootstrap (`knowledge.DefaultBootstrap`) writes a root `SKILL.md` describing the
+`/logs/`, `/artifacts/` and `/memory/` directories; `knowledge.BootstrapOnce`
+guards it with the `/.initialized` sentinel (`knowledge.SentinelPath`), so a
+shared store is initialized by whichever agent reaches it first and never
+re-initialized. Build the config directly
+(`knowledge.Config{Store: s, ExposeTool: false, ...}`) to opt out of a piece —
+`NewConfig` applies the Python defaults (tool + event log on; the zero `Config`
+disables both, and a nil `Store` makes the whole option a no-op).
+
 **Optional stores (contrib).** The SQLite and Redis backends live in their own modules
 so the core keeps zero dependencies (D-048/D-059/D-069). From a module that already
 depends on AGo: `go get github.com/luckystrker/ago/contrib/knowledgesqlite` (or
@@ -761,7 +776,25 @@ mem := agent.New("memo", "...", agent.WithConfig(cfg), agent.WithStreamBase(s),
 drop-in `knowledge.Store` implementations (atomic `Append` — cross-goroutine, and for
 SQLite cross-process too); `streamredis.NewStorage(rdb, opts...)` is a `stream.Storage`
 (one Redis list per stream). OnChange notifies only mutations through the same store
-instance — cross-process change detection is your poll loop.
+instance — cross-process change detection is a poll loop (`knowledge.NewPollingWatcher`
+below, or your own).
+
+**Watching a store for changes.** `knowledge.NewPollingWatcher` polls a store through the
+`knowledge.VersionSource` capability — `VersionsUnder(prefix) (map[string]string, error)`
+returning `{path: version}`; `MemoryStore` implements it (a store-wide monotonic counter):
+
+```go
+w := knowledge.NewPollingWatcher(kstore, "/memory/", func(path string) {
+    fmt.Println("changed:", path)
+}, 500*time.Millisecond) // 0 → default 500ms; shorter clamps to a 50ms floor
+if err := w.Start(ctx); err != nil {
+    return err // takes the initial snapshot: pre-Start writes never fire
+}
+defer w.Close()
+```
+
+New, rewritten and removed paths all fire once per tick; a failed read skips the tick, a
+panicking callback is dropped, and `Close` (or cancelling `Start`'s context) stops it.
 
 **Policies.** A `policies.AssemblyPolicy` transforms `(prompts, events)` before each
 model call; policies compose left to right — filters and injections first, reductions
@@ -890,12 +923,13 @@ A client connecting with `mcp.New(&mcp.MCPStdioConfig{Command: "your-agent"})` (
 extra tools, `tools/call` runs one exchange, text/image/file results map back through
 the ordinary MCP content blocks. Deferred: sessions, paused runs, OAuth, MCP Apps.
 
-## Protocol endpoints: A2A, ACP, AG-UI
+## Protocol endpoints: A2A, ACP, AG-UI, A2UI
 
-Three packages expose an agent to the outside world over standard protocols, stdlib only.
+Four packages expose an agent to the outside world over standard protocols, stdlib only.
 Each is a functional subset of its Python module — the deferred pieces are listed in
 [docs/PORT_STATUS.md](PORT_STATUS.md) and decided in [docs/DECISIONS.md](DECISIONS.md)
-(D-049/D-050 + D-067 for A2A, D-052 + D-066 for ACP, D-053 + D-065 for AG-UI).
+(D-049/D-050 + D-067 for A2A, D-052 + D-066 for ACP, D-053 + D-065 for AG-UI, D-076 for
+A2UI).
 
 ### A2A (`github.com/luckystrker/ago/a2a`) — agent-to-agent over HTTP/JSON-RPC
 
@@ -1134,6 +1168,61 @@ open entities. Bad resumes (unknown interrupt id, missing record, wrong proof, m
 payload) are a single coded RUN_ERROR **before** RUN_STARTED, and the turn stays
 answerable. Without the server, plain `agui.ServeAgent(a)`/`Handler` keep the one-exchange
 behavior: a question surfaces as a `RUN_ERROR` like any turn failure.
+
+### A2UI (`github.com/luckystrker/ago/a2ui`) — model-generated UI over HTTP
+
+A2UI (protocol **v1.0 only**, D-076) is the protocol where the model renders declarative
+UI — surfaces of components wrapped in `<a2ui-json>` tags — and the client renderer
+answers with clicks and function calls. The package pieces:
+
+- **Wire types** — `a2ui.Message` (the server→client union: `CreateSurface`,
+  `UpdateComponents`, `UpdateDataModel`, `DeleteSurface`, `CallRendererFunction`,
+  `AgentFunctionResponse`; exactly one payload per envelope), the flat `a2ui.Component`
+  with `NewText`/`NewImage`, and `a2ui.ToJSONL(messages)` as the canonical wire form.
+- **Parser + schema** — `a2ui.NewSchemaManager()` vendors the v1.0 basic catalog;
+  `a2ui.NewParser(mgr).Parse(response)` splits a model reply into prose and A2UI
+  operations, `Validate` checks them against the catalog (a hand-rolled JSON-Schema
+  subset) and `FormatValidationError` renders the errors for model self-correction;
+  `PromptSection(actions, opts)` builds the how-to-render-A2UI prompt section.
+- **Actions** — named server-side buttons: the model describes them, the server runs the
+  handler on click with no model round-trip.
+- **Server** — one `http.Handler` for the whole exchange (SSE frames by default, NDJSON
+  via `a2ui.WithEncoding(a2ui.EncodingJSONL)`).
+
+```go
+mgr, err := a2ui.NewSchemaManager()
+parser := a2ui.NewParser(mgr) // Parse(reply) → prose + <a2ui-json> operations
+
+actions := a2ui.NewActionRegistry()
+actions.Register(a2ui.Action{
+    Name:           "confirm_order",
+    Description:    "Confirm the current order.", // described to the model in the prompt
+    ExampleContext: map[string]any{"order_id": "A-114"},
+    Fn: func(ctx context.Context, params map[string]any) (any, error) {
+        return a2ui.NewText("status", "Order A-114 confirmed"), nil // a click is answered server-side
+    },
+})
+
+srv := a2ui.NewServer(
+    a2ui.WithActions(actions),
+    a2ui.WithPromptHandler(func(ctx context.Context, prompt string) (a2ui.Turn, error) {
+        reply, err := assistant.Ask(ctx, prompt) // your agent runs the turn
+        if err != nil {
+            return a2ui.Turn{}, err
+        }
+        res := parser.Parse(reply.Body()) // res.Text is the prose; res.Operations the UI payloads
+        return a2ui.Turn{Text: res.Text}, nil
+    }),
+)
+mux.Handle("/a2ui", srv) // POST only; SSE frames by default
+```
+
+The server is stateless — the client sends its full state on every POST. Clicks on
+registered actions and every renderer `callAgentFunction` are answered on the spot
+(`UNKNOWN_FUNCTION` / `INVALID_FUNCTION_CALL` / `FUNCTION_FAILED`, correlated by
+`functionCallId`); unregistered clicks, client error reports, function responses and
+trailing user text are rewritten into one prompt for the `PromptHandler`, whose
+`Turn{Text, Messages}` streams back as `text`/`data` frames.
 
 ## Multi-agent network
 

@@ -48,6 +48,23 @@ func (w *EventLogWriter) AppendEvent(streamID string, ev events.Event) error {
 	return w.store.Append(LogPath(streamID), append(line, '\n'))
 }
 
+// Persist rewrites logs/<streamID>.jsonl with the given events, one JSON line
+// per event (Python parity: EventLogWriter.persist — the agent writes the whole
+// stream history at the end of each ask, so the file always holds the full
+// transcript even when a continuation reuses the stream).
+func (w *EventLogWriter) Persist(streamID string, evs []events.Event) error {
+	buf := make([]byte, 0, 256*len(evs))
+	for _, ev := range evs {
+		line, err := events.MarshalEvent(ev)
+		if err != nil {
+			return fmt.Errorf("knowledge: marshal event for stream %q: %w", streamID, err)
+		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
+	return w.store.Write(LogPath(streamID), buf)
+}
+
 // Replay loads every event logged for streamID, in append order. Broken lines —
 // invalid JSON, a missing "@type", or a payload that fails to decode — are
 // skipped. A stream with no log replays as empty.

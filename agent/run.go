@@ -101,6 +101,13 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	r.llm = client
 	r.cx.SetDependency("ago:config", cfg)
 
+	// Knowledge scope entry: bootstrap the store once per agent before anything
+	// else consumes it (Python parity: _drive_scope's outermost
+	// `async with self._knowledge_context.enter(context)`).
+	if err := a.enterKnowledge(); err != nil {
+		return err
+	}
+
 	// System prompt: static fragments + dynamic hooks, seeded only when the
 	// context carries no prompt yet — continuations clone the previous turn's
 	// context and re-seeding would duplicate every fragment on the wire

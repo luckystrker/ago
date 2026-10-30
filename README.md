@@ -68,12 +68,12 @@ models — no API keys needed.
 | 🙋 **Human-in-the-loop** | pluggable human hooks, tool approvals, timed-out asks, transcript repair for abandoned tool calls |
 | 📦 **Structured output** | JSON-schema from Go types, validated answers with automatic re-asking |
 | 🗂️ **Tasks & subtasks** | task lifecycle with checkpoints, `run_subtask`/`run_subtasks` fan-out with usage roll-up, `AsTool` delegation |
-| 🧠 **Knowledge & policies** | virtual filesystem store (plus optional SQLite/Redis modules), context-assembly policies (sliding window, token budget, alerts) |
+| 🧠 **Knowledge & policies** | virtual filesystem store with a self-describing bootstrap, change polling (`PollingWatcher`) and the model-facing `knowledge` tool (`agent.WithKnowledgeConfig`); optional SQLite/Redis modules; context-assembly policies (sliding window, token budget, alerts) |
 | 🗜️ **Compaction & aggregation** | LLM-driven history summarization behind triggers, keeping the transcript valid for replay |
 | 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
 | 🔌 **MCP, both sides** | client (stdio + streamable HTTP, paginated discovery, content mapping) and server (`mcpserver`: expose an agent as the conversational `ask` tool); MCP UI resources and in-frame actions for tool results |
 | 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay, view projections, a pluggable arbiter, expectation sweepers with audit, task mirror, client LLM tools (`peers`/`channels`/`tasks`/`context`/`delegate`) |
-| 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (agent-card discovery, JSON-RPC + REST, tasks, push notifications, client-side tools and HITL over the wire, declarative security schemes), **ACP** (stdio JSON-RPC, both roles: cancel, load, full update vocabulary, mediated fs/terminal, MCP gateway, token auth) and **AG-UI** (HTTP SSE, AG-UI 1.0, held-turn interrupts with resume) |
+| 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (agent-card discovery, JSON-RPC + REST, tasks, push notifications, client-side tools and HITL over the wire, declarative security schemes), **ACP** (stdio JSON-RPC, both roles: cancel, load, full update vocabulary, mediated fs/terminal, MCP gateway, token auth), **AG-UI** (HTTP SSE, AG-UI 1.0, held-turn interrupts with resume) and **A2UI** (model-generated UI surfaces over HTTP, protocol v1.0) |
 | 🧪 **Eval harness** | produce-then-grade runs: event-sourced traces (no OTEL), six scorer families + registry, JSONL datasets, failure attribution, LLM judge and dual-order pairwise, run diffs with regression gates, Wilson CI / Cohen's kappa, parallel cases |
 | 🗣️ **Voice & terminal** | `live.Cascade` STT→LLM→TTS spoken turns (ready OpenAI stages); `tui.REPL` line chat with streaming echo |
 
@@ -203,13 +203,15 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
   multi-agent network (incl. views, arbiter, expectation sweepers, task mirror, client
   LLM tools), eval (attribution, registry, JSONL, diffs, stats, concurrency), TUI, live
-  cascade — `go build`/`vet`/`test` green on every package (46 packages, 0 failures).
+  cascade — `go build`/`vet`/`test` green on every package (47 packages, 0 failures).
 - **Protocol endpoints ported as functional subsets** (each remainder is a recorded
   decision): `github.com/luckystrker/ago/a2a` (push notifications, client-tools
   extension, context/HITL over the wire, REST, security schemes; gRPC closed
   permanently — D-071), `github.com/luckystrker/ago/acp` (cancel/load, full update
   vocabulary, mediated fs/terminal, MCP gateway, token auth), `github.com/luckystrker/ago/agui`
-  (held-turn interrupts with resume proofs and state snapshots), `github.com/luckystrker/ago/eval`
+  (held-turn interrupts with resume proofs and state snapshots), `github.com/luckystrker/ago/a2ui`
+  (model-generated UI over HTTP, v1.0 — parser, schema validation, actions, server,
+  golden-tested against the running Python), `github.com/luckystrker/ago/eval`
   (event-sourced traces instead of OTEL).
 - **Optional modules** under `contrib/` (own go.mod, external deps allowed only there;
   the core stays at zero): `knowledgesqlite`, `knowledgeredis`, `streamredis`, `wslink`
@@ -217,7 +219,8 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   dedicated job.
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").
-- **Deferred remainders** (honest, each with a decision record): a2ui; the realtime
+- **Deferred remainders** (honest, each with a decision record): A2UI v0.9/v0.9.1 and its
+  Starlette/stream middleware (the v1.0 core is ported); the realtime
   audio stack and sound devices behind `live`; Docker/Daytona sandboxes behind the code
   runner; ACP OAuth auth kinds and the cross-process session store — see
   [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
