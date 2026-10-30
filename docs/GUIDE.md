@@ -9,14 +9,17 @@ module `github.com/luckystrker/ago`, Go 1.24; `go get github.com/luckystrker/ago
 as of 2026-10-30.
 
 Sections: [Concepts](#concepts) · [Agents](#agents) · [Tools](#tools) ·
-[Plugins](#plugins) · [Model providers](#model-providers) ·
+[Tool packs](#tool-packs-toolpacks) · [Plugins](#plugins) ·
+[Model providers](#model-providers) ·
 [Files API](#files-api) · [Middleware](#middleware) ·
 [Human-in-the-loop](#human-in-the-loop) ·
 [Observers, watches, alerts and halts](#observers-watches-alerts-and-halts) ·
 [Knowledge, policies, compaction, aggregation](#knowledge-policies-compaction-aggregation) ·
 [MCP](#mcp-model-context-protocol) ·
 [Protocol endpoints](#protocol-endpoints-a2a-acp-ag-ui) · [Multi-agent network](#multi-agent-network) ·
-[Testing](#testing) · [Evaluation](#evaluation) · [Examples index](#examples-index) · [Troubleshooting](#troubleshooting)
+[Testing](#testing) · [Evaluation](#evaluation) ·
+[Terminal chat and voice](#terminal-chat-and-voice-tui-live) ·
+[Examples index](#examples-index) · [Troubleshooting](#troubleshooting)
 
 ## Concepts
 
@@ -388,7 +391,12 @@ what the ported Python clients carry; anything else fails the call fast with
 |---|---|---|
 | `config/anthropic` | web_search, web_fetch, code_execution, memory, mcp_server (incl. the request's `mcp_servers` parameter), tool_search | file_search, image_generation, shell |
 | `config/gemini` | web_search (`googleSearch`), web_fetch (`urlContext`), code_execution, file_search (requires `WithFileSearchStoreNames`) | memory, mcp_server, tool_search, shell, image_generation |
-| chat-completions (`config/openai`, zai, mistral, dashscope) and `config/ollama` | — | every hosted type (hosted mappings need the OpenAI Responses API, which is not ported) |
+| `config/openai` **Responses** (`openai.NewOpenAIResponses`, below) | web_search, file_search, code_interpreter, image_generation, shell (container auto or reference), mcp, tool_search (`defer_loading`) — hosted output comes back as `BuiltinToolCallEvent`/`BuiltinToolResultEvent` | — |
+| chat-completions (`openai.NewOpenAICompletions`, zai, mistral, dashscope) and `config/ollama` | — | every hosted type (hosted mappings live on the Responses API and the other providers) |
+
+The OpenAI Responses client is what carries OpenAI hosted tools — with the Chat
+Completions config the same `tools.NewWebSearch(...)` fails fast. See
+[The OpenAI Responses API](#the-openai-responses-api-openairesponsesconfig) below.
 
 ### Executor semantics
 
@@ -401,6 +409,42 @@ The agent registers a `tools.Executor` for every turn. What it guarantees
 - **Not found.** A call whose name no registered tool owns is answered with `ToolNotFoundEvent` (error text `` Tool `X` not found ``). Hosted/builtin schemas (non-`function` `SchemaType`) are excluded — the provider settles those calls.
 - **HITL first.** A human-input failure inside a tool (or approval middleware) is never recorded as a tool result: it abandons the batch and ends the turn with a `*hitl` error.
 - **Client tools.** `tools.NewClientTool(map[string]any{...})` declares a tool the remote client executes itself — the argument is the flat wire schema (`"name"` required, plus `"description"`, `"parameters"`, `"defer_loading"`); the call becomes a `ClientToolCallEvent` replayed to the model as a forced `ModelResponse` for the client to answer.
+
+## Tool packs (`toolpacks`)
+
+`github.com/luckystrker/ago/toolpacks` carries the ready-made tools Python ships beside
+the framework (`ag2/tools/{shell,code,search,skills,dynamic}`, `toolkits/filesystem.py`) —
+each constructor returns a `tools.Tool` (or a toolkit of them) you pass to `agent.WithTools`
+like any hand-written tool (D-062/D-063):
+
+```go
+shell, err := toolpacks.NewShellTool(
+	toolpacks.WithShellWorkdir("C:/work"),   // commands run here (unset: the caller's dir)
+	toolpacks.WithShellTimeout(30*time.Second),
+	toolpacks.WithShellEnv(map[string]string{"GOFLAGS": "-trimpath"}),
+	toolpacks.WithShellBlockPatterns(`rm\s+-rf\s+/`)) // advisory refusal patterns
+
+runner, err := toolpacks.NewLocalCodeRunner() // run_code: python/bash/javascript locally
+
+fs, err := toolpacks.NewFilesystemToolkit("C:/work/data") // read/write/list/mkdir/glob, root-guarded
+a := agent.New("ops", "...", agent.WithConfig(cfg),
+	agent.WithTools(shell, runner))
+a2 := agent.New("filer", "...", agent.WithConfig(cfg), agent.WithTools(fs.Tools()...))
+```
+
+Web search against the real engines (HTML/REST, no SDK): `NewDuckDuckGoSearch(opts...)`,
+`NewTavilySearch(apiKey, opts...)`, `NewPerplexitySearch(apiKey, opts...)` — the Tavily
+and Perplexity keys can instead ride the conversation: build with
+`WithTavilyAPIKeyVariable()` / `WithPerplexityAPIKeyVariable()` and set the declared
+variable per conversation. `NewSkillsToolkit(dir).Tools()`
+serves an [agentskills.io](https://agentskills.io) layout (`list`/`load`/
+`read_skill_resource`). `NewDynamicAgentFactory(cfg, pool, opts...)` builds
+spawn-on-demand sub-agents from a spec: the model names a role, the factory composes
+`spec.ToAgent` + `AsTool` and the child's lifecycle events and usage roll up on the
+caller's stream.
+
+Deferred from the Python packs: Docker/Daytona sandboxes (the code runner is the local
+backend), the TypeScript runner, `update_file`/`delete_file`, the skills script runner.
 
 ## Plugins
 
@@ -446,6 +490,8 @@ config field first, then the standard environment variable. Missing model or key
 | Constructor (package `github.com/luckystrker/ago/config/…`) | Fields / options | Env fallback |
 |---|---|---|
 | `openai.NewOpenAICompletions(model)` | `APIKey`, `BaseURL`, `Temperature/TopP *float64`, `MaxTokens/MaxCompletionTokens *int64`, `Stop`, `Seed`, `User`, `ParallelToolCalls *bool`, `ResponseFormat`, `Streaming`, `Timeout`, `MaxRetries` (default 4), `Organization`, `Project`, `DefaultHeaders`, `ExtraBody` | `OPENAI_API_KEY` |
+| `openai.NewOpenAIResponses(model)` | the Completions fields above, Responses-shaped: `MaxOutputTokens`, `MaxToolCalls`, `Store *bool` (nil = default true), `TopLogprobs`, `Metadata`, `PromptCacheKey`, `PromptCacheOptions`, `Reasoning{Effort, Summary}`, `ServiceTier`, `Truncation`; the only config whose hosted tools reach the wire (below) | `OPENAI_API_KEY` |
+| `openai.NewOpenAIDecisions()` | `APIKey`, `BaseURL`, `Organization`, `Project`, `Timeout`, `MaxRetries` (4), `SafetyIdentifier`, `BooleanThreshold` (0.5), `Descriptions`, `QuestionInstructions`, `ExtraBody`; model defaults to `openai.DefaultDecisionsModel` | `OPENAI_API_KEY` |
 | `anthropic.NewAnthropic(model)` | `APIKey`, `BaseURL`, `MaxTokens` (default 4096), `StopSequences`, `Temperature/TopP`, `Streaming`, `Timeout`, `MaxRetries` (2), `PromptCaching` (true) | `ANTHROPIC_API_KEY` |
 | `gemini.NewGemini(apiKey, model, opts...)` | `WithBaseURL`, `WithTemperature`, `WithTopP`, `WithTopK`, `WithMaxOutputTokens`, `WithStopSequences`, `WithStreaming` | `GEMINI_API_KEY` |
 | `ollama.NewOllama(model, opts...)` | `WithHost` (default `http://127.0.0.1:11434`), `WithAPIKey`, `WithTemperature`, `WithTopP`, `WithMaxTokens`, `WithStop`, `WithSeed`; `WithStreaming(true)` refuses to create (non-streaming port) | `OLLAMA_API_KEY` (optional) |
@@ -466,6 +512,56 @@ hot, err := cfg.Clone(map[string]any{"Temperature": &temp}) // Go field name or 
 ```
 
 **Structured output** is provider-transparent: with `WithResponseSchema` the OpenAI engine sends a strict `json_schema` response format; Anthropic/Gemini/Ollama embed the schema in the system prompt and validate on return. **Offline testing**: swap the config for `agotest.NewTestConfig(...)` (see [Testing](#testing)) — nothing else changes.
+
+### The OpenAI Responses API (`OpenAIResponsesConfig`)
+
+`openai.NewOpenAIResponses(model)` builds a `config.ModelConfig` for the Responses API —
+`POST {base}/v1/responses` over raw HTTP/SSE (D-060), same `Create()`/`Clone` contract as
+every other config, plus `CreateFilesClient()`:
+
+```go
+rcfg := openai.NewOpenAIResponses("gpt-5.2")
+rcfg.Streaming = true // SSE: chunks/reasoning events appear on the stream
+effort := "medium"
+rcfg.Reasoning = &openai.Reasoning{Effort: effort}
+store := false
+rcfg.Store = &store // nil would keep the API default (true); nil-clears work in Clone too
+
+a := agent.New("researcher", "...", agent.WithConfig(rcfg),
+	agent.WithTools(
+		tools.NewWebSearch(tools.WithWebSearchMaxUses(5)), // hosted: runs at OpenAI
+		tools.NewFileSearch(tools.WithVectorStoreIDs([]string{"vs_123"})),
+		myLocalTool)) // ordinary function tools ride along as function items
+```
+
+Hosted tools configured in [Hosted (builtin) tools](#hosted-builtin-tools) reach the
+wire here (web_search/file_search/code_interpreter/image_generation/shell/mcp/
+tool_search); hosted output items map back to `BuiltinToolCallEvent`/
+`BuiltinToolResultEvent` on the stream, so observers and usage accounting see them like
+local tool activity. `events.FileIdInput` inputs map to `input_file.file_id` — the one
+input path that needs `CreateFilesClient()` on the same config.
+
+### The OpenAI Decisions API (`OpenAIDecisionsConfig`)
+
+`openai.NewOpenAIDecisions()` builds the Decisions client: give the agent a
+decision-shaped response schema and the turn's answer is what the API committed to — a
+bool probability against `BooleanThreshold`, an enum choice, a 0..1 score — rendered as
+JSON the schema validates. The schema arrives through `WithResponseSchema` (or
+`CallOptions.ResponseSchema` headless); the question text needs instructions — the
+agent prompt, `QuestionInstructions`, or the schema's description. A schema that is not
+one of the four decision shapes (bool, string enum, int enum from 0, 0..1 number) is
+refused before the request; an API refusal comes back as
+`*openai.DecisionRefusedError` (match with `errors.As`):
+
+```go
+dcfg := openai.NewOpenAIDecisions()
+judge := agent.New("gatekeeper", "Decide whether the tests may run in prod.",
+	agent.WithConfig(dcfg),
+	agent.WithResponseSchema(response.NewSchema[bool]("ship_it", "Ship the release today?")))
+rep, err := judge.Ask(ctx, events.TextInput{Content: "All 214 tests green, coverage 91%."})
+var verdict bool
+_ = json.Unmarshal([]byte(rep.Body()), &verdict)
+```
 
 ## Files API
 
@@ -541,6 +637,24 @@ Builtins:
 | `middleware.Retry(attempts)` | retries a failing model call, linear backoff; never retries cancellation |
 | `middleware.Logging()` | slog log lines around every hook (honors `slog.SetDefault`) |
 | `middleware.Approval()` | every tool call asks the human Y/N/Always via HITL (see below) |
+| `contrib/otelx.Middleware(tp)` | OpenTelemetry spans around turn / LLM call / tool execution (own module — see below) |
+
+**Telemetry (`contrib/otelx`).** The OTEL middleware lives in its own module so the core
+stays dependency-free (D-064): `go get github.com/luckystrker/ago/contrib/otelx` from a
+module that already depends on AGo, then
+
+```go
+factory, shutdown, err := otelx.InstallDefault(ctx,
+	otelx.WithCollector("localhost:4318")) // OTLP/HTTP; or otelx.WithStdout()
+defer shutdown(ctx)
+
+a := agent.New("bot", "...", agent.WithConfig(cfg), agent.WithMiddleware(factory))
+```
+
+Spans: `ago.turn` → `ago.llm_call` (model, provider, usage tokens incl. cache/thinking,
+finish reasons) and `ago.tool_execution` (tool name, call id); errors and
+`ToolErrorEvent` answers set the span status. Have your own `TracerProvider`? Hand it to
+`otelx.Middleware(tp)` instead of `InstallDefault`.
 
 ## Human-in-the-loop
 
@@ -628,6 +742,26 @@ or cancelled.
 `knowledge.NewLockedStore(inner)`. `knowledge.NewEventLogWriter(store)` appends a JSONL
 log of any stream's events (`AppendEvent(streamID, ev)`, `Replay(streamID)`,
 `Streams()`) — the durability primitive behind network WALs and resume.
+
+**Optional stores (contrib).** The SQLite and Redis backends live in their own modules
+so the core keeps zero dependencies (D-048/D-059/D-069). From a module that already
+depends on AGo: `go get github.com/luckystrker/ago/contrib/knowledgesqlite` (or
+`knowledgeredis`, `streamredis`), then
+
+```go
+kstore, err := knowledgesqlite.NewStore("agent.db") // pure-Go SQLite, no cgo
+// or: kstore := knowledgeredis.NewStore(rdb, knowledgeredis.WithPrefix("myapp"))
+// or, for conversation transcripts: sstore := streamredis.NewStorage(rdb)
+s := stream.NewMemoryStream(stream.WithStorage(sstore)) // streamredis speaks stream.Storage
+mem := agent.New("memo", "...", agent.WithConfig(cfg), agent.WithStreamBase(s),
+	agent.WithMiddleware(/* policies over kstore, e.g. WorkingMemoryPolicy */))
+```
+
+`knowledgesqlite.NewStore(dbPath)` and `knowledgeredis.NewStore(rdb, opts...)` are
+drop-in `knowledge.Store` implementations (atomic `Append` — cross-goroutine, and for
+SQLite cross-process too); `streamredis.NewStorage(rdb, opts...)` is a `stream.Storage`
+(one Redis list per stream). OnChange notifies only mutations through the same store
+instance — cross-process change detection is your poll loop.
 
 **Policies.** A `policies.AssemblyPolicy` transforms `(prompts, events)` before each
 model call; policies compose left to right — filters and injections first, reductions
@@ -734,12 +868,34 @@ Builders: `RawHTML` (inline HTML), `ExternalURL` (rendered in an iframe),
 `ui://`; `mcpui.Marshal(res)` renders the byte-exact wire JSON (plain `json.Marshal`
 is shape-equivalent but HTML-escapes).
 
+### Serving an agent over MCP (`mcpserver`)
+
+`github.com/luckystrker/ago/mcpserver` is the inverse of the client: it exposes an
+agent as an MCP server — the conversation is one `ask` tool the remote MCP client
+calls (D-058). The server is stateless; every `tools/call` is an independent exchange.
+
+```go
+srv, err := mcpserver.NewServerForAgent(a) // one blocking agent turn per ask on a fresh stream
+// or a plain bridge: mcpserver.NewServer(mcpserver.ServerConfig{
+// 	Ask: func(ctx context.Context, userText string) (string, error) { ... },
+// 	Tools: []tools.Tool{calc}, // extra deterministic tools served next to ask
+// })
+
+err = srv.Stdio()                    // serve on stdin/stdout until EOF...
+http.Handle("/mcp", srv.Handler())   // ...or streamable HTTP (POST + SSE stream)
+```
+
+A client connecting with `mcp.New(&mcp.MCPStdioConfig{Command: "your-agent"})` (as in
+`examples/mcp_stdio`) now talks to your agent: `tools/list` reports `ask` plus the
+extra tools, `tools/call` runs one exchange, text/image/file results map back through
+the ordinary MCP content blocks. Deferred: sessions, paused runs, OAuth, MCP Apps.
+
 ## Protocol endpoints: A2A, ACP, AG-UI
 
 Three packages expose an agent to the outside world over standard protocols, stdlib only.
 Each is a functional subset of its Python module — the deferred pieces are listed in
 [docs/PORT_STATUS.md](PORT_STATUS.md) and decided in [docs/DECISIONS.md](DECISIONS.md)
-(D-049/D-050 for A2A, D-052 for ACP, D-053 for AG-UI).
+(D-049/D-050 + D-067 for A2A, D-052 + D-066 for ACP, D-053 + D-065 for AG-UI).
 
 ### A2A (`github.com/luckystrker/ago/a2a`) — agent-to-agent over HTTP/JSON-RPC
 
@@ -793,6 +949,56 @@ base64). Remote failures come back as sentinel errors — match with `errors.Is`
 `a2a.ErrTaskNotFound` (-32001), `a2a.ErrTaskNotCancelable` (-32002), `a2a.ErrWire`,
 `a2a.ErrTransport`, `a2a.ErrRPC`.
 
+**Push notifications.** Configure a store and the server grows the whole push surface —
+the card flips `capabilities.pushNotifications`, the four JSON-RPC methods
+`tasks/pushNotificationConfig/set|get|list|delete` answer, and every terminal task fires
+the registered webhooks asynchronously (D-067):
+
+```go
+srv := a2a.NewServer(a2a.ServerConfig{
+	// Card, Handle, Store as above…
+	PushStore: a2a.NewMemoryPushConfigStore(), // implement a2a.PushConfigStore to persist
+})
+mux := http.NewServeMux()
+mux.Handle("/a2a", srv.Handler())
+mux.Handle("/webhook", a2a.NewPushReceiver("s3cret", func(ctx context.Context, t *a2a.Task) error {
+	fmt.Println("task", t.ID, "finished on the far side")
+	return nil
+}))
+```
+
+The client registers one config per task (`cl.SetPushConfig(ctx, taskID, a2a.PushConfig{URL: …, Token: …})`,
+plus `Get/List/DeletePushConfig`); `DefaultPushSender` POSTs the task as
+`application/a2a+json` with the token on `X-A2A-Token`, which is the header
+`PushReceiver` checks constant-time.
+
+**Client-side tools and HITL over the wire** — the `urn:ag2:client-tools:v1` extension.
+A client that executes tools itself advertises their schemas on the message; the agent
+answers `input-required` with tool-call parts; the client runs them locally and resumes
+the same task with the results (D-067):
+
+```go
+schemas := []a2a.ToolSchema{ /* from tools.NewClientTool(...).Schemas() */ }
+final, err := cl.RunClientTools(ctx,
+	a2a.AttachClientTools(a2a.NewMessage(a2a.RoleUser, a2a.NewTextPart("Zip the reports")),
+		schemas),
+	schemas,
+	func(ctx context.Context, calls []a2a.ToolCall) ([]a2a.ToolResultEntry, error) {
+		// execute locally, one ToolResultEntry per call (Content + Error string)
+		return results, nil
+	})
+```
+
+`RunWithHumanInput` is the same loop for a parked HITL question: its callback answers
+the agent's question and the text continuation rides the same task id. The server side
+opts in with `ServerConfig.HandleClientTools` + `HandleToolResults`; context-variable
+sync rides `Message.metadata` under `ag2.context_update` when `ServerConfig.SyncVariables`
+is set (`a2a.ExtractContextUpdate`/`WithContextUpdate`/`StripReservedVariables` are
+usable directly). Non-RPC callers can use the REST twin on the same handler:
+`POST /message:send`, `POST /tasks`, `GET /tasks/{id}?historyLength=N`,
+`POST /tasks/{id}:cancel`. The gRPC transport does not exist and never will (D-071) —
+JSON-RPC and REST carry the full served surface.
+
 ### ACP (`github.com/luckystrker/ago/acp`) — Agent Client Protocol over stdio
 
 Both protocol roles live in one package, over newline-delimited JSON-RPC (the same
@@ -804,29 +1010,50 @@ a := agent.New("ago-assistant", "...", agent.WithConfig(cfg))
 err := acp.ServeAgent(a, acp.ServeConfig{AgentName: "ago-assistant", AgentVersion: "0.1.0"})
 ```
 
-A custom handler streams incremental text through `emit` (each call pushes one
-`agent_message_chunk` update) and returns the final body — it is delivered once more only
-when it differs from what already streamed:
+A custom handler streams incremental text through `emit` (each `emit.Message` call pushes
+one `agent_message_chunk` update) and returns the final body — it is delivered once more
+only when it differs from what already streamed. The handler owns the turn's `ctx`: it is
+cancelled when the client sends `session/cancel` mid-turn, and a cancelled turn answers
+`{"stopReason":"cancelled"}`, never a protocol error (D-066). The `Emitter` carries the
+rest of the update vocabulary — `Thought`, `Plan`, `ToolCall`/`ToolCallUpdate`, `Usage`:
 
 ```go
 var sess *acp.Session
 err := acp.Serve(acp.ServeConfig{
 	OnSession: func(s *acp.Session) { sess = s }, // capture the session handle
-	Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
-		emit("working on it…")
-		dec, err := sess.RequestPermission(context.Background(), "write_file", `{"path":"a.txt"}`)
+	Handle: func(ctx context.Context, sessionID, userText string, emit *acp.Emitter) (string, error) {
+		emit.Message("working on it…")
+		emit.ToolCall("t1", "write_file", "write", "pending", `{"path":"a.txt"}`)
+		dec, err := sess.RequestPermission(ctx, "write_file", `{"path":"a.txt"}`)
 		if err != nil {
 			return "", err
 		}
 		if !dec.Allowed() {
 			return "", errors.New("write rejected")
 		}
-		ans, ok, _ := sess.Elicit(context.Background(), "Proceed?") // ok=false → declined
+		ans, ok, _ := sess.Elicit(ctx, "Proceed?") // ok=false → declined
 		_ = ans
+		emit.ToolCallUpdate("t1", "write_file", "completed", "")
 		return "done", nil
 	},
 })
 ```
+
+`ServeAgent` (the served-agent variant) projects a real conversation: reasoning →
+`agent_thought_chunk` (only with `StreamThoughts: true`), the per-call tool events →
+`tool_call`/`tool_call_update`, and each turn's `UsageEvent` → `usage_update{used, size}`
+when `ContextWindow` is set. **`session/load`** reattaches to a session this connection
+issued and replays its history before answering (`ServeAgent` keeps per-session
+conversations; a plain `Serve` needs `ServeConfig.History` for it). **Auth**: set
+`ServeConfig.Auth` (e.g. `acp.NewStaticTokenAuth("token")`) — every session method then
+requires a successful `authenticate` first, and `initialize` advertises the methods.
+**Mediated fs/terminal** (client role): give the `Bridge` an `FS: &acp.FSConfig{Root: "C:/work"}`
+field and it answers the agent's `fs/read_text_file`/`fs/write_text_file` and
+`terminal/*` requests confined under that root (symlinks resolved, escapes refused;
+terminal output capped with its head kept and a truncated flag). `Bridge.FS == nil`
+(the default) disables it: every mediated request is answered `-32601` and
+`initialize` advertises no fs capability (D-066). `Bridge.OnUpdate` sees every
+`session/update` the agent streams, which is how a `Load` replay reaches your UI.
 
 The `Permission`/`Elicit` policies on `ServeConfig` decide what ever reaches the client:
 a nil policy (or a false answer) denies **locally** — the reject decision is synthesized,
@@ -883,8 +1110,30 @@ h := agui.Handler(agui.HandlerConfig{
 })
 ```
 
-An agent that asks a human a question fails the run — the client reads `RUN_ERROR` (the
-held-turn interrupt machinery of Python's `interrupts.py` is deferred, D-053).
+An agent that asks a human a question does not fail the run anymore — the held-turn
+machinery of Python's `interrupts.py` is ported (D-065). `agui.NewServer` owns the turns:
+a `HumanInputRequest` (a question or a tool approval) parks the run — the exchange ends
+with RUN_FINISHED carrying an `interrupt` outcome (`InterruptOutcome{Interrupts []Interrupt}`),
+and the answer rides the next POST of the same thread as a resume entry
+(`ResumeEntry{InterruptID, Status: "resolved"|"cancelled", Payload}`):
+
+```go
+srv, err := agui.NewServer(
+	agui.WithRetention(agui.Retention{TTL: 15 * time.Minute, MaxHeld: 64}), // defaults 900s/128
+	// agui.WithResumeProof(),   // refuse resumes without the issued proof token
+	// agui.WithStateSnapshots(), // STATE_SNAPSHOT of the conversation variables per run
+)
+mux := http.NewServeMux()
+mux.Handle("/agent", srv.ServeAgent("assistant", "You help humans.", agent.WithConfig(cfg)))
+defer srv.Close() // cancels every held or running turn
+```
+
+Resolved interrupts rebind to the new exchange (RUN_STARTED → the held events → the
+turn continues → RUN_FINISHED success); cancelled ones abandon the run and close its
+open entities. Bad resumes (unknown interrupt id, missing record, wrong proof, malformed
+payload) are a single coded RUN_ERROR **before** RUN_STARTED, and the turn stays
+answerable. Without the server, plain `agui.ServeAgent(a)`/`Handler` keep the one-exchange
+behavior: a question surfaces as a `RUN_ERROR` like any turn failure.
 
 ## Multi-agent network
 
@@ -935,6 +1184,44 @@ handle (`.State`, `.CloseReason`). Other pieces: the `Envelope` wire vocabulary
 handoff/finish markers, and `HumanClient` for operator seats (`client.RegisterHuman`,
 inbox via `Recv`). The full runnable story is `examples/group`.
 
+**Views, arbiter, expectations, task mirror, client tools** (D-056):
+
+- *Views* project a channel's WAL into what a participant's model should see — the
+  caller folds them in a participant handler: `network.FullTranscript{}`,
+  `network.NewWindowedSummary(20)`, `network.NamedTranscript{}`,
+  `network.NewNamedWindowedSummary(20)`. Pass `ViewOptions{RenderEnvelope: …, NameFor: hub.NameFor}`
+  to keep the adapter's envelope rendering and passport names:
+
+  ```go
+  view, err := network.NewWindowedSummary(20)
+  evs := view.Project(hub.ReadWAL(ch.ID), writerC.AgentID(),
+      network.ViewOptions{NameFor: hub.NameFor})
+  // evs: []events.Event — ModelMessage/ModelRequest lines, a CompactionSummary head
+  ```
+
+- *Arbiter*: `network.NewHub(network.WithHubArbiter(myArbiter))` swaps the default
+  `RuleBasedArbiter` (which enforces the per-agent `Rule`) for your own — embed
+  `network.BaseArbiter` and override the gates you care about (`AuthorizeSend`,
+  `AuthorizeDispatch`, `AuthorizeChannelOpen`, `ResolveUnknownAudience` for federated
+  rerouting). A `Deny(reason)` on send fails the send; on dispatch it silently skips
+  that one recipient.
+
+- *Expectations*: declare them in `ChannelManifest.Expectations`
+  (`acks_within`/`reply_within`/`max_silence` evaluators, `notify_channel`/`auto_close`
+  handlers) and run `hub.SweepExpectations()` on a ticker — or
+  `network.NewExpectationSweeper(hub, interval)` — plus `network.WithAuditSink`
+  (`network.NewFileAuditLog("audit.jsonl")`) for the violation trail. Nobody auto-starts
+  the loop; hub owners opt in.
+
+- *Task mirror*: `network.NewTaskMirror(hub, ownerID, channelID)` subscribes an agent's
+  stream and forwards the `Task*` events into the hub task store
+  (`hub.ObserveTask`/`UpdateTask`/`Tasks`).
+
+- *Client tools*: `tools, err := network.ClientTools(hc, writerC)` builds
+  `peers`/`channels`/`tasks`/`context`/`delegate` as ordinary `[]tools.Tool` — hand them
+  to `agent.WithTools` and a bridged agent can find peers, open channels, report task
+  progress and delegate work over a consulting channel by itself.
+
 ## Testing
 
 `agotest "github.com/luckystrker/ago/testing"` (package `agotesting`) scripts the model — no API keys, no
@@ -978,7 +1265,8 @@ suite := eval.Suite{
 			eval.Threshold{Inner: eval.Correctness{Mode: eval.MatchContains}, Min: 1.0},
 		}},
 }
-res, err := eval.Run(ctx, a, suite) // cases run sequentially; a failing ask never aborts the run
+res, err := eval.Run(ctx, a, suite) // 4 cases in flight by default (WithConcurrency(1) = strict order);
+                                    // a failing ask never aborts the run
 for _, cr := range res.Cases {
 	fmt.Println(cr.Name, cr.Passed, cr.Output, cr.Err)
 }
@@ -1013,6 +1301,78 @@ fmt.Println(tr.FinalResponse, tr.Tokens().TotalTokens, len(tr.ToolCalls))
 `eval.Compare(a, b)` tallies two `RunResult`s paired by case name — `WinRate` is B's rate
 and ties count 0.5. `eval.LoadJSON` round-trips the stored events through the `@type`
 registry, so token math and event-based scorers keep working on a loaded run.
+
+**Datasets, registries, diffs, stats, concurrency** (D-061):
+
+```go
+// Suite from a JSONL dataset: one case per line — input required, expected/scorers
+// optional; scorers are registry names or {"name": ..., "params": {...}}.
+suite, err := eval.SuiteFromJSONL("tasks.jsonl", reg)
+
+// The scorer registry builds scorers from names + params (the @scorer stand-in);
+// SetClient feeds the LLM-backed built-ins (llm_judge, failure attribution).
+reg := eval.NewScorerRegistry()
+reg.SetClient(cl)
+sc, err := reg.Build("threshold", map[string]any{"min": 0.8,
+	"inner": map[string]any{"name": "correctness", "params": map[string]any{"mode": "contains"}}},
+	eval.CaseScope{Expected: "Paris"})
+userScorer := func(params map[string]any, scope eval.CaseScope) (eval.Scorer, error) { /* ... */ }
+_ = reg.Register("my_scorer", userScorer)
+
+// Failure attribution: mechanical detection over the trace, plus a one-call
+// LLM attributor for the semantic modes.
+attr := eval.FailureAttribution{Client: cl}
+verdict, err := attr.Score(ctx, trace)
+mechanical := eval.DetectMechanical(trace) // ask error / terminal tool error / no answer
+
+// Parallel cases (default 4 in flight); 1 = strict suite order.
+res, err = eval.Run(ctx, a, suite, eval.WithConcurrency(8))
+```
+
+Compare a run against its baseline and gate on regressions — cases pair by name, and
+`Summary` renders the printable form:
+
+```go
+diff := eval.Diff(current, baseline)            // DiffStrict errors on mismatched suites
+if len(diff.Regressions) > 0 { /* fail the gate */ }
+fmt.Println(diff.Summary())                     // or iterate diff.Cases / Improvements
+lo, hi := baseline.PassRateCI()                 // Wilson CI, z = 1.96
+agr := eval.CohenKappa(pairs)                   // raw agreement + chance-corrected kappa
+```
+
+## Terminal chat and voice (`tui`, `live`)
+
+**`tui`** — the text UI of `ag2/textual.py` without a TUI framework (D-056): a plain
+line REPL. The first input runs `Agent.Ask`; every later line continues the same
+conversation through `AgentReply.Ask`, so history accumulates across the session:
+
+```go
+err := tui.REPL(a, os.Stdin, os.Stdout, tui.WithStreaming()) // /help, /exit; WithStreaming echoes chunks
+```
+
+**`live`** — the HTTP cascade of `ag2/live/cascade.py` (D-057/D-072): one spoken turn is
+transcribe → answer → synthesize. The stages are interfaces you fill — the OpenAI ones
+ship ready — and the LLM leg is a plain function, so an agent reply body works as-is:
+
+```go
+casc := live.Cascade{
+	STT: &live.OpenAITranscriber{APIKey: key},            // whisper-1, /audio/transcriptions
+	LLM: func(ctx context.Context, text string) (string, error) {
+		rep, err := assistant.Ask(ctx, text)
+		if err != nil {
+			return "", err
+		}
+		return rep.Body(), nil
+	},
+	TTS: &live.OpenAISynthesizer{APIKey: key, Format: "mp3"}, // tts-1, /audio/speech
+}
+replyText, audioOut, mime, err := casc.Handle(ctx, clip, "audio/wav", "alloy")
+```
+
+A whitespace-only transcript ends the turn silently. Provider errors wrap `live.ErrAPI`;
+an incomplete cascade fails with `live.ErrIncomplete`. The realtime-websocket stack
+(turn detection, barge-in, streaming TTS) and OS sound devices are out of scope (D-072) —
+bring your own audio source through the `Transcriber`/`Synthesizer` interfaces.
 
 ## Examples index
 

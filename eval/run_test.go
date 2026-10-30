@@ -2,7 +2,10 @@ package eval
 
 import (
 	stdcontext "context"
+	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/luckystrker/ago/agent"
 	"github.com/luckystrker/ago/events"
@@ -72,7 +75,9 @@ func TestRunSuite(t *testing.T) {
 		},
 	}
 
-	res, err := Run(stdcontext.Background(), a, suite)
+	// Concurrency 1: the scripted queue is per-case FIFO, so the deterministic
+	// sequential mode is what a scripted suite needs.
+	res, err := Run(stdcontext.Background(), a, suite, WithConcurrency(1))
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -147,5 +152,147 @@ func TestRunEmptySuiteAndNilAgent(t *testing.T) {
 	}
 	if len(res.Cases) != 0 || res.PassRate != 0 {
 		t.Errorf("empty suite result: %+v", res)
+	}
+}
+
+// rendezvousSuite gives every case its own prompt and a contains-check on the
+// scripted reply.
+func rendezvousSuite(n int) Suite {
+	suite := make(Suite, n)
+	for i := range suite {
+		suite[i] = Case{
+			Name:     fmt.Sprintf("case-%d", i),
+			Input:    fmt.Sprintf("q%d", i),
+			Expected: "done",
+			Scorers:  []Scorer{Correctness{Expected: "done", Mode: MatchContains}},
+		}
+	}
+	return suite
+}
+
+// rendezvousResponses scripts every case to call the tool once, then answer.
+func rendezvousResponses(n int) []*events.ModelResponse {
+	resps := make([]*events.ModelResponse, 0, 2*n)
+	for i := 0; i < n; i++ {
+		resps = append(resps,
+			toolResp("rendezvous", "{}"),
+			textResp("all done"),
+		)
+	}
+	return resps
+}
+
+func TestRunConcurrentCases(t *testing.T) {
+	const n = 4
+	var peak atomic.Int64
+	a := agent.New("evaluated", "",
+		agent.WithConfig(agotest.NewTestConfig(rendezvousResponses(n)...)),
+		agent.WithTools(mustRendezvousTool(t, 100*time.Millisecond, &peak)),
+	)
+
+	// Default concurrency (4): the four cases overlap inside the tool.
+	res, err := Run(stdcontext.Background(), a, rendezvousSuite(n))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if peak.Load() < 2 {
+		t.Errorf("cases did not overlap, peak in-flight = %d", peak.Load())
+	}
+	if res.PassRate != 1.0 {
+		t.Fatalf("pass rate: %v (%+v)", res.PassRate, res.Cases)
+	}
+	// The result stays in suite order regardless of completion order.
+	for i, cr := range res.Cases {
+		if cr.Name != fmt.Sprintf("case-%d", i) || cr.Output != "all done" {
+			t.Errorf("case %d out of place: %+v", i, cr)
+		}
+	}
+}
+
+func TestRunConcurrencyLimits(t *testing.T) {
+	const n = 3
+	// A fresh agent per run: the scripted queue is consumed once per run, so
+	// each limit check needs its own script and its own peak counter.
+	runLimit := func(limit int) int64 {
+		t.Helper()
+		var peak atomic.Int64
+		a := agent.New("evaluated", "",
+			agent.WithConfig(agotest.NewTestConfig(rendezvousResponses(n)...)),
+			agent.WithTools(mustRendezvousTool(t, 30*time.Millisecond, &peak)),
+		)
+		res, err := Run(stdcontext.Background(), a, rendezvousSuite(n), WithConcurrency(limit))
+		if err != nil {
+			t.Fatalf("run limit %d: %v", limit, err)
+		}
+		if res.PassRate != 1.0 {
+			t.Fatalf("run limit %d pass rate: %v", limit, res.PassRate)
+		}
+		return peak.Load()
+	}
+	if got := runLimit(1); got != 1 {
+		t.Errorf("WithConcurrency(1) must serialize cases, peak = %d", got)
+	}
+	// Zero or negative clamps to 1 (Python parity: max(1, concurrency)).
+	if got := runLimit(0); got != 1 {
+		t.Errorf("zero concurrency must clamp to 1, peak = %d", got)
+	}
+}
+
+func mustRendezvousTool(t *testing.T, d time.Duration, peak *atomic.Int64) tools.Tool {
+	t.Helper()
+	var inFlight atomic.Int64
+	fn := func(struct{}) (string, error) {
+		cur := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if cur <= p || peak.CompareAndSwap(p, cur) {
+				break
+			}
+		}
+		time.Sleep(d)
+		inFlight.Add(-1)
+		return "done", nil
+	}
+	tool, err := tools.NewFunctionTool("rendezvous", "Touch the barrier", fn)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	return tool
+}
+
+// TestRunFailureMarksTraceErr pins the ask error onto the trace, where the
+// failure attribution scorer reads it (Python parity: Trace.exception). The
+// suite overdraws the script: whichever case misses the single scripted
+// response fails, and exactly one does.
+func TestRunFailureMarksTraceErr(t *testing.T) {
+	a := scriptedAgent(t, textResp("only one answer"))
+	suite := Suite{
+		{Name: "a", Input: "q", Expected: "only", Scorers: []Scorer{Correctness{Expected: "only", Mode: MatchContains}, FailureAttribution{}}},
+		{Name: "b", Input: "q2", Expected: "only", Scorers: []Scorer{Correctness{Expected: "only", Mode: MatchContains}, FailureAttribution{}}},
+	}
+	res, err := Run(stdcontext.Background(), a, suite, WithConcurrency(2))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	var failed, ok *CaseResult
+	for i := range res.Cases {
+		if res.Cases[i].Err != "" {
+			failed = &res.Cases[i]
+		} else {
+			ok = &res.Cases[i]
+		}
+	}
+	if failed == nil || ok == nil {
+		t.Fatalf("exactly one case must fail: %+v", res.Cases)
+	}
+	if !ok.Passed || ok.Trace.Err != "" {
+		t.Errorf("clean case: %+v", ok)
+	}
+	if failed.Trace.Err == "" {
+		t.Errorf("failed ask must stamp Trace.Err")
+	}
+	attr := failed.Scores[1]
+	if attr.Name != "failure" || attr.Passed || attr.Details["error_mode"] != "crash" {
+		t.Errorf("attribution on failed ask: %+v", attr)
 	}
 }

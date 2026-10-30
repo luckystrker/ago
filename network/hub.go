@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/internal/uuid"
 	"github.com/luckystrker/ago/knowledge"
+	"github.com/luckystrker/ago/task"
 )
 
 // Hub operation errors. Wrap with %w at the raise site; match with
@@ -292,20 +294,26 @@ type Notifier func(env Envelope)
 // state machine, adapter dispatch and the optional WAL. Safe for concurrent
 // use.
 type Hub struct {
-	mu        sync.Mutex
-	passports map[string]Passport // agent_id → passport
-	byName    map[string]string   // name → agent_id
-	rules     map[string]Rule
-	resumes   map[string]Resume
-	channels  map[string]*ChannelHandle
-	adapters  map[string]ChannelAdapter // "type@version"
-	notifiers map[string]Notifier
-	logs      map[string][]Envelope // per-channel accepted envelopes (in-memory WAL mirror)
-	waiters   map[string]chan *ChannelHandle
-	wal       WAL
-	now       func() time.Time
-	ids       *idMinter
-	ackWait   time.Duration
+	mu               sync.Mutex
+	passports        map[string]Passport // agent_id → passport
+	byName           map[string]string   // name → agent_id
+	rules            map[string]Rule
+	resumes          map[string]Resume
+	channels         map[string]*ChannelHandle
+	adapters         map[string]ChannelAdapter // "type@version"
+	notifiers        map[string]Notifier
+	logs             map[string][]Envelope // per-channel accepted envelopes (in-memory WAL mirror)
+	waiters          map[string]chan *ChannelHandle
+	arbiter          HubArbiter
+	audit            AuditSink
+	tasks            map[string]task.Metadata // observed tasks (task_mirror forwards agent-side Task* events)
+	expectEvaluators map[string]ExpectationEvaluator
+	expectHandlers   map[string]ViolationHandler
+	firedViolations  map[string]map[string]bool // channel → "(idx|kind|violator)" fires (in-memory dedup)
+	wal              WAL
+	now              func() time.Time
+	ids              *idMinter
+	ackWait          time.Duration
 }
 
 // HubOption configures a Hub.
@@ -322,21 +330,48 @@ func WithHubClock(now func() time.Time) HubOption { return func(h *Hub) { h.now 
 // (default 30s).
 func WithAckTimeout(d time.Duration) HubOption { return func(h *Hub) { h.ackWait = d } }
 
+// WithHubArbiter replaces the access/routing arbiter (default
+// RuleBasedArbiter). Only one arbiter is active; the most recent
+// registration wins. A nil arbiter keeps the default.
+func WithHubArbiter(a HubArbiter) HubOption {
+	return func(h *Hub) {
+		if a != nil {
+			h.arbiter = a
+		}
+	}
+}
+
+// WithAuditSink attaches the audit sink: the hub appends one entry per
+// expectation-violation fire (and other hub-crossing events as they gain
+// audit coverage). Nil disables auditing.
+func WithAuditSink(sink AuditSink) HubOption { return func(h *Hub) { h.audit = sink } }
+
 // NewHub creates an empty hub. Register adapters before creating channels.
 func NewHub(opts ...HubOption) *Hub {
 	h := &Hub{
-		passports: make(map[string]Passport),
-		byName:    make(map[string]string),
-		rules:     make(map[string]Rule),
-		resumes:   make(map[string]Resume),
-		channels:  make(map[string]*ChannelHandle),
-		adapters:  make(map[string]ChannelAdapter),
-		notifiers: make(map[string]Notifier),
-		logs:      make(map[string][]Envelope),
-		waiters:   make(map[string]chan *ChannelHandle),
-		now:       time.Now,
-		ids:       &idMinter{},
-		ackWait:   30 * time.Second,
+		passports:        make(map[string]Passport),
+		byName:           make(map[string]string),
+		rules:            make(map[string]Rule),
+		resumes:          make(map[string]Resume),
+		channels:         make(map[string]*ChannelHandle),
+		adapters:         make(map[string]ChannelAdapter),
+		notifiers:        make(map[string]Notifier),
+		logs:             make(map[string][]Envelope),
+		waiters:          make(map[string]chan *ChannelHandle),
+		arbiter:          RuleBasedArbiter{},
+		tasks:            make(map[string]task.Metadata),
+		expectEvaluators: make(map[string]ExpectationEvaluator),
+		expectHandlers:   make(map[string]ViolationHandler),
+		firedViolations:  make(map[string]map[string]bool),
+		now:              time.Now,
+		ids:              &idMinter{},
+		ackWait:          30 * time.Second,
+	}
+	for _, e := range DefaultExpectationEvaluators() {
+		h.expectEvaluators[e.Name()] = e
+	}
+	for _, vh := range DefaultViolationHandlers() {
+		h.expectHandlers[vh.Name()] = vh
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -430,6 +465,19 @@ func (h *Hub) Passport(nameOrID string) (Passport, error) {
 	return h.passportLocked(nameOrID)
 }
 
+// Registrations returns a snapshot of every passport in the hub (the peers
+// tool's directory view), ordered by name.
+func (h *Hub) Registrations() []Passport {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]Passport, 0, len(h.passports))
+	for _, p := range h.passports {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 func (h *Hub) passportLocked(nameOrID string) (Passport, error) {
 	if p, ok := h.passports[nameOrID]; ok {
 		return p, nil
@@ -517,31 +565,27 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 		return nil, fmt.Errorf("%w: no adapter registered for manifest %q@%s", ErrNotFound, manifest.Type, manifest.Version)
 	}
 
-	// Concurrency cap on the creator.
-	if cap := creatorRule.MaxConcurrentChannels; cap > 0 {
-		active := 0
-		for _, ch := range h.channels {
-			if ch.CreatorID == creatorID && !ch.State.Terminal() {
-				active++
-			}
-		}
-		if active >= cap {
-			h.mu.Unlock()
-			return nil, fmt.Errorf("%w: creator %q exceeded max_concurrent_channels (%d >= %d)",
-				ErrAccessDenied, creator.Name, active, cap)
+	// Pre-flight gate (arbiter): concurrency cap on the creator plus the
+	// invitees' inbound access. The dispatch path silently filters
+	// envelopes from blocked senders, so without this pre-check an invite
+	// to a recipient who blocks the creator would be dropped and the
+	// creator would hang until the ack timeout.
+	active := 0
+	for _, ch := range h.channels {
+		if ch.CreatorID == creatorID && !ch.State.Terminal() {
+			active++
 		}
 	}
-	// Pre-flight inbound check: an invite to a recipient who blocks the
-	// creator would otherwise be dropped silently and the creator would
-	// hang until the ack timeout.
-	for _, id := range participants[1:] {
-		rule := h.rules[id]
-		invitee := h.passports[id]
-		if !Match(rule.InboundGlobs, creator.Name) {
-			h.mu.Unlock()
-			return nil, fmt.Errorf("%w: invitee %q does not accept inbound from %q",
-				ErrAccessDenied, invitee.Name, creator.Name)
-		}
+	invitees := participants[1:]
+	inviteePassports := make([]Passport, len(invitees))
+	inviteeRules := make([]Rule, len(invitees))
+	for i, id := range invitees {
+		inviteePassports[i] = h.passports[id]
+		inviteeRules[i] = h.rules[id]
+	}
+	if d := h.arbiter.AuthorizeChannelOpen(manifest, creator, creatorRule, inviteePassports, inviteeRules, active); !d.Allowed {
+		h.mu.Unlock()
+		return nil, denyErr(d)
 	}
 
 	channelID := uuid.New()
@@ -833,19 +877,16 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 		return Envelope{}, fmt.Errorf("%w: envelope on channel %s", ErrTTLExpired, ch.ID)
 	}
 
-	// Outbound access + delegation depth — explicit audiences only;
-	// broadcasts skip (protocol broadcasts address the creator too).
+	// Outbound access + delegation depth (arbiter). Explicit audiences
+	// only; broadcasts skip (protocol broadcasts address the creator too).
+	var recipients []Passport
 	if env.Audience != "" && env.Audience != env.SenderID {
 		if recipient, ok := h.passports[env.Audience]; ok {
-			if !Match(senderRule.OutboundGlobs, recipient.Name) {
-				return Envelope{}, fmt.Errorf("%w: sender %q may not send to %q",
-					ErrAccessDenied, sender.Name, recipient.Name)
-			}
+			recipients = append(recipients, recipient)
 		}
 	}
-	if cap := senderRule.MaxDelegationDepth; cap > 0 && env.Depth > cap {
-		return Envelope{}, fmt.Errorf("%w: sender %q depth %d > %d",
-			ErrDepthExceeded, sender.Name, env.Depth, cap)
+	if d := h.arbiter.AuthorizeSend(env, sender, senderRule, recipients); !d.Allowed {
+		return Envelope{}, denyErr(d)
 	}
 
 	// Adapter validate+fold. On error the state stays untouched and the
@@ -913,19 +954,23 @@ func (h *Hub) resolveTargetsLocked(ch *ChannelHandle, env Envelope) []dispatchTa
 			}
 		}
 	}
+	// Federation hook: audience members no passport covers can be
+	// redirected by the arbiter (default: dropped silently).
+	ids = h.resolveUnknownLocked(env, ids)
+
 	targets := make([]dispatchTarget, 0, len(ids))
-	senderName := h.agentNameLocked(env.SenderID)
+	sender, hasSender := h.passports[env.SenderID]
 	for _, id := range ids {
 		p, ok := h.passports[id]
 		if !ok {
-			continue // unknown audience ids drop silently (single-hub behavior)
+			continue // replacement ids that stay unknown drop silently
 		}
 		t := dispatchTarget{id: id, name: p.Name, isSelf: id == env.SenderID}
-		if !t.isSelf {
-			// Inbound access: silently skip blocked recipients — the rest of
-			// the audience still receives.
+		if !t.isSelf && hasSender {
+			// Inbound access (arbiter): silently skip blocked recipients —
+			// the rest of the audience still receives.
 			t.rule = h.rules[id]
-			if !Match(t.rule.InboundGlobs, senderName) {
+			if d := h.arbiter.AuthorizeDispatch(env, sender, p, t.rule); !d.Allowed {
 				continue
 			}
 		}
@@ -994,6 +1039,8 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 	ch.State = target
 	ch.ClosedAt = h.now()
 	ch.CloseReason = reason
+	// Terminal channel: the fired-violation dedup cache is dead weight.
+	delete(h.firedViolations, channelID)
 	// Lifecycle snapshot: swallowed (see recordLocked).
 	_ = h.recordLocked(channelSnapshot(ch))
 

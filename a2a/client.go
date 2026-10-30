@@ -12,21 +12,23 @@ import (
 )
 
 // Client is a transport-level A2A client: agent-card discovery plus the
-// request/response JSON-RPC methods against one server. Safe for concurrent
-// use.
+// request/response JSON-RPC methods against one server, the push-notification
+// config surface, and the client-tools / HITL drivers (clienttools.go). Safe
+// for concurrent use.
 //
 // This is not the conversational A2AClient of Python (client.py:159 — an
-// LLMClient that ships full AG2 history, drives streams/polling to a terminal
-// task and syncs context variables); that turn machinery is deferred (D-049).
+// LLMClient that ships full AG2 history per turn and syncs conversation
+// state); that turn machinery is deferred (D-049).
 //
 // AGO-DEVIATION: Python's A2AClient is an LLMClient provider (not a tool), so
 // no tool adapter ships from this package; D-049.
 type Client struct {
-	base     string
-	cardPath string
-	http     *http.Client
-	headers  map[string]string
-	nextID   atomic.Int64
+	base       string
+	cardPath   string
+	http       *http.Client
+	headers    map[string]string
+	extensions []string
+	nextID     atomic.Int64
 }
 
 // ClientOption configures a Client.
@@ -53,6 +55,16 @@ func WithHeaders(h map[string]string) ClientOption {
 // it at LegacyCardPath for v0.x-only servers).
 func WithCardPath(p string) ClientOption {
 	return func(c *Client) { c.cardPath = p }
+}
+
+// WithExtensions activates protocol extension URIs on the connection: every
+// request carries the A2A-Extensions header with them (comma-separated, the
+// A2A spec spelling; parity: extension.py extension_call_context — the
+// header on jsonrpc/rest), and the drivers keep the URIs on continuation
+// messages. Card reconciliation is ValidateExtensionActivation's job — call
+// it with the fetched card before the first exchange.
+func WithExtensions(uris ...string) ClientOption {
+	return func(c *Client) { c.extensions = append(c.extensions, uris...) }
 }
 
 // NewClient builds a Client against the server at baseURL (for example
@@ -95,7 +107,9 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 // as the result. The server records the exchange as a Task in its store;
 // correlate via the reply's TaskID and Client.TasksGet. A remote JSON-RPC
 // error (Handle failure → internal error, unknown task → ErrTaskNotFound)
-// comes back through the sentinels of this package.
+// comes back through the sentinels of this package. A server that parked the
+// turn input-required answers with a Task record, which this method refuses —
+// use SendMessageTask or one of the drivers for extension/HITL exchanges.
 func (c *Client) SendMessage(ctx context.Context, msg *Message) (*Message, error) {
 	result, err := c.call(ctx, MethodMessageSend, map[string]any{"message": msg})
 	if err != nil {
@@ -197,6 +211,21 @@ func (c *Client) applyHeaders(req *http.Request) {
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	if len(c.extensions) > 0 {
+		req.Header.Set(HeaderA2AExtensions, strings.Join(c.extensions, ","))
+	}
+}
+
+// ValidateExtensions fetches the agent card and reconciles the client's
+// activated URIs against it in both directions (parity: client.py:328 —
+// validate_extension_activation at connect). ErrExtensionNotSupported on a
+// mismatch.
+func (c *Client) ValidateExtensions(ctx context.Context) error {
+	card, err := c.AgentCard(ctx)
+	if err != nil {
+		return err
+	}
+	return ValidateExtensionActivation(card, c.extensions)
 }
 
 // rpcErrToGo maps a wire error object to the package sentinels; the code

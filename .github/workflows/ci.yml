@@ -56,3 +56,32 @@ jobs:
           go run ./examples/ask          > /dev/null
           go run ./examples/tools        > /dev/null
           go run ./examples/structured_output > /dev/null
+
+  contrib:
+    name: Contrib modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      # Each contrib/<name> is its own Go module (own go.mod, replace => ../..)
+      # and is invisible to the root ./... gates — build, vet and test each one
+      # from its own directory. A missing entry fails the loop without touching
+      # the other modules.
+      - name: Build, vet and test every contrib module
+        run: |
+          status=0
+          for dir in contrib/*/; do
+            name=$(basename "$dir")
+            echo "::group::contrib/$name"
+            if ! (cd "$dir" && go build ./... && go vet ./... && go test -count=1 ./...); then
+              echo "::error::contrib/$name gates failed"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status

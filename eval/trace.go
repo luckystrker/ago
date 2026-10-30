@@ -42,6 +42,7 @@ type Trace struct {
 	LLMCalls      []LLMCall      `json:"llm_calls"`
 	ToolCalls     []ToolCall     `json:"tool_calls"`
 	FinalResponse string         `json:"final_response,omitempty"`
+	Err           string         `json:"err,omitempty"` // the ask failure, if any (Python parity: Trace.exception)
 	Events        []events.Event `json:"events,omitempty"`
 }
 
@@ -159,6 +160,7 @@ func (t Trace) MarshalJSON() ([]byte, error) {
 		LLMCalls      []LLMCall         `json:"llm_calls"`
 		ToolCalls     []ToolCall        `json:"tool_calls"`
 		FinalResponse string            `json:"final_response,omitempty"`
+		Err           string            `json:"err,omitempty"`
 		Events        []json.RawMessage `json:"events,omitempty"`
 	}
 	return json.Marshal(alias{
@@ -168,6 +170,7 @@ func (t Trace) MarshalJSON() ([]byte, error) {
 		LLMCalls:      t.LLMCalls,
 		ToolCalls:     t.ToolCalls,
 		FinalResponse: t.FinalResponse,
+		Err:           t.Err,
 		Events:        evs,
 	})
 }
@@ -184,6 +187,7 @@ func (t *Trace) UnmarshalJSON(data []byte) error {
 		LLMCalls      []LLMCall         `json:"llm_calls"`
 		ToolCalls     []ToolCall        `json:"tool_calls"`
 		FinalResponse string            `json:"final_response,omitempty"`
+		Err           string            `json:"err,omitempty"`
 		Events        []json.RawMessage `json:"events,omitempty"`
 	}
 	if err := json.Unmarshal(data, &w); err != nil {
@@ -195,6 +199,7 @@ func (t *Trace) UnmarshalJSON(data []byte) error {
 	t.LLMCalls = w.LLMCalls
 	t.ToolCalls = w.ToolCalls
 	t.FinalResponse = w.FinalResponse
+	t.Err = w.Err
 	t.Events = make([]events.Event, 0, len(w.Events))
 	for i, raw := range w.Events {
 		ev, err := events.UnmarshalEvent(raw)

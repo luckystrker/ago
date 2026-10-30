@@ -1,6 +1,7 @@
 package agui
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -75,6 +76,98 @@ func TestReadRunInput(t *testing.T) {
 					t.Fatal("want an error")
 				}
 			})
+		}
+	})
+}
+
+// The input parser accepts both key spellings: camelCase, the protocol's own,
+// and snake_case, which a hand-written client often sends. Where both name one
+// field, the camelCase value wins.
+func TestReadRunInputSnakeCase(t *testing.T) {
+	t.Run("a snake_case body serves like its camelCase twin", func(t *testing.T) {
+		body := `{
+		  "thread_id": "t1", "run_id": "r1", "protocol_version": "1.0",
+		  "parent_run_id": "p1",
+		  "messages": [
+			{"id": "m1", "role": "user", "content": "hello"},
+			{"id": "m2", "role": "assistant", "content": "calling",
+			 "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{\"x\":1}"}}]},
+			{"id": "m3", "role": "tool", "tool_call_id": "c1", "content": "done"}
+		  ],
+		  "resume": [{"interrupt_id": "i1", "status": "resolved", "payload": "blue"}]
+		}`
+		in, err := ReadRunInput([]byte(body))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if in.ThreadID != "t1" || in.RunID != "r1" || in.ProtocolVersion != "1.0" || in.ParentRunID != "p1" {
+			t.Fatalf("ids lost: %+v", in)
+		}
+		if len(in.Messages) != 3 {
+			t.Fatalf("messages = %d, want 3", len(in.Messages))
+		}
+		if tc := in.Messages[1].ToolCalls; len(tc) != 1 || tc[0].ID != "c1" || tc[0].Function.Name != "f" {
+			t.Fatalf("snake_case tool_calls lost: %+v", in.Messages[1].ToolCalls)
+		}
+		if in.Messages[2].ToolCallID != "c1" {
+			t.Fatalf("snake_case tool_call_id lost: %+v", in.Messages[2])
+		}
+		if len(in.Resume) != 1 || in.Resume[0].InterruptID != "i1" || in.Resume[0].Payload != "blue" {
+			t.Fatalf("snake_case resume lost: %+v", in.Resume)
+		}
+	})
+
+	t.Run("camelCase wins when a body carries both spellings", func(t *testing.T) {
+		in, err := ReadRunInput([]byte(`{
+		  "threadId": "camel", "thread_id": "snake",
+		  "runId": "r1",
+		  "messages": [{"id":"m1","role":"user","content":"x","toolCallId":"camel","tool_call_id":"snake"}]
+		}`))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if in.ThreadID != "camel" {
+			t.Fatalf("threadId = %q, want the camelCase value", in.ThreadID)
+		}
+		if in.Messages[0].ToolCallID != "camel" {
+			t.Fatalf("toolCallId = %q, want the camelCase value", in.Messages[0].ToolCallID)
+		}
+	})
+
+	t.Run("state and forwardedProps are values, not key aliased", func(t *testing.T) {
+		in, err := ReadRunInput([]byte(`{
+		  "threadId": "t1", "runId": "r1",
+		  "state": {"snake_case_key": {"tool_call_id": "kept"}},
+		  "forwardedProps": {"tool_calls": 1},
+		  "messages": [{"id":"m1","role":"user","content":"x"}]
+		}`))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var state map[string]any
+		if err := json.Unmarshal(in.State, &state); err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		inner := state["snake_case_key"].(map[string]any)
+		if inner["tool_call_id"] != "kept" {
+			t.Fatalf("the application's own keys were rewritten: %v", state)
+		}
+	})
+
+	t.Run("a resume entry of unknown status is stripped, the run served", func(t *testing.T) {
+		in, err := ReadRunInput([]byte(`{
+		  "threadId": "t1", "runId": "r1",
+		  "messages": [{"id":"m1","role":"user","content":"x"}],
+		  "resume": [
+			{"interruptId": "i1", "status": "maybe", "payload": "?"},
+			{"interruptId": "i2", "status": "resolved", "payload": "y"}
+		  ]
+		}`))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if len(in.Resume) != 1 || in.Resume[0].InterruptID != "i2" {
+			t.Fatalf("resume = %+v, want only the resolved entry", in.Resume)
 		}
 	})
 }

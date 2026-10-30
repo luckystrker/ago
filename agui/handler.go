@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/luckystrker/ago/agent"
@@ -40,6 +41,14 @@ func Handler(cfg HandlerConfig) http.Handler {
 	if run == nil {
 		run = func(context.Context, RunAgentInput, func(Event)) error { return nil }
 	}
+	return handlerFor(caps, func(ctx context.Context, input RunAgentInput, ex *exchange) error {
+		return run(ctx, input, ex.emit)
+	})
+}
+
+// handlerFor builds the endpoint: GET answers with the capabilities JSON, POST
+// streams one exchange.
+func handlerFor(caps func() AgentCapabilities, serve exchangeFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -57,7 +66,7 @@ func Handler(cfg HandlerConfig) http.Handler {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid AG-UI RunAgentInput body"})
 				return
 			}
-			serveExchange(w, r, input, run)
+			serveExchangeEx(w, r, input, serve)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -88,73 +97,147 @@ func staticCapabilities() AgentCapabilities {
 	}
 }
 
+// exchange is one HTTP exchange carrying a run: emit writes AG-UI events onto
+// the response; done closes when the exchange is over or the client went away;
+// ended closes once a terminal event has been written onto the stream.
+type exchange struct {
+	emit  func(Event)
+	done  <-chan struct{}
+	ended <-chan struct{}
+}
+
+// wait blocks until the exchange's run ended on the wire — the terminal event
+// is written — or the exchange is over because the client went away. A run that
+// pauses waits here until its resume ends it; a held turn outlives the wait.
+func (ex *exchange) wait() {
+	select {
+	case <-ex.ended:
+	case <-ex.done:
+	}
+}
+
+// exchangeFunc drives one POSTed run against an exchange (HandlerConfig.Run's
+// form for code that needs the exchange's end signals).
+type exchangeFunc func(ctx context.Context, input RunAgentInput, ex *exchange) error
+
 // serveExchange writes one run as SSE: the events emit produces go out as
 // "data: <json>" frames until the terminal one, which ends the response (Python
 // parity: serve_exchange plus the EventEncoder's frame shape).
 func serveExchange(w http.ResponseWriter, r *http.Request, input RunAgentInput, run RunFunc) {
+	serveExchangeEx(w, r, input, func(ctx context.Context, input RunAgentInput, ex *exchange) error {
+		return run(ctx, input, ex.emit)
+	})
+}
+
+// serveExchangeEx is serveExchange for a callback that wants the exchange's end
+// signals: a run that pauses — leaving a held turn running — returns when its
+// interrupt event is on the wire, not when the turn is over.
+func serveExchangeEx(w http.ResponseWriter, r *http.Request, input RunAgentInput, run exchangeFunc) {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 
 	// Events flow through a channel so the run's goroutine blocks on a slow
 	// client the way Python's send blocks on a slow exchange — backpressure, not
-	// an unbounded buffer.
+	// an unbounded buffer. frames is never closed: the turn may outlive the
+	// exchange, and a send racing the response's end is dropped on done instead
+	// of panicking on a closed channel.
 	type frame struct{ raw []byte }
 	frames := make(chan frame, 16)
-	var ended atomic.Bool
+	var (
+		doneOnce  sync.Once
+		endedOnce sync.Once
+		endedFlag atomic.Bool
+		runGone   = make(chan struct{})
+		done      = make(chan struct{})
+		ended     = make(chan struct{})
+	)
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 	emit := func(e Event) {
 		raw, err := json.Marshal(e)
 		if err != nil {
 			slog.Error("agui: dropping an event that does not encode", "event", e.eventType(), "err", err)
 			return
 		}
-		if isTerminal(e) {
-			ended.Store(true)
+		terminal := isTerminal(e)
+		if terminal {
+			endedFlag.Store(true)
 		}
-		frames <- frame{raw: raw}
+		select {
+		case frames <- frame{raw: raw}:
+			if terminal {
+				endedOnce.Do(func() { close(ended) })
+			}
+		case <-done:
+			// No exchange is carrying the run any more; the event is dropped
+			// (Python parity: a send into a closed stream logs and drops).
+		}
 	}
 
-	done := make(chan struct{})
 	go func() {
-		defer close(frames)
+		defer close(runGone)
+		defer closeDone()
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
 					slog.Error("agui: run panicked", "panic", rec)
 				}
 			}()
-			if err := run(r.Context(), input, emit); err != nil {
+			if err := run(r.Context(), input, &exchange{emit: emit, done: done, ended: ended}); err != nil {
 				// The outcome is on the stream; a callback error without one is
 				// repaired below.
 				slog.Error("agui: run failed", "err", err)
 			}
 		}()
-		if !ended.Load() {
+		if !endedFlag.Load() {
 			// A run that started on the wire always ends on it — on a callback
 			// that stopped short, and on one that panicked (Python parity:
 			// serve_exchange's not-ended RUN_ERROR).
 			emit(runErrorEvent(errors.New("the run was stopped before it could finish")))
 		}
-		close(done)
 	}()
 
-	for f := range frames {
+	write := func(f frame) bool {
 		line := make([]byte, 0, len(f.raw)+8)
 		line = append(line, "data: "...)
 		line = append(line, f.raw...)
 		line = append(line, '\n', '\n')
 		if _, err := w.Write(line); err != nil {
-			// The client went away; drain what is left rather than deadlocking
-			// the run, and stop writing.
-			for range frames {
-			}
-			break
+			// The client went away; stop writing.
+			return false
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
+		return true
 	}
-	<-done
+
+read:
+	for {
+		select {
+		case f := <-frames:
+			if !write(f) {
+				break read
+			}
+		case <-done:
+			// The run side is finished for this exchange: what it already
+			// queued — the terminal included — still goes out.
+			for {
+				select {
+				case f := <-frames:
+					if !write(f) {
+						break read
+					}
+				default:
+					break read
+				}
+			}
+		}
+	}
+	// A write failure releases the producer; on the normal path done is closed
+	// already and this returns at once.
+	closeDone()
+	<-runGone
 }
 
 // RunFunc drives one POSTed run (HandlerConfig.Run).

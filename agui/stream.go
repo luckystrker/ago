@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/internal/uuid"
@@ -11,11 +12,13 @@ import (
 
 // Stream projects one served turn: an ago conversation stream's events become
 // AG-UI events on emit (Python parity: stream.py's map_events_to_ag_ui
-// subscriber, plus the usage meter). One Stream serves one run; it is not safe
-// for concurrent use — the projection runs inside the stream's synchronous
-// dispatch, which serializes it.
+// subscriber, plus the usage meter). One Stream serves one turn and may span
+// several exchanges; safe for concurrent use — the projection state is guarded,
+// so a pause's bookkeeping can read it from another goroutine while the stream
+// dispatch keeps emitting.
 type Stream struct {
 	emit func(Event)
+	mu   sync.Mutex
 
 	// message ids opened on the wire and not yet closed (Python parity:
 	// streaming_msg_id / reasoning_msg_id).
@@ -27,6 +30,10 @@ type Stream struct {
 	// calls are the tool calls this run started, and whether each was answered
 	// (Python parity: TurnOutput._calls, for pendingToolCallIds).
 	calls map[string]bool
+	// openSubs are the subagent invocations announced and not yet ended, in
+	// announcement order (Python parity: the SUBAGENT_STARTED half of
+	// TurnOutput._open).
+	openSubs []string
 	// usage accumulates every UsageEvent the run spent, as it was spent.
 	usage []events.UsageEvent
 }
@@ -45,6 +52,8 @@ func NewStream(emit func(Event)) *Stream {
 // out individually (AGO-DEVIATION: Python has no such batch on the stream, so
 // double-projecting results is not a question it faces — see D-053).
 func (s *Stream) Handle(ev events.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	e := events.AsValue(ev)
 
 	// A reasoning span ends where the reasoning stops, whatever follows it
@@ -174,6 +183,7 @@ func (s *Stream) Handle(ev events.Event) {
 		s.usage = append(s.usage, e)
 
 	case events.TaskStarted:
+		s.openSubs = append(s.openSubs, e.TaskID)
 		s.emit(SubagentStartedEvent{
 			baseEvent:        baseEvent{Type: "SUBAGENT_STARTED", Timestamp: TimestampMs()},
 			SubagentRunID:    e.TaskID,
@@ -185,6 +195,7 @@ func (s *Stream) Handle(ev events.Event) {
 	case events.TaskCompleted:
 		// No usage rides on these: the run's own total already holds the
 		// delegated spend (Python parity: map_task_event_to_ag_ui).
+		s.closeSub(e.TaskID)
 		var result any = e.Result
 		if e.Result == "" {
 			result = nil
@@ -196,6 +207,7 @@ func (s *Stream) Handle(ev events.Event) {
 		})
 
 	case events.TaskFailed:
+		s.closeSub(e.TaskID)
 		message := e.Error
 		if message == "" {
 			message = "subtask failed"
@@ -203,6 +215,7 @@ func (s *Stream) Handle(ev events.Event) {
 		s.emit(subagentError(e.TaskID, message))
 
 	case events.TaskCancelled:
+		s.closeSub(e.TaskID)
 		message := "cancelled"
 		if e.Reason != "" {
 			message = "cancelled: " + e.Reason
@@ -210,6 +223,7 @@ func (s *Stream) Handle(ev events.Event) {
 		s.emit(subagentError(e.TaskID, message))
 
 	case events.TaskExpired:
+		s.closeSub(e.TaskID)
 		s.emit(subagentError(e.TaskID, "expired"))
 
 	case AGUIEvent:
@@ -229,6 +243,66 @@ func subagentError(taskID, message string) SubagentErrorEvent {
 		SubagentRunID: taskID,
 		Message:       message,
 	}
+}
+
+// closeSub forgets an invocation that ended. Called from Handle, under mu.
+func (s *Stream) closeSub(taskID string) {
+	for i, id := range s.openSubs {
+		if id == taskID {
+			s.openSubs = append(s.openSubs[:i], s.openSubs[i+1:]...)
+			return
+		}
+	}
+}
+
+// OpenSubagent reports whether an invocation with this id is open on the wire —
+// announced and not yet ended (Python parity: TurnOutput.is_open_subagent).
+func (s *Stream) OpenSubagent(taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range s.openSubs {
+		if id == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+// Closings ends every entity still open on the wire — innermost first — for a
+// run ending before it did (Python parity: TurnOutput._close_open, the abandon
+// path). The projection state is reset, so the events are emitted once.
+func (s *Stream) Closings() []Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Event
+	if s.streamingMsgID != "" {
+		out = append(out, TextMessageEndEvent{
+			baseEvent: baseEvent{Type: EventTextMessageEnd, Timestamp: TimestampMs()},
+			MessageID: s.streamingMsgID,
+		})
+		s.streamingMsgID = ""
+	}
+	if s.reasoningMsgID != "" {
+		out = append(out, ReasoningMessageEndEvent{
+			baseEvent: baseEvent{Type: EventReasoningMessageEnd, Timestamp: TimestampMs()},
+			MessageID: s.reasoningMsgID,
+		}, ReasoningEndEvent{
+			baseEvent: baseEvent{Type: EventReasoningEnd, Timestamp: TimestampMs()},
+			MessageID: s.reasoningMsgID,
+		})
+		s.reasoningMsgID = ""
+	}
+	// Announced before their invocation closed, so a client was told about
+	// them: the failure is what the wire needs to let them go (Python parity:
+	// _closing on SUBAGENT_STARTED).
+	for i := len(s.openSubs) - 1; i >= 0; i-- {
+		out = append(out, subagentError(s.openSubs[i], "the run was cancelled before this invocation finished"))
+	}
+	s.openSubs = nil
+	return out
 }
 
 // answerCall marks a call answered; a ToolCallResultEvent for a call this run
@@ -342,6 +416,8 @@ func (s *Stream) closeReasoning() {
 // call order (Python parity: TurnOutput.success_outcome). The map is iterated in
 // insertion order through a slice, so the result is stable.
 func (s *Stream) SuccessOutcome() SuccessOutcome {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var pending []string
 	for id, answered := range s.calls {
 		if !answered {
@@ -355,8 +431,10 @@ func (s *Stream) SuccessOutcome() SuccessOutcome {
 // take, or nil for a run that spent nothing (Python parity:
 // map_usage_events_to_ag_ui).
 func (s *Stream) TakeUsage() []TokenUsage {
+	s.mu.Lock()
 	spent := s.usage
 	s.usage = nil
+	s.mu.Unlock()
 	return tokenUsageFromEvents(spent)
 }
 

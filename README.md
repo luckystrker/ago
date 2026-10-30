@@ -60,20 +60,22 @@ models — no API keys needed.
 | 🧠 **One `Agent` type** | blocking `Ask`, observable `Run`, continuations on the same stream, `Resume` from mid-trajectory |
 | 📡 **Event-sourced core** | every observation is an event: pub/sub stream, durable transcript, replays and usage accounting are event logs |
 | 🔧 **Tools as subscribers** | function tools with schema generation and dependency injection, toolkits, parallel execution, `final=true` tools, name precedence, hosted builtin tools executed by the provider (`web_search`, `code_execution`, …) |
+| 🧰 **Tool packs** | ready-made tools over the framework: shell, local code runner, filesystem guard, DuckDuckGo/Tavily/Perplexity search, skills loader, dynamic sub-agent factory (`toolpacks`) |
 | 🧩 **Plugins** | tools, middleware and prompt fragments bundled under one name (`plugin.Bundle`), applied to the agent at construction |
-| 🌐 **7 LLM providers** | OpenAI, Anthropic, Gemini, Ollama, Z.AI, Mistral, DashScope — full clients; xAI/Bedrock/TypeSafe as config stubs |
+| 🌐 **7 LLM providers + Responses/Decisions** | OpenAI (Chat Completions **and** the Responses API with hosted tools, plus the Decisions API), Anthropic, Gemini, Ollama, Z.AI, Mistral, DashScope — full clients; xAI/Bedrock/TypeSafe as config stubs |
 | 📁 **Files API** | provider-agnostic upload/read/list/delete — OpenAI and Anthropic clients behind one `files.API` wrapper |
-| 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals |
+| 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals; OTEL telemetry as the optional `contrib/otelx` module |
 | 🙋 **Human-in-the-loop** | pluggable human hooks, tool approvals, timed-out asks, transcript repair for abandoned tool calls |
 | 📦 **Structured output** | JSON-schema from Go types, validated answers with automatic re-asking |
 | 🗂️ **Tasks & subtasks** | task lifecycle with checkpoints, `run_subtask`/`run_subtasks` fan-out with usage roll-up, `AsTool` delegation |
-| 🧠 **Knowledge & policies** | virtual filesystem store, context-assembly policies (sliding window, token budget, alerts) |
+| 🧠 **Knowledge & policies** | virtual filesystem store (plus optional SQLite/Redis modules), context-assembly policies (sliding window, token budget, alerts) |
 | 🗜️ **Compaction & aggregation** | LLM-driven history summarization behind triggers, keeping the transcript valid for replay |
 | 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
-| 🔌 **MCP client** | JSON-RPC 2.0 over stdio and streamable HTTP, tool discovery with pagination, content mapping; MCP UI resources and in-frame actions for tool results |
-| 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay |
-| 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (JSON-RPC 2.0 HTTP: agent-card discovery, `message/send`+stream, tasks), **ACP** (stdio JSON-RPC, both roles: `Serve`/`ServeAgent` and a subprocess `Bridge`) and **AG-UI** (HTTP SSE event stream, AG-UI 1.0) |
-| 🧪 **Eval harness** | produce-then-grade runs: event-sourced traces (no OTEL), `Correctness`/`TokenBudget`/`ToolsCalled`/`Threshold` scorers, LLM judge and dual-order pairwise comparison, JSON run results with win-rate comparison |
+| 🔌 **MCP, both sides** | client (stdio + streamable HTTP, paginated discovery, content mapping) and server (`mcpserver`: expose an agent as the conversational `ask` tool); MCP UI resources and in-frame actions for tool results |
+| 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay, view projections, a pluggable arbiter, expectation sweepers with audit, task mirror, client LLM tools (`peers`/`channels`/`tasks`/`context`/`delegate`) |
+| 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (agent-card discovery, JSON-RPC + REST, tasks, push notifications, client-side tools and HITL over the wire, declarative security schemes), **ACP** (stdio JSON-RPC, both roles: cancel, load, full update vocabulary, mediated fs/terminal, MCP gateway, token auth) and **AG-UI** (HTTP SSE, AG-UI 1.0, held-turn interrupts with resume) |
+| 🧪 **Eval harness** | produce-then-grade runs: event-sourced traces (no OTEL), six scorer families + registry, JSONL datasets, failure attribution, LLM judge and dual-order pairwise, run diffs with regression gates, Wilson CI / Cohen's kappa, parallel cases |
+| 🗣️ **Voice & terminal** | `live.Cascade` STT→LLM→TTS spoken turns (ready OpenAI stages); `tui.REPL` line chat with streaming echo |
 
 ## 📦 Install
 
@@ -171,7 +173,7 @@ func main() {
 | [docs/MIGRATION.md](docs/MIGRATION.md) | class-by-class map: Python AG2 → AGo |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the binding package contracts |
 | [docs/PORT_STATUS.md](docs/PORT_STATUS.md) | what is ported / partial / stubbed / deferred |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | 50+ decision records behind every deviation from Python |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 70+ decision records behind every deviation from Python |
 
 ## 💡 Examples
 
@@ -195,18 +197,29 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
 
 ## 🧭 Status
 
-- **Ported and gated:** the core framework, all 7 full providers, tools (incl. hosted
-  builtin tools and plugins), Files API, MCP client + MCP UI constructors, middleware,
+- **Ported and gated:** the core framework, all 7 full providers **plus the OpenAI
+  Responses and Decisions APIs**, tools (incl. hosted builtin tools and plugins), the
+  tool packs, Files API, MCP client **and server** + MCP UI constructors, middleware,
   HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
-  multi-agent network — `go build`/`vet`/`test` green on every package.
-- **Ported as functional subsets** (each with documented deferrals): `github.com/luckystrker/ago/a2a`
-  (transport-level A2A — the conversational client machinery is deferred), `github.com/luckystrker/ago/acp`
-  (both ACP stdio roles — session store/guard/mediated filesystem deferred), `github.com/luckystrker/ago/agui`
-  (AG-UI serving — the held-turn interrupt machinery is deferred), `github.com/luckystrker/ago/eval`
+  multi-agent network (incl. views, arbiter, expectation sweepers, task mirror, client
+  LLM tools), eval (attribution, registry, JSONL, diffs, stats, concurrency), TUI, live
+  cascade — `go build`/`vet`/`test` green on every package (46 packages, 0 failures).
+- **Protocol endpoints ported as functional subsets** (each remainder is a recorded
+  decision): `github.com/luckystrker/ago/a2a` (push notifications, client-tools
+  extension, context/HITL over the wire, REST, security schemes; gRPC closed
+  permanently — D-071), `github.com/luckystrker/ago/acp` (cancel/load, full update
+  vocabulary, mediated fs/terminal, MCP gateway, token auth), `github.com/luckystrker/ago/agui`
+  (held-turn interrupts with resume proofs and state snapshots), `github.com/luckystrker/ago/eval`
   (event-sourced traces instead of OTEL).
+- **Optional modules** under `contrib/` (own go.mod, external deps allowed only there;
+  the core stays at zero): `knowledgesqlite`, `knowledgeredis`, `streamredis`, `wslink`
+  (WebSocket network link), `otelx` (OpenTelemetry middleware). CI runs them as a
+  dedicated job.
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").
-- **Deferred:** a2ui, live voice, Redis/SQLite stores, WebSocket link — see
+- **Deferred remainders** (honest, each with a decision record): a2ui; the realtime
+  audio stack and sound devices behind `live`; Docker/Daytona sandboxes behind the code
+  runner; ACP OAuth auth kinds and the cross-process session store — see
   [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
 - **Reviewed:** an independent port-parity review against the Python sources found and
   fixed 20 confirmed defects; the review trail is in the git history and decision records.

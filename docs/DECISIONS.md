@@ -57,6 +57,9 @@ Medium: **zai**, **mistral**, **dashscope** (OpenAI-compatible-ish REST).
 Stubs (config structs exist, Create returns "not yet implemented"): **xai** (Python uses a
 gRPC SDK), **bedrock** (needs AWS SigV4/credentials chain), **typesafe** (niche SDK).
 OpenAI Responses/Decisions APIs: deferred (config structs noted, client later).
+Closed 2026-10-30: both APIs are ported in `config/openai` (`OpenAIResponsesConfig`/
+`ResponsesClient`, `OpenAIDecisionsConfig`/`DecisionsClient`) — D-060, closure record
+D-068. The stub rows above (xai/bedrock/typesafe) are unchanged.
 
 ## D-009 — 2026-10-28 — Tools DI: reflection-based binding
 
@@ -1308,6 +1311,27 @@ card signing/verification, `validate_input_modes`, cluster mode
 machine (submitted/working/completed/failed/canceled only — no
 input-required/auth-required/rejected).
 
+Supplemented 2026-10-30 (D-067, same day, owner directive): the second a2a wave
+closed most of this entry's deferrals — push notifications, the
+`urn:ag2:client-tools:v1` extension with client-side execution drivers,
+context-variable sync and HITL over the wire, the REST transport, and the
+declarative security schemes of security.py. Two amendments to the paragraphs
+above: the task-state machine now also carries `input-required` — the
+client-tools and HITL continuations are meaningless without a state that says
+"answer pending on the caller", Python parks there too (executor.py
+`requires_input`); and the conversational machinery is only partially closed —
+`Client.RunClientTools`/`RunWithHumanInput` drive input-required continuations
+through callbacks, but full AG2 history shipping and reconnect/resubscribe stay
+deferred. Still deferred, and **gRPC stays deferred permanently**: JSON-RPC +
+REST already carry the full protocol semantics — the gRPC binding is the same
+method vocabulary over a different wire encoding, and serving it requires
+protobuf codegen (protoc) plus the `google.golang.org/protobuf` dependency,
+which the zero-dependency core forbids (D-048); there is no AG2 behavior
+reachable through gRPC that JSON-RPC/REST do not also reach. Also still
+deferred: `validate_input_modes`, cluster mode, tenants, card JWS
+signing/verification (D-067 — no stdlib JWS/JWT), and the `a2a:tenant` /
+`TENANT_VARIABLE_KEY` per-call routing (wire shape only).
+
 ## D-050 — 2026-10-30 — a2a: message/stream is a two-event SSE; client-side streaming is not ported
 
 The server implements `message/stream` as Server-Sent Events with exactly two
@@ -1322,6 +1346,14 @@ its terminal outcome. The `Client` does not consume streams at all — it uses
 `message/send` only. `message/send` records the exchange as a Task
 (completed/failed) in the shared store before answering, which is what makes
 `tasks/get`/`tasks/cancel` meaningful against a synchronous handler.
+
+Supplemented 2026-10-30 (D-067): the two-event shape now also carries a third
+outcome — `input-required` as the terminal event, when the configured
+`HandleClientTools` parks the turn for client execution or a HITL question
+(the `working` event still precedes it; the task record is stored in the
+parked state, so the continuation can resume it by id). The continuation loop
+itself still rides `message/send`, not the stream — the stream stays a
+one-shot projection of one synchronous turn.
 
 ## D-051 — 2026-10-30 — eval: the Trace is event-sourced, not OTEL-reconstructed (ago/eval supersedes the D-010 deferral for this slice)
 
@@ -1581,3 +1613,1103 @@ imports, status bullets), root AGENTS.md, docs/ARCHITECTURE.md, docs/GUIDE.md,
 docs/MIGRATION.md (incl. a re-run of its §7 gates), docs/PORT_STATUS.md (incl. its Gates
 block) and .github/workflows/ci.yml. Historical decision records keep the old `ago/...`
 spellings — they are records of the layout they described.
+
+## D-056 — 2026-10-30 — tui: textual.py ported as a stdlib line REPL (ago/tui)
+
+Owner directive: the TUI ships without a TUI framework. `ag2/ag2/textual.py` is a
+textual `App` (Header / ScrollableContainer / Input / Markdown widgets); AGo has zero
+external dependencies in the core module (D-003), so `github.com/luckystrker/ago/tui`
+rebuilds the same conversation surface as a plain line loop: `REPL(a *agent.Agent,
+in io.Reader, out io.Writer, opts ...Option) error` reads lines, sends each as the
+next user turn and prints the answer. The first turn goes through `Agent.Ask`, every
+later turn continues the same conversation through `AgentReply.Ask` — Python parity
+of `self.conversation.ask(text) if self.conversation else self.agent.ask(text)`, and
+the scripted test asserts the second model call already sees the first user turn.
+Commands `/help` and `/exit` (plus end-of-input) end the loop; a failed turn is
+reported on the output and the loop continues instead of dying.
+
+Streaming (Python parity: the `ModelMessageChunk` / `ModelReasoning` sub_scopes
+appending into the assistant block): the `WithStreaming()` option drives the turn
+through `AgentRun` and subscribes `ModelMessageChunk` on the run's stream, writing
+each delta to the output as produced; the final body is printed only when it differs
+from the joined deltas — the same final-text-once rule `acp`'s ServeAgent uses. A
+non-streaming client simply produces no deltas and the final body prints as usual.
+
+Deferred: the textual App surface itself (widgets, markdown rendering, the
+"Thinking…" block that `ModelReasoning` deltas fill before the answer replaces it) —
+no TUI framework in the core; a reasoning-echo option can be added later without an
+API change.
+
+## D-057 — 2026-10-30 — live: the HTTP cascade slice ported (ago/live); the realtime stack stays deferred
+
+Owner directive: port `ag2/ag2/live/cascade.py` as the plain STT→LLM→TTS HTTP chain,
+without the realtime-websocket machinery. `github.com/luckystrker/ago/live` ships
+`Cascade{STT Transcriber; LLM func(ctx, text) (string, error); TTS Synthesizer}` with
+`Handle(ctx, audio, mime, voice) (replyText, audioOut, mimeOut, err)`: transcribe,
+answer, synthesize, with stage failures wrapped `live: transcribe` / `live: llm` /
+`live: synthesize` over the cause. A whitespace-only transcript ends the turn
+silently (Python parity: cascade.py `_turn`'s `if not text.strip(): return`).
+
+Scope deltas against the Python `CascadeConfig`:
+
+- The Python class implements `RealtimeConfig` and is driven by `LiveAgent` inside a
+  conversation context: turn detector (`SilenceTurnDetector`), barge-in, playback
+  start/complete events, a capped tool loop and streaming TTS via
+  `StreamingTTSConfig`. The Go `Cascade` is one synchronous function per spoken turn
+  per the brief; those realtime pieces stay deferred — they need websocket clients
+  and sound-device I/O, both outside the stdlib-only core (extends the live/ deferral
+  D-010 carried).
+- The LLM stage is `func(ctx, text) (string, error)` instead of a `ModelConfig`:
+  any driver fits (an agent reply body, a config client, a stub in tests). A thin
+  adapter over `agent.Agent` can be added later without an API change.
+- Ready-made OpenAI stages over `net/http`, no SDK: `OpenAITranscriber` (POST
+  `/audio/transcriptions`, multipart with the part's real Content-Type and a
+  filename extension derived from the mime — the endpoint infers the container from
+  it; `response_format=text`; optional `language`). AGO-DEVIATION: Python streams
+  transcript deltas (`TranscriptionChunkEvent` / `TranscriptionCompletedEvent`) onto
+  the context; here one blocking request — the cascade shape has no live event stream
+  to publish deltas to. `OpenAISynthesizer` (POST `/audio/speech`, JSON body).
+  AGO-DEVIATION: Python pins `response_format="pcm"` for its realtime player; here
+  `Format` is a field (default `"mp3"`, the API default) and the reply reports the
+  media type (response Content-Type, else the type implied by the format). Python's
+  `STTTranslationConfig` and the elevenlabs/gemini/mistral providers are not ported.
+
+Provider errors surface as a shared sentinel `live.ErrAPI` (status + body snippet);
+an incomplete `Cascade` (any stage missing) fails fast with `live.ErrIncomplete`.
+`events/voice.py` stays unported alongside the realtime stack.
+
+## D-059 — 2026-10-30 — contrib: the SQLite/Redis knowledge and stream backends port as optional modules (contrib/knowledgesqlite, contrib/knowledgeredis, contrib/streamredis)
+
+(Numbering correction, same drift the D-041 entry documents: this entry briefly held
+"D-058" concurrently with the mcpserver entry, which kept the number via its earlier
+citations — the contrib entry moves to the next free number.)
+
+Supersedes the D-011 deferral for the sqlite/redis knowledge backends and the
+`streams/redis` deferral for this slice (owner directive), under the D-048 packaging
+policy: each backend is its own Go module in `contrib/<name>/` —
+`module github.com/luckystrker/ago/contrib/<name>`, `require github.com/luckystrker/ago
+v0.0.0` + `replace github.com/luckystrker/ago => ../..`, external dependencies allowed
+only there. The root module stays at zero `require` entries; `contrib/` is invisible to
+the root gates (`./...` skips nested modules).
+
+- `contrib/knowledgesqlite` — `knowledge.Store` over `modernc.org/sqlite` (pure Go, no
+  cgo — the machine has no C toolchain). One `files(path, data, updated_at)` table,
+  prefix matching via `substr(path, 1, ?) = ?` (never LIKE — Python's own rationale).
+  Append runs read-modify-write inside a `BEGIN IMMEDIATE` transaction (`_txlock=
+  immediate` DSN), the exact atomicity Python's `_sync_append` pins: appends from
+  concurrent goroutines, other instances and other processes never lose entries.
+- `contrib/knowledgeredis` — `knowledge.Store` over `redis/go-redis/v9`, client
+  injected (`NewStore(rdb redis.UniversalClient, ...)`). Content keys
+  `{prefix}:{path}`, companion sorted-set index `{prefix}:__index` + version counter
+  (Python `ag2:knowledge` defaults); Append is the Python `_APPEND_SCRIPT` Lua port —
+  APPEND+INCR+ZADD in one server-side step, atomic across connections on one node.
+- `contrib/streamredis` — `stream.Storage` over go-redis: one list per stream at
+  `{prefix}:{stream_id}` (default `ag2:stream`), SaveEvent RPUSH, SetHistory a
+  transactional DEL+RPUSH pipeline, DropHistory DEL — the Python storage.py shape.
+  Events round-trip through `events.MarshalEvent/UnmarshalEvent` ("@type" JSON).
+
+AGO-DEVIATION (all three, one decision): Python's `on_change` attaches a
+`PollingChangeWatcher` (500 ms) and the sqlite/redis backends expose
+`list_versions_under` for it. AGo's `Store.OnChange` contract is in-process callbacks
+(MemoryStore/DiskStore parity), so the contrib backends notify only mutations through
+the same instance and carry no version column — the sqlite table uses `updated_at`
+metadata instead of Python's `version`. Not ported for the same reason: Python's
+pickle serializer (streamredis is "@type"-JSON only — pickle is arbitrary-code
+execution against anyone with Redis write access), the URL-based constructor
+overloads (client injection only). The core protocol methods carry no `context`;
+the Redis clients run on `context.Background()`.
+
+Tests are stdlib `testing`, offline: `github.com/alicebob/miniredis/v2` stands in for
+the Redis server (including Lua EVAL), SQLite tests run on `t.TempDir()` files —
+including Python's cross-instance atomic-append scenario with 8/20 concurrent
+appenders. Gates: root suite green with the root `go.mod` untouched, plus
+`go build ./... && go test ./...` inside each contrib module.
+
+## D-058 — 2026-10-30 — mcp: the serving side ported as a stateless subset (ago/mcpserver supersedes the D-010 deferral for this slice)
+
+Owner directive, same wave as D-049/D-052/D-053. `ago/mcpserver` ports the serving
+side of `ag2/ag2/mcp/` (server.py, executor.py, tools.py, transport.py) as a
+stateless MCP server exposing one Ask bridge as the conversational `ask` tool,
+with optional deterministic tools (`ServerConfig.Tools []tools.Tool` — the
+`mcp_tool` parity: schema plus function) served next to it. `NewServerForAgent`
+bridges a `*agent.Agent` directly (every ask is one blocking `Run`/`Start`/
+`Result` turn on a fresh stream, reply body as text content — the agent must be
+usable with a fresh stream per call, same caveat as agui.ServeAgent).
+
+Wire subset: `initialize` (revision negotiation over the single-element support
+set `{2024-11-05}` — the same revision the ago/mcp client offers; an unknown
+requested revision is answered with this one), `tools/list` (fixed set, ask
+first, no cursor), `tools/call` (unknown name → JSON-RPC invalid-params, the
+executor's MCPError arm; empty `message` guard and the `conversation`-argument
+refusal mirror the executor's sessions=False path), `ping`, and
+`notifications/initialized` (as notification — never answered — or as request,
+confirmed empty). The tools methods refuse before a handshake ran on the server
+process; the ask tool's inputSchema carries `message` (required) and `context`
+(folded in front of the message as `Context:\n…\n<message>`, the two-input
+_build_inputs shape collapsed into the one string the Ask bridge takes).
+
+Transports: `Stdio()` — newline-delimited JSON-RPC on stdin/stdout, the same
+no-framing dialect as the ago/mcp stdio client (garbled lines skipped; one
+request at a time); `Handler()` — streamable HTTP (POST, notifications answered
+202, GET held open as a silent server-to-client SSE stream with a keepalive
+comment frame, DELETE refused alongside other methods).
+
+Result mapping (Python parity: mappers.py): reply text / function-tool result
+parts → content blocks — TextInput→text, BinaryInput→image/audio (media-type
+prefix, base64) or an embedded `resource` blob, UrlInput→`resource_link` (the
+serving tool's name fills the required `name`), DataInput and future variants →
+JSON text, empty result → one empty text block; failures become isError content
+with the message only (tool_error / the executor's exception arm). Deterministic
+tools are invoked through the Tool machinery itself: registered on a scratch
+memory stream, the call event sent, the result event collected from the
+synchronous dispatch — **AGO-DEVIATION**: Python calls the handler function
+directly; Go's `tools.Tool` interface has no direct call.
+
+**Not ported — sessions/conversations** (`sessions.py`): the server is
+stateless, no conversation handle is minted or accepted, `Mcp-Session-Id` is
+never issued and an incoming one ignored. **Pause/resume** (`pause.py`): a
+served turn lives inside its exchange and cannot come back as
+`InputRequiredResult`. **Security** (`security.py`): no OAuth 2.1 resource-
+server routes, no bearer middleware, no DNS-rebinding protection (TransportConfig's
+validation deltas defer with it). **MCP Apps UI** (`apps.py`): no `_meta` ui
+bindings, no SEP-2133 extensions. **stream_progress**: the string-in/string-out
+Ask bridge carries no stream to forward ModelMessageChunk/ToolCall events from,
+so no progress/log notifications. **resources/prompts** (`resources.py`,
+`prompts.py`): not advertised. **Argument-schema validation** (`mappers.py
+input_validation_error`): deferred; the executor's empty-message guard stands
+in. **POST answers are always application/json** (Python's `json_response=True`
+mode) — the per-request SSE answer branch is not served; batch requests are
+refused. Tool-name conflicts and hosted (non-function) schemas fail
+construction (`ErrConflict`, parity with MCPToolNameConflictError).
+
+Tests are network-free: the real ago/mcp client drives the real server over
+`httptest` (HTTP) and over a re-exec'd test binary on stdio (the
+mcp/stdio_test.go TestMain helper pattern with the roles flipped — the child is
+the system under test): handshake info, tools/list order and schema, ask text
+and context folding, echo through the function-tool machinery, fail →
+ErrToolCall, unknown tool → ErrProtocol, negotiation echo/downgrade, the
+before-initialize gate, ping/202-notifications/batch/garbage refusals, the GET
+stream shape, construction refusals, the never-answering-tool guard, and the
+content-mapping branches (unit).
+
+## D-060 — 2026-10-30 — config/openai: the Responses API and the Decisions API are ported; hosted tools have their OpenAI client
+
+Supersedes the D-008 deferral of `openai_responses_client.py` /
+`openai_decisions_client.py` for this slice (owner directive), and closes the
+hosted-tool gap D-047/D-048 documented: the Chat-Completions engine rejects
+every hosted schema with "hosted tools need the Responses API, which is not
+ported" (config/openaicompat.go) — that client now exists, so the hosted
+schemas of `ago/tools/hosted.go` reach the wire.
+
+**Responses** (`config/openai/responses.go`): `OpenAIResponsesConfig`
+(NewOpenAIResponses + Provider/Model/Create/Clone/CreateFilesClient; defaults
+mirror the Python dataclass: store and parallel_tool_calls on and always sent,
+4 transport retries, OPENAI_API_KEY fallback) and `ResponsesClient`
+(config.LLMClient) POSTing `{base}/v1/responses` over ago/internal/httpx with
+SSE via ago/internal/sse. Input mapping (`responsesInput`) replays
+ModelRequest (one user message per part; FileIdInput → `input_file.file_id`
+with no filename — the API mutual-exclusion), ModelResponse (assistant text +
+`function_call` items), ToolResultsEvent (`function_call_output`, single
+input_text collapsing to a string), CompactionSummary, image/document
+BinaryInput (data URLs, `detail` via VendorMetadata whitelisted
+auto/low/high/original) and UrlInput (`file_url` without filename). Tools
+(`toolToResponsesAPI`): function (top-level name, `defer_loading`),
+web_search (search_context_size/user_location/filters.allowed_domains, plus
+the historical `max_uses` the Python mapper keeps sending), file_search
+(vector_store_ids/max_num_results/filters), code_interpreter (container auto),
+shell (container_auto with network_policy / container_reference; a shell
+without a hosted environment is rejected — client-executed bash stays out),
+image_generation, mcp (`require_approval:"never"`, blocked_tools rejected,
+AuthorizationToken → bearer header under the Headers-precedence rule) and
+tool_search. Response side: `message` → ModelMessage, `reasoning` → summaries,
+`function_call` → ToolCallEvent, hosted items (web_search_call,
+code_interpreter_call, image_generation_call, file_search_call, mcp_call,
+mcp_list_tools, shell_call + shell_call_output paired by call_id) →
+BuiltinToolCallEvent/BuiltinToolResultEvent with the item's own outcome parts
+and metadata; image_generation_call results also land in ModelResponse.Files.
+Usage normalization lifts input/output/total tokens and the cached /
+cache-write / reasoning detail tokens (normalize_responses_usage parity).
+Response schemas become `text.format` (json_schema, strict, StrictifySchema);
+`store:false` adds include reasoning.encrypted_content.
+
+**Decisions** (`config/openai/decisions.go`): `OpenAIDecisionsConfig`
+(NewOpenAIDecisions: model gpt-6-luna, boolean_threshold 0.5,
+safety_identifier omitted unless set) and `DecisionsClient` POSTing
+`{base}/v1/decisions`: the response schema is read as one DecisionSpec
+(response.FromResponse) and becomes the single question (predicate / choice
+with config-keyed descriptions / score levels requiring the 0..n-1 rubric);
+instructions assemble as prompt + question_instructions + schema question
+(string forms only); every tool is rejected before the request; the answer
+(predicate thresholded by boolean_threshold, choice string, score snapped to
+the nearest level) renders through DecisionSpec.Render into the ModelMessage,
+whose Metadata carries the answer object minus type/name; refusals raise
+DecisionRefusedError; usage normalizes like Responses; ModelResponse.Provider
+is "openai-decisions".
+
+**Replay carrier.** Python replays hosted items through vendor event types
+(OpenAIServerToolCallEvent.item, OpenAIReasoningEvent.item, persisted
+ProviderReplay anchors). AGo's event vocabulary has no vendor item slot, so
+the raw wire item travels in BuiltinToolCallEvent.VendorMetadata["item"] and
+(in line with Python, which keeps `item` only for shell outputs) a shell
+result in BuiltinToolResultEvent.Result.Metadata["item"]; `responsesInput`
+replays them (minus output-only fields such as `created_by`, skipping a
+shell_call whose shell_call_output never arrived). **Deviations, all recorded
+as such in code:** reasoning summaries surface as transient ModelReasoning and
+reasoning items are not stored/replayed (events.ModelReasoning is transient
+and carries no item slot — with store:false and reasoning models the API may
+ask for the encrypted anchor AGo cannot resend); shell command/output delta
+chunks are not surfaced (the finished items carry the content); prompt-cache
+diagnostics are deferred (the vendor diagnostics event has no AGo carrier —
+PromptCacheKey/PromptCacheOptions still travel; the client keeps no
+last-response-id chaining state, so it stays stateless and concurrency-safe);
+skills extraction/merge into the shell environment is deferred (no SkillsTool
+in AGo); question_instructions carries strings only (the sequence-of-parts
+form is deferred); websocket_base_url is not modeled (no websocket transport);
+`Containers` (containers.py ContainerManager) stays deferred — nothing in the
+ported responses client references it.
+
+Regressions: `config/openai/responses_test.go` (config defaults, clone
+semantics, non-stream and SSE round trips with a tool call, hosted web_search
+wire schema + call/result events + second-call replay, input mapping incl.
+FileIdInput, audio fail-fast, shell mapping, unsupported hosted schemas,
+defer_loading, strict text.format, store:false include, usage normalization,
+streaming reasoning + code_interpreter events), `config/openai/decisions_test.go`
+(defaults, no-Files-API, choice/predicate/score round trips with wire
+assertions on /v1/decisions, threshold semantics, refusal, unsupported schema,
+tools rejected before the request, instruction assembly + input flattening,
+inline-image mapping, needs-question guard). Whole-module gates re-run (see
+PORT_STATUS).
+
+
+## D-061 — 2026-10-30 — eval: attribution, scorer registry, Suite JSONL, RunDiff, Wilson/kappa stats, parallel cases (the D-051 deferrals close for this slice)
+
+Owner directive, same wave as D-049/D-051/D-052. Six `ago/eval` additions, all
+stdlib-only:
+
+**Failure attribution** (`attribution.go`, Python parity:
+`scorers/attribution.py`). `DetectMechanical` names the failures a Trace
+carries on its face — the ask raised, a tool errored terminally with no answer
+produced, or the run finished without an answer — and `FailureAttribution`
+exposes them as a Scorer whose `Details["error_mode"]` is the categorical
+verdict (Python: `Feedback.value`), so a run's failure-mode distribution reads
+off the scores. For the semantic modes (incorrect answer, ignored constraint,
+…) the LLM attributor reads the numbered trajectory over one headless client
+call, under the same JSON-verdict discipline as `LLMJudge` (non-JSON verdict is
+a recorded fail; a verdict with no `error_mode` degrades to "other" — Python:
+`content()` returning None). To see the crash at all, `Trace` gained an `Err`
+field (`json:"err"`, Python parity: `Trace.exception`), stamped by `Run` from
+the ask failure; `CaseResult.Err` stays as-is. Deviations: the attributor sees
+only the trace, so the first model call's input stands in for the task prompt
+and the reference section of the Python prompt is dropped; `response_schema`
+structured output + retries are not ported (D-051's judge deviation applies
+verbatim). Note: the brief's phrase "shares of tool calls that influenced the
+final answer" does not describe `attribution.py` — that scorer is failure
+attribution, and its Python semantics are what shipped.
+
+**Scorer registry** (`registry.go`, the `@scorer` DI stand-in). Where Python
+introspects a scorer function's parameters and injects by name, AGo resolves a
+scorer *name* plus a params map: `ScorerRegistry` maps names to
+`ScorerFactory func(params map[string]any, scope CaseScope) (Scorer, error)`,
+pre-registered with the built-ins (`correctness`, `token_budget`,
+`tools_called`, `threshold`, `llm_judge`, `failure`); `SetClient` feeds the
+client-backed ones. Built-ins reject unknown param keys (typos must not
+swallow); user-registered factories validate their own. `CaseScope.Expected`
+lets a data-driven `correctness` fall back to the case's expected answer — the
+data twin of the in-code `Correctness{Expected: c.Expected}` idiom.
+
+**Suite from JSONL** (`dataset_jsonl.go`, Python parity: `Suite.from_jsonl`,
+reduced to the AGo Case fields). One case per line: `input` required, `name`
+auto-fills `task-0000`… in dataset order, `expected` feeds the case and the
+scorers' scope, `scorers` entries are a registry name or
+`{"name", "params"}`. Blank lines skip; a UTF-8 BOM is tolerated
+(`utf-8-sig` parity); errors carry file and line. Deviation: the Python
+suite's name/source metadata and per-task tags have no slot on `Suite []Case`
+and are dropped.
+
+**RunDiff** (`diff.go`, Python parity: `results/diff.py`, reduced to what an
+AGo `RunResult` records). `Diff(current, baseline)` lines the runs up by case
+name and classifies each shared case regression/improvement/unchanged, lists
+the only-in-* cases, and tallies per-scorer pass rates over the shared cases;
+`DiffStrict` errors on mismatched suites (Python: `strict=True` raising
+`RunsNotComparableError`); `Summary` renders the printable form. Deviation:
+Python keys flips by (scorer key, task id) and detects content drift from the
+tasks' `inputs`/`reference_outputs`; the AGo RunResult persists neither, so
+the diff is per case and content drift is undetectable until per-case inputs
+ride on the result.
+
+**Stats** (`stats.go`, Python parity: `pairwise._wilson_ci` with z = 1.96 and
+`pairwise._cohen_kappa` over the a/b/tie vocabulary, general labels welcome).
+`WilsonCI` clamps to [0,1] and yields (0,0) for n = 0; `RunResult.PassRateCI`
+wraps the run's pass rate; `CohenKappa` returns the raw rate plus the
+chance-corrected kappa, with the degenerate expected-agreement-of-1 case
+reporting 1 instead of dividing by zero. Golden tests pin values computed with
+the Python reference formulas run verbatim.
+
+**Parallel cases** (`run.go`, Python parity: `runner.py` `concurrency=4`).
+`Run` takes variadic `RunOption`s; `WithConcurrency(n)` caps in-flight cases
+(default `DefaultConcurrency` = 4, clamped to >= 1). Each goroutine writes its
+own `CaseResult` slot — the result needs no locks and stays in suite order
+regardless of completion order. `WithConcurrency(1)` runs inline on the
+calling goroutine in strict suite order — the deterministic mode a per-case
+scripted model double needs, since a shared script queue cannot serve
+overlapping asks. Agent sharing is safe: every case runs on its own stream and
+streams serialize their turns independently (`agent.Agent.locks`).
+
+Regressions: `eval/attribution_test.go` (mechanical detector table, the
+deterministic and LLM-attributed scorer paths, Trace.Err JSON round trip),
+`eval/registry_test.go` (built-in factories incl. nested threshold and client
+backing, param/typo rejection, user factories, concurrent use),
+`eval/dataset_jsonl_test.go` (loading, scope fallback, end-to-end run,
+error table, BOM/blank handling), `eval/diff_test.go` (movements, only-in
+exclusion, strict gate, scorer rates, summary),
+`eval/stats_test.go` (Wilson/kappa goldens, PassRateCI),
+`eval/run_test.go` (overlap via an in-flight-peak tool, concurrency-1
+serialization, clamp, Trace.Err stamping), plus the pre-existing suite.
+
+## D-062 — 2026-10-30 — toolpacks: the ready-made tool packs port as ago/toolpacks (shell, local code runner, filesystem, search, skills)
+
+Owner directive. `ago/toolpacks` builds the ready-made tools of ag2/ag2/tools/ on
+the ago/tools framework; every constructor returns a `tools.Tool` implemented over
+`FunctionTool`/`Toolkit` (the FunctionTool delegation Python uses). The exec
+result shape is Python's verbatim: combined stdout+stderr, whitespace-trimmed,
+truncated at max_output with a trailing notice; a non-zero exit appends
+`[exit code: N]`, a timeout reports 124 with Python's sentence, a missing command
+127 (sandbox/local.py `_run_subprocess`, adapter/shell.py `_format`).
+
+- **Shell** (`shell.go`, shell/tool.py SandboxShellTool over sandbox/local.py):
+  `NewShellTool` runs commands through the platform shell (`cmd /c` on Windows,
+  `sh -c` elsewhere; Python hardcodes `sh -c` — the port covers both hosts),
+  with workdir (auto temp dir; `Close` deletes only the auto one), timeout, env
+  merge, max output. Deviation: `WithShellBlockPatterns` matches the raw
+  command line case-insensitively instead of Python's argv word match — the Go
+  tool has no restricted (shell-less) mode whose argv could be matched, and a
+  word match behind `sh -c` would check what the shell has not expanded yet;
+  the Python caveat (advisory filter, not a security boundary) carries over.
+- **Local code runner** (`coderunner.go`, code/tool.py SandboxCodeTool over
+  sandbox/local.py + adapter DEFAULT_RUNNERS): `NewLocalCodeRunner` is the
+  explicitly-named local backend (Python requires the backend to be passed for
+  the same reason — no accidental unsandboxed execution), `run_code(code,
+  language)` with python/bash inline runners and a javascript file runner;
+  languages are restricted via `WithCodeLanguages`. Deviations: `sh` is an
+  accepted bash alias and the bash runner falls back to `sh`; the TypeScript
+  (ts-node) runner and the Docker/Daytona backends are deferred.
+- **Filesystem** (`filesystem.go`, toolkits/filesystem.py, abbreviated to the
+  brief's five): read_file, write_file (UTF-8 pinned, parents created),
+  list_directory, make_directory, find_files (Python 3.13 `**` semantics). The
+  traversal guard resolves the deepest existing prefix through symlinks and
+  re-checks containment. Deviations: Python's update_file and delete_file and
+  the `raw=true` base64 read are not ported.
+- **Search** (`search.go`, search/{duckduckgo,tavily,perplexity}.py):
+  `NewDuckDuckGoSearch` replaces the ddgs SDK with a direct fetch of the HTML
+  endpoint and a regex parser (the brief's simplified variant), unwrapping the
+  `/l/?uddg=` redirect hrefs; `NewTavilySearch` and `NewPerplexitySearch`
+  (a toolkit: perplexity_search + perplexity_answer) call the REST APIs. The
+  API key never enters the tool schema (Python parity: constructor-only); where
+  Python resolves several request parameters as Variables, the port carries a
+  per-conversation variable override for the key (`tavily_api_key` /
+  `perplexity_api_key`) instead, and the optional request parameters beyond
+  max_results/depth/topic/include_answer (Tavily) and max_results (Perplexity)
+  are deferred — Python's Variable-resolvable kwargs per tool do not map onto
+  the argument-struct schema one to one.
+- **Skills** (`skills.go`, skills/toolkit.py over runtime/local, abbreviated):
+  `NewSkillsToolkit(dir)` discovers `<dir>/<name>/SKILL.md` with a
+  `key: value` frontmatter parser (the YAML subset the toolkit reads — no YAML
+  dependency in the core module) and serves list_skills, load_skill (the
+  wrapped `<skill_content>` body with the resource list) and
+  read_skill_resource; the name argument is enum-constrained to the discovered
+  skills (the `Literal[name, …]` parity, via WithToolSchema). Deviations: one
+  runtime (no multi-runtime last-to-first delegation chain), the script runner
+  and the install/extract path are not ported; a skill without a frontmatter
+  name falls back to its directory name instead of being skipped by the lenient
+  loader.
+
+Tests are stdlib-only: httptest fakes for the three search APIs, temp-dir
+fixtures for filesystem/skills, real subprocesses for shell/code (python when
+on PATH, the bash/sh runner otherwise — the brief's skip-compatible fallback;
+the timeout and exit-code paths exercise without an interpreter too). Google
+Maps, X-search and image generation stay deferred per the brief.
+
+## D-063 — 2026-10-30 — toolpacks/dynamic: the factory composes delegation through Agent.AsTool; the child-failure wording follows subagent_tool, not handler.py
+
+`NewDynamicAgentFactory` (dynamic/factory.py + handler.py resolve_and_run)
+resolves the model-built spec against the pool via `spec.AgentSpec.ToAgent`,
+attaches the spec's response schema as `response.RawSchema` (Python:
+`to_agent`'s spec-schema branch), then delegates through the child's
+`AsTool()` rather than a run_task reimplementation — the shared machinery
+(TaskStarted/Completed/Failed, the rolled-up subtask UsageEvent, the
+dependency/variable copy, the HITL bridge) cannot be reached from outside the
+agent package, and duplicating it would fork the delegation semantics. Two
+consequences: a child that fails after starting surfaces as AsTool's
+"Sub-task '<name>' failed: …" success-text instead of handler.py's
+"Error: {result.error}" (the spec-resolution failure keeps the handler's exact
+"Error: unknown tools […]. Available: […]" wording with Python list reprs), and
+the delegation rides a synthetic per-call tool call on the parent stream under
+a unique name (`task_<child>_<8 hex>`), because the framework routes calls to
+tools by name and two concurrent same-named children must not answer each
+other's calls.
+
+## D-056 — 2026-10-30 — network wave 2: views, arbiter, expectation sweepers, task mirror, client tools, federation stub
+
+The six deferred pieces of the D-031 network subset land in `github.com/luckystrker/ago/network`
+(owner directive; each was listed as deferred in the D-031 row of PORT_STATUS).
+
+- **views.go** — `ViewPolicy` + `FullTranscript` / `WindowedSummary` / `NamedTranscript` /
+  `NamedWindowedSummary` (Python `views/base.py` + `builtin.py`). Pure projections: WAL slice +
+  participant + renderer + name resolver → `[]events.Event` (`ModelRequest`/`ModelMessage`,
+  head `events.CompactionSummary` for the windowed views). `DefaultRenderEnvelope` folds the
+  adapters' `default_render_envelope` and the packet handoff-shape; `Hub.NameFor` is the
+  passport-backed resolver. AGO-DEVIATION: the AGo `CompactionSummary` carries `Content` only
+  (no `event_count` field) — the count rides in the summary line. Adapters do not call views
+  automatically; the call pattern stays handler-owned (adapter folds), documented on the type.
+- **arbiter.go** — `HubArbiter` seam (six gates) + `BaseArbiter` (no-op base) +
+  `RuleBasedArbiter` (default). The hub consults it at the exact pre-commit points Python does:
+  `Register` is *not* gated (Python parity — the reference hub never calls `authorize_register`),
+  `CreateChannel` runs `AuthorizeChannelOpen` instead of the inline concurrency/inbound
+  pre-flight, `Send` runs `AuthorizeSend` (explicit audiences only, broadcasts skip) before the
+  WAL append, dispatch runs `AuthorizeDispatch` per recipient (Deny = silent skip) and
+  `ResolveUnknownAudience` for unknown audience ids (federation hook). `Decision` collapses the
+  Python `Allow`/`Deny` dataclasses into one struct; the depth-cap Deny carries
+  `ErrDepthExceeded` so the pre-existing sentinel tests keep their meaning, everything else
+  defaults to `ErrAccessDenied`. AGO-DEVIATIONS: gates are synchronous (the hub holds its lock —
+  arbiters must not block); `AuthorizeInbox` exists on the seam but the hub never consults it —
+  delivery inboxes live client-side and the AGo `Rule` carries no inbox block.
+- **expectations.go / audit.go** — `ChannelManifest.Expectations` (the D-031 data-only
+  `Expectation` grows `OnViolation`/`AppliesTo`) evaluated by three pure evaluators
+  (`acks_within`, `reply_within`, `max_silence`) against channel + WAL + clock, deduplicated per
+  (channel, expectation index, violator) in an in-memory cache cleared on terminal transitions.
+  Handlers: `audit` (no-op), `notify_channel` (posts `ag2.expectation.violated`; on a pending
+  channel the post fails and is suppressed — Python parity), `auto_close` (close with reason
+  `expectation_violated:<kind>`). `Hub.SweepExpectations` runs one deterministic tick;
+  `ExpectationSweeper` wraps it in an interval loop (default none — hub owners opt in, unlike
+  Python's auto-started sweeper). Every *fire* reaches the optional `AuditSink`
+  (`WithAuditSink`; `FileAuditLog` JSONL / `SliceAuditLog`) before the handler, even when the
+  handler lookup misses (unknown `on_violation` values stay silently unconsumed — Python
+  parity), and sink failures are swallowed. Task store rides along: `Hub.ObserveTask` /
+  `UpdateTask` / `Task` / `Tasks` over `task.Metadata` (in-memory only, no
+  `max_concurrent_tasks` cap — the AGo Rule has no task-limits block).
+- **taskmirror.go** — `TaskMirror` subscribes a `stream.Stream` for the six `Task*` events and
+  forwards them into the hub task store; `ErrTaskNotFound` on progress/completion is swallowed
+  (never crashes the agent turn), the agent-side `ExpiresAt` carries through, re-observe
+  updates in place.
+- **clienttools.go** — `ClientTools(hc, self)` builds `peers` / `channels` / `tasks` /
+  `context` / `delegate` as `[]tools.Tool` (reflection `FunctionTool`s; bound by closure over
+  the `HubClient` + calling `AgentClient` — AGO-DEVIATION vs the Python `AgentClientInject`
+  DI, same shape one notify handler produces). `tasks progress/complete` act on the context
+  dependency `task.DepKey` (`ag:task`) — the TaskInject analogue. `delegate` opens a consulting
+  channel (handshake awaited inside `CreateChannel`), suppresses the local handler for the
+  channel's lifetime (`AgentClient.SuppressHandler`/`ResumeHandler`), posts the prompt one hop
+  deep, and waits by polling `Hub.ReadWAL` for the respondent's text or a terminal channel
+  event (AGO-DEVIATION vs `wait_for_channel_event`'s inbox — polling is deterministic for the
+  in-process subset), with the `functions.`-prefix target fallback and the available-targets
+  hint on a miss. `peers find/describe` reads the new `Hub.Registrations()` directory view
+  (skills/SKILL.md and the cost-profile sorting are not ported — no skills registry in the
+  subset). The `network → tools` import is a deliberate extension of the ARCHITECTURE graph
+  (no cycle: tools does not import network).
+- **remote.go** — `RemoteAgentProxy` as an interface stub: no implementations ship and the hub
+  does not consult the seam (Python parity: no proxies ship there either); remote-audience
+  routing is the arbiter's `ResolveUnknownAudience` hook until a proxy registry lands.
+
+Gates re-run from the repo root after the change: `go build ./...` and `go vet ./...` clean;
+`go test ./... -count=1` exit 0 (46 packages `ok`, zero failures) with `go test ./network/...`
+green including the new suites (views golden projections, arbiter allow/deny + federation
+reroute, sweeper violations → audit + envelope + dedup + interval loop, task mirror lifecycle,
+client tools end-to-end through the real `FunctionTool` stream path, delegate consult against a
+live peer); `go build ./examples/...` / `go vet ./examples/...` clean. The optional
+`contrib/wslink` module runs its own gates from its directory (D-057): `go build ./...`,
+`go vet ./...`, `go test ./... -count=1` — all green.
+
+## D-057 — 2026-10-30 — contrib/ layout: optional modules with their own go.mod
+
+First `contrib/<name>` module: `contrib/wslink` (`module
+github.com/luckystrker/ago/contrib/wslink`), the WebSocket `transport.Link` port of
+`ag2/network/transport/ws.py`. Pattern, for every future contrib module:
+
+- own `go.mod` at `contrib/<name>/`, `require github.com/luckystrker/ago v0.0.0` plus
+  `replace github.com/luckystrker/ago => ../..`; external dependencies are allowed there and
+  forbidden in the root module (D-003 stands);
+- `go get` runs only inside the module's own directory;
+- gates for a contrib module run from its directory (`go build ./...`, `go vet ./...`,
+  `go test ./...`) in addition to the root gates, which stay clean because the root module
+  never imports contrib (the dependency points one way: contrib → core).
+
+`wslink` itself: `wslink.Conn` implements `transport.Link` over `github.com/coder/websocket`
+(pure Go, no cgo), one JSON text message per frame via `transport.MarshalFrame` /
+`UnmarshalFrame`; `Dial` is the client side, `ServeWS` the `http.HandlerFunc` upgrade path.
+Malformed inbound messages are skipped (ws.py parity); heartbeat rides the library's control
+frames; Close wakes blocked Recv with an error wrapping `transport.ErrLinkClosed` and Send
+with `ErrClosed`. AGO-DEVIATION: no auto-reconnect and no `since_envelope_id` replay — Python
+`ws.py` does one connect per open and leaves reconnect to the tenant ("callers that need
+backoff wrap it"), so there is nothing to port; replay, when a tenant needs it, is an
+application-level Hello-frame field the hub answers from its WAL, not a transport concern.
+Tests run over `httptest` + a real `coder/websocket` dial: echo through the Link semantics,
+server→client push, malformed-frame skipping, context cancellation, Close waking Recv,
+unknown-frame-kind rejection, plain-HTTP refusal.
+
+## D-064 — 2026-10-30 — contrib/otelx: the agent-side telemetry middleware ported as an optional module (closes the TelemetryMiddleware deferral)
+
+Owner directive, same contrib wave as D-059, under the D-057 packaging. `contrib/otelx`
+ports `ag2/middleware/builtin/telemetry.py` (the D-013 "telemetry builtin not ported"
+note) as its own module: the core stays dependency-free (D-003); the module requires
+go.opentelemetry.io/otel + sdk, plus the stdout and OTLP/HTTP exporters for
+InstallDefault only, pinned at v1.41.0 — the newest release whose whole module graph
+still declares go ≤ 1.24 (otel v1.42+ and the 2026-era indirects of the first @latest
+attempt require go ≥ 1.25; the attempt was discarded for exactly that).
+
+Contract: `Middleware(tp trace.TracerProvider) middleware.Factory` — OnTurn/OnLLMCall/
+OnToolExecution wrap next with spans `ago.turn` (internal), `ago.llm_call` (client) and
+`ago.tool_execution` (internal), each parented under its instance's turn span (a Factory
+builds one instance per turn; Go has no ambient context, so the parenting is explicit
+under a mutex instead of `start_as_current_span`). `ago.llm_call` stamps model/provider
+(`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.provider.name`), the usage
+tokens (`gen_ai.usage.input/output/total_tokens` + cache_read/cache_creation/thinking)
+and finish_reasons off the ModelResponse, only for reported fields; `ago.tool_execution`
+stamps the tool name/call id/type. Pipeline errors record an exception event and set the
+span status to Error; a `ToolErrorEvent` answer (value or pointer) does the same when
+next() itself succeeded (Python parity). OnHumanInput passes through.
+`InstallDefault(ctx, opts...)` wires the SDK provider (batcher) and returns
+(factory, shutdown): WithStdout/WithStdoutWriter (JSON lines) or WithCollector
+(OTLP/HTTP; host:port and http:// → plaintext, https:// → TLS, "" → plaintext
+localhost:4318), registering the process-global provider.
+
+AGO-DEVIATION: span names `ago.*` instead of Python's "invoke_agent <agent>"/"chat"/
+"execute_tool <name>"; tracer scope `github.com/luckystrker/ago/contrib/otelx` instead
+of `opentelemetry.instrumentation.ag2` (same schema URL 1.11.0); InstallDefault speaks
+only OTLP/HTTP — a gRPC user builds their own provider and hands it to Middleware.
+Deferred: content capture (message bodies, tool arguments/results, the 8192-char
+truncation), the constructor knobs (agent/provider/model names, span_attributes), the
+`await_human_input` span, the `record_usage` subscription spans (spend that never
+becomes an LLM span — subtask rollups, compaction — stays untraced; the Go UsageEvent
+surface lives in ago/usage without a stream-subscription API for this), and the
+traceparent dependency relaying from network envelopes (the hub-side network.envelope
+tracing has no Go counterpart).
+
+Tests are network-free: sdktrace/tracetest SpanRecorder in-memory (nesting on one trace
+under the turn span, attribute stamping, empty-usage omission, error status via the
+pipeline-error and ToolErrorEvent value/pointer paths, per-turn instance isolation,
+concurrent tool execution under one turn, nil-provider global fallback, human-input
+pass-through) plus InstallDefault over a buffer and against an OTLP endpoint on
+httptest.
+
+## D-065 — 2026-10-30 — agui: held-turn interrupts, state snapshots, snake_case input (closes the D-053 deferrals for interrupts.py)
+
+Owner directive: port the remaining `ag2/ag_ui` surface — interrupts.py's
+held-turn machinery, the STATE_SNAPSHOT emitters, and dual-case run-input
+parsing. All of it lands in `github.com/luckystrker/ago/agui`.
+
+What was built:
+
+- `Server` (`agui/server.go`) serves one agent with turns owned by the server
+  rather than by an HTTP request (`NewServer` + `Options()`/`ServeAgent` +
+  `Handler`). A `HumanInputRequest` on a served run — question or tool
+  approval — parks the turn: the exchange ends on a `RUN_FINISHED` whose
+  outcome is the new `InterruptOutcome` (`agui/events.go`, wire shape from the
+  protocol schema's `RunFinishedInterruptOutcome`/`Interrupt`), never a
+  `RUN_ERROR`. The answer arrives as the `resume` entries of a later POST on
+  the same thread: `resolved` rebinds the turn to the new exchange (fresh
+  RUN_STARTED, then the events kept while paused, then the continuation),
+  `cancelled` abandons it (kept events + closings for open entities, then
+  RUN_FINISHED cancelled). Refusals are lone coded `RUN_ERROR`s before
+  RUN_STARTED: `INTERRUPT_NOT_COVERED`, `INTERRUPT_PAYLOAD_REFUSED`,
+  `INTERRUPT_NOT_PROVEN` — with the turn restored unchanged, so a legitimate
+  answer in time still resumes it.
+- `Retention` (default 900s / 128 held) bounds unanswered questions in an
+  in-memory registry keyed by thread; expiry releases the turn, and the hook's
+  own timer releases it even with no traffic. Registry entries are per-process:
+  resumes must be routed back to this server, nothing survives a restart.
+- Resume proofs: every interrupt carries `metadata["ago"]["proof"]` (32 random
+  bytes, per interrupt, constant-time compare). A proof that is present must be
+  the one issued; refusing absent proofs is opt-in (`WithResumeProof`).
+  AGO-DEVIATION: the envelope key is `"ago"` where Python uses `"ag2"`.
+- The mechanism rides the existing HITL plumbing: `Options()` installs
+  `hitl.DefaultHook` behind an `interrupter` middleware (`agui/interrupts.go`)
+  that intercepts by the asking context's stream id, so runs outside the server
+  keep their own arrangements. The run scope is opened on
+  `context.WithoutCancel` — a paused turn must not die with the response it
+  paused on (Python: the task lives outside the request scope).
+- `WithStateSnapshots` emits a `STATE_SNAPSHOT` at the start of every run: the
+  client's `state` keys and the conversation's variables together, reserved
+  `ag:`/`a2a:` keys stripped, declared in capabilities as
+  `state.snapshots=true`; `humanInTheLoop.interrupts=true` is now declared by
+  the served answer.
+- Run-input parsing (`agui/run_input.go`) decodes through an alias struct
+  accepting both camelCase (the SDK's spelling) and snake_case keys — top
+  level, messages, tool calls, resume entries — camelCase winning when a body
+  carries both; `state`/`forwardedProps`/tool parameters stay untouched values.
+  A resume entry of unknown status is stripped with a warning (Python parity:
+  `_known_entries`).
+
+AGO-DEVIATION / deferred (the honest edges of the minimal mechanism):
+
+- AGo's `Context.Ask` hands middleware the request stripped of its
+  `ToolApprovalRequest` wrapper (`middleware/approval.go` documents this), so
+  the served interrupt cannot name `toolCallId` or say
+  `reason=tool_call`; every interrupt reads `input_required`, and approvals
+  travel through the same text channel — a boolean resume payload is
+  translated to the words the approval middleware reads (`true`→`y`,
+  `false`→`n`) for any interrupt, where Python refuses booleans for
+  non-approvals.
+- Subagent suspension is deferred: a paused run does not close its open
+  invocations as suspended and re-announce them on resume (interrupts.py's
+  TurnOutput re-announcement ledger); open invocations are only closed when a
+  turn is abandoned. `SubagentRunID` attribution on an interrupt uses the
+  projection's open-invocation tracking instead of the full ledger.
+- Seeding the turn's variables from the client's `state` is deferred (the
+  served run cannot write the conversation variables from outside the agent
+  package); the client's state is merged into the snapshot representation only.
+- Opening snapshots are emitted unconditionally when configured, not only when
+  they differ from what the client holds.
+
+Gates re-run for this entry: `go build ./...`, `go vet ./...`,
+`go test ./...` (all packages green), `go build ./examples/...` — plus
+`go test ./agui/ -count=5` for stability. Tests are network-free (httptest):
+the interrupt/resume cycle (question → partial SSE → resume POST →
+continuation), state snapshot, dual-case input, refusals with the turn kept
+answerable, cancelled-resume abandonment, retention expiry, resume proofs,
+boolean payload translation, shutdown release. The race detector could not run
+in the authoring environment (no C compiler for cgo).
+
+## D-066 — 2026-10-30 — acp: session/cancel, session/load, the full update vocabulary, mediated fs/terminal, the MCP gateway and token auth (closes the D-052 deferrals for this slice)
+
+Owner directive, same wave as D-065. `ago/acp` closes the deferrals D-052
+recorded ("Not ported": `session/cancel` + the cancelled stop reason,
+`session/load` replay, auth, the thought/plan/tool-call/usage updates, the
+mediated `fs/*` + `terminal/*`, `tool_gateway.py`) as a functional subset of
+the Python modules — session.py/agent.py/executor.py/mappers.py (serve),
+bridge.py (client), auth.py. Wire shapes were pinned against the SDK the
+reference itself pins (`agent-client-protocol` 0.12.1, extracted from the
+wheel): `usage_update` carries `{used, size, cost?}` (the stabilized context
+shape — NOT per-call token fields), `tool_call`/`tool_call_update` carry
+`toolCallId/title/kind/status/content/rawInput`, `plan` carries `entries
+[{content, priority, status}]`, the mediated methods are `fs/read_text_file`,
+`fs/write_text_file`, `terminal/create`, `terminal/output`,
+`terminal/wait_for_exit`, `terminal/kill`, `terminal/release`, and the error
+codes are the ACP ones (`-32000` auth required, `-32002` resource not found —
+the previous implementation-defined "session not found" code already matched).
+
+**Serve role.** Reading moved to a dedicated goroutine (replies to a channel,
+notifications dispatched immediately, requests queued to the serve loop — one
+request runs at a time, unchanged), which is what makes a cancel deliverable
+mid-turn. `session/cancel` stops the named session's turn context and is
+ignored for unknown sessions (agent.py parity: a notification has no reply
+channel); a cancelled turn answers `{"stopReason": "cancelled"}` — never a
+protocol error, whatever the handler returned. `Handle` now receives the
+turn's `context.Context` plus an `*Emitter` (`Message/Thought/Plan/ToolCall/
+ToolCallUpdate/Usage`) — a signature change over D-052, documented here
+because a handler that ignores its context still gets the cancelled stop
+reason. `session/load` reattaches to a session this connection issued and
+replays its stored history before the response (user turns as
+`user_message_chunk` with `messageId`, replies as `agent_message_chunk`, tool
+calls started once and settled once — mappers.history_to_session_updates
+parity); a plain `Serve` has no history source, `ServeAgent` replays its
+per-session conversations; cross-process storage stays deferred.
+`authenticate` + an `Auth` provider gate every session method
+(`_require_session_scope` parity); `initialize` advertises `loadSession:
+true` and the provider's `authMethods`. `ServeAgent`'s live projection maps
+`ModelReasoning` → `agent_thought_chunk` (only when `StreamThoughts` is on —
+Python's `stream_thoughts` default), the per-call tool events → `tool_call` /
+`tool_call_update` (the batch `ToolCallsEvent`/`ToolResultsEvent` are the
+loop's own bookkeeping and would double every call on the wire — executor
+parity), and `UsageEvent` → `usage_update` only when `ServeConfig.
+ContextWindow` is set, because the shape's required `size` (context window)
+has no truthful value otherwise; `used` is the session's running token total.
+
+**Client role.** `Cancel` writes the `session/cancel` notification without
+taking the Bridge lock (the lock is held by the parked `Prompt` — taking it
+would deadlock against the very answer the cancel unblocks); `closed` became
+atomic for the same reason. `PromptTurn` returns the stop reason next to the
+text (`Prompt` keeps its D-052 signature). `Load` drives `session/load` and
+the replay reaches the new `OnUpdate` hook — which receives every
+`session/update` the agent streams, chunk or not. `SessionNewWithServers`
+announces HTTP MCP servers in `session/new` and refuses stdio entries
+(`ErrUndeclarableServer`): a command only the declarer can run is useless to
+a subprocess agent (the reference's `session.ensure` takes `HttpMcpServer`
+only). The mediated `fs/*`/`terminal/*` are answered under a root guard
+(bridge.py `_confine` parity: `confine()` resolves symlinks in existing
+components and refuses anything outside the root; terminals run confined to
+the same root, output capped with the head kept and a truncated flag —
+bridge.py `_Terminal`). `Bridge.FS == nil` is the disable option: every
+mediated request answers `-32601`, the answer a client owes for a method it
+never advertised, and `initialize` advertises `clientCapabilities.fs` only
+when enabled — truthful on the deny side too.
+
+**MCP gateway** (`tool_gateway.go`): `ToolGateway` proxies tool calls to
+declared servers through the `ago/mcp` client — one connection per server,
+dialed lazily on the first call (a client's declaration must not spawn
+subprocesses on the agent's behalf until its handler asks). The serve role
+records declared servers on the Session and exposes `Session.Gateway()` for
+handlers; deviations recorded below.
+
+AGO-DEVIATION / deferred:
+
+- Python's `tool_gateway.py` hosts the AG2 agent's local tools on an
+  in-process HTTP MCP server and hands the URL to the CLI agent — the
+  opposite direction. The Go subset ports the consume direction only (proxy
+  through the `ago/mcp` client, per the porting brief); hosting local tools
+  over HTTP for the agent is deferred (it needs an HTTP MCP server on
+  net/http — doable, but a separate slice).
+- The served AGo agent's own tools are not routed through the gateway:
+  `ServeAgent` runs plain `Ask` turns (D-052) whose tools resolve through the
+  AGo tool framework; a handler that wants client-declared servers calls
+  `Session.Gateway()` itself.
+- `guard.py` (the `_meta` merge guard) is not ported because the behavior it
+  guards does not exist here: the Go dispatcher decodes params into typed
+  structs and drops `_meta` — nothing merges metadata over request fields.
+- `list_directory` and `run_terminal` from the brief's method list are not in
+  the reference's method set (bridge.py / SDK 0.12.1 carry no such methods);
+  the mediated set is exactly the reference's.
+- The serve side never CALLS `fs/*`/`terminal/*` (Python's ACPAgent never
+  does either); only the answering side is implemented.
+- The batch result events flatten error identity (the executor embeds
+  `ToolResultEvent` in `ToolResultsEvent`), so a live `tool_call_update`
+  settles errors as `failed` only via the loose error events; batch results
+  are emitted `completed` with the error text as content. A signal-terminated
+  terminal reports a negative exit code, no signal name.
+- `StaticTokenAuth` is the auth subset ported (the env-key/secret case); the
+  terminal/OAuth auth-method kinds are deferred. `PromptResponse`'s unstable
+  `usage` field is not emitted.
+- The session store (LRU/TTL/queues), cross-connection session/load and
+  model pickers stay deferred (D-052).
+
+Tests: the re-exec suite grows one child role per mechanism —
+`acp-cancel-agent` (parks until the cancel notification, answers the
+cancelled stop reason), `acp-load-agent` (replays two chunks on session/load),
+`acp-fs-probe-agent` (line/limit read, escape refusal, write-through-
+mkdirs), `acp-term-probe-agent` (create → wait → output → release of a
+re-exec'd one-shot echo role), `acp-fake-mcp-server` (stdio MCP the gateway
+dials) — plus in-process fake-client tests for the serve side (cancel stops
+the turn context and answers cancelled, stray cancels ignored, load replay
+with messageIds, the update vocabulary and its StreamThoughts/ContextWindow
+gates, the static-token flow, the gateway against an httptest MCP server,
+`confine` unit cases).
+
+Gates re-run for this entry: `go build ./...`, `go vet ./...`,
+`go test ./...` (all packages green, 0 skipped), `go build ./examples/...`,
+`go vet ./examples/...`; `go test ./acp/ -count=1` re-run after the docs
+sweep. The race detector could not run in the authoring environment (no C
+compiler for cgo), same note as D-065.
+
+## D-067 — 2026-10-30 — a2a wave 2: push notifications, the client-tools extension, context/HITL over the wire, REST, declarative security schemes; card JWS signing stays deferred
+
+Owner directive, the same wave as the D-049/D-050 supplements above. `ago/a2a`
+closes the remaining a2a deferrals that do not need new dependencies. What
+shipped:
+
+- **Push notifications** (`push.go`, parity push.py + server.py): a
+  `PushConfigStore` (`MemoryPushConfigStore`) behind the four JSON-RPC methods
+  `tasks/pushNotificationConfig/set|get|list|delete` — the v0.3 wire spellings
+  (a2a-sdk `src/a2a/compat/v0_3/jsonrpc_adapter.py:60-63`), consistent with the
+  `message/send`-style method names the package already serves; the 1.x
+  dispatcher renames them to the gRPC-derived `CreateTaskPushNotificationConfig`
+  family, a rename-only difference. Config wire shape is the a2a-sdk
+  `TaskPushNotificationConfig` proto (url, token,
+  authentication{scheme, credentials}, server-issued id). Configuring a store
+  flips `capabilities.pushNotifications` on the served card (parity server.py:218)
+  and arms dispatch: on every terminal commit the server fires each registered
+  webhook asynchronously (`context.WithoutCancel` — the RPC has its answer
+  already; a webhook outage cannot fail it). `DefaultPushSender` POSTs the task
+  record as `application/a2a+json` with the token on `X-A2A-Token`;
+  `PushReceiver` is the matching webhook endpoint (POST, constant-time token
+  check, Task decode, callback). AGO-DEVIATION: the token header spelling is
+  this package's contract between its own sender and receiver — the a2a-sdk
+  leaves the sender to an app-supplied `PushNotificationSender`, so there is no
+  upstream spelling to match. Client side: `SetPushConfig`/`GetPushConfig`/
+  `ListPushConfigs`/`DeletePushConfig` (parity push.py create/get/list/delete).
+  An optional `PushURLValidator` refuses webhook URLs at set time (parity
+  server.py `push_url_validator`).
+- **The `urn:ag2:client-tools:v1` extension** (`extension.go`, parity
+  extension.py + mappers/tools.py): the URI and the four `vnd.ag2.*` MIME
+  constants; `ToolSchema`/`ToolCall`/`ToolResultEntry` with the Python payload
+  dicts (schemas `{"tools":[...]}`, calls `{"id","name","arguments"}` —
+  arguments stays the JSON string AG2 holds; results
+  `{"results":[{"id","name","content","error"}]}` — only the error string
+  survives the wire, as in Python). Server: `ServerConfig.HandleClientTools`
+  replaces `Handle` for a turn carrying tool-schemas parts; returning calls
+  parks the task `input-required` with one tool-call data part per call on the
+  status message (parity executor.py's `requires_input`), returning none
+  completes. `HandleToolResults` resumes a task parked by id — the same two
+  legs as executor.py `_build_initial_event` (ToolResultsEvent vs ModelRequest).
+  Client: `AttachClientTools` stamps the URI on `Message.extensions` and
+  appends the schemas part (parity `build_user_message` advertise_extension);
+  `RunClientTools` loops park → execute-callback → results continuation until
+  the task is terminal. `ValidateExtensionActivation` reconciles activated URIs
+  with the card in both directions (parity extension.py
+  `validate_extension_activation`, including the native-URI exemption).
+- **Context variables + HITL over the wire** (`contextwire.go` + driver, parity
+  mappers/messages.py extract/build + executor.py bracket): the
+  `ag2.context_update` metadata key; `ExtractContextUpdate` returns an empty
+  map on absence/non-object (callers merge unconditionally);
+  `StripReservedVariables` drops the `ag:`/`a2a:` prefixes on both wire
+  directions (parity context.py:289 `RESERVED_VARIABLE_PREFIXES` — declared
+  locally, an AGO-DEVIATION: the Go core does not export the strip helper and
+  a2a stays a leaf package). The server engages the sync only when
+  `ServerConfig.SyncVariables` is set: inbound delta (stripped) keyed by task
+  id, returned final set (stripped) attached to the reply. HITL: a parked task
+  whose status message is the question is answered by `Client.RunWithHumanInput`
+  — the text continuation goes out under the same task id (parity
+  `build_input_response_message`), extensions preserved because activation is
+  per-request. The drivers cap the loops at 16 wire rounds (`wireRoundLimit`) —
+  Python relies on `input_required_timeout` instead; a fixed cap is the honest
+  equivalent against a misbehaving server.
+- **REST transport** (`rest.go`, parity transports/rest.py mounting the a2a-sdk
+  `create_rest_routes`): `POST /message:send`, `POST /tasks` (the same send
+  under the wave's alias path), `GET /tasks/{id}` with `?historyLength=`, and
+  `POST /tasks/{id}:cancel` — the send/get/cancel trio of the wave's scope;
+  payloads `application/a2a+json` (a2a-sdk constants.py
+  `A2A_JSON_MEDIA_TYPE`), errors as JSON-RPC error objects with HTTP mappings
+  (400 invalid, 404 unknown task, 409 terminal cancel, 500 handler/store).
+  Not ported from the SDK route table: `tasks/list` (GET /tasks),
+  `/extendedAgentCard`, the `/{tenant}` mount (tenants stay deferred), and the
+  `tasks/{id}/pushNotificationConfigs` REST routes (the push surface speaks
+  JSON-RPC only).
+- **Declarative security schemes** (`security.go`, parity security.py):
+  `NamedScheme`/`SecurityRequirement` and the six factories
+  (bearer/http/api-key/oauth2/oidc/mtls). Wire shapes verified against the
+  official Go SDK (a2aproject/a2a-go a2a/auth.go, a2a/agent.go): the scheme is
+  the nested ProtoJSON oneof (`httpAuthSecurityScheme`, ...), scopes render as
+  `{}` / `{"list":[...]}` inside `{"schemes": {...}}` (legacy bare arrays
+  accepted on decode), the card carries `securitySchemes` +
+  `securityRequirements`.
+- **Card/extension wire fields** (`types.go`): `Message.extensions` +
+  `Message.metadata`, `DataPart.mediaType` (+part metadata), `AgentExtension`
+  on capabilities with `extendedAgentCard`, and the `input-required` task
+  state (the D-049 amendment above). The client stamps `A2A-Extensions`
+  (comma-separated, the A2A spec spelling; parity extension.py
+  `extension_call_context`) via `WithExtensions`, and `SendMessageTask` /
+  the drivers absorb both message/send result shapes (Message for immediate
+  completions, Task for parks — the probe AG2's client runs, client.py).
+
+**Deferred — card JWS signing/verification stays closed**: `sign_card`,
+`CardSigner`, `card_signature_verifier` and `A2ACardSignatureError` (errors.py)
+are real JWS over the card payload; the stdlib has no JWS/JWT (no HS256/RS256
+primitives short of rolling the JOSE stack by hand, which is exactly the
+crypto-not-invented-here territory the zero-dependency rule exists to avoid).
+security.py itself is pure card metadata and is fully ported above; the
+signing layer around it is not. Also still deferred: full history shipping on
+continuations (`ag2.history+json` parts), reconnect/resubscribe,
+`validate_input_modes`, cluster mode, tenants, gRPC (permanently — see the
+D-049 supplement).
+
+Gates for this entry: `go build ./...`, `go vet ./...` (clean);
+`go test -count=1 ./a2a/ -v` — 62 tests ok; full `go test -timeout 300s` over
+`$(go list ./... | grep -v /acp)` — 46 packages ok, 0 failures; `./acp` was
+excluded because a concurrently-authored test in that package
+(`TestServeCancelStopsTheTurn`, acp/serve_extend_test.go — another agent's
+in-flight work, not this wave's) hung past the timeout; `go build ./examples/...`
+and `go vet ./examples/...` clean. The race detector could not run in the
+authoring environment (no C compiler for cgo), same note as D-065/D-066.
+
+## D-068 — 2026-10-30 — Final wave: the D-008 Responses/Decisions deferral is closed (config/openai)
+
+Closes the last open line of D-008's provider surface: `OpenAIResponsesConfig` and
+`OpenAIDecisionsConfig` exist as full clients, not config stubs. The detail record is
+D-060; this entry is the closure ledger against the deferral.
+
+- `NewOpenAIResponses(model)` → `Create() (config.LLMClient, error)` — the
+  Responses API over raw HTTP/SSE on `internal/httpx` + `internal/sse` (no SDK, D-003):
+  `POST {base}/v1/responses`, field parity with the Python dataclass
+  (Temperature/TopP/MaxOutputTokens/MaxToolCalls/Store(nil = default true)/
+  ParallelToolCalls(nil = default true)/TopLogprobs/Metadata/PromptCacheKey/
+  PromptCacheOptions/Reasoning{Effort,Summary}/ServiceTier/User/Truncation/Timeout/
+  MaxRetries(default 4)/Organization/Project/DefaultHeaders/ExtraBody); `Clone`
+  accepts Go field names with snake_case aliases, nil clears. `CreateFilesClient`
+  delegates to the existing Files client (D-046).
+- Hosted builtin tools reach the wire through this client — the D-047 carrier gap on
+  the OpenAI side is closed: web_search, file_search, code_interpreter, image_generation,
+  shell (container auto/reference), MCP, tool_search (`defer_loading`). Hosted output
+  items map back to `BuiltinToolCallEvent`/`BuiltinToolResultEvent` with second-call
+  item replay. `FileIdInput` maps to `input_file.file_id` (the Chat-Completions engine
+  still rejects it, D-017/D-020).
+- `NewOpenAIDecisions()` → `DecisionsClient` — decision-only schemas (bool, string
+  enum, int enum numbered from 0, 0..1 number; anything else is refused with the
+  schema guidance), thresholded answers (`BooleanThreshold`, default 0.5), refusal as
+  `*DecisionRefusedError{Name}`, default model `DefaultDecisionsModel` ("gpt-6-luna").
+
+Still deferred (D-060's honest remainder): OpenAI Containers (nothing in the ported
+client references them), prompt-cache diagnostics events, reasoning-item replay, shell
+delta chunks, question-instruction parts (Decisions), `websocket_base_url`. The
+D-008 stubs (xai/bedrock/typesafe) are unchanged.
+
+## D-069 — 2026-10-30 — Final wave: the contrib "extras" policy is applied across all five optional modules
+
+The D-048 policy (itself the extension of D-003; the extras shape mirrors AG2's
+`optional_import_block`, ag2/ag2/_import_utils.py:93) materialized through the D-057
+layout. Five modules ship under `contrib/<name>/`, each its own Go module —
+`module github.com/luckystrker/ago/contrib/<name>`, `require github.com/luckystrker/ago
+v0.0.0` + `replace github.com/luckystrker/ago => ../..` — the only places in the
+repository where external dependencies are allowed:
+
+| module | dependency | carries | record |
+|---|---|---|---|
+| `contrib/knowledgesqlite` | `modernc.org/sqlite` v1.34.1 (pure Go) | `knowledge.Store` | D-059 |
+| `contrib/knowledgeredis` | `redis/go-redis/v9` v9.5.1 (+ miniredis test dep) | `knowledge.Store` | D-059 |
+| `contrib/streamredis` | `redis/go-redis/v9` v9.5.1 (+ miniredis test dep) | `stream.Storage` | D-059 |
+| `contrib/wslink` | `github.com/coder/websocket` v1.8.15 | `transport.Link` | D-057 |
+| `contrib/otelx` | `go.opentelemetry.io/otel` v1.41.0 + sdk/stdout/OTLP exporters | telemetry `middleware.Factory` | D-064 |
+
+Verified 2026-10-30: the root `go.mod` is `module github.com/luckystrker/ago` + `go 1.24`
+with **zero `require` entries** — `contrib/` is invisible to the root `./...` gates
+(nested modules), and the dependency points one way (contrib → core). Gates re-run from
+each module directory (`go build ./...`, `go vet ./...`, `go test -count=1 ./...`): all
+five green. CI runs a dedicated `contrib` job that loops `contrib/*/` (added this wave).
+
+## D-070 — 2026-10-30 — Final wave: closure ledger for network/a2a/acp/agui/eval against D-049..D-053
+
+Each protocol wave closed its D-049..D-053 slice with its own record (network: D-056
+wave 2; eval: D-061; agui: D-065; acp: D-066; a2a: D-067). This entry is the
+project-level statement of what "closed" means per zone and what honestly remains.
+
+- **network** (D-031 + D-056): closed — view policies, the `HubArbiter` seam with the
+  `RuleBasedArbiter` default, expectation evaluators/handlers + `AuditSink` +
+  `ExpectationSweeper` (owners opt in), `TaskMirror`, `ClientTools` (peers/channels/
+  tasks/context/delegate as `[]tools.Tool`), `Hub.NameFor`/`Registrations`. Remains:
+  no `AuthorizeInbox` consultation (client-side inboxes), federation has no
+  implementations (`RemoteAgentProxy` stays an interface stub; remote routing goes
+  through `ResolveUnknownAudience`), the sweeper never auto-starts, no skills/SKILL.md
+  registry behind the peers tool.
+- **a2a** (D-049/D-050 + D-067): closed — push notifications (store + four JSON-RPC
+  methods + async webhook dispatch + sender/receiver), the `urn:ag2:client-tools:v1`
+  extension with server legs and client drivers, context-variable sync and HITL over
+  `Message.metadata`, the REST twin, declarative security schemes, `input-required`
+  task state. Remains: full history shipping (`ag2.history+json`),
+  reconnect/resubscribe, card JWS signing/verification (no stdlib JWS — D-067),
+  `validate_input_modes`, cluster mode, tenants. gRPC is closed permanently — D-071.
+- **acp** (D-052 + D-066): closed — both roles, `session/cancel` (cancelled stop
+  reason, never an error), `session/load` with per-session replay, the full
+  `session/update` vocabulary (thoughts under `StreamThoughts`, plan, tool calls,
+  `usage_update` under `ContextWindow`), token auth (`Auth`/`StaticTokenAuth`),
+  mediated `fs/read_text_file`/`fs/write_text_file` under the root guard, the
+  `terminal/*` family confined to the same root, the MCP gateway (consume direction).
+  Remains: the multi-session store, cross-process `session/load` storage, the
+  tool_gateway HOST direction (exposing local tools over HTTP), serving the agent's
+  own tools through the gateway, `guard.py` (its `_meta` merge target does not exist
+  in the Go dispatcher), OAuth/terminal auth kinds, model pickers, remote transports.
+- **agui** (D-053 + D-065): closed — the held-turn `Server` (a question pauses the run
+  as RUN_FINISHED with an `interrupt` outcome; the answer rides the next POST's resume
+  entries; resolved rebinds, cancelled abandons), in-memory retention (default
+  900s/128), optional resume proofs, STATE_SNAPSHOT of conversation variables,
+  snake_case run-input keys. Remains: REASONING_ENCRYPTED_VALUE, the subagent
+  suspension ledger (open invocations close on abandon, are not re-announced on
+  resume), seeding the turn's variables from the client's state, prompt-level inputs
+  folded into the opening transcript request.
+- **eval** (D-051 + D-061): closed — failure attribution (mechanical + one-call LLM
+  attributor, `Trace.Err`), the scorer registry (name + params factories, built-ins,
+  `SetClient`), `SuiteFromJSONL`, `Diff`/`DiffStrict`/`Summary`, `WilsonCI`/`CohenKappa`,
+  parallel cases (`WithConcurrency`, default 4). Remains: OTEL/Tempo/OTLP trace sources
+  and `evaluate_traces` (the trace stays event-sourced — the core D-051 deviation),
+  repeats/per-task configs/`BudgetThresholds`/lifecycle events, suite name/source
+  metadata + tags (no slot on `Suite []Case`), pairwise single-order mode.
+
+## D-071 — 2026-10-30 — a2a: the gRPC transport is closed permanently, not deferred
+
+Decision: AGo will not carry an A2A gRPC binding — not "later", ever. Upgrades the
+D-049/D-067 "deferred permanently" note to a positive closure so the ledger states the
+reasons, not just the verdict:
+
+1. **No lost behavior.** The gRPC binding is the A2A method vocabulary over a different
+   wire encoding. The Go server already serves every ported method over JSON-RPC 2.0
+   (message/send, message/stream, tasks/get, tasks/cancel, the push-config family, the
+   client-tools and HITL continuation legs) and over the REST twin
+   (`POST /message:send`, `POST /tasks`, `GET /tasks/{id}?historyLength=`,
+   `POST /tasks/{id}:cancel` — a2a/rest.go:16-19). There is no AG2 behavior reachable
+   only through gRPC.
+2. **Dependency cost is structural.** Serving gRPC requires protobuf codegen (protoc)
+   plus `google.golang.org/protobuf`. That is an external dependency — forbidden in the
+   core (D-003/D-048) — and unlike the contrib cases (a driver, an SDK), the payload is
+   generated artifacts that must track a2a proto revisions forever, for a transport no
+   ported behavior needs. A contrib module buys nothing here.
+3. **Clients resolve to JSONRPC by construction.** The served card always carries
+   `supportedInterfaces`, and when the config leaves them unset the server fills in
+   exactly one JSONRPC interface at protocol version "1.0" (D-049) — the path 1.x
+   clients take; REST covers non-RPC callers.
+
+The a2a row in PORT_STATUS lists gRPC as the honest permanent remainder of an otherwise
+ported slice; nobody needs to re-open this.
+
+## D-072 — 2026-10-30 — Final wave: live keeps the HTTP cascade; the realtime stack and sound devices stay deferred
+
+`github.com/luckystrker/ago/live` is the ported slice (D-057): `Cascade{STT Transcriber;
+LLM func(ctx, text) (string, error); TTS Synthesizer}` with `Handle(ctx, audio, mime,
+voice) (replyText, audioOut, mimeOut, err)` — transcribe, answer, synthesize; a
+whitespace-only transcript ends the turn silently (cascade.py `_turn` parity); stage
+failures wrap the cause; an incomplete cascade fails fast with `ErrIncomplete`, provider
+errors surface as `ErrAPI` (status + body snippet). Ready OpenAI stages over net/http:
+`OpenAITranscriber` (Model default "whisper-1", optional Language) and
+`OpenAISynthesizer` (Model default "tts-1", Voice default "alloy", Format default
+"mp3", Speed).
+
+Still deferred, deliberately — the honest remainder of `ag2/live/`:
+
+- the realtime-websocket stack (LiveAgent-driven `RealtimeConfig`, turn detection,
+  barge-in, streaming TTS, `STTTranslationConfig`) — websocket clients plus
+  sound-device I/O, both outside the stdlib-only core (D-057);
+- the elevenlabs/gemini/mistral live providers;
+- `events/voice.py` (the voice event vocabulary has no consumer without the stack);
+- **sound devices** (OS audio capture/playback): no stdlib surface exists; a Go port
+  would need a platform audio dependency, i.e. a contrib module — there is nothing to
+  put behind `Cascade`'s plain-byte `Transcriber`/`Synthesizer` interfaces until an
+  application brings its own audio source, which the interfaces already allow.
+
+## D-073 — 2026-10-30 — mcpserver, toolpacks, tui: the three new packages and why the Go layout splits them
+
+Three packages land without a 1:1 Python module counterpart; each carves one role out
+of a Python module that bundled several:
+
+- **`mcpserver`** — the *serving* half of `ag2/mcp/` (server.py, executor.py, tools.py,
+  transport.py; record D-058). Python kept client and server in one module; AGo splits
+  them because the roles pull the dependency graph in different directions: the client
+  (`ago/mcp`, D-029) stays a leaf (events/stream/tools/middleware only), while the
+  server imports `agent` (`NewServerForAgent` builds one blocking agent turn per ask)
+  and the client itself (verified imports, 2026-10-30). One package per role keeps an
+  MCP consumer from pulling the whole agent. Statelessness is the second cut: every
+  `tools/call` is an independent exchange; sessions/paused-runs/OAuth/MCP-Apps are
+  deferred (D-058).
+- **`toolpacks`** — the ready-made tool *content* of `ag2/tools/` (shell, code +
+  sandbox/local, toolkits/filesystem.py, search, skills, dynamic/factory.py; records
+  D-062/D-063). Python shipped them beside the tool framework; AGo separates the
+  framework (`ago/tools`: schema, binding, executor) from concrete tools
+  (`ago/toolpacks`: `NewShellTool`, `NewLocalCodeRunner`, `NewFilesystemToolkit`,
+  `NewDuckDuckGoSearch`/`NewTavilySearch`/`NewPerplexitySearch`, `NewSkillsToolkit`,
+  `NewDynamicAgentFactory`) so the framework stays dependency-free and the packs can
+  grow without touching it. Deferred: Docker/Daytona sandboxes, the TypeScript runner,
+  parts of the skills runtime (D-062).
+- **`tui`** — `ag2/textual.py` without the textual framework (record D-056-tui):
+  `REPL(a, in, out, opts...)` with `/help`//`exit` and `WithStreaming()` chunk echo.
+  The textual App surface (widgets, markdown, the reasoning block) stays deferred —
+  no TUI framework in the zero-dependency core.
+
+## D-074 — 2026-10-30 — a2a: atomic task state transitions (TaskUpdater + per-task fallback)
+
+`TaskStore.Get` returns a deep copy and `Save` replaces the record, so every
+read-modify-write cycle the server runs — a turn committing its outcome,
+`tasks/cancel` flipping a task to canceled — was a lost-update race: two
+continuations resuming one parked task (the client-tools and HITL flows do
+exactly that) clobbered each other's history entry and status, and a cancel
+landing while a turn ran was overwritten by the turn's finishing `Save` — a
+canceled task resurrected as completed. Python never sees this because the
+interpreter's event loop serializes the interleavings; Go's concurrent HTTP
+handlers do not.
+
+The fix makes the transition atomic instead of widening any lock around the
+agent turn (a lock held across the whole `Handle` call would also stall
+`tasks/cancel` for the turn's full duration):
+
+- **`TaskUpdater`** — optional `TaskStore` extension (`Update(id, mutate)`):
+  re-read, mutate and write under one store-lock hold. `MemoryTaskStore`
+  implements it; its results come back by deep copy, keeping the store's
+  callers-never-share-state invariant.
+- **Fallback** — stores without `Update` get a per-task mutex in `Server`
+  across the `Get`→`Save` pair. Default flows never enter it.
+- **History merges at commit** — the turn appends its incoming message to the
+  history the store holds at commit time, not to the snapshot it loaded at
+  begin: a concurrent continuation's entry survives.
+- **Refusal policy** — a stored `canceled` record refuses a turn's commit (the
+  cancel won; the turn's outcome is dropped wholesale and the caller is
+  answered with the stored Task record — a canceled task never resurrects).
+  `completed`/`failed` records still continue on an explicit new message with
+  the same task id, matching the executor's append-to-whatever-id-arrives
+  behavior the REST tests pin; `tasks/cancel` refuses over every terminal
+  state, as before (-32002).
+
+AGO-DEVIATION: the cancel-wins-over-a-running-turn ordering has no Python
+counterpart — the single-threaded loop makes the race unrepresentable there
+(D-050 covers the related store-before-answer deviation).
