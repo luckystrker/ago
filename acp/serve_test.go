@@ -40,6 +40,16 @@ type fakeClient struct {
 	// requestHook answers an agent→client request; the returned value becomes
 	// the response result. nil answers with an empty result.
 	requestHook func(method string, params json.RawMessage) any
+
+	// writeMu serializes writes to w: the session/cancel notify fires from
+	// its own goroutine mid-turn while the test goroutine writes requests.
+	// A shared bufio.Writer used from two goroutines can silently drop a
+	// buffered line on overlapping Flushes — the lost session/prompt that
+	// hung CI for the full 10-minute test timeout.
+	writeMu sync.Mutex
+	outFile *os.File // the agent's stdout; deadlines bound await
+	// scanned holds the raw lines seen by the current await, for diagnostics.
+	scanned [][]byte
 }
 
 type recordedRequest struct {
@@ -60,7 +70,7 @@ func startServe(t *testing.T, serve func(in io.Reader, out io.Writer) error) *fa
 	done := make(chan error, 1)
 	go func() { done <- serve(agentIn, agentOut) }()
 
-	fc := &fakeClient{t: t, w: bufio.NewWriter(agentInW), sc: bufio.NewScanner(agentOutR)}
+	fc := &fakeClient{t: t, w: bufio.NewWriter(agentInW), sc: bufio.NewScanner(agentOutR), outFile: agentOutR}
 	fc.sc.Buffer(make([]byte, 0, 64*1024), scanBuffer)
 	t.Cleanup(func() {
 		agentInW.Close() // stdin EOF ends the serve loop
@@ -89,8 +99,10 @@ func (c *fakeClient) call(method string, params any) (json.RawMessage, *rpcError
 	if err != nil {
 		c.t.Fatalf("marshal request: %v", err)
 	}
+	c.writeMu.Lock()
 	fmt.Fprintln(c.w, string(payload))
 	c.w.Flush()
+	c.writeMu.Unlock()
 	return c.await(c.id)
 }
 
@@ -98,12 +110,19 @@ func (c *fakeClient) call(method string, params any) (json.RawMessage, *rpcError
 // accumulate, agent→client requests are recorded, answered via the hook and
 // replied inline.
 func (c *fakeClient) await(wantID int64) (json.RawMessage, *rpcError) {
+	// A missed reply used to hang the package for the 10-minute test
+	// timeout; the read deadline fails the test in 30s with diagnostics.
+	if c.outFile != nil {
+		_ = c.outFile.SetReadDeadline(time.Now().Add(30 * time.Second))
+	}
+	c.scanned = nil
 	for c.sc.Scan() {
 		line := strings.TrimSpace(c.sc.Text())
 		if line == "" {
 			continue
 		}
 		var msg incoming
+		c.scanned = append(c.scanned, []byte(line))
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
@@ -115,8 +134,10 @@ func (c *fakeClient) await(wantID int64) (json.RawMessage, *rpcError) {
 					result = c.requestHook(msg.Method, msg.Params)
 				}
 				payload, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: *msg.ID, Result: result})
+				c.writeMu.Lock()
 				fmt.Fprintln(c.w, string(payload))
 				c.w.Flush()
+				c.writeMu.Unlock()
 			} else if msg.Method == "session/update" {
 				if u := decodeUpdate(msg.Params); u != nil {
 					c.updates = append(c.updates, *u)
@@ -129,7 +150,13 @@ func (c *fakeClient) await(wantID int64) (json.RawMessage, *rpcError) {
 		}
 		return msg.Result, msg.Error
 	}
-	c.t.Fatalf("agent stream ended before reply %d", wantID)
+	scanErr := c.sc.Err()
+	scanned := make([]string, 0, len(c.scanned))
+	for _, l := range c.scanned {
+		scanned = append(scanned, string(l))
+	}
+	c.t.Fatalf("agent stream ended or stalled before reply %d (scan err: %v); lines seen: %q",
+		wantID, scanErr, scanned)
 	return nil, nil
 }
 
