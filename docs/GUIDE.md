@@ -4,8 +4,9 @@ AGo is a Go framework for building LLM agents: one `Agent` type, an event stream
 conversation, tools registered as stream subscribers, middleware wrapped around every
 turn, model call, tool execution and human-input hop, and a hub that hosts multi-agent
 channels. It is a port of AG2 (Python) with zero external dependencies — stdlib only,
-module `ago`, Go 1.24; add the repo and import `"ago/..."` (no `go get`). Every snippet
-below was compile-checked against the tree as of 2026-10-30.
+module `github.com/luckystrker/ago`, Go 1.24; `go get github.com/luckystrker/ago` and import
+`"github.com/luckystrker/ago/..."`. Every snippet below was compile-checked against the tree
+as of 2026-10-30.
 
 Sections: [Concepts](#concepts) · [Agents](#agents) · [Tools](#tools) ·
 [Plugins](#plugins) · [Model providers](#model-providers) ·
@@ -24,7 +25,7 @@ fragments as the system message, sends the conversation history to the configure
 and returns the answer. Everything else — tools, middleware, HITL, structured output,
 subtasks — is opt-in via `agent.With*` options (`agent/agent.go`).
 
-**Stream.** Every conversation lives on a `stream.Stream` (`ago/stream`): an event bus
+**Stream.** Every conversation lives on a `stream.Stream` (`github.com/luckystrker/ago/stream`): an event bus
 with a durable transcript (`History`) and an inbox (`Enqueue`/`Drain` of pending
 `ModelRequest`s). Subscribers receive events in registration order:
 ```go
@@ -88,7 +89,7 @@ img, err := events.ImageInput("https://example.com/cat.png", "", nil, "") // →
 ask := events.EnsureRequest("What is in this picture?", img)
 ```
 
-**Context.** `agocontext.Context` (`ago/context`) is the per-conversation handle tools,
+**Context.** `agocontext.Context` (`github.com/luckystrker/ago/context`) is the per-conversation handle tools,
 middleware and observers receive: the stream, the system-prompt fragments, dependency
 (DI) and variable maps, and the HITL hook.
 
@@ -179,7 +180,7 @@ reply, err := a.Resume(ctx, seed...)
 
 ### Structured output
 
-Attach a response schema (`ago/response`); the model is asked for JSON of that shape,
+Attach a response schema (`github.com/luckystrker/ago/response`); the model is asked for JSON of that shape,
 and validation holds the answer to it:
 
 ```go
@@ -209,7 +210,7 @@ builds a yes/no / choice / score question.
 ### Tasks and subtasks
 
 `Agent.Task` opens a tracked unit of work on the agent's private stream; the caller
-drives the lifecycle (`agent/task.go`, `ago/task`):
+drives the lifecycle (`agent/task.go`, `github.com/luckystrker/ago/task`):
 
 ```go
 t, err := a.Task(ctx, "Quarterly report", agent.TaskWithTTL(10*time.Minute))
@@ -357,7 +358,7 @@ agent.WithTools(tk) // the toolkit contributes all member schemas
 
 ### Hosted (builtin) tools
 
-Some capabilities run **at the provider**, server-side. Their `ago/tools` constructors
+Some capabilities run **at the provider**, server-side. Their `github.com/luckystrker/ago/tools` constructors
 (`tools/hosted.go`) build schema carriers: the schema joins the model request (translated
 by the provider's mapper) and the provider executes — `Register` subscribes nothing, so
 there is no local function to run and no local result event:
@@ -404,7 +405,7 @@ The agent registers a `tools.Executor` for every turn. What it guarantees
 ## Plugins
 
 A plugin bundles an agent's cross-cutting contributions — tools, middleware and
-system-prompt material — behind one named value (`ago/plugin`). Build a
+system-prompt material — behind one named value (`github.com/luckystrker/ago/plugin`). Build a
 `plugin.Bundle`, then hand it to `agent.WithPlugin`; the bundle expands into the very
 options the agent already accepts, once, at construction (`agent/agent.go` `WithPlugin`):
 
@@ -438,11 +439,11 @@ and middleware directly.
 
 A provider config implements `config.ModelConfig` (`Provider()`, `Model()`,
 `Create() (config.LLMClient, error)`, `Clone(overrides)`). Each provider lives in its
-own package (`ago/config/openai`, `ago/config/anthropic`, …); API keys resolve the
+own package (`github.com/luckystrker/ago/config/openai`, `github.com/luckystrker/ago/config/anthropic`, …); API keys resolve the
 config field first, then the standard environment variable. Missing model or key →
 `Create()` returns an error wrapping `config.ErrNotProvided`.
 
-| Constructor (package `ago/config/…`) | Fields / options | Env fallback |
+| Constructor (package `github.com/luckystrker/ago/config/…`) | Fields / options | Env fallback |
 |---|---|---|
 | `openai.NewOpenAICompletions(model)` | `APIKey`, `BaseURL`, `Temperature/TopP *float64`, `MaxTokens/MaxCompletionTokens *int64`, `Stop`, `Seed`, `User`, `ParallelToolCalls *bool`, `ResponseFormat`, `Streaming`, `Timeout`, `MaxRetries` (default 4), `Organization`, `Project`, `DefaultHeaders`, `ExtraBody` | `OPENAI_API_KEY` |
 | `anthropic.NewAnthropic(model)` | `APIKey`, `BaseURL`, `MaxTokens` (default 4096), `StopSequences`, `Temperature/TopP`, `Streaming`, `Timeout`, `MaxRetries` (2), `PromptCaching` (true) | `ANTHROPIC_API_KEY` |
@@ -468,7 +469,7 @@ hot, err := cfg.Clone(map[string]any{"Temperature": &temp}) // Go field name or 
 
 ## Files API
 
-`ago/files` is the provider-agnostic Files API (Python parity: `FilesAPI`).
+`github.com/luckystrker/ago/files` is the provider-agnostic Files API (Python parity: `FilesAPI`).
 `files.Client` is the contract every provider implements — `Upload`/`Read`/`List`/
 `Delete` — and `files.NewAPI` wraps one provider's client with the argument checks
 Python's wrapper performs. A provider's client is built from its model config, so the
@@ -497,7 +498,7 @@ response verbatim. Handing a file reference into a *message* is not supported �
 
 ## Middleware
 
-Middleware is a four-hook onion around the agent turn (`ago/middleware`):
+Middleware is a four-hook onion around the agent turn (`github.com/luckystrker/ago/middleware`):
 
 ```go
 type Middleware interface {
@@ -559,7 +560,7 @@ a := agent.New("operator", "You manage releases.", agent.WithConfig(cfg),
 	agent.WithHitlHook(hook))
 ```
 
-Semantics (`ago/hitl`, `context/context.go`):
+Semantics (`github.com/luckystrker/ago/hitl`, `context/context.go`):
 
 - The question is delivered to the hook **without being transcribed** (an interrupt subscriber swallows it). An external participant may answer instead of the hook: send a `HumanMessage` with `ParentID` = the request's id and `Stream.Get` picks it up.
 - `req.Timeout` (seconds) covers asking and waiting; expiry is `*hitl.TimeoutError`.
@@ -614,7 +615,7 @@ func (g *PathGuardian) Register(cx *agocontext.Context) error {
 `policies.AlertPolicy` (below) turns non-fatal alerts into prompt fragments
 (deduplicated) and fatal ones into a `events.HaltEvent`; the agent's halt check
 converts that into a synthetic response `"HALTED: <reason>"` instead of a model call.
-For pull-style waiting use `ago/watch`: `watch.EventWatch(s, cond)`,
+For pull-style waiting use `github.com/luckystrker/ago/watch`: `watch.EventWatch(s, cond)`,
 `watch.IntervalWatch(d)`, `watch.DelayWatch(d)`, composites `AllOf` / `AnyOf` /
 `Sequence`, and `WatchFunc` for plain functions — each `Wait(ctx)` blocks until fired
 or cancelled.
@@ -684,7 +685,7 @@ one summary: triggers `SummaryCountTrigger(n)` / `UsageTrigger(total)`, strategy
 
 ## MCP (Model Context Protocol)
 
-`ago/mcp` is a minimal MCP client: JSON-RPC 2.0 over **streamable HTTP**
+`github.com/luckystrker/ago/mcp` is a minimal MCP client: JSON-RPC 2.0 over **streamable HTTP**
 (`mcp.MCPServerConfig`) or a **stdio subprocess** (`mcp.MCPStdioConfig`):
 
 ```go
@@ -708,7 +709,7 @@ Remote tools are `DeclaredInCode() == false`, so a code-declared tool keeps name
 precedence. MCP content maps back to inputs: text → `TextInput`, image/audio →
 `BinaryInput`, resource links → `UrlInput`; `isError` results become tool errors.
 
-**MCP UI.** `ago/mcpui` builds the data side of MCP Apps — no connection of its own: a
+**MCP UI.** `github.com/luckystrker/ago/mcpui` builds the data side of MCP Apps — no connection of its own: a
 UI resource is a block a tool result hands to an MCP-UI-capable host (which renders
 HTML, an iframe URL or a Remote-DOM script from it), and a UI action is the JSON an
 in-frame button posts back to the host:
@@ -740,7 +741,7 @@ Each is a functional subset of its Python module — the deferred pieces are lis
 [docs/PORT_STATUS.md](PORT_STATUS.md) and decided in [docs/DECISIONS.md](DECISIONS.md)
 (D-049/D-050 for A2A, D-052 for ACP, D-053 for AG-UI).
 
-### A2A (`ago/a2a`) — agent-to-agent over HTTP/JSON-RPC
+### A2A (`github.com/luckystrker/ago/a2a`) — agent-to-agent over HTTP/JSON-RPC
 
 `a2a.NewServer` turns a handler function into an A2A server: agent-card discovery plus
 the JSON-RPC methods `message/send`, `message/stream` (SSE), `tasks/get` and
@@ -792,7 +793,7 @@ base64). Remote failures come back as sentinel errors — match with `errors.Is`
 `a2a.ErrTaskNotFound` (-32001), `a2a.ErrTaskNotCancelable` (-32002), `a2a.ErrWire`,
 `a2a.ErrTransport`, `a2a.ErrRPC`.
 
-### ACP (`ago/acp`) — Agent Client Protocol over stdio
+### ACP (`github.com/luckystrker/ago/acp`) — Agent Client Protocol over stdio
 
 Both protocol roles live in one package, over newline-delimited JSON-RPC (the same
 transport template as the MCP stdio client). **Serve** an agent so any ACP client can
@@ -847,7 +848,7 @@ Operations serialize under the bridge's lock — at most one exchange in flight.
 sentinels: `acp.ErrNotProvided` (empty command), `acp.ErrProtocol` (wire failure, peer
 error, peer exited), `acp.ErrClosed` (operations after `Close`).
 
-### AG-UI (`ago/agui`) — serve over the AG-UI event stream
+### AG-UI (`github.com/luckystrker/ago/agui`) — serve over the AG-UI event stream
 
 `agui.ServeAgent` serves an agent over HTTP speaking AG-UI 1.0: GET answers the
 capabilities JSON, POST runs one turn and streams it as SSE `data:` events:
@@ -887,7 +888,7 @@ held-turn interrupt machinery of Python's `interrupts.py` is deferred, D-053).
 
 ## Multi-agent network
 
-`ago/network` hosts many participants on one in-process hub. A channel is a typed
+`github.com/luckystrker/ago/network` hosts many participants on one in-process hub. A channel is a typed
 conversation (`consulting`, `conversation`, `discussion`, `workflow` adapters ship
 builtin routing); a `TransitionGraph` in the manifest steers a workflow channel.
 Participants are callbacks or bridged agents — the caller bridges agent turns; the
@@ -936,7 +937,7 @@ inbox via `Recv`). The full runnable story is `examples/group`.
 
 ## Testing
 
-`agotest "ago/testing"` (package `agotesting`) scripts the model — no API keys, no
+`agotest "github.com/luckystrker/ago/testing"` (package `agotesting`) scripts the model — no API keys, no
 network, everything offline:
 
 ```go
@@ -960,7 +961,7 @@ cfg := agotest.NewTestConfig(
 
 ## Evaluation
 
-`ago/eval` grades agent runs, produce-then-grade (Python parity: `ag2.eval`; the trace is
+`github.com/luckystrker/ago/eval` grades agent runs, produce-then-grade (Python parity: `ag2.eval`; the trace is
 built from the event log — no OpenTelemetry anywhere, D-051). `eval.Run` asks the agent
 per case, rebuilds a `Trace` from the reply's stream history, and scores it:
 

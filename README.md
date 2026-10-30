@@ -11,7 +11,10 @@
   <a href="https://github.com/luckystrker/ago/releases">
     <img src="https://img.shields.io/github/v/release/luckystrker/ago?color=green&label=release" alt="Release">
   </a>
-  <a href="https://github.com/luckystrker/ago/blob/main/ago/go.mod">
+  <a href="https://pkg.go.dev/github.com/luckystrker/ago">
+    <img src="https://pkg.go.dev/badge/github.com/luckystrker/ago" alt="Go Reference">
+  </a>
+  <a href="https://github.com/luckystrker/ago/blob/main/go.mod">
     <img src="https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.24+">
   </a>
   <a href="LICENSE">
@@ -72,12 +75,37 @@ models — no API keys needed.
 | 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (JSON-RPC 2.0 HTTP: agent-card discovery, `message/send`+stream, tasks), **ACP** (stdio JSON-RPC, both roles: `Serve`/`ServeAgent` and a subprocess `Bridge`) and **AG-UI** (HTTP SSE event stream, AG-UI 1.0) |
 | 🧪 **Eval harness** | produce-then-grade runs: event-sourced traces (no OTEL), `Correctness`/`TokenBudget`/`ToolsCalled`/`Threshold` scorers, LLM judge and dual-order pairwise comparison, JSON run results with win-rate comparison |
 
-## 🚀 Quick start
+## 📦 Install
+
+One module — `github.com/luckystrker/ago` — serves both the framework and the `ago` CLI.
+
+**The `ago` command-line helper** (version banner, environment doctor, offline demo):
 
 ```bash
-git clone https://github.com/luckystrker/ago
-cd ago
+go install github.com/luckystrker/ago/cmd/ago@latest
 ```
+
+**The framework, as a dependency of your program:**
+
+```bash
+go get github.com/luckystrker/ago
+```
+
+```go
+import (
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/tools"
+)
+```
+
+**Or a prebuilt binary via the installer script** (fetches a release archive, verifies its
+sha256, falls back to a source build):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luckystrker/ago/main/install.sh | sh
+```
+
+## 🚀 Quick start
 
 ```go
 package main
@@ -86,10 +114,10 @@ import (
 	"context"
 	"fmt"
 
-	"ago/agent"
-	"ago/events"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 func main() {
@@ -130,9 +158,10 @@ func main() {
 }
 ```
 
-> The framework module lives in [`ago/`](ago/) (import paths `ago/agent`, `ago/tools`, …);
-> examples are a separate module in [`examples/`](examples/) tied by `go.work`.
-> Verify everything: `cd ago && go test ./...`.
+> One Go module at the repo root: the framework packages (`agent/`, `events/`, `tools/`, … —
+> import paths `github.com/luckystrker/ago/agent`, `github.com/luckystrker/ago/tools`, …) and
+> the runnable examples in [`examples/`](examples/) inside the same module. Verify everything
+> from the repo root: `go test ./...`.
 
 ## 📚 Documentation
 
@@ -170,10 +199,10 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   builtin tools and plugins), Files API, MCP client + MCP UI constructors, middleware,
   HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
   multi-agent network — `go build`/`vet`/`test` green on every package.
-- **Ported as functional subsets** (each with documented deferrals): `ago/a2a`
-  (transport-level A2A — the conversational client machinery is deferred), `ago/acp`
-  (both ACP stdio roles — session store/guard/mediated filesystem deferred), `ago/agui`
-  (AG-UI serving — the held-turn interrupt machinery is deferred), `ago/eval`
+- **Ported as functional subsets** (each with documented deferrals): `github.com/luckystrker/ago/a2a`
+  (transport-level A2A — the conversational client machinery is deferred), `github.com/luckystrker/ago/acp`
+  (both ACP stdio roles — session store/guard/mediated filesystem deferred), `github.com/luckystrker/ago/agui`
+  (AG-UI serving — the held-turn interrupt machinery is deferred), `github.com/luckystrker/ago/eval`
   (event-sourced traces instead of OTEL).
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").

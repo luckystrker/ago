@@ -29,10 +29,10 @@ import (
 	"strings"
 	"time"
 
-	"ago/agent"
-	"ago/events"
-	"ago/network"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/network"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 func main() {

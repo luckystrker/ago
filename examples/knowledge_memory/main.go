@@ -37,14 +37,14 @@ import (
 	"fmt"
 	"os"
 
-	"ago/agent"
-	"ago/config"
-	agocontext "ago/context"
-	"ago/events"
-	"ago/knowledge"
-	"ago/middleware"
-	"ago/policies"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/config"
+	agocontext "github.com/luckystrker/ago/context"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/knowledge"
+	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/policies"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 // assembler is the AGo stand-in for Python's AssemblerMiddleware: before each

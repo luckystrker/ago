@@ -11,9 +11,9 @@ import (
 	"context"
 	"fmt"
 
-	"ago/agent"
-	"ago/events"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 func main() {

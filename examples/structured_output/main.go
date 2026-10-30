@@ -22,11 +22,11 @@ import (
 	"fmt"
 	"math"
 
-	"ago/agent"
-	"ago/events"
-	"ago/response"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/response"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 // Ingredient and Recipe play the part of the Pydantic models in the original.

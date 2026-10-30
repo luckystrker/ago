@@ -36,14 +36,14 @@ import (
 	"context"
 	"fmt"
 
-	"ago/agent"
-	"ago/compact"
-	agocontext "ago/context"
-	"ago/events"
-	"ago/middleware"
-	"ago/policies"
-	"ago/stream"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/compact"
+	agocontext "github.com/luckystrker/ago/context"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/policies"
+	"github.com/luckystrker/ago/stream"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 // questions is the user's side of the dialogue (Python parity). The last turn

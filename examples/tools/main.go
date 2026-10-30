@@ -12,10 +12,10 @@ import (
 	"fmt"
 	"time"
 
-	"ago/agent"
-	"ago/events"
-	agotest "ago/testing"
-	"ago/tools"
+	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/events"
+	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 func main() {

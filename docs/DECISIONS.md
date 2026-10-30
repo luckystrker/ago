@@ -1517,3 +1517,67 @@ not-found answer, usage on RUN_FINISHED, input history seeding asserted through
 cancelled outcome, handler-callback passthrough (STATE_SNAPSHOT/CUSTOM/Raw) and
 the not-ended-run RUN_ERROR repair; plus unit coverage of the event JSON forms,
 transcript round-trip of `AGUIEvent`, and every projection branch.
+
+## D-054 — 2026-10-30 — release: tagged asset names, redirect-based latest resolution, checksums; install.sh + release.yml
+
+The release pipeline is two files: `.github/workflows/release.yml` (a `v*` tag push
+builds `./cmd/ago` for linux/darwin/windows × amd64/arm64 and publishes the release)
+and `install.sh` (curl|sh-safe POSIX installer). The asset contract the installer
+depends on:
+
+- `ago_<tag>_<os>_<arch>.tar.gz` on unix, `ago_<tag>_<os>_<arch>.zip` on windows;
+  the archive root holds the binary as `ago` / `ago.exe` (the installer moves it to
+  the target name, no path juggling inside archives);
+- `checksums.txt` in `sha256sum` output format beside the archives; a missing file
+  degrades to a warning, a mismatch aborts the install.
+
+Two deliberate readings of the brief. First, `/releases/latest/download/<asset>`
+cannot resolve "latest" for assets whose name carries the version — GitHub requires
+the exact asset name — so the installer resolves the latest tag by following the
+redirect of `.../releases/latest` (the final URL contains `/releases/tag/<tag>`).
+No API call, no token, which is what the brief actually asked for; the asset URL
+itself stays `.../releases/download/<tag>/ago_<tag>_<os>_<arch>.<ext>` as sketched.
+Second, the release is published by a separate job that collects per-target build
+artifacts: a matrix shard cannot compute `checksums.txt` over all six archives, and
+six concurrent `gh release create` calls would race on the same release. The
+installer carries one test hook, `AGO_INSTALL_REPO_URL` (release base URL override),
+used to exercise download, checksum verification and both archive layouts against a
+local server that mimics the GitHub layout; normal use always hits GitHub. When
+curl and wget are both absent, or the download fails, it falls back to
+`git clone --depth 1` (+ `--branch <tag>` when the tag is known) and
+`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=<tag>" ./cmd/ago`
+— the same stamp contract as the workflow (`main.Version` in `cmd/ago/main.go`;
+the installer's `dev` default matches the source default).
+
+## D-055 — 2026-10-30 — module: canonical Go module path `github.com/luckystrker/ago`; go.mod at the repo root
+
+Owner directive: the module moves from the bare path `ago` to the canonical
+`github.com/luckystrker/ago`, with `go.mod` at the repository root. The motivation is
+distribution: a module path without a domain cannot be fetched — `go get` and `go install`
+resolve a module path through the Go module proxy to a hosted repository, and pkg.go.dev
+does not index non-domain paths — so under the old layout a consumer had to clone the repo
+and wire a `replace` (plus a `go.work`) by hand. With the canonical path the standard flows
+work: `go get github.com/luckystrker/ago`, `go install github.com/luckystrker/ago/cmd/ago@latest`,
+and a pkg.go.dev reference page for the module.
+
+What moved:
+
+- Framework packages from `ago/<pkg>` to directories at the repo root; import paths become
+  `github.com/luckystrker/ago/<pkg>` — the earlier "import paths are unaffected" statement
+  is void, every consumer import changes. The port itself is unaffected: package names,
+  exported APIs and the wire vocabulary are untouched; a module-path rename moves code and
+  changes import strings, nothing else.
+- Examples from the separate `agoexamples` module into `examples/` inside the same module;
+  `go.work` and the `replace` directive are gone. All gates run from the repo root:
+  `go build ./...`, `go vet ./...`, `go test ./...` (42 packages `ok`, 0 failures, 0
+  skipped), plus `go build ./examples/...` / `go vet ./examples/...` and an offline `go run`
+  of the thirteen examples — re-verified for this entry.
+- New `cmd/ago` CLI helper (`version` / `doctor` / offline `demo`) gives `go install` a
+  concrete target; its `-ldflags "-X main.Version=..."` stamp contract is shared with
+  install.sh and release.yml (D-054).
+
+Docs sweep in the same change: README (Install section, pkg.go.dev badge, Quick start
+imports, status bullets), root AGENTS.md, docs/ARCHITECTURE.md, docs/GUIDE.md,
+docs/MIGRATION.md (incl. a re-run of its §7 gates), docs/PORT_STATUS.md (incl. its Gates
+block) and .github/workflows/ci.yml. Historical decision records keep the old `ago/...`
+spellings — they are records of the layout they described.

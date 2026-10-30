@@ -27,12 +27,12 @@ import (
 	"strings"
 	"sync"
 
-	"ago/agent"
-	agocontext "ago/context"
-	"ago/events"
-	"ago/observers"
-	"ago/stream"
-	agotest "ago/testing"
+	"github.com/luckystrker/ago/agent"
+	agocontext "github.com/luckystrker/ago/context"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/observers"
+	"github.com/luckystrker/ago/stream"
+	agotest "github.com/luckystrker/ago/testing"
 )
 
 func main() {

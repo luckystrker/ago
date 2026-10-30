@@ -1,0 +1,106 @@
+# Release pipeline: pushing a v* tag builds the ago CLI for six OS/arch pairs,
+# archives each (.tar.gz on unix, .zip on windows) and publishes the GitHub
+# release with a checksums.txt.
+#
+# Asset contract install.sh depends on (see docs/DECISIONS.md D-054):
+#   ago_<tag>_<os>_<arch>.tar.gz / .zip  — the archive root holds the binary as ago / ago.exe
+#   checksums.txt                        — sha256 of every archive, in sha256sum output format
+#
+# The build is a matrix; the release itself is published by a separate job
+# that collects all six archives — one shard cannot build checksums.txt over
+# the whole set, and six concurrent "gh release create" calls would race.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          suffix=""
+          if [ "${GOOS}" = "windows" ]; then suffix=".exe"; fi
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.Version=${{ github.ref_name }}" \
+            -o "dist/ago_${GOOS}_${GOARCH}${suffix}" ./cmd/ago
+
+      - name: Package
+        run: |
+          tag="${{ github.ref_name }}"
+          mkdir -p stage out
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp "dist/ago_windows_${{ matrix.arch }}.exe" stage/ago.exe
+            zip -j "out/ago_${tag}_windows_${{ matrix.arch }}.zip" stage/ago.exe
+          else
+            cp "dist/ago_${{ matrix.os }}_${{ matrix.arch }}" stage/ago
+            tar -czf "out/ago_${tag}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" -C stage ago
+          fi
+          ls -l out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ago-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ago-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ago_*.tar.gz ago_*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh determines the repository from --repo / GH_REPO / git remote;
+          # this job has no checkout, so GH_REPO is the only source left.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/ago_*.tar.gz dist/ago_*.zip dist/checksums.txt --clobber

@@ -17,16 +17,16 @@ and the translation rules Python→Go. Every porting agent must implement agains
    Stream pub/sub is synchronous (in the caller's goroutine, under a lock); background work uses
    `go func` with panic recovery.
 4. **Errors are values.** Sentinel errors per package (`errors.Is`/`errors.As`), wrapping with `%w`.
-5. **Every package compiles + has tests.** Gate (from `ago/`, the framework module):
+5. **Every package compiles + has tests.** Gate (from the repo root — `go.mod` sits there):
    `go build ./... && go vet ./... && go test ./...`.
 6. Tests are table-driven, stdlib `testing` only, no testify.
 
 ## Module layout
 
-Module name: `ago` (framework name "AGo"). The framework module lives in the `ago/`
-directory of the repository (so the repo root holds docs, examples and CI); import paths
-are unaffected (`ago/agent`, ...). Examples are a separate module (`agoexamples`) in
-`examples/` with `replace ago => ../ago`; a `go.work` at the repo root ties them together.
+Module path: `github.com/luckystrker/ago` (framework name "AGo"). `go.mod` sits at the
+repository root and every framework package is a directory at the root (`agent/`, `events/`,
+...; import paths `github.com/luckystrker/ago/agent`, ...). Examples are part of the same
+module, in `examples/`; there is no `go.work`.
 Go packages (dependency order, arrows = imports):
 
 ```
@@ -146,7 +146,7 @@ type Storage interface {
 }
 // ships: MemoryStorage (map+mutex); DiskStorage later (knowledge pkg owns file-based EventLog)
 
-type Subscriber func(ev events.Event, ctx *contextpkg.Context) error   // ctx = *ago/context.Context (import: ago/context)
+type Subscriber func(ev events.Event, ctx *contextpkg.Context) error   // ctx = *agocontext.Context (import: github.com/luckystrker/ago/context)
 type Condition = events.Condition
 type SubID string
 
@@ -566,7 +566,7 @@ Each has its own `main.go` in package main; README table of what each demonstrat
 - **Wave 0 (manual)**: module scaffold, docs, `events`, `stream`, `context` — foundation contracts.
 - **Wave 1 (workflow, parallel)**: hitl+middleware, response, tools, config-core+internal/httpx+internal/sse,
   providers openai, providers anthropic, providers gemini+ollama, providers zai/mistral/dashscope+stubs,
-  usage+task, testing. Each agent: implement package + tests, run `go build ./ago/... && go test ./ago/<pkg>/`,
+  usage+task, testing. Each agent: implement package + tests, run `go build ./... && go test ./<pkg>/`,
   iterate to green.
 - **Wave 2 (manual)**: `agent` (turn loop) — most subtle, written by the lead.
 - **Wave 3 (workflow, parallel)**: knowledge, policies, compact, aggregate, observers, watch, spec,
