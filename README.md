@@ -56,8 +56,10 @@ models — no API keys needed.
 |---|---|
 | 🧠 **One `Agent` type** | blocking `Ask`, observable `Run`, continuations on the same stream, `Resume` from mid-trajectory |
 | 📡 **Event-sourced core** | every observation is an event: pub/sub stream, durable transcript, replays and usage accounting are event logs |
-| 🔧 **Tools as subscribers** | function tools with schema generation and dependency injection, toolkits, parallel execution, `final=true` tools, name precedence |
+| 🔧 **Tools as subscribers** | function tools with schema generation and dependency injection, toolkits, parallel execution, `final=true` tools, name precedence, hosted builtin tools executed by the provider (`web_search`, `code_execution`, …) |
+| 🧩 **Plugins** | tools, middleware and prompt fragments bundled under one name (`plugin.Bundle`), applied to the agent at construction |
 | 🌐 **7 LLM providers** | OpenAI, Anthropic, Gemini, Ollama, Z.AI, Mistral, DashScope — full clients; xAI/Bedrock/TypeSafe as config stubs |
+| 📁 **Files API** | provider-agnostic upload/read/list/delete — OpenAI and Anthropic clients behind one `files.API` wrapper |
 | 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals |
 | 🙋 **Human-in-the-loop** | pluggable human hooks, tool approvals, timed-out asks, transcript repair for abandoned tool calls |
 | 📦 **Structured output** | JSON-schema from Go types, validated answers with automatic re-asking |
@@ -65,7 +67,7 @@ models — no API keys needed.
 | 🧠 **Knowledge & policies** | virtual filesystem store, context-assembly policies (sliding window, token budget, alerts) |
 | 🗜️ **Compaction & aggregation** | LLM-driven history summarization behind triggers, keeping the transcript valid for replay |
 | 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
-| 🔌 **MCP client** | JSON-RPC 2.0 over stdio and streamable HTTP, tool discovery with pagination, content mapping |
+| 🔌 **MCP client** | JSON-RPC 2.0 over stdio and streamable HTTP, tool discovery with pagination, content mapping; MCP UI resources and in-frame actions for tool results |
 | 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay |
 
 ## 🚀 Quick start
@@ -162,8 +164,9 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
 
 ## 🧭 Status
 
-- **Ported and gated:** the core framework, all 7 full providers, tools, middleware,
-  HITL, tasks, knowledge, policies, compaction, observers, watches, spec, MCP client,
+- **Ported and gated:** the core framework, all 7 full providers, tools (incl. hosted
+  builtin tools and plugins), Files API, MCP client + MCP UI constructors, middleware,
+  HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
   multi-agent network — `go build`/`vet`/`test` green on every package.
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").

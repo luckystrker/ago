@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,11 @@ import (
 	"ago/events"
 	"ago/internal/httpx"
 )
+
+// mcpClientBeta is the beta flag the MCP connector answers to; the request
+// carries it exactly when mcp_servers is non-empty (Python parity:
+// anthropic_client.py, the `betas` set).
+const mcpClientBeta = "mcp-client-2025-11-20"
 
 // Client performs Messages-API calls with one resolved configuration. Safe for
 // concurrent use; created fresh per turn by AnthropicConfig.Create.
@@ -85,6 +91,16 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 		}
 		body["tools"] = wireTools
 	}
+	// The tools[] mcp_toolset entries reference servers defined here (Python
+	// parity: extra_body {"mcp_servers": [...]}) — ExtractMCPServers collects
+	// them from the same hosted schemas ConvertTools mapped.
+	var betas []string
+	if servers := ExtractMCPServers(opts.Tools); len(servers) > 0 {
+		body["mcp_servers"] = servers
+		// The connector's tools[] mcp_toolset blocks only work under the beta
+		// flag, so the body field and the header travel together.
+		betas = append(betas, mcpClientBeta)
+	}
 	if len(c.stopSequences) > 0 {
 		body["stop_sequences"] = c.stopSequences
 	}
@@ -101,6 +117,13 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	headers := map[string]string{
 		"x-api-key":         c.apiKey,
 		"anthropic-version": APIVersion,
+	}
+	if len(betas) > 0 {
+		// Python joins sorted(betas | user-set default betas); the AGo config
+		// has no default_headers field to fold in (AGO-DEVIATION, files.go),
+		// so the framework-set flags go out alone.
+		slices.Sort(betas)
+		headers["anthropic-beta"] = strings.Join(betas, ",")
 	}
 	client := &httpx.Client{MaxRetries: c.maxRetries, Timeout: c.timeout}
 	url := c.baseURL + messagesPath

@@ -45,10 +45,12 @@ policies → events, context, knowledge — assembly policies
 compact/aggregate → events, context  — triggers/strategies + middlewares
 observers → events, stream, context  — Observer protocol, LoopDetector, TokenMonitor
 watch   → events, stream             — Watch protocol, Interval/Event/AllOf/AnyOf/Sequence
+plugin  → tools, middleware, context — Plugin contributions (tools/middleware/prompts), Bundle
 agent   → everything above           — Agent, AgentRun, AgentReply, turn loop, subtasks
 spec    → agent, tools               — AgentSpec from/to agent
 network → agent, events, stream, knowledge, task — hub, channels, envelope, links, adapters
 mcp     → tools, context             — MCP client (stdio+HTTP JSON-RPC), MCPToolkit
+mcpui   → events                     — MCP UI resources/actions (data constructors)
 testing → config, events, stream     — TestConfig, TrackingConfig, fake clients
 examples/                            — runnable programs (offline ones use testing pkg)
 ```
@@ -275,6 +277,19 @@ func NewToolkit(name string, mws []middleware.Middleware, ts ...Tool) (*Toolkit,
 type ClientTool struct{...}    // DeclaredInCode=false; call → ClientToolCallEvent
 type SubagentTool = FunctionTool variant wrapping agent (lives in agent pkg to avoid import cycle;
                         agent.AsTool returns tools.Tool)
+
+// Hosted builtin tools (hosted.go, D-047): schema carriers for provider-executed
+// capabilities — WebSearchTool, WebFetchTool, CodeExecutionTool, FileSearchTool,
+// ImageGenerationTool, ShellTool, MemoryTool, MCPServerTool, ToolSearchTool.
+// Each: Name() = the tool type ("web_search", ...), DeclaredInCode()=true,
+// Schemas → one ToolSchema impl (fields = the Python dataclass fields, snake_case
+// JSON), Register → no-op subscriptions (the tool runs at the provider;
+// ToolSearchTool registers its deferred members instead). Constructor options
+// carry the Python kwargs: NewWebSearch(WithWebSearchMaxUses(3), ...). A
+// ToolSearchToolSchema travels with the members' schemas copied to
+// DeferLoading=true. Provider mappers map what the ported Python clients map
+// (anthropic server-tool blocks + mcp_servers; gemini googleSearch/urlContext/
+// codeExecution/fileSearch); everything else → config.ErrUnsupportedTool.
 
 type Executor struct{...}
 func NewExecutor() *Executor
@@ -514,6 +529,20 @@ base64, resource link→UrlInput, unknown→JSON text); `is_error` → error; co
 `MCPServerConfig{URL, Headers, AuthorizationToken, ServerLabel, AllowedTools, BlockedTools,
 ToolNamePrefix}` and `MCPStdioConfig{Command, Args, Env, CWD}`; `MCPToolkit` → tools.Tool with
 `DeclaredInCode=false`.
+
+### package `mcpui`
+
+Data constructors of Python ag2/mcp_ui — no protocol code. UI resources for MCP-UI hosts:
+RawHTML/ExternalURL/RemoteDOM over text or base64-blob encoding, `ui://` guard ahead of every
+builder-specific check, `_meta` merging (`mcpui.dev/ui-`-prefixed UI keys, caller metadata
+verbatim and winning on collision). Wire shape is the mcp EmbeddedResource:
+`Resource{type:"resource", resource:{uri, mimeType, _meta?, text|blob}}`. UI actions
+ToolCall/Prompt/Link/Intent/Notify (`{type, payload}`; `toolName`/`messageId` stay camelCase —
+the mcp-ui-server types define them so) and PostMessage, byte-identical to Python's
+json.dumps + html.escape via an unexported dumps-compatible renderer. WithUIResource appends
+resources to a ToolResult as DataInput parts (the content-array convention). Exact wire bytes
+come from mcpui.Marshal: encoding/json HTML-escapes at every entry point, so json.Marshal is
+shape-equivalent but escapes <, >, &. Deviations: D-045.
 
 ### package `testing`
 

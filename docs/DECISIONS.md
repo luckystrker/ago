@@ -1090,3 +1090,187 @@ builds: that sentence is what the model reads on the next call, so transcripts a
 provider replays differ from earlier builds and now match Python. Regressions:
 the events suite pins the sentence verbatim;
 `TestHitlMissingHookRepairsHistory` exercises the repair path end to end.
+
+## D-044 — 2026-10-30 — plugin: plugins apply at agent construction; turn-scoped attach/detach is not ported
+
+Python carries plugins two ways: constructor-level (`Agent(plugins=...)`, applied permanently
+via `PluginTarget._apply_plugin`, ag2/ag2/plugin.py:337-340) and invocation-level
+(`additional_plugins`, applied inside `_turn_scope` and removed at turn end through
+AsyncExitStack callbacks with identity-preserving `_PluginPrompt` markers —
+ag2/ag2/agent.py:1432-1453). AGo ports the constructor path only: `agent.WithPlugin(p)`
+expands the plugin into the existing options once, at `agent.New`. The turn-scoped path
+— attaching and detaching plugins mid-conversation, including their per-turn context
+contributions (dependencies, variables, prompt fragments added and retracted per turn)
+— is deferred; nothing in the Go surface can add or retract contributions after
+construction.
+
+The Go Plugin carries the tool/middleware/prompt legs only. Python plugins also collect
+HITL hooks, dependencies, variables, observers and assembly policies
+(plugin.py:220-254); the AGo surface has no slot for them in this wave.
+
+Ordering parity holds where the ported legs land: plugin tools append after the agent's
+own; plugin middleware appends after the agent's own, which places it innermost
+(Python add_middleware: appended runs closest to the model); plugin prompt fragments
+extend the collectors, and plugin prompt hooks run through the same seeding pipeline
+as `agent.WithPromptHook` hooks. Regressions: the `ago/plugin` suite pins the
+Bundle→Plugin accessors, a tool round trip through `WithPlugin`, middleware order,
+static and dynamic fragments via `PromptLines` capture, and empty/nil plugins being
+harmless.
+
+## D-045 — 2026-10-30 — mcpui: the ag2/mcp_ui data constructors are ported, stdlib-only
+
+Supersedes the `mcp_ui` deferral in D-010 for this slice (owner directive): `ago/mcpui` ports
+ag2/ag2/mcp_ui/resources.py and actions.py — the pure data constructors, no protocol code.
+Python delegates to the mcp-ui-server SDK; AGo reproduces its wire shapes with stdlib only
+(the SDK adds no behavior the constructors need). Shapes were verified against
+mcp-ui-server 1.0.0 + mcp 2.x by running the reference code: a resource renders as
+`{"type":"resource","resource":{"uri",…,"mimeType","_meta"?,"text"|"blob"}}` (by_alias,
+exclude_none), an action as `{"type","payload"}`.
+
+Deviations from Python parity, all marked in code:
+
+- Map key order: Go maps have no insertion order, so `params`/`_meta` object keys serialize
+  in sorted order where Python keeps dict insertion order. The JSON data is identical; only
+  byte order of keys differs. PostMessage stays deterministic because of this.
+- Floats render via Go's shortest representation (`1`), not Python's repr (`1.0`).
+- Exact mcp wire bytes require `mcpui.Marshal`: encoding/json HTML-escapes <, > and &
+  (`\u003c`…) at every entry point, and re-escapes even a Marshaler's output, so no custom
+  MarshalJSON can opt out. Through a JSON parser both spellings decode identically — plain
+  `json.Marshal` is shape-equivalent.
+- `WithUIResource` is a Go-side helper: Python only documents the "include the UIResource in
+  the toolResult content array" convention (mcp_ui_server core.py docstring) and ships no
+  function; AGo expresses it by appending DataInput parts to `ToolResult.Parts`.
+- The PostMessage serializer (pythonJSON) handles the JSON-basic value set natively with
+  json.dumps separators (`": "`, `", "`) and ensure_ascii escaping; unknown value types fall
+  back to compact encoding/json. Named slices expand element-wise to keep the separator.
+
+Regressions: the ago/mcpui suite pins every constructor against the captured Python goldens
+(text/blob encodings, both frameworks, prefixed+verbatim `_meta`), all five actions (wire
+JSON and PostMessage bytes, including the apostrophe breakout test), ensure_ascii surrogate
+pairs, the uri-before-framework guard order, and the attach helper round trip.
+
+## D-046 — 2026-10-30 — files: the Files API moves out of deferred — ago/files plus OpenAI and Anthropic clients
+
+`ag2/ag2/files/` and the two provider `files.py` modules port to `ago/files` and to
+`FilesClient`/`CreateFilesClient` in `ago/config/{openai,anthropic}`. The package direction
+is fixed by the cycle risk: `ago/files` imports no config package; `config/<provider>`
+returns a `files.Client`.
+
+Typed surface follows the wave brief, which drops two Python fields: `created_at`
+(UploadedFile, inherited from FileIdInput) and `media_type` (FileContent, set by the
+Anthropic read). Both survive in `Raw` (the provider's decoded response object); no
+timestamp parsing is ported (`_created_at_to_float` has no destination field).
+
+Upload keeps Python's two validations as sentinels (`ErrNoData` for nil data — AGo has no
+`path=` parameter, callers read disk themselves; `ErrFilenameRequired` for the empty
+filename). Python's provider options kwargs (`**provider_options`) have no Go counterpart.
+
+Transport lives in the provider files, not in `internal/httpx`: the Files API needs
+multipart, GET and DELETE, while httpx speaks POST+JSON only and was outside this wave's
+file set. The retry loop mirrors httpx semantics (connection errors and 429/5xx,
+exponential backoff capped at 8s, Retry-After capped at a minute). Non-2xx answers wrap a
+per-provider `ErrFilesAPI` sentinel.
+
+Wire details pinned against the AG2 tests (test/config/{openai,anthropic}/test_files.py),
+which run against the real SDKs: OpenAI list pagination is `has_more`+`last_id` with
+`?after=` on the following request; Anthropic list pagination is `next_page` with `?page=`
+— not the `has_more`/`after` pair. OpenAI upload defaults an empty purpose to
+`assistants`; Anthropic upload sends no purpose field at all — the argument only fills the
+returned metadata (files.py:33-45 never forwards it). The Anthropic client targets
+`{base}/v1/files` under `anthropic-beta: files-api-2025-04-14` (the Python client reaches
+the API through the SDK's `beta.files` namespace; the SDK itself is not vendored in the
+repo, so the header value is taken from the documented beta flag, not verified against SDK
+source). An unset Anthropic timeout becomes 600s (files.py: `timeout if timeout is not
+None else 600.0`).
+
+`FileIdInput` message mapping is untouched: the Python files client has no direct mapper
+binding — the only link is that `UploadedFile` subclasses `FileIdInput`, so a Python
+uploaded file can be passed straight into message inputs. The Go struct deliberately
+drops that inheritance (brief contract), so mappers keep failing fast with
+`ErrUnsupportedInput` (D-017/D-020). Python's `OpenAIDecisionsConfig.create_files_client`
+raises NotImplementedError and has no Go config to attach to — nothing to port.
+
+Regressions: `ago/files` pins the wrapper validations and pass-through delegation;
+`config/openai` and `config/anthropic` suites pin the multipart upload bodies (purpose
+field present/absent, part content types, auth/beta headers), the two-call read order,
+both pagination shapes (0/1/3 pages), delete, non-2xx → `ErrFilesAPI`, and
+`CreateFilesClient` key resolution (explicit → env → `ErrNotProvided`).
+
+## D-047 — 2026-10-30 — tools: hosted builtin tools become schema carriers; anthropic/gemini mappers map them
+
+The nine builtin tools (`ag2/ag2/tools/builtin/`: web_search, web_fetch,
+code_execution, file_search, image_generation, shell, memory, mcp_server,
+tool_search) port to `ago/tools/hosted.go` as schema carriers: each is a `Tool`
+whose `Schemas` returns one `ToolSchema` impl (provider-neutral type string =
+Python's dataclass `type`), whose `Register` subscribes nothing, and whose options
+carry the Python constructor kwargs. Provider mappers translate only what the
+ported Python clients translate: Anthropic maps web_search (minus
+`search_context_size`, which the Python mapper also drops), code_execution,
+web_fetch (version gates `use_cache`/`response_inclusion` + the request-wide
+`url_sources` tool check), memory, mcp_server (the `mcp_toolset` tools[] entry
+plus `ExtractMCPServers` into the request's `mcp_servers` parameter — Python's
+`extra_body` shape) and tool_search (regex/bm25 variants); shell is rejected with
+the client-side explanation; file_search/image_generation fail fast (OpenAI
+Responses-only, D-008). Gemini maps web_search→`googleSearch` (excludeDomains
+only), web_fetch→`urlContext` (every field ignored), code_execution→
+`codeExecution` and file_search→`fileSearch` (`store_names` required); wire keys
+follow the google-genai SDK's camelCase REST aliases — the shape the ported
+Python client actually sends. The Chat-Completions engine keeps rejecting every
+hosted schema (Python's Completions `tool_to_api` does the same); documented at
+the `ToolToAPI` branch.
+
+Deviations. Python resolves `Variable`-annotated tool kwargs per turn
+(`builtin/_resolve.py`); a Go carrier takes concrete values at construction and
+`Schemas` ignores the context. Go's zero-value schema stands in for the Python
+dataclass's default instance: an empty version/mode field resolves to the Python
+default literal in both the carriers and the mappers (`WebSearchToolSchema{}`
+plays `WebSearchToolSchema()`). Gemini-side, Python builds a ToolConfig with
+`include_server_side_tool_invocations` and replays server-side invocations as
+`GeminiServerToolCallEvent`; the AGo client does not parse grounding metadata, so
+no ToolConfig is emitted and grounding travels only as ordinary response text —
+request-side mapping is still meaningful, response-side replay is not ported.
+Anthropic `server_tool_use` response blocks were already dropped (client comment);
+unchanged. `ToolSearchTool` copies each member function schema with
+`defer_loading` set (Python rebuilds `FunctionToolSchema` the same way) and
+registers the members so their expanded calls are answered client-side.
+
+Regressions: `ago/tools/hosted_test.go` (golden schema JSON, defaults, snapshot
+isolation, tool_search deferral/registration), `config/anthropic/hosted_test.go`
+(golden server-tool blocks, version gates, url_sources resolution incl. the
+mcp_toolset configs path, `ExtractMCPServers`, httptest wire body with
+`mcp_servers`), `config/gemini/hosted_test.go` (golden blocks, mixed-request
+ordering, unsupported set, httptest wire body), `config` `TestToolToAPIUnsupported`
+extended with a real carrier.
+
+## D-048 — 2026-10-30 — Dependency policy: optional subsystems may take dependencies, but only outside the core
+
+Owner decision, extending D-003. The core module `ago` keeps **zero external
+dependencies** — unchanged hard rule; every package under `ago/` (including the newer
+`ago/files`, `ago/plugin`, `ago/mcpui` slices and the hosted builtin tools) is
+stdlib-only in this wave: `ago/go.mod` and `examples/go.mod` carry no `require`
+entries (verified 2026-10-30), the Files clients speak raw `net/http` multipart and
+`ago/mcpui` reproduces the mcp-ui-server wire shapes without the SDK (D-045/D-046).
+
+What is new is the escape hatch and its shape, mirroring AG2's extras policy
+(`optional_import_block`, ag2/ag2/_import_utils.py:93 — third-party-SDK features live
+behind an optional import and ship as an extra, never in the required install): a
+subsystem that genuinely needs a dependency it cannot reproduce over the stdlib (a
+vendor SDK, a SQLite/Redis driver — the D-011 blockers) may take it, but is packaged
+**outside the core** — a separate Go module with its own go.mod, `replace`-tied from
+the repo root like `examples/` already is. The core's dependency surface stays empty
+for everyone who does not import the optional module. A `require` inside any core
+`ago/*` package still demands a DECISIONS entry per AGENTS.md rule 2; none exists
+today.
+
+Completes the hosted-tool provider matrix of D-047 (checked against the mappers):
+**anthropic** maps web_search, web_fetch, code_execution, memory, mcp_server and
+tool_search, and rejects shell (client-side bash explanation),
+file_search/image_generation (OpenAI Responses-only)
+(config/anthropic/mappers.go:426-491); **gemini** maps web_search→googleSearch,
+web_fetch→urlContext, code_execution and file_search (store_names required), and
+rejects every other hosted type (config/gemini/mappers.go:250-295); the shared
+chat-completions engine (openai/zai/mistral/dashscope) rejects every hosted schema
+(config/openaicompat.go:362-383); **ollama** rejects every hosted schema through its
+own mapper — "Ollama speaks only function calling" (config/ollama/mappers.go:168-180);
+the stub providers (xai/bedrock/typesafe) never reach a mapper — `Create()` fails
+first. Every rejection wraps `config.ErrUnsupportedTool`.
