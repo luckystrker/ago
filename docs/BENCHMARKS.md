@@ -8,8 +8,10 @@ per call) dominates production and is deliberately out of scope; these numbers
 bound what the framework itself adds around it.
 
 Harness sources: `benchmarks/agobench/main.go` (Go), `benchmarks/pybench/bench.py`
-(Python). Raw results compared here: `benchmarks/results_go.json`,
-`benchmarks/results_py.json`.
+(Python). Each run also writes raw samples to `benchmarks/results_go.json` /
+`benchmarks/results_py.json` next to the harnesses; they are generated
+artifacts (gitignored), not stored in the repository — the tables below carry
+the compared numbers, and the Reproducing section regenerates the files.
 
 ## Methodology
 
@@ -71,7 +73,7 @@ Harness sources: `benchmarks/agobench/main.go` (Go), `benchmarks/pybench/bench.p
   mean over K consecutive iterations, K auto-calibrated so one batch spans
   ≥10 ms — the same batch timing `go test -bench` uses. K is disclosed per
   scenario in `results_go.json` notes (stored run: plain_chat K=512,
-  tool_roundtrip K=256, streaming K=512, concurrent K=64; re-calibrated each
+  tool_roundtrip K=128, streaming K=512, concurrent K=64; re-calibrated each
   run). Python's `perf_counter` resolves single iterations and does not need
   batching.
 
@@ -82,37 +84,37 @@ computed from the stored samples.
 
 | Scenario | Python median | Go median | Go faster | Python p95 | Go p95 |
 |---|---:|---:|---:|---:|---:|
-| plain_chat (3 turns) | 9.2363 | 0.0237 | 390.3× | 23.7286 | 0.0292 |
-| tool_roundtrip (5 tool rounds) | 16.1068 | 0.0684 | 235.5× | 17.4631 | 0.0809 |
-| streaming (2 turns × 20 chunks) | 13.2613 | 0.0232 | 571.3× | 14.0929 | 0.0254 |
-| concurrent (50 × 2-turn conversations) | 270.9264 | 0.2792 | 970.5× | 312.6362 | 0.3033 |
+| plain_chat (3 turns) | 10.3012 | 0.0277 | 371.9× | 22.2882 | 0.0313 |
+| tool_roundtrip (5 tool rounds) | 18.0714 | 0.0743 | 243.2× | 24.7209 | 0.0821 |
+| streaming (2 turns × 20 chunks) | 15.5651 | 0.0253 | 615.2× | 22.3744 | 0.0288 |
+| concurrent (50 × 2-turn conversations) | 325.9965 | 0.3332 | 978.4× | 368.6991 | 0.3919 |
 
 Full sample arrays, per-scenario notes and batch K: `benchmarks/results_go.json`,
 `benchmarks/results_py.json`.
 
 ## Conclusions (dry facts from the numbers)
 
-- **plain_chat.** A full 3-turn conversation: 0.024 ms (Go) vs 9.24 ms (Python),
-  390.3×. Per turn (derived): ≈0.008 ms vs ≈3.08 ms. Python's p95 is 2.6× its
-  median (one 23.7 ms sample among 15); Go's p95 is 1.23× its median.
+- **plain_chat.** A full 3-turn conversation: 0.028 ms (Go) vs 10.30 ms (Python),
+  371.9×. Per turn (derived): ≈0.009 ms vs ≈3.43 ms. Python's p95 is 2.2× its
+  median (one 22.3 ms sample among 15); Go's p95 is 1.13× its median.
 - **tool_roundtrip.** The 6-model-call loop with 5 tool executions:
-  0.068 ms vs 16.11 ms, 235.5× — the smallest gap of the four scenarios. Per
-  model call (derived): ≈0.011 ms vs ≈2.68 ms.
+  0.074 ms vs 18.07 ms, 243.2× — the smallest gap of the four scenarios. Per
+  model call (derived): ≈0.012 ms vs ≈3.01 ms.
 - **streaming.** 40 chunk dispatches, all received through a real subscription
-  consumer on both sides, + 2 durable responses: 0.023 ms vs 13.26 ms, 571.3×.
-  On the Go side streaming costs the same as plain_chat (0.023 vs 0.024 ms —
+  consumer on both sides, + 2 durable responses: 0.025 ms vs 15.57 ms, 615.2×.
+  On the Go side streaming costs the same as plain_chat (0.025 vs 0.028 ms —
   both scenarios run the identical non-recording fake, and the
   chunk consumer's subscription check adds no measurable overhead); on the
-  Python side streaming still costs more than plain chat (13.26 vs 9.24 ms
+  Python side streaming still costs more than plain chat (15.57 vs 10.30 ms
   median) despite fewer turns (2 vs 3) — the per-turn join subscription is a
   visible share of that.
-- **concurrent.** 50 simultaneous 2-turn conversations: 0.279 ms total (Go) vs
-  270.93 ms (Python), 970.5×. Per conversation (derived): ≈0.0056 ms vs
-  ≈5.42 ms. Goroutines run the 50 conversations across cores — per conversation
+- **concurrent.** 50 simultaneous 2-turn conversations: 0.333 ms total (Go) vs
+  326.00 ms (Python), 978.4×. Per conversation (derived): ≈0.0067 ms vs
+  ≈6.52 ms. Goroutines run the 50 conversations across cores — per conversation
   the wall cost lands below the sequential per-2-turn estimate from plain_chat
-  (≈0.016 ms derived); Python's event loop interleaves them on one thread, so
+  (≈0.018 ms derived); Python's event loop interleaves them on one thread, so
   its per-conversation cost stays close to the sequential per-2-turn estimate
-  (≈6.16 ms derived).
+  (≈6.87 ms derived).
 
 ## Limitations
 
@@ -121,7 +123,7 @@ Full sample arrays, per-scenario notes and batch K: `benchmarks/results_go.json`
    only the overhead added around real calls.
 2. **Memory figures are not comparable across sides.** Go reports a whole-run
    `HeapAlloc` delta (`runtime.ReadMemStats` around all measurements, default
-   GOGC, no forced GC; +1.56 MB over the entire session, informational).
+   GOGC, no forced GC; +1.27 MB over the entire session, informational).
    Python reports tracemalloc peak per single untimed iteration (e.g. 200 KB
    plain_chat, 7.94 MB concurrent). Different allocators, different accounting —
    do not read these as "one side uses less memory".
@@ -140,6 +142,9 @@ Full sample arrays, per-scenario notes and batch K: `benchmarks/results_go.json`
 5. **One machine, Windows.** Absolute numbers move with hardware, OS and
    background load; the relative ordering per scenario is the durable signal.
    Re-run both harnesses on the same machine when comparing across sessions.
+   Across two same-machine sessions the per-scenario ratios moved within ≈8%
+   (e.g. plain_chat 390.3× → 371.9×, concurrent 970.5× → 978.4×) with the
+   scenario ordering unchanged.
 
 ## Reproducing
 
