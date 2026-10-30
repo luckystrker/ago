@@ -1274,3 +1274,246 @@ chat-completions engine (openai/zai/mistral/dashscope) rejects every hosted sche
 own mapper — "Ollama speaks only function calling" (config/ollama/mappers.go:168-180);
 the stub providers (xai/bedrock/typesafe) never reach a mapper — `Create()` fails
 first. Every rejection wraps `config.ErrUnsupportedTool`.
+
+## D-049 — 2026-10-30 — a2a: transport-level subset — the conversational A2AClient machinery is not ported
+
+Supersedes the `a2a/` deferral in D-010 for this slice (owner directive): `ago/a2a`
+ports the A2A wire surface — protocol types with camelCase tags and the `kind`
+part discriminator, agent-card discovery at `/.well-known/agent-card.json` plus the
+legacy `/.well-known/agent.json` alias, JSON-RPC 2.0 `message/send` /
+`tasks/get` / `tasks/cancel`, a `TaskStore` interface with the memory
+implementation, a `Client` (AgentCard/SendMessage/TasksGet/TasksCancel), and a
+local JSON-RPC helper (not shared with `ago/mcp`). The served card always
+carries the discovery fields a 1.x client resolves a transport through —
+`protocolVersion` and `supportedInterfaces`; when `ServerConfig.Card` leaves
+them unset the server fills in one JSONRPC interface over the card URL stamped
+with the current protocol version "1.0" (parity: `build_card` always emits
+`supported_interfaces` via `_build_interfaces` at `PROTOCOL_VERSION_CURRENT`,
+and an SDK 1.x / AG2 client fails card resolution on an empty list —
+`select_interface` raises `A2AInvalidCardError`). Config-declared interfaces
+are served verbatim. (Blocking review fix, 2026-10-30: the field reduction the
+first revision shipped silently was not a recorded deferral; the `tenant`
+routing feature itself stays deferred — the field is wire shape only.)
+
+Not ported (honest deferrals, each an `// AGO-DEVIATION` in code): Python's
+`A2AClient` is an `LLMClient` (ag2/ag2/a2a/client.py:159) that ships full AG2
+history per turn, drives streaming/polling to a terminal task, resumes
+`input_required` continuations, syncs context variables, and executes
+client-side tools through the `urn:ag2:client-tools:v1` extension — none of that
+turn machinery exists in Go, so `ago/a2a.Client` is a transport-level client and
+no `Tools()` adapter ships (Python's A2AClient is not a tool either, it is an
+LLM provider). Also deferred: the REST and gRPC transports, push notifications,
+card signing/verification, `validate_input_modes`, cluster mode
+(`VersionedTaskStore`/`TaskEventStream`), tenants, and the reduced task-state
+machine (submitted/working/completed/failed/canceled only — no
+input-required/auth-required/rejected).
+
+## D-050 — 2026-10-30 — a2a: message/stream is a two-event SSE; client-side streaming is not ported
+
+The server implements `message/stream` as Server-Sent Events with exactly two
+JSON-RPC-wrapped `status-update` results: `working` (`final=false`) then the
+terminal `completed`/`failed` (`final=true`, reply attached on
+`status.message` — the shape AG2's client absorbs from the completed
+transition, ag2/ag2/a2a/client.py:561-566). Chunked text artifacts, artifact
+updates, `tasks/resubscribe` reconnects, and mid-stream cancels are not
+modeled: the Go `Server` handler contract is one synchronous
+`Handle(ctx, *Message) (*Message, error)` call, so the stream can only report
+its terminal outcome. The `Client` does not consume streams at all — it uses
+`message/send` only. `message/send` records the exchange as a Task
+(completed/failed) in the shared store before answering, which is what makes
+`tasks/get`/`tasks/cancel` meaningful against a synchronous handler.
+
+## D-051 — 2026-10-30 — eval: the Trace is event-sourced, not OTEL-reconstructed (ago/eval supersedes the D-010 deferral for this slice)
+
+`ago/eval` ports the eval harness as produce-then-grade: `Run(ctx, agent, suite)`
+asks the agent per `Case`, rebuilds a `Trace` from the reply's stream history
+(`BuildTrace` — `ModelResponse` → `LLMCalls` paired with the `model_call`
+`UsageEvent` emitted just before each, `ToolCallEvent`-family → `ToolCalls`
+with results/errors matched by call id), scores it, and tallies a `RunResult`
+(`SaveJSON`/`LoadJSON`/`Compare`).
+
+The core architectural difference from Python: **AGo builds the Trace directly
+from the event log, with no OpenTelemetry anywhere.** Python's `run_agent`
+wraps the turn in `TelemetryMiddleware` → in-memory span exporter →
+`readable_spans_to_trace`, and `evaluate_traces` grades traces from OTEL /
+Tempo / OTLP sources — one span→Trace path on purpose. AGo's event log is
+already the durable, ordered record of exactly what those spans captured
+(`agent/turn.go` emits `UsageEvent` before the response; tool events land on
+the stream), so reconstructing from events removes a dependency and a lossy
+projection instead of porting it: stream-only events Python's spans never see
+are visible here too. Trace stores the raw `Events`, so `Trace.Tokens()` sums
+`UsageEvent`s through `ago/usage` (Python parity: response usage excluded to
+avoid double counting), and — unlike Python's store, which drops events on
+load — `SaveJSON`/`LoadJSON` round-trip events through the `@type` registry,
+keeping token math alive on loaded runs.
+
+Scorers: `Scorer{ Name; Score(ctx, trace) (Score, error) }` with
+`Score`-as-data (`Name/Value/Passed/Details`); boolean scorers carry 1.0/0.0 so
+`Threshold` and run math treat them uniformly. `Correctness` (final-answer vs
+expected; exact/casefold/contains, zero = casefold, the Python default),
+`TokenBudget` (per-trace input+output ≤ max — Python's `token_budget`; the
+Python cost scorer is this budget), `ToolsCalled` (any/all over a name list),
+`Threshold` (numeric gate ≥ min, inner-name preserving, ungradeable → fail),
+`LLMJudge` (one headless client call, JSON verdict `{score, reason}`, clamped
+to [0,1], pass = ≥ 0.5), `Pairwise` (dual-order position swap, conservative
+tie on flip). A scorer error never aborts a run: the runner records it as a
+failing score (Python: `Feedback(score=None)`, "scorer raised").
+
+Deferred (Python parity gaps, all recorded here): OTEL/Tempo/OTLP trace
+sources and `evaluate_traces` (superseded by the event path above); the
+`@scorer` DI decorator and injectable-params introspection (a typed Go
+interface replaces function-signature reflection); the `attribution` scorer;
+run-level machinery — repeats, per-task model configs, `BudgetThresholds`,
+concurrency (AGo runs cases sequentially), eval lifecycle events on a Stream,
+`RunDiff` regression diffing (AGo ships the pairwise win-rate tally
+`Compare`, ties counting 0.5, Python parity); `Suite.from_jsonl`, tags and
+metadata; the judge's `response_schema` structured output + validation retries
+(a bare client call with JSON parsing instead, so a non-JSON verdict is a
+recorded fail rather than a re-ask); pairwise single-order mode, Wilson CI and
+Cohen's kappa.
+
+## D-052 — 2026-10-30 — acp: both protocol roles over newline JSON-RPC; the session store, guard and mediated filesystem stay deferred
+
+`ago/acp` ports the Agent Client Protocol as two stdio roles in one package
+(supersedes the D-010 deferral for this slice, owner directive), stdlib-only,
+transport identical to `ago/mcp` stdio — JSON-RPC 2.0, one message per line,
+no Content-Length framing, 8 MiB scan cap.
+
+**Serve role** (`Serve(ServeConfig)`, Python parity `ag2/ag2/acp/agent.py`
+ACPAgent + executor): `initialize` (version answered as `min(client, ours)`,
+truthful capabilities — text-only `promptCapabilities`), `session/new`
+(uuid4 id; `cwd`/`mcpServers` recorded as context, never acted on), and
+`session/prompt` running `cfg.Handle(sessionID, userText, emit)` with each
+`emit` pushing one `agent_message_chunk` `session/update`; the handler's final
+text goes out as one more chunk only when it differs from what was already
+streamed (executor parity: `_forward_updates` + `_send_final_text`), so a
+non-streaming handler still delivers. A handler error is a JSON-RPC internal
+error carrying the reason; an unknown session is `-32002` "acp-session:<id>"
+(parity: `resource_not_found`). `ServeAgent(a *agent.Agent, cfg)` builds the
+handler: per-session conversation continuity (first prompt `Run`, later
+prompts continue the stored reply), `ModelMessageChunk` deltas streamed live.
+
+**Client role** (`NewBridge/SessionNew/Prompt/Close`, Python parity
+`ag2/acp/bridge.py` + `client.py`): subprocess launch + initialize handshake,
+one serialized exchange at a time under the Bridge lock; `Prompt` returns the
+`agent_message_chunk` text accumulated during the turn. Agent→client requests
+are answered inline from the policies — `Permission(toolCall, input)` selects
+the agent's first `allow_once`/`allow_always` option (parity:
+`permissions.resolve_permission_option_id`), `Elicit(message)` accepts with the
+answer or declines; a nil policy or false denies/declines and nothing is ever
+fabricated. The serve side mirrors this: `Session.RequestPermission` consults
+`cfg.Permission` first and synthesizes the reject decision locally (deny never
+touches the wire), `Session.Elicit` gates the question on `cfg.Elicit` and the
+client's accept carries the answer.
+
+Wire dialect — the SDK's spelling is what this package emits: the
+session/update block under **`content`** (parity: `mappers.py`
+`block_text(update.content)`) and the session/request_permission answer nested
+**`{"outcome": {"outcome": "selected"|"cancelled", "optionId": …}}`** (parity:
+`bridge.py` `RequestPermissionResponse(outcome=AllowedOutcome(...))` /
+`DeniedOutcome`). An earlier revision of this package emitted `contentBlock`
+and a flattened `{outcome, optionId}` with `outcome_selected`/
+`outcome_cancelled` values, citing a porting-brief pin; a blocking review
+found the brief pins no dialect and the shapes are unreadable to standard ACP
+peers (an SDK client reads `content` — chunks arrive empty otherwise — and a
+real agent refuses a flat answer by schema), so the emission moved onto the
+SDK forms (2026-10-30). Input stays tolerant: `contentBlock` updates and flat
+answers are still understood, and a zero `Decision` emits the cancelled
+outcome — an absent selection denies, never allows. Deny answers select a
+`reject_once`/`reject_always` option the agent actually offered (Python
+parity: `resolve_permission_option_id` returns the reject option; a
+synthesized id the agent never offered would be refused too). Elicitation is
+text-only (no form/url modes, no per-property rendering or coercion, no
+MAX_ATTEMPTS loop — parity: `elicitation.py` `_resolve_form`).
+
+Deferred (recorded here as the honest gaps): `session/cancel` and the
+`cancelled` stop reason; `session/load` + history replay (`history_to_session_updates`);
+the multi-session store (LRU cap, idle TTL, retention, per-session queues —
+Serve runs one request at a time; per-session state is a plain map); auth
+(`auth.py`); thought/plan/tool-call/usage updates and `stream_thoughts`;
+the mediated filesystem (`fs/*`), terminals (`terminal/*`) and `tool_gateway.py`;
+`guard.py`; `session.py`/`sessions.py` model pickers and high-water-mark prompt
+shipping; `config.py`'s remote/transport variants (AGo's Bridge is subprocess-stdio
+only).
+
+Tests are network-free: the Bridge suite re-execs the test binary as a fake
+ACP agent (`TestMain` process-helper pattern, `mcp/stdio_test.go` template —
+two-chunk prompt, outbound permission + elicitation round-trips, policies on
+and off); the serve suite runs `serveIO`/`serveAgentIO` over `os.Pipe` against
+an in-process fake client (initialize/new/prompt shapes, final-text-once
+dedup, handler-error mapping, permission deny-synthesized/allow/reject/
+cancelled, elicitation gate/accept/decline, ServeAgent streaming via a
+chunk-publishing client double and non-streaming via `agotest.NewTestConfig`).
+
+Note (docs sweep, 2026-10-30): the deferral/dialect comments in `ago/acp`
+cited "D-049" for a while — D-049 is the a2a supersession, the same numbering
+drift the D-041 entry documents for the earlier wave; corrected to cite this
+entry when the wire dialect was moved onto the SDK forms.
+
+## D-053 — 2026-10-30 — ag_ui: one synchronous exchange per run; the held-turn interrupt machinery is not ported (ago/agui supersedes the D-010 deferral for this slice)
+
+Owner directive, same wave as D-049/D-051/D-052. `ago/agui` ports the serving side
+of `ag2/ag_ui/` against the ag-ui-protocol **1.0** wire vocabulary (read off the
+SDK's generated models, `ag_ui/_generated/models.py` — the same source the Python
+module builds on; THINKING_* left the protocol in 1.0, reasoning travels as
+REASONING_*). Ported: the event structs with camelCase tags and the SDK's
+omit-when-unset serialization (`events.go`); `RunAgentInput` parsing with
+unknown-role stripping and pre-run base64 refusal (`run_input.py`); the projection
+(`stream.py` `map_events_to_ag_ui`): ModelMessageChunk → TEXT_MESSAGE_*,
+ModelReasoning → REASONING_* spans closed by the next non-reasoning event,
+ModelResponse → TEXT_MESSAGE_END or the whole-answer TEXT_MESSAGE_CHUNK,
+ToolCallEvent → TOOL_CALL_START/ARGS/END closed before execution,
+ToolResultEvent → TOOL_CALL_RESULT (lone text as a string, else parts),
+ClientToolCallEvent → TOOL_CALL_CHUNK, task lifecycle → SUBAGENT_*, usage grouped
+per (provider, model) with the anthropic/bedrock cache correction and recomputed
+totals (`usage.py`), pendingToolCallIds on the success outcome; `Handler`/
+`ServeAgent` over `net/http` (GET capabilities, POST → SSE `data: <json>\n\n`,
+400 before any stream on an unparseable body), protocol-major refusal
+(`UNSUPPORTED_PROTOCOL_VERSION` before RUN_STARTED), cancelled-run outcome on
+server-side cancellation (`drive_run`'s CancelledError → cancelled outcome).
+
+**Not ported — the held-turn machinery (`interrupts.py`, ~1200 lines):** a served
+turn in AGo lives inside its HTTP exchange; there is no `ServedTurns` registry,
+no retention/eviction, no RUN_FINISHED interrupt outcome, no resume entries, no
+per-interrupt proofs, no tool-approval or subagent-suspension wiring, no
+capability declaration of `humanInTheLoop.interrupts`. An agent that asks a human
+a question fails the run and the client reads RUN_ERROR. REASONING_ENCRYPTED_VALUE
+(Gemini thought signatures) is deferred with it — AGo has no Gemini
+thought-signature plumbing to project. STATE_SNAPSHOT/STATE_DELTA: the state
+merge (`client state | agent variables | run variables`) needs agent internals
+AGo does not expose (variables, config, hitl hook, tasks config are all
+unexported on `agent.Agent`), so ServeAgent emits no snapshots and declares no
+`state` capability; handlers with their own `Run` callback can emit
+STATE_SNAPSHOT through the event vocabulary. Subsequent deferrals of the same
+shape, each with an AGO-DEVIATION comment in the code: prompt-level inputs
+(system/developer messages, the shared-context block from `RunAgentInput.context`)
+fold into the opening transcript request instead of per-run prompt fragments
+(Python passes them to `agent.ask` as prompt; AGo's fragments are fixed at agent
+construction); content-part metadata is dropped (ago inputs have no metadata
+field); provider-tagged file handles are always skipped, since the served agent's
+provider is not readable (Python skips only foreign-tagged ones); the
+client-tool-name suppression of Python's projection is replaced by call-id
+suppression, because AGo's executor sends the model's ToolCallEvent before the
+client tool answers it — the reverse of Python's dispatch order — and the
+gathered `ToolResultsEvent` is not projected (its results already went out
+individually; Python has no such batch on its stream). Input parsing accepts the
+camelCase wire spellings only, where the SDK also accepts snake_case attribute
+names. ServeAgent documents that the served agent must be usable with a fresh
+stream per turn: a `WithStreamBase` agent would have every request's history
+seeded over the shared transcript.
+
+Identity.Type says **"ago"** where Python says "ag2" — the serving framework's
+own name. Imports: `ago/agent` and `ago/events` per the brief, plus `ago/stream`
+(the projection subscribes through `stream.SubscribeOptions` — the same edge
+`agent` already has, no new cycle) and `ago/internal/uuid` for message ids (the
+same helper `ago/events` uses).
+
+Tests are network-free (`httptest` + `agotest.NewTestConfig`): GET capabilities
+(shape and the omitted sections), POST streaming run over a chunk-publishing
+client double (RUN_STARTED → TEXT_MESSAGE_START/CONTENT×N/END → RUN_FINISHED with
+camelCase frames), agent failure → RUN_ERROR, tool-call projection with the
+not-found answer, usage on RUN_FINISHED, input history seeding asserted through
+`TestConfig.Calls`, 400 on an unparseable body, protocol-major refusal,
+cancelled outcome, handler-callback passthrough (STATE_SNAPSHOT/CUSTOM/Raw) and
+the not-ended-run RUN_ERROR repair; plus unit coverage of the event JSON forms,
+transcript round-trip of `AGUIEvent`, and every projection branch.

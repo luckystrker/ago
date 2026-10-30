@@ -13,8 +13,9 @@ Sections: [Concepts](#concepts) · [Agents](#agents) · [Tools](#tools) ·
 [Human-in-the-loop](#human-in-the-loop) ·
 [Observers, watches, alerts and halts](#observers-watches-alerts-and-halts) ·
 [Knowledge, policies, compaction, aggregation](#knowledge-policies-compaction-aggregation) ·
-[MCP](#mcp-model-context-protocol) · [Multi-agent network](#multi-agent-network) ·
-[Testing](#testing) · [Examples index](#examples-index) · [Troubleshooting](#troubleshooting)
+[MCP](#mcp-model-context-protocol) ·
+[Protocol endpoints](#protocol-endpoints-a2a-acp-ag-ui) · [Multi-agent network](#multi-agent-network) ·
+[Testing](#testing) · [Evaluation](#evaluation) · [Examples index](#examples-index) · [Troubleshooting](#troubleshooting)
 
 ## Concepts
 
@@ -732,6 +733,158 @@ Builders: `RawHTML` (inline HTML), `ExternalURL` (rendered in an iframe),
 `ui://`; `mcpui.Marshal(res)` renders the byte-exact wire JSON (plain `json.Marshal`
 is shape-equivalent but HTML-escapes).
 
+## Protocol endpoints: A2A, ACP, AG-UI
+
+Three packages expose an agent to the outside world over standard protocols, stdlib only.
+Each is a functional subset of its Python module — the deferred pieces are listed in
+[docs/PORT_STATUS.md](PORT_STATUS.md) and decided in [docs/DECISIONS.md](DECISIONS.md)
+(D-049/D-050 for A2A, D-052 for ACP, D-053 for AG-UI).
+
+### A2A (`ago/a2a`) — agent-to-agent over HTTP/JSON-RPC
+
+`a2a.NewServer` turns a handler function into an A2A server: agent-card discovery plus
+the JSON-RPC methods `message/send`, `message/stream` (SSE), `tasks/get` and
+`tasks/cancel`. The handler is one synchronous `Message → Message` call; the server
+records every exchange as a `Task` in its store, which is what makes `tasks/get` and
+`tasks/cancel` meaningful:
+
+```go
+srv := a2a.NewServer(a2a.ServerConfig{
+	Card: a2a.AgentCard{
+		Name:               "ago-assistant",
+		Version:            "0.1.0",
+		Capabilities:       a2a.AgentCapabilities{Streaming: true}, // gates message/stream
+		DefaultInputModes:  []string{"text/plain"},
+		DefaultOutputModes: []string{"text/plain"},
+	},
+	Handle: func(ctx context.Context, msg *a2a.Message) (*a2a.Message, error) {
+		reply, err := assistant.Ask(ctx, a2aText(msg)) // concat the *a2a.TextPart parts
+		if err != nil {
+			return nil, err // → JSON-RPC internal error + a failed Task in the store
+		}
+		return a2a.NewMessage(a2a.RoleAgent, a2a.NewTextPart(reply.Body())), nil
+	},
+	Store: a2a.NewMemoryTaskStore(), // the default; implement a2a.TaskStore to persist
+})
+http.ListenAndServe(":8000", srv.Handler()) // also serves /.well-known/agent-card.json
+```
+
+The served card always carries `protocolVersion` and `supportedInterfaces` — the
+discovery fields 1.x clients resolve a transport through. When the config leaves
+them unset, the server fills in one JSONRPC interface over the card URL at the
+current protocol version (`a2a.ProtocolVersionCurrent`, `"1.0"`); interfaces the
+config declares are served verbatim.
+
+The client is transport-level — Python's conversational `A2AClient` (an `LLMClient`
+shipping full history and driving streams to a terminal task) is deferred (D-049):
+
+```go
+cl := a2a.NewClient("http://localhost:8000")
+card, _ := cl.AgentCard(ctx)                                        // discovery
+reply, _ := cl.SendMessage(ctx, a2a.NewMessage(a2a.RoleUser, a2a.NewTextPart("Hi!")))
+task, _ := cl.TasksGet(ctx, reply.TaskID)                           // correlate by task id
+// also: cl.TasksCancel(ctx, taskID); WithHTTPClient/WithHeaders/WithCardPath options
+```
+
+Message parts are discriminated on the wire by `kind`: `a2a.NewTextPart(text)`,
+`a2a.NewDataPart(any)`, `a2a.NewFilePart(a2a.FileBlock{URI: …})` (or `Bytes` for inline
+base64). Remote failures come back as sentinel errors — match with `errors.Is` against
+`a2a.ErrTaskNotFound` (-32001), `a2a.ErrTaskNotCancelable` (-32002), `a2a.ErrWire`,
+`a2a.ErrTransport`, `a2a.ErrRPC`.
+
+### ACP (`ago/acp`) — Agent Client Protocol over stdio
+
+Both protocol roles live in one package, over newline-delimited JSON-RPC (the same
+transport template as the MCP stdio client). **Serve** an agent so any ACP client can
+drive it — blocks on stdin/stdout until the client disconnects:
+
+```go
+a := agent.New("ago-assistant", "...", agent.WithConfig(cfg))
+err := acp.ServeAgent(a, acp.ServeConfig{AgentName: "ago-assistant", AgentVersion: "0.1.0"})
+```
+
+A custom handler streams incremental text through `emit` (each call pushes one
+`agent_message_chunk` update) and returns the final body — it is delivered once more only
+when it differs from what already streamed:
+
+```go
+var sess *acp.Session
+err := acp.Serve(acp.ServeConfig{
+	OnSession: func(s *acp.Session) { sess = s }, // capture the session handle
+	Handle: func(sessionID, userText string, emit func(chunk string)) (string, error) {
+		emit("working on it…")
+		dec, err := sess.RequestPermission(context.Background(), "write_file", `{"path":"a.txt"}`)
+		if err != nil {
+			return "", err
+		}
+		if !dec.Allowed() {
+			return "", errors.New("write rejected")
+		}
+		ans, ok, _ := sess.Elicit(context.Background(), "Proceed?") // ok=false → declined
+		_ = ans
+		return "done", nil
+	},
+})
+```
+
+The `Permission`/`Elicit` policies on `ServeConfig` decide what ever reaches the client:
+a nil policy (or a false answer) denies **locally** — the reject decision is synthesized,
+no wire traffic, nothing fabricated; a true answer relays the client's choice.
+
+**Bridge** is the other role — drive an external ACP agent (a CLI coding agent in ACP
+mode) as a subprocess:
+
+```go
+br, err := acp.NewBridge("some-acp-agent", []string{"--acp"}, nil) // nil env → os.Environ()
+defer br.Close() // idempotent; closes stdin, kills after a grace period
+br.Permission = func(toolCall, input string) bool { return toolCall == "read_file" }
+br.Elicit = func(message string) (string, bool) { return "yes", true }
+sid, err := br.SessionNew("C:/work")
+answer, err := br.Prompt(sid, "Which tests fail?") // the agent_message_chunk text of the turn
+```
+
+Operations serialize under the bridge's lock — at most one exchange in flight. Errors are
+sentinels: `acp.ErrNotProvided` (empty command), `acp.ErrProtocol` (wire failure, peer
+error, peer exited), `acp.ErrClosed` (operations after `Close`).
+
+### AG-UI (`ago/agui`) — serve over the AG-UI event stream
+
+`agui.ServeAgent` serves an agent over HTTP speaking AG-UI 1.0: GET answers the
+capabilities JSON, POST runs one turn and streams it as SSE `data:` events:
+
+```go
+mux := http.NewServeMux()
+mux.Handle("/agent", agui.ServeAgent(a)) // the agent must be usable with a fresh stream per turn
+http.ListenAndServe(":8080", mux)
+```
+
+Each run is projected from the conversation stream's events: chunks →
+`TEXT_MESSAGE_START/CONTENT/END`, reasoning → `REASONING_*` spans, tool calls →
+`TOOL_CALL_START/ARGS/END` + `TOOL_CALL_RESULT`, task lifecycle → `SUBAGENT_*`, token
+usage onto `RUN_FINISHED`. The pieces are usable directly — `agui.NewStream(emit)` builds
+the projection (`Handle` one ago event at a time, `TakeUsage`/`SuccessOutcome` read the
+run's ledger), `agui.ReadRunInput(body)` parses a request, `agui.CapabilitiesFor(a)`
+reads the capability snapshot.
+
+Custom handlers drive the run themselves through `agui.Handler` and may emit protocol
+events directly — including the extension points (`STATE_SNAPSHOT`, `CUSTOM`, `Raw` for
+anything the package does not model):
+
+```go
+h := agui.Handler(agui.HandlerConfig{
+	Capabilities: func() agui.AgentCapabilities { return agui.CapabilitiesFor(a) },
+	Run: func(ctx context.Context, in agui.RunAgentInput, emit func(agui.Event)) error {
+		emit(agui.NewRunStartedEvent(in.ThreadID, in.RunID))
+		emit(agui.NewCustomEvent("progress", map[string]any{"step": 1}))
+		emit(agui.NewRunFinishedEvent(in.ThreadID, in.RunID))
+		return nil // the outcome travels on the stream; errors are logged, not written
+	},
+})
+```
+
+An agent that asks a human a question fails the run — the client reads `RUN_ERROR` (the
+held-turn interrupt machinery of Python's `interrupts.py` is deferred, D-053).
+
 ## Multi-agent network
 
 `ago/network` hosts many participants on one in-process hub. A channel is a typed
@@ -804,6 +957,61 @@ cfg := agotest.NewTestConfig(
 - `agotest.NewTrackingConfig(realCfg)` records calls through a real provider the same
   way. Provider packages are tested with `httptest` fake servers; your own tests can
   follow the same pattern.
+
+## Evaluation
+
+`ago/eval` grades agent runs, produce-then-grade (Python parity: `ag2.eval`; the trace is
+built from the event log — no OpenTelemetry anywhere, D-051). `eval.Run` asks the agent
+per case, rebuilds a `Trace` from the reply's stream history, and scores it:
+
+```go
+suite := eval.Suite{
+	{Name: "capital", Input: "Capital of France?", Expected: "Paris",
+		Scorers: []eval.Scorer{
+			eval.Correctness{}, // zero Mode = casefold equality (the Python default)
+			eval.TokenBudget{Max: 300},
+		}},
+	{Name: "uses-tool", Input: "Weather in Lisbon?",
+		Scorers: []eval.Scorer{
+			eval.ToolsCalled{Names: []string{"get_weather"}}, // Mode: CallAll (default) or CallAny
+			eval.Threshold{Inner: eval.Correctness{Mode: eval.MatchContains}, Min: 1.0},
+		}},
+}
+res, err := eval.Run(ctx, a, suite) // cases run sequentially; a failing ask never aborts the run
+for _, cr := range res.Cases {
+	fmt.Println(cr.Name, cr.Passed, cr.Output, cr.Err)
+}
+fmt.Println("pass rate:", res.PassRate)
+_ = res.SaveJSON("results/baseline.json")
+```
+
+Scorer conventions: boolean scorers carry 1.0/0.0 values (so `Threshold` and run math
+treat them uniformly); a scorer error never aborts a run — `ScoreWith` records it as a
+failing score (Python: `Feedback(score=None)`).
+
+LLM-graded scorers take any `config.LLMClient`; the judge's reply must be a JSON verdict
+`{"score": …, "reason": …}`, clamped to [0,1], passing at ≥ 0.5 (use `Threshold` for a
+different gate). A non-JSON verdict is a recorded fail, not a re-ask:
+
+```go
+cl, err := anthropic.NewAnthropic("claude-sonnet-4-5").Create() // ANTHROPIC_API_KEY
+judge := eval.LLMJudge{Client: cl, Rubric: "Factually correct and concise."}
+pair := eval.Pairwise{Client: cl, Rubric: "Which answer serves the user better?"}
+outcome, err := pair.Compare(ctx, traceA, traceB) // Winner "a"/"b"/"tie"; a verdict that
+// flips between the two response orders resolves to a tie (positional-bias guard)
+```
+
+Traces stand alone too — build one from any history and read it:
+
+```go
+evs, _ := reply.History().GetEvents()
+tr := eval.BuildTrace(evs)
+fmt.Println(tr.FinalResponse, tr.Tokens().TotalTokens, len(tr.ToolCalls))
+```
+
+`eval.Compare(a, b)` tallies two `RunResult`s paired by case name — `WinRate` is B's rate
+and ties count 0.5. `eval.LoadJSON` round-trips the stored events through the `@type`
+registry, so token math and event-based scorers keep working on a loaded run.
 
 ## Examples index
 

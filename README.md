@@ -69,6 +69,8 @@ models — no API keys needed.
 | 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
 | 🔌 **MCP client** | JSON-RPC 2.0 over stdio and streamable HTTP, tool discovery with pagination, content mapping; MCP UI resources and in-frame actions for tool results |
 | 🕸️ **Multi-agent network** | hub, channels, envelopes (`ag2.*` wire vocabulary), four channel adapters, workflow transitions, WAL replay |
+| 🔗 **Protocol endpoints** | serve or consume agents over **A2A** (JSON-RPC 2.0 HTTP: agent-card discovery, `message/send`+stream, tasks), **ACP** (stdio JSON-RPC, both roles: `Serve`/`ServeAgent` and a subprocess `Bridge`) and **AG-UI** (HTTP SSE event stream, AG-UI 1.0) |
+| 🧪 **Eval harness** | produce-then-grade runs: event-sourced traces (no OTEL), `Correctness`/`TokenBudget`/`ToolsCalled`/`Threshold` scorers, LLM judge and dual-order pairwise comparison, JSON run results with win-rate comparison |
 
 ## 🚀 Quick start
 
@@ -140,7 +142,7 @@ func main() {
 | [docs/MIGRATION.md](docs/MIGRATION.md) | class-by-class map: Python AG2 → AGo |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the binding package contracts |
 | [docs/PORT_STATUS.md](docs/PORT_STATUS.md) | what is ported / partial / stubbed / deferred |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | 35+ decision records behind every deviation from Python |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 50+ decision records behind every deviation from Python |
 
 ## 💡 Examples
 
@@ -168,10 +170,15 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   builtin tools and plugins), Files API, MCP client + MCP UI constructors, middleware,
   HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
   multi-agent network — `go build`/`vet`/`test` green on every package.
+- **Ported as functional subsets** (each with documented deferrals): `ago/a2a`
+  (transport-level A2A — the conversational client machinery is deferred), `ago/acp`
+  (both ACP stdio roles — session store/guard/mediated filesystem deferred), `ago/agui`
+  (AG-UI serving — the held-turn interrupt machinery is deferred), `ago/eval`
+  (event-sourced traces instead of OTEL).
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").
-- **Deferred:** protocol servers (a2a/acp/ag_ui/a2ui), live voice, Redis/SQLite stores,
-  WebSocket link — see [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
+- **Deferred:** a2ui, live voice, Redis/SQLite stores, WebSocket link — see
+  [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
 - **Reviewed:** an independent port-parity review against the Python sources found and
   fixed 20 confirmed defects; the review trail is in the git history and decision records.
 
