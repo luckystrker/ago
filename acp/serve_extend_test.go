@@ -27,8 +27,10 @@ func (c *fakeClient) notify(method string, params any) {
 	if err != nil {
 		c.t.Fatalf("marshal notification: %v", err)
 	}
+	c.writeMu.Lock()
 	fmt.Fprintln(c.w, string(payload))
 	c.w.Flush()
+	c.writeMu.Unlock()
 }
 
 // updateKinds lists the kinds of the collected updates, for compact assertions.
