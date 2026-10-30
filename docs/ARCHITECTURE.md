@@ -51,6 +51,7 @@ spec    → agent, tools               — AgentSpec from/to agent
 network → agent, events, stream, knowledge, task — hub, channels, envelope, links, adapters
 mcp     → tools, context             — MCP client (stdio+HTTP JSON-RPC), MCPToolkit
 mcpui   → events                     — MCP UI resources/actions (data constructors)
+agui    → agent, events, stream      — AG-UI serving (HTTP SSE endpoint, event projection)
 testing → config, events, stream     — TestConfig, TrackingConfig, fake clients
 examples/                            — runnable programs (offline ones use testing pkg)
 ```
