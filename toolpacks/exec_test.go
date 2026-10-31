@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	"errors"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -282,13 +283,28 @@ func grandchildProbe() (start []string, listCmd []string, ok bool) {
 	return []string{"sh", "-c", "sleep 60 & sleep 60"}, []string{"pgrep", "-f", "sleep 60"}, true
 }
 
+// listMatching runs the probe listing. pgrep exits 1 when nothing matches —
+// for the post-kill check that is the success case, not an error.
+func listMatching(t *testing.T, listCmd []string) string {
+	t.Helper()
+	out, err := exec.Command(listCmd[0], listCmd[1:]...).Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return string(out)
+	}
+	if err != nil {
+		t.Fatalf("%s: %v", listCmd[0], err)
+	}
+	return string(out)
+}
+
 func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	start, listCmd, ok := grandchildProbe()
 	if !ok {
 		t.Skip("no process-listing tool on this platform")
 	}
 	// A stray matching process from outside the test would poison the verdict.
-	if out, err := exec.Command(listCmd[0], listCmd[1:]...).Output(); err == nil && strings.Contains(strings.ToLower(string(out)), strings.ToLower(nameOf(start))) {
+	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
 	res := runLocalCommand(start, "", nil, false, 2*time.Second, defaultMaxOutput)
@@ -298,11 +314,7 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	// The kill runs inside the context cancel; give the table a moment to
 	// settle before listing.
 	time.Sleep(500 * time.Millisecond)
-	out, err := exec.Command(listCmd[0], listCmd[1:]...).Output()
-	if err != nil {
-		t.Fatalf("%s: %v", listCmd[0], err)
-	}
-	if strings.Contains(strings.ToLower(string(out)), strings.ToLower(nameOf(start))) {
+	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
 		t.Fatalf("a grandchild survived the timeout kill:\n%s", out)
 	}
 }
