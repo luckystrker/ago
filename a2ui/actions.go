@@ -29,6 +29,13 @@ type Action struct {
 	// func signature has no such schema, so ExampleContext must be given
 	// explicitly when it should appear in the prompt.
 	Fn ActionFunc
+	// AuthorizedOnly marks the handler as privileged: it runs only for
+	// requests that presented the server's auth token (WithAuthToken).
+	// Without WithAuthToken no request can be authorized, so such an action
+	// never runs — deny by default, never silently fall back to anonymous.
+	// AGO-DEVIATION: security hardening for exposing the server beyond
+	// loopback; Python's a2ui has no such flag.
+	AuthorizedOnly bool
 }
 
 // ActionRegistry maps action names to the handlers that run on click.

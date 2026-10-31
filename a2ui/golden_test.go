@@ -139,10 +139,16 @@ func TestGoldenWireForms(t *testing.T) {
 
 	// to_jsonl_typed is byte-exact: these messages carry no free-form props,
 	// so the Go field order matches the capture literals.
-	if got, want := ToJSONL(msgs), goldenStr(t, "to_jsonl_typed"); got != want {
+	got, err := ToJSONL(msgs)
+	if err != nil {
+		t.Fatalf("ToJSONL: %v", err)
+	}
+	if want := goldenStr(t, "to_jsonl_typed"); got != want {
 		t.Errorf("ToJSONL byte mismatch:\n  want %q\n  got  %q", want, got)
 	}
-	if got, want := ToJSONL(nil), goldenStr(t, "to_jsonl_empty"); got != want {
+	if got, err = ToJSONL(nil); err != nil {
+		t.Fatalf("ToJSONL(nil): %v", err)
+	} else if want := goldenStr(t, "to_jsonl_empty"); got != want {
 		t.Errorf("ToJSONL(nil): want %q, got %q", want, got)
 	}
 

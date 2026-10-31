@@ -3,6 +3,7 @@ package acp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,16 @@ import (
 // working directory is used, the way Python falls back to config.cwd.
 type FSConfig struct {
 	Root string
+
+	// TerminalInheritEnv opts the mediated terminals into the complete parent
+	// environment instead of the shared toolpacks whitelist. The terminal
+	// command line is model-controlled, so by default one `env` in a terminal
+	// must not disclose the parent's keys (audit H-6); turn this on only when
+	// the parent process carries nothing secret.
+	//
+	// AGO-DEVIATION: Python's TerminalManager inherits everything; AGo
+	// defaults to the whitelist, full inheritance is this opt-in.
+	TerminalInheritEnv bool
 }
 
 // root resolves the configured confinement root to its real path.
@@ -85,6 +96,58 @@ func confine(root, path string) (string, error) {
 	return resolved, nil
 }
 
+// openConfined returns a root handle plus path relative to it: the pair every
+// mediated read and write goes through. confine alone leaves a TOCTOU window
+// — it resolves the symlinks, hands back a plain path, and the later open
+// re-walks the disk an agent controls, so a component swapped for a symlink
+// between the two would be followed. An os.Root re-resolves symlinks at open
+// time and refuses any that escape, closing the window (audit M-21).
+//
+// AGO-DEVIATION: Python's _confine checks a realpath and opens by path; AGo
+// opens through a root handle.
+func openConfined(root, path string) (*os.Root, string, error) {
+	full, err := confine(root, path)
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err := filepath.Rel(root, full)
+	if err != nil {
+		// confine guarantees full is root itself or under it; an unreachable
+		// branch kept for safety.
+		return nil, "", fmt.Errorf("%w: path %q escapes root %q", ErrPathEscapes, path, root)
+	}
+	rt, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, "", err
+	}
+	return rt, filepath.ToSlash(rel), nil
+}
+
+// mkdirAllRoot creates the parent directories of rel through the root handle,
+// one Mkdir per component — Root has no MkdirAll, and creating each directory
+// through the handle keeps the walk inside the confinement.
+func mkdirAllRoot(rt *os.Root, rel string) error {
+	dir := filepath.Dir(rel)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	cur := ""
+	for _, part := range strings.Split(dir, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		if cur == "" {
+			cur = part
+		} else {
+			cur = cur + "/" + part
+		}
+		if err := rt.Mkdir(cur, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 // read_text_file wire shapes (ACP fs/read_text_file): {sessionId, path, line?,
 // limit?} → {content}. line is the 1-based line to start at; limit caps how
 // many lines are returned.
@@ -109,11 +172,17 @@ func (b *Bridge) fsRead(params readTextFileParams) (readTextFileResult, *rpcErro
 	if err != nil {
 		return readTextFileResult{}, rpcErr(codeInternalError, "%s", err.Error())
 	}
-	full, cerr := confine(root, params.Path)
+	rt, rel, cerr := openConfined(root, params.Path)
 	if cerr != nil {
 		return readTextFileResult{}, rpcErr(codeResourceNotFound, "%s", cerr.Error())
 	}
-	data, rerr := os.ReadFile(full)
+	defer rt.Close()
+	f, rerr := rt.Open(rel)
+	if rerr != nil {
+		return readTextFileResult{}, rpcErr(codeResourceNotFound, "read %s: %s", params.Path, rerr.Error())
+	}
+	data, rerr := io.ReadAll(f)
+	f.Close()
 	if rerr != nil {
 		return readTextFileResult{}, rpcErr(codeResourceNotFound, "read %s: %s", params.Path, rerr.Error())
 	}
@@ -156,17 +225,24 @@ func (b *Bridge) fsWrite(params writeTextFileParams) *rpcError {
 	if err != nil {
 		return rpcErr(codeInternalError, "%s", err.Error())
 	}
-	full, cerr := confine(root, params.Path)
+	rt, rel, cerr := openConfined(root, params.Path)
 	if cerr != nil {
 		return rpcErr(codeResourceNotFound, "%s", cerr.Error())
 	}
-	if dir := filepath.Dir(full); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return rpcErr(codeInternalError, "write %s: %s", params.Path, err.Error())
-		}
+	defer rt.Close()
+	if merr := mkdirAllRoot(rt, rel); merr != nil {
+		return rpcErr(codeInternalError, "write %s: %s", params.Path, merr.Error())
 	}
-	if err := os.WriteFile(full, []byte(params.Content), 0o644); err != nil {
-		return rpcErr(codeInternalError, "write %s: %s", params.Path, err.Error())
+	f, werr := rt.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if werr != nil {
+		return rpcErr(codeInternalError, "write %s: %s", params.Path, werr.Error())
+	}
+	if _, werr = f.WriteString(params.Content); werr != nil {
+		f.Close()
+		return rpcErr(codeInternalError, "write %s: %s", params.Path, werr.Error())
+	}
+	if werr = f.Close(); werr != nil {
+		return rpcErr(codeInternalError, "write %s: %s", params.Path, werr.Error())
 	}
 	return nil
 }

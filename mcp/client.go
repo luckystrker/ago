@@ -53,7 +53,10 @@ const maxToolPages = 100
 // in flight. A Client is safe for concurrent use.
 //
 // AGO-DEVIATION: the exported operations carry no context.Context (the porting
-// brief pins the signatures); they run on context.Background().
+// brief pins the signatures); they run on context.Background(). The transports
+// still cap every exchange with their own deadline (MCPServerConfig.Timeout,
+// MCPStdioConfig.Timeout), so a hung server fails the call after the deadline
+// instead of holding this Client's lock forever.
 type Client struct {
 	kind     configKind
 	httpCfg  *MCPServerConfig
@@ -221,6 +224,15 @@ func (c *Client) request(ctx context.Context, method string, params any) (json.R
 	}
 	c.nextID++
 	res, err := c.tr.call(ctx, c.nextID, method, params)
+	if errors.Is(err, ErrTimeout) {
+		// The exchange missed its deadline and the transport killed the
+		// connection (a stdio subprocess, or an HTTP request cut mid-flight).
+		// The session is broken: drop it so the next operation rebuilds one
+		// instead of writing into dead pipes.
+		c.tr.close()
+		c.ready = false
+		return res, err
+	}
 	if !errors.Is(err, errSessionExpired) {
 		return res, err
 	}

@@ -3,8 +3,11 @@ package knowledge
 import (
 	"bytes"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -549,5 +552,194 @@ func TestEventLogWriterReplayMissingStream(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("replay missing stream = %v, want empty", got)
+	}
+}
+
+// TestDiskStoreSymlinkTraversal closes the symlink hole of the purely lexical
+// escape check (audit L-22): a symlink stored inside the root must not turn
+// store paths into reads or writes outside it.
+func TestDiskStoreSymlinkTraversal(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOPSECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(root, "leak.txt")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "outdir")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	s := NewDiskStore(root)
+
+	if _, err := s.Read("/leak.txt"); !errors.Is(err, ErrTraversal) {
+		t.Errorf("read via file symlink: err = %v, want ErrTraversal", err)
+	}
+	if _, err := s.Read("/outdir/secret.txt"); !errors.Is(err, ErrTraversal) {
+		t.Errorf("read via dir symlink: err = %v, want ErrTraversal", err)
+	}
+	if err := s.Write("/leak.txt", []byte("evil")); !errors.Is(err, ErrTraversal) {
+		t.Errorf("write via file symlink: err = %v, want ErrTraversal", err)
+	}
+	if err := s.Write("/outdir/new.txt", []byte("evil")); !errors.Is(err, ErrTraversal) {
+		t.Errorf("write via dir symlink: err = %v, want ErrTraversal", err)
+	}
+	if err := s.Append("/outdir/new.txt", []byte("evil")); !errors.Is(err, ErrTraversal) {
+		t.Errorf("append via dir symlink: err = %v, want ErrTraversal", err)
+	}
+	if err := s.Delete("/leak.txt"); !errors.Is(err, ErrTraversal) {
+		t.Errorf("delete file symlink: err = %v, want ErrTraversal", err)
+	}
+	if err := s.Delete("/outdir"); !errors.Is(err, ErrTraversal) {
+		t.Errorf("delete dir symlink: err = %v, want ErrTraversal", err)
+	}
+	if _, err := s.List("/outdir"); !errors.Is(err, ErrTraversal) {
+		t.Errorf("list dir symlink: err = %v, want ErrTraversal", err)
+	}
+	if s.Exists("/leak.txt") {
+		t.Error("exists via outside symlink = true, want false")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("write escaped root through symlink (stat err = %v)", err)
+	}
+	got, err := os.ReadFile(secret)
+	if err != nil || string(got) != "TOPSECRET" {
+		t.Errorf("outside file damaged through symlink: (%q, %v)", got, err)
+	}
+
+	// A symlink that resolves inside the root keeps working.
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "in.txt"), []byte("inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, filepath.Join(root, "alias")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	data, err := s.Read("/alias/in.txt")
+	if err != nil || string(data) != "inside" {
+		t.Errorf("read via inside symlink = (%q, %v), want inside", data, err)
+	}
+	if err := s.Write("/alias/written.txt", []byte("w")); err != nil {
+		t.Errorf("write via inside symlink: %v", err)
+	} else if _, err := os.Stat(filepath.Join(realDir, "written.txt")); err != nil {
+		t.Errorf("write via inside symlink landed nowhere: %v", err)
+	}
+}
+
+// TestDiskStoreDeleteRoot proves Delete refuses to wipe the whole store
+// (audit L-22).
+func TestDiskStoreDeleteRoot(t *testing.T) {
+	root := t.TempDir()
+	s := NewDiskStore(root)
+	if err := s.Write("/memory/working.md", []byte("state")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for _, p := range []string{"/", "", "//"} {
+		if err := s.Delete(p); !errors.Is(err, ErrDeleteRoot) {
+			t.Errorf("delete %q: err = %v, want ErrDeleteRoot", p, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "memory", "working.md")); err != nil {
+		t.Errorf("delete root removed store content: %v", err)
+	}
+}
+
+// TestDiskStoreWritePermsAndAtomicity checks the audit L-22 hardening of the
+// write path: owner-only permissions (where the OS models them) and an atomic
+// replace that leaves no temporary files behind.
+func TestDiskStoreWritePermsAndAtomicity(t *testing.T) {
+	root := t.TempDir()
+	s := NewDiskStore(root)
+
+	if err := s.Write("/a/b/file.txt", []byte("one")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := s.Write("/a/b/file.txt", []byte("two")); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if err := s.Append("/a/b/log.txt", []byte("l")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	got, err := s.Read("/a/b/file.txt")
+	if err != nil || string(got) != "two" {
+		t.Fatalf("read after overwrite = (%q, %v), want two", got, err)
+	}
+
+	var leftovers []string
+	err = filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(e.Name(), tmpPrefix) {
+			leftovers = append(leftovers, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk store tree: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("write left temporaries behind: %v", leftovers)
+	}
+
+	if runtime.GOOS != "windows" {
+		// Directories 0700, files 0600: transcripts stay owner-only.
+		for _, tc := range []struct {
+			path string
+			want fs.FileMode
+		}{
+			{filepath.Join(root, "a"), 0o700},
+			{filepath.Join(root, "a", "b"), 0o700},
+			{filepath.Join(root, "a", "b", "file.txt"), 0o600},
+			{filepath.Join(root, "a", "b", "log.txt"), 0o600},
+		} {
+			info, err := os.Stat(tc.path)
+			if err != nil {
+				t.Fatalf("stat %s: %v", tc.path, err)
+			}
+			if info.Mode().Perm() != tc.want {
+				t.Errorf("%s perm = %o, want %o", tc.path, info.Mode().Perm(), tc.want)
+			}
+		}
+	}
+}
+
+// TestEventLogWriterPersistAtomicRewrite proves Persist replaces the whole log
+// through the atomic Write path: the previous content is fully gone and no
+// temporaries survive next to the log (audit L-22).
+func TestEventLogWriterPersistAtomicRewrite(t *testing.T) {
+	store := NewDiskStore(t.TempDir())
+	w := NewEventLogWriter(store)
+
+	for _, c := range []string{"old-1", "old-2"} {
+		if err := w.AppendEvent("s1", events.TextInput{Content: c}); err != nil {
+			t.Fatalf("append %s: %v", c, err)
+		}
+	}
+	if err := w.Persist("s1", []events.Event{events.TextInput{Content: "new"}}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	got, err := w.Replay("s1")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("replay after persist = %d events, want exactly 1", len(got))
+	}
+	if in, ok := got[0].(*events.TextInput); !ok || in.Content != "new" {
+		t.Errorf("replayed event = %#v, want TextInput{Content:new}", got[0])
+	}
+
+	entries, err := store.List("/" + LogsDir)
+	if err != nil {
+		t.Fatalf("list logs: %v", err)
+	}
+	if len(entries) != 1 || entries[0] != "s1.jsonl" {
+		t.Fatalf("logs dir = %v, want exactly [s1.jsonl]", entries)
 	}
 }

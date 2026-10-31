@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+
+	"github.com/luckystrker/ago/toolpacks"
 )
 
 // Mediated terminals for the Bridge role (Python parity: bridge.py
@@ -25,12 +27,14 @@ import (
 // output → {output, truncated, exitStatus?}; wait_for_exit → {exitCode,
 // signal?}; kill and release answer {}.
 type createTerminalParams struct {
-	SessionID       string        `json:"sessionId"`
-	Command         string        `json:"command"`
-	Args            []string      `json:"args"`
-	Env             []envVariable `json:"env"`
-	CWD             string        `json:"cwd"`
-	OutputByteLimit int           `json:"outputByteLimit"`
+	SessionID string        `json:"sessionId"`
+	Command   string        `json:"command"`
+	Args      []string      `json:"args"`
+	Env       []envVariable `json:"env"`
+	CWD       string        `json:"cwd"`
+	// OutputByteLimit caps the captured output. Unset (or non-positive) falls
+	// back to defaultTerminalOutputLimit — capture is always bounded.
+	OutputByteLimit int `json:"outputByteLimit"`
 }
 
 type envVariable struct {
@@ -67,14 +71,17 @@ type terminalIDParams struct {
 // Safe for concurrent use.
 type terminalManager struct {
 	root string
+	// inheritEnv is the full-inheritance opt-in (FSConfig.TerminalInheritEnv):
+	// without it the child starts from the shared whitelist only.
+	inheritEnv bool
 
 	mu        sync.Mutex
 	terminals map[string]*managedTerminal
 	counter   int
 }
 
-func newTerminalManager(root string) *terminalManager {
-	return &terminalManager{root: root, terminals: map[string]*managedTerminal{}}
+func newTerminalManager(root string, inheritEnv bool) *terminalManager {
+	return &terminalManager{root: root, inheritEnv: inheritEnv, terminals: map[string]*managedTerminal{}}
 }
 
 // managedTerminal is one running command with capped output capture.
@@ -88,6 +95,15 @@ type managedTerminal struct {
 	done chan struct{} // closed after the command exited and the output drained
 	exit *exitStatus
 }
+
+// defaultTerminalOutputLimit caps the captured output of a terminal whose
+// create request set no outputByteLimit. The ACP field is optional and Python
+// leaves an unset limit uncapped; a default here bounds the buffer a runaway
+// command (or a hostile agent) would otherwise grow without limit.
+//
+// AGO-DEVIATION: Python's TerminalManager caps only when the caller passes
+// output_byte_limit; the Go bridge always caps, at this default minimum.
+const defaultTerminalOutputLimit = 1 << 20 // 1 MiB
 
 // create starts command and returns the terminal id immediately: the command
 // runs in the background while the agent keeps working (Python parity:
@@ -107,7 +123,16 @@ func (m *terminalManager) create(params createTerminalParams) (string, *rpcError
 	}
 	cmd := exec.Command(params.Command, params.Args...)
 	cmd.Dir = cwd
-	env := append([]string(nil), os.Environ()...)
+	// The child environment is the disclosure channel audit H-6 closed in
+	// toolpacks: the agent's command line is model-controlled, so one `env`
+	// would hand the model every key of the parent process (OPENAI_API_KEY
+	// included). The same shared whitelist builds the environment here —
+	// full inheritance only through the explicit opt-in.
+	//
+	// AGO-DEVIATION: Python's TerminalManager inherits the complete parent
+	// environment; AGo defaults to the whitelist (security audit 2026-10-31,
+	// H-6), full inheritance is opt-in via FSConfig.TerminalInheritEnv.
+	env := toolpacks.InheritedEnv(m.inheritEnv)
 	for _, kv := range params.Env {
 		env = append(env, kv.Name+"="+kv.Value)
 	}
@@ -120,7 +145,11 @@ func (m *terminalManager) create(params createTerminalParams) (string, *rpcError
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 
-	term := &managedTerminal{limit: params.OutputByteLimit, cmd: cmd, done: make(chan struct{})}
+	limit := params.OutputByteLimit
+	if limit <= 0 {
+		limit = defaultTerminalOutputLimit
+	}
+	term := &managedTerminal{limit: limit, cmd: cmd, done: make(chan struct{})}
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
@@ -284,7 +313,7 @@ func (b *Bridge) requireTerms(method string) *rpcError {
 	}
 	b.termsOnce.Do(func() {
 		if root, err := b.FS.root(); err == nil {
-			b.terms = newTerminalManager(root)
+			b.terms = newTerminalManager(root, b.FS.TerminalInheritEnv)
 		}
 	})
 	if b.terms == nil {

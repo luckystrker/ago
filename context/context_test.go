@@ -3,6 +3,7 @@ package context
 import (
 	stdcontext "context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -230,5 +231,92 @@ func TestAskHookFailureKeepsFailureAtDeadline(t *testing.T) {
 	var te *hitl.TimeoutError
 	if errors.As(err, &te) {
 		t.Fatal("hook failure must not classify as TimeoutError")
+	}
+}
+
+// TestTurnContextCarried pins the SetTurnContext/TurnContext contract used to
+// propagate turn cancellation into hook-bearing code that sees no stdlib
+// context parameter (audit M-26).
+func TestTurnContextCarried(t *testing.T) {
+	c := New(stream.NewMemoryStream())
+	if c.TurnContext() != stdcontext.Background() {
+		t.Fatal("unset turn context must be Background")
+	}
+	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
+	defer cancel()
+	c.SetTurnContext(ctx)
+	if c.TurnContext() != ctx {
+		t.Fatal("TurnContext must return the installed context")
+	}
+	if c.Clone().TurnContext() != ctx {
+		t.Fatal("a clone must carry the turn context")
+	}
+	c.SetTurnContext(nil)
+	if c.TurnContext() != stdcontext.Background() {
+		t.Fatal("a cleared turn context must fall back to Background")
+	}
+}
+
+// TestAskSanitizesUntrustedTimeout pins audit L-19: NaN, infinite and negative
+// timeouts coming from untrusted events must behave as "no deadline" instead of
+// corrupting the deadline arithmetic (a +Inf conversion to Duration is
+// undefined and effectively fires immediately).
+func TestAskSanitizesUntrustedTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout float64
+	}{
+		{"nan", math.NaN()},
+		{"pos-inf", math.Inf(1)},
+		{"neg-inf", math.Inf(-1)},
+		{"negative", -7},
+		{"huge-finite", 1e12}, // overflows the Duration conversion
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			answer := make(chan struct{})
+			c := New(stream.NewMemoryStream())
+			c.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
+				<-answer
+				return &events.HumanMessage{Content: "ok"}, nil
+			})
+			type out struct {
+				val string
+				err error
+			}
+			got := make(chan out, 1)
+			go func() {
+				v, err := c.Ask(stdcontext.Background(), &events.HumanInputRequest{Content: "q", Timeout: tc.timeout})
+				got <- out{v, err}
+			}()
+			select {
+			case r := <-got:
+				t.Fatalf("Ask returned (%q, %v) before the hook answered: bad timeout became a live deadline", r.val, r.err)
+			case <-time.After(200 * time.Millisecond):
+			}
+			close(answer)
+			select {
+			case r := <-got:
+				if r.err != nil || r.val != "ok" {
+					t.Fatalf("Ask = (%q, %v), want (ok, nil)", r.val, r.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Ask did not return after the hook answered")
+			}
+		})
+	}
+}
+
+// TestAskAppliesFiniteTimeout is the positive control for the sanitization
+// above: a small finite timeout still fires as a hitl timeout.
+func TestAskAppliesFiniteTimeout(t *testing.T) {
+	c := New(stream.NewMemoryStream())
+	c.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
+		<-hctx.Done()
+		return nil, hctx.Err()
+	})
+	_, err := c.Ask(stdcontext.Background(), &events.HumanInputRequest{Content: "q", Timeout: 0.05})
+	var te *hitl.TimeoutError
+	if !errors.As(err, &te) {
+		t.Fatalf("want *hitl.TimeoutError, got %v", err)
 	}
 }

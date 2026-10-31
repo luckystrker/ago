@@ -46,6 +46,13 @@ type MCPStdioConfig struct {
 	Env []string
 	// CWD is the subprocess working directory; empty inherits the parent's.
 	CWD string
+	// Timeout bounds one exchange — writing the request line and waiting for
+	// the matching reply. Zero means the default (30s, the same cap the HTTP
+	// branch gets via connection_timeout); a negative value removes the cap.
+	// AGO-DEVIATION: Python's MCPStdioServerConfig has no timeout — a hung
+	// subprocess there blocks the tool call forever; AGo fails the exchange,
+	// kills the subprocess and rebuilds the session on the next operation.
+	Timeout time.Duration
 	// AllowedTools lists the server-side tool names to expose; nil means all.
 	// AGO-DEVIATION: the brief's struct sketch omitted the filter fields, but
 	// Tools() must filter both transports — they match Python's

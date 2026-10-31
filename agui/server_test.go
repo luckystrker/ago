@@ -520,3 +520,34 @@ func TestServerCloseReleasesHeldTurns(t *testing.T) {
 		t.Fatal("Close left the question held")
 	}
 }
+
+// A Guard given to the Server applies to the endpoint it serves.
+func TestServerGuardAppliesToEndpoint(t *testing.T) {
+	_, _, h := askingServer(t, WithGuard(NewGuard(WithAuthToken("s3cret"))))
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Post(ts.URL, "application/json", strings.NewReader(runBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("POST without the token: status = %d, want 401", resp.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader(runBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer s3cret")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post with the token: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("POST with the token: status = %d, want 200", resp2.StatusCode)
+	}
+}

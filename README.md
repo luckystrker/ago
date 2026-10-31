@@ -175,6 +175,44 @@ func main() {
 | [docs/PORT_STATUS.md](docs/PORT_STATUS.md) | what is ported / partial / stubbed / deferred |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | 70+ decision records behind every deviation from Python |
 
+## 🔐 Security
+
+Read this before wiring AGo to a network. The framework's safety posture is "the
+deployment is the security boundary" — three consequences matter:
+
+**Network handlers ship with no authentication on by default.** Every HTTP/WebSocket
+surface — `a2a`, `mcpserver`, `agui`, `a2ui`, the `contrib/wslink` link — is a plain
+`http.Handler` that does not verify the caller unless you turn something on: no token
+check, no Origin/Host fence, no rate limit. This is deliberate (Go services wrap
+handlers with their own middleware), but it means a default-configured endpoint accepts
+anyone who can reach it — on `a2a`, `message/send` drives the agent's LLM spend and
+tools, and `tasks/get` returns conversation history. Therefore:
+
+- keep the listener on **loopback** (`127.0.0.1`), or
+- expose it only **behind an authenticating reverse proxy** and **enable the built-in
+  auth hooks** — `a2a.ServerConfig.Authorize`, `mcpserver.ServerConfig.Authorize`,
+  `a2ui.WithAuthToken` — or wrap the handler in your own auth middleware
+  (`agui` and `contrib/wslink` rely on the wrapper).
+
+Never bind a default-configured handler to a non-loopback interface.
+
+**Shell and the code runner are not sandboxes.** `toolpacks.NewShellTool` and
+`toolpacks.NewLocalCodeRunner` execute LLM-controlled commands and code on the host with
+the full permissions of the process. There is no filesystem, network or memory
+isolation — only a timeout, an output cap, an optional env allowlist and (for code) a
+language allowlist; the Docker/Daytona sandbox backends of Python AG2 are not ported.
+The shell block-pattern option is advisory filtering, not a security boundary. Treat
+both tools as *executes arbitrary code by design*: wire the approval middleware
+(`middleware.Approval`) or a HITL hook on every agent that carries them, and assume that
+one prompt injection in any untrusted input the agent reads (search results, fetched
+files, skill resources) is enough to reach that code execution.
+
+**Outbound HTTP honors `HTTP_PROXY`/`HTTPS_PROXY` from the environment.** Provider
+clients, MCP and the A2A client ride `net/http`, so ambient proxy variables apply to
+every outbound request — standard Go behavior, not an AGo feature or bug. If a
+production profile must not route LLM traffic through the ambient proxy, override it on
+a custom transport (`http.Transport.Proxy = nil`).
+
 ## 💡 Examples
 
 All examples run offline on scripted models — clone and `go run ./examples/<name>`:

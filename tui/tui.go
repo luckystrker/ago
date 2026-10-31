@@ -78,7 +78,9 @@ func REPL(a *agent.Agent, in io.Reader, out io.Writer, opts ...Option) error {
 		if err != nil {
 			// The turn failed; keep the previous conversation so the user can
 			// retry, and stay in the loop.
-			if _, werr := fmt.Fprintf(out, "error: %v\n", err); werr != nil {
+			// Error texts from providers can echo untrusted response bodies,
+			// so they go through the same terminal sanitizer.
+			if _, werr := fmt.Fprintf(out, "error: %s\n", sanitizeTerminal(err.Error())); werr != nil {
 				return fmt.Errorf("tui: write error: %w", werr)
 			}
 		}
@@ -93,7 +95,9 @@ func blockingTurn(a *agent.Agent, prev *agent.AgentReply, text string, out io.Wr
 		return prev, err
 	}
 	if body := reply.Body(); body != "" {
-		if _, err := fmt.Fprintln(out, body); err != nil {
+		// Model text is untrusted; strip terminal control data before it
+		// reaches out (audit H-10, ANSI/OSC injection).
+		if _, err := fmt.Fprintln(out, sanitizeTerminal(body)); err != nil {
 			return reply, fmt.Errorf("tui: write reply: %w", err)
 		}
 	}
@@ -115,6 +119,10 @@ func streamingTurn(a *agent.Agent, prev *agent.AgentReply, text string, out io.W
 
 	var mu sync.Mutex
 	var streamed strings.Builder
+	// san carries an incomplete escape sequence across deltas, so a sequence
+	// split by the provider's chunking is swallowed whole instead of leaking
+	// half of it (audit H-10).
+	var san sanitizer
 	sub := run.Stream().Subscribe(func(ev events.Event) error {
 		chunk, ok := events.AsValue(ev).(events.ModelMessageChunk)
 		if !ok {
@@ -123,7 +131,7 @@ func streamingTurn(a *agent.Agent, prev *agent.AgentReply, text string, out io.W
 		mu.Lock()
 		defer mu.Unlock()
 		streamed.WriteString(chunk.Content)
-		if _, err := io.WriteString(out, chunk.Content); err != nil {
+		if _, err := io.WriteString(out, san.push(chunk.Content)); err != nil {
 			return fmt.Errorf("tui: write chunk: %w", err)
 		}
 		return nil
@@ -144,7 +152,8 @@ func streamingTurn(a *agent.Agent, prev *agent.AgentReply, text string, out io.W
 		}
 	}
 	if body := reply.Body(); body != "" && body != joined {
-		if _, err := fmt.Fprintln(out, body); err != nil {
+		// Untrusted model text; sanitized like every other write (H-10).
+		if _, err := fmt.Fprintln(out, sanitizeTerminal(body)); err != nil {
 			return reply, fmt.Errorf("tui: write reply: %w", err)
 		}
 	}

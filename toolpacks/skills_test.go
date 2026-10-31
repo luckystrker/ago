@@ -118,6 +118,60 @@ func TestSkillsToolkitResourceRead(t *testing.T) {
 	}
 }
 
+// TestSkillsToolkitSymlinkEscape: a resource (or SKILL.md) swapped for a
+// symlink pointing outside the skills directory must not read its target —
+// the model-facing read fails closed instead (audit M-18). Skipped where
+// symlinks cannot be created.
+func TestSkillsToolkitSymlinkEscape(t *testing.T) {
+	root := newSkillsFixture(t)
+	secret := filepath.Join(filepath.Dir(root), "id_rsa")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY MATERIAL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	relLink := filepath.Join(root, "alpha", "references", "leak.md")
+	if err := os.Symlink(secret, relLink); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	// An in-root symlink, discovered with the rest: reading it must still work
+	// — the check confines, it does not ban symlinks outright.
+	if err := os.Symlink(filepath.Join(root, "alpha", "references", "guide.md"),
+		filepath.Join(root, "alpha", "references", "inner.md")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+
+	st, err := NewSkillsToolkit(root)
+	if err != nil {
+		t.Fatalf("NewSkillsToolkit: %v", err)
+	}
+	_, cx := newTestContext()
+
+	// The link is advertised (it lives in the skill directory), but reading it
+	// is refused rather than following it out.
+	ev := callTool(t, st, cx, "read_skill_resource", `{"name":"alpha","resource":"references/leak.md"}`)
+	got := resultPartText(t, ev)
+	if !strings.Contains(got, "TOOL_ERROR") || strings.Contains(got, "PRIVATE KEY") {
+		t.Fatalf("symlinked resource read = %q, want a refusal without the target", got)
+	}
+
+	// An in-root symlink still reads through.
+	ev = callTool(t, st, cx, "read_skill_resource", `{"name":"alpha","resource":"references/inner.md"}`)
+	if got := resultPartText(t, ev); !strings.Contains(got, "Step one.") {
+		t.Fatalf("in-root symlink resource read = %q, want the target content", got)
+	}
+
+	// load_skill resolves SKILL.md the same way: a symlinked SKILL.md outside
+	// the directory is a refusal, not a read.
+	if err := os.Remove(filepath.Join(root, "beta", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(root, "beta", "SKILL.md")); err == nil {
+		ev := callTool(t, st, cx, "load_skill", `{"name":"beta"}`)
+		if got := resultPartText(t, ev); !strings.Contains(got, "TOOL_ERROR") || strings.Contains(got, "PRIVATE KEY") {
+			t.Fatalf("symlinked SKILL.md load = %q, want a refusal without the target", got)
+		}
+	}
+}
+
 func TestSkillsToolkitNameEnum(t *testing.T) {
 	st, err := NewSkillsToolkit(newSkillsFixture(t))
 	if err != nil {

@@ -63,6 +63,15 @@ func typeSchema(t reflect.Type, inProgress map[reflect.Type]bool) (map[string]an
 	if isScalarKind(t.Kind()) {
 		return scalarSchema(t, fieldTags{})
 	}
+	// Cycles can enter through any compound kind (struct field, slice element,
+	// map value, pointer target), so the guard must sit here, before the kind
+	// switch — a recursive type would otherwise exhaust the stack, and a Go
+	// process cannot recover from that.
+	if inProgress[t] {
+		return nil, fmt.Errorf("response: recursive type %s is not supported", t)
+	}
+	inProgress[t] = true
+	defer delete(inProgress, t)
 	switch t.Kind() {
 	case reflect.Struct:
 		return structSchema(t, inProgress)
@@ -83,12 +92,6 @@ func typeSchema(t reflect.Type, inProgress map[reflect.Type]bool) (map[string]an
 }
 
 func structSchema(t reflect.Type, inProgress map[reflect.Type]bool) (map[string]any, error) {
-	if inProgress[t] {
-		return nil, fmt.Errorf("response: recursive type %s is not supported", t)
-	}
-	inProgress[t] = true
-	defer delete(inProgress, t)
-
 	properties := make(map[string]any)
 	required := []string{} // always non-nil: an object schema carries "required" even when empty
 	for i := 0; i < t.NumField(); i++ {
@@ -104,7 +107,8 @@ func structSchema(t reflect.Type, inProgress map[reflect.Type]bool) (map[string]
 					// embedding time.Time promotes only its unexported fields
 					continue
 				}
-				sub, err := structSchema(embedded, inProgress)
+				// Route through typeSchema so the embedded type is cycle-marked too.
+				sub, err := typeSchema(embedded, inProgress)
 				if err != nil {
 					return nil, err
 				}

@@ -60,12 +60,14 @@ func (p *AlertPolicy) Apply(prompts []string, evs []events.Event, ctx *agocontex
 
 	// AGO-DEVIATION: Python adds one "[FATAL ALERT]" prompt note (D-030) and a
 	// joined block instead of these per-alert lines (D-030); the split into
-	// inject-everything-non-fatal + halt-on-first-fatal is Python parity.
+	// inject-everything-non-fatal + halt-on-first-fatal is Python parity. Each
+	// line is fenced with wrapUntrusted: the message is model/observer-writable
+	// and must read as data, not instructions (audit L-25).
 	for _, a := range fresh {
 		if a.Severity == events.SeverityFatal {
 			continue // fatal alerts ride the HaltEvent below, not the prompt
 		}
-		prompts = append(prompts, fmt.Sprintf("alert(%s) from %s: %s", a.Severity, a.Source, a.Message))
+		prompts = append(prompts, wrapUntrusted(fmt.Sprintf("alert(%s) from %s: %s", a.Severity, a.Source, a.Message)))
 	}
 	for _, a := range fresh {
 		if a.Severity != events.SeverityFatal {

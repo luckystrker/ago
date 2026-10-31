@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"testing"
 	"time"
 
@@ -302,5 +303,82 @@ func TestSendErrHandledSwallowsWithoutPersist(t *testing.T) {
 	}
 	if h, _ := s.History().GetEvents(); len(h) != 1 {
 		t.Fatalf("delivered event must persist, got %d events", len(h))
+	}
+}
+
+// TestGetBuffersBurst pins audit L-21: Get must not drop matching events when a
+// burst exceeds any fixed channel capacity — the answer to a HITL question has
+// to survive whatever else arrives around it.
+func TestGetBuffersBurst(t *testing.T) {
+	s := NewMemoryStream(WithLogger(discardLogger()))
+	const burst = 64
+	got := make(chan events.Event, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ev, err := s.Get(context.Background(), events.TypeOf[events.ModelMessage]())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		got <- ev
+	}()
+	time.Sleep(100 * time.Millisecond) // let Get's subscription register
+	for i := 0; i < burst; i++ {
+		if err := s.Send(&events.ModelMessage{Content: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	select {
+	case ev := <-got:
+		if m, ok := events.AsValue(ev).(events.ModelMessage); !ok || m.Content != "0" {
+			t.Fatalf("first matching event lost or reordered: %#v", ev)
+		}
+	case err := <-errCh:
+		t.Fatalf("get: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Get lost the matching events under burst")
+	}
+}
+
+// TestInboxCapEvictsOldest pins audit M-28: with WithInboxCap set, an Enqueue
+// past the cap evicts the oldest pending request instead of growing forever.
+func TestInboxCapEvictsOldest(t *testing.T) {
+	s := NewMemoryStream(WithLogger(discardLogger()), WithInboxCap(2))
+	for i := 0; i < 3; i++ {
+		if err := s.Enqueue(&events.TextInput{Content: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+	pending := s.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d requests, want 2", len(pending))
+	}
+	for i, want := range []string{"1", "2"} {
+		if ti, ok := pending[i].Parts[0].(*events.TextInput); !ok || ti.Content != want {
+			t.Fatalf("pending[%d] = %#v, want TextInput %q", i, pending[i].Parts[0], want)
+		}
+	}
+}
+
+// TestTranscriptCapEvictsOldest pins audit M-28: with WithTranscriptCap set,
+// writes past the cap evict the oldest events from the durable transcript.
+func TestTranscriptCapEvictsOldest(t *testing.T) {
+	s := NewMemoryStream(WithLogger(discardLogger()), WithTranscriptCap(3))
+	for i := 0; i < 5; i++ {
+		if err := s.Send(&events.HumanMessage{Content: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	evs, err := s.History().GetEvents()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(evs) != 3 {
+		t.Fatalf("transcript = %d events, want 3", len(evs))
+	}
+	for i, want := range []string{"2", "3", "4"} {
+		if hm, ok := events.AsValue(evs[i]).(events.HumanMessage); !ok || hm.Content != want {
+			t.Fatalf("evs[%d] = %#v, want HumanMessage %q", i, evs[i], want)
+		}
 	}
 }

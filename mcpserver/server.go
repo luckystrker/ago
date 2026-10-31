@@ -10,6 +10,11 @@
 // state across calls — conversation sessions, paused runs, MCP Apps UI, OAuth
 // resource-server security — is deferred (docs/DECISIONS.md D-056); the server
 // is stateless, and every tools/call runs an independent exchange.
+//
+// Deployment gates that carry no server state exist as plain config: an
+// Authorize hook gates the protocol surface (initialize and the tools
+// methods), Host/Origin allowlists gate the HTTP transport, and the stdio
+// loop runs each exchange on its own deadline.
 package mcpserver
 
 import (
@@ -22,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/luckystrker/ago/agent"
 	agocontext "github.com/luckystrker/ago/context"
@@ -51,6 +57,20 @@ const (
 	defaultServerName    = "ago-mcp-server"
 	defaultServerVersion = "0.0.0" // Python parity: _DEFAULT_VERSION
 	defaultToolName      = "ask"
+
+	// defaultMaxStreams caps the concurrent GET listener streams when
+	// ServerConfig.MaxStreams is unset. The streamable-HTTP shape is one
+	// stream per client session, so the cap leaves room for a fleet of local
+	// clients while bounding what a stream-opening loop can pin — each held
+	// GET is one connection plus one goroutine until the client goes away.
+	defaultMaxStreams = 64
+
+	// defaultCallTimeout bounds one stdio exchange when ServerConfig.
+	// CallTimeout is unset: far above a legitimate agent turn, far below the
+	// forever a stuck handler would otherwise hold the single-threaded loop.
+	// Raise it — or disable it with any negative value — when an exchange
+	// legitimately runs longer, e.g. behind a human-approval gate.
+	defaultCallTimeout = 10 * time.Minute
 )
 
 // ServerConfig wires a Server.
@@ -85,6 +105,64 @@ type ServerConfig struct {
 
 	// ToolDescription overrides the conversational tool's description.
 	ToolDescription string
+
+	// Authorize gates the protocol surface: it runs before dispatch on every
+	// initialize and tools/* message, and a returned error refuses the call
+	// with a fixed unauthorized error (the error text stays off the wire; a
+	// refused notification is dropped, since no caller is waiting). It must
+	// be safe for concurrent use. Nil leaves the surface open — do not
+	// expose a server beyond loopback without either this hook or an
+	// authenticating proxy in front of it.
+	//
+	// The ctx carries the caller's transport: over HTTP,
+	// RequestFromContext returns the originating request (headers, remote
+	// address) for credential checks; over stdio it returns nil, and the
+	// hook can still gate by method.
+	//
+	// AGO-DEVIATION: Python gates the surface with an OAuth 2.1 resource
+	// server requirement (security.py — bearer middleware answering HTTP
+	// 401); the Go subset takes this plain hook, and the OAuth routes stay
+	// deferred with D-058.
+	Authorize func(ctx context.Context, method string) error
+
+	// MaxStreams caps how many GET listener streams the HTTP transport holds
+	// open at once; a GET over the cap is answered 503 and holds nothing.
+	// Zero means defaultMaxStreams. AGO-DEVIATION: the ported transport has
+	// no such cap (D-058); without one, a loop of GETs exhausts connections
+	// and goroutines because this subset holds each stream until the client
+	// goes away, with no idle reaping.
+	MaxStreams int
+
+	// CallTimeout bounds one stdio exchange: when it fires, the exchange's
+	// context is canceled, its reply carries the failure, and the loop reads
+	// the next message instead of blocking forever. The bound only
+	// interrupts handlers that honor their context — one that blocks outside
+	// it cannot be stopped in-process. Zero means defaultCallTimeout; any
+	// negative value disables the bound.
+	//
+	// AGO-DEVIATION: the ported stdio loop runs on context.Background()
+	// (D-058); one stuck tool would otherwise stop the transport forever.
+	CallTimeout time.Duration
+
+	// AllowedHosts, when non-empty, admits on the HTTP transport only
+	// requests whose Host header matches one entry exactly (host or
+	// host:port, case-insensitive); anything else answers 403. This closes
+	// DNS-rebinding against loopback deployments, where a rebinding page
+	// reaches the server with its own Host. Nil disables the check.
+	//
+	// AGO-DEVIATION: TransportConfig's validation deltas were deferred with
+	// the OAuth surface (D-058); this allowlist is the Go-native stand-in.
+	AllowedHosts []string
+
+	// AllowedOrigins, when non-empty, requires every HTTP request carrying
+	// an Origin header (browsers send it cross-origin) to match one entry
+	// exactly (scheme://host[:port], case-insensitive); anything else
+	// answers 403. Requests without Origin — every native MCP client — pass,
+	// so this is a browser-request fence, not authentication. Nil disables
+	// the check.
+	//
+	// AGO-DEVIATION: as AllowedHosts.
+	AllowedOrigins []string
 }
 
 // ServerOption overrides ServerConfig fields for NewServerForAgent.
@@ -116,6 +194,34 @@ func WithTools(ts ...tools.Tool) ServerOption {
 	return func(c *ServerConfig) { c.Tools = append(c.Tools, ts...) }
 }
 
+// WithAuthorize sets the hook gating initialize and tools/*; see
+// ServerConfig.Authorize.
+func WithAuthorize(fn func(ctx context.Context, method string) error) ServerOption {
+	return func(c *ServerConfig) { c.Authorize = fn }
+}
+
+// WithMaxStreams caps the concurrent GET listener streams; see
+// ServerConfig.MaxStreams.
+func WithMaxStreams(n int) ServerOption { return func(c *ServerConfig) { c.MaxStreams = n } }
+
+// WithCallTimeout bounds one stdio exchange; a negative value disables the
+// bound (see ServerConfig.CallTimeout).
+func WithCallTimeout(d time.Duration) ServerOption {
+	return func(c *ServerConfig) { c.CallTimeout = d }
+}
+
+// WithAllowedHosts restricts the Host values the HTTP transport serves; see
+// ServerConfig.AllowedHosts.
+func WithAllowedHosts(hosts ...string) ServerOption {
+	return func(c *ServerConfig) { c.AllowedHosts = hosts }
+}
+
+// WithAllowedOrigins restricts the browser origins the HTTP transport
+// serves; see ServerConfig.AllowedOrigins.
+func WithAllowedOrigins(origins ...string) ServerOption {
+	return func(c *ServerConfig) { c.AllowedOrigins = origins }
+}
+
 // toolEntry is one advertised MCP tool: its declaration and the way a call
 // runs. Instances are immutable after NewServer.
 type toolEntry struct {
@@ -133,7 +239,8 @@ type toolEntry struct {
 // is an http.Handler and Stdio() serves a process; the JSON-RPC method
 // dispatch itself is transport-independent. A Server is safe for concurrent
 // use: the tool registry is fixed at construction and the only mutable state
-// is the initialized flag (atomic).
+// is the initialized flag (atomic); the GET listener-stream slots are a
+// buffered channel.
 type Server struct {
 	name         string
 	version      string
@@ -141,6 +248,12 @@ type Server struct {
 
 	ask    *toolEntry
 	extras []*toolEntry // construction order; the ask tool is always first on the wire
+
+	authorize      func(ctx context.Context, method string) error // nil = surface open
+	streams        chan struct{}                                  // GET listener-stream slots
+	callTimeout    time.Duration                                  // stdio exchange bound; < 0 = off
+	allowedHosts   []string
+	allowedOrigins []string
 
 	initialized atomic.Bool
 }
@@ -160,6 +273,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if toolName == "" {
 		toolName = defaultToolName
 	}
+	maxStreams := cfg.MaxStreams
+	if maxStreams <= 0 {
+		maxStreams = defaultMaxStreams
+	}
+	callTimeout := cfg.CallTimeout
+	if callTimeout == 0 {
+		callTimeout = defaultCallTimeout
+	}
 
 	ask := &toolEntry{
 		name:        toolName,
@@ -174,7 +295,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return askOutcome(ctx, askCall, args)
 	}
 
-	s := &Server{name: cfg.Name, version: cfg.Version, instructions: cfg.Instructions, ask: ask}
+	s := &Server{
+		name:           cfg.Name,
+		version:        cfg.Version,
+		instructions:   cfg.Instructions,
+		ask:            ask,
+		authorize:      cfg.Authorize,
+		streams:        make(chan struct{}, maxStreams),
+		callTimeout:    callTimeout,
+		allowedHosts:   cfg.AllowedHosts,
+		allowedOrigins: cfg.AllowedOrigins,
+	}
 	seen := map[string]bool{toolName: true}
 	// The scratch context exists because the Tool contract hands Schemas a
 	// conversation context; function tools ignore it, but a caller's tool may
@@ -286,6 +417,15 @@ const (
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
 	codeInternalError  = -32603
+
+	// codeUnauthorized refuses a call whose ServerConfig.Authorize check
+	// failed. JSON-RPC reserves -32000..-32099 for implementation-defined
+	// server errors; MCP carries auth failures at the HTTP layer (401 with
+	// WWW-Authenticate), which this subset's always-JSON answers replace
+	// until the OAuth routes land (D-058) — so the refusal travels the one
+	// channel both transports share, with a fixed message (the hook's error
+	// text stays off the wire).
+	codeUnauthorized = -32001
 )
 
 type rpcRequest struct {
@@ -326,6 +466,16 @@ func (s *Server) handle(ctx context.Context, req *rpcRequest) *rpcResponse {
 	if req.Method == "" {
 		return nil // a reply to a request this server never sent
 	}
+	if s.authorize != nil && gatedMethod(req.Method) {
+		if err := s.authorize(ctx, req.Method); err != nil {
+			// A notification has no caller to answer; a refusal drops it.
+			if req.ID == nil || isNullID(req.ID) {
+				return nil
+			}
+			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
+				Error: rpcErr(codeUnauthorized, "unauthorized")}
+		}
+	}
 	if req.ID == nil || isNullID(req.ID) {
 		// A notification: only the initialized confirmation carries meaning.
 		if req.Method == "notifications/initialized" {
@@ -365,6 +515,24 @@ func (s *Server) handle(ctx context.Context, req *rpcRequest) *rpcResponse {
 		return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
 			Error: rpcErr(codeMethodNotFound, "method %q is not supported", req.Method)}
 	}
+}
+
+// gatedMethod reports whether ServerConfig.Authorize runs for a method:
+// initialize and the tools methods are everything an unauthenticated caller
+// could learn from or drive. ping and the notifications answer nothing about
+// the served agent, so they stay open.
+func gatedMethod(method string) bool {
+	return method == "initialize" || strings.HasPrefix(method, "tools/")
+}
+
+// callCtx bounds one stdio exchange (ServerConfig.CallTimeout; negative
+// disables the bound). The deadline only interrupts handlers that honor the
+// context — the loop itself stays single-threaded until the handler returns.
+func (s *Server) callCtx() (context.Context, context.CancelFunc) {
+	if s.callTimeout > 0 {
+		return context.WithTimeout(context.Background(), s.callTimeout)
+	}
+	return context.Background(), func() {}
 }
 
 // initializeResult builds the handshake answer. The requested revision is

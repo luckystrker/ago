@@ -25,10 +25,11 @@ func (r *AgentRun) executeTurn() {
 	resp, err := r.runTurn()
 	if err != nil {
 		r.err = err
-		// A failed HITL prompt leaves model-requested tool calls unanswered;
-		// repair the transcript so the next model call is valid (Python parity:
-		// close_unanswered_tool_calls on HumanInputError).
-		if isHitlFailure(err) {
+		// A failed HITL prompt or an exhausted tool-round budget leaves
+		// model-requested tool calls unanswered; repair the transcript so the
+		// next model call is valid (Python parity: close_unanswered_tool_calls
+		// on HumanInputError; the round cap is the AGo addition, audit H-11).
+		if isHitlFailure(err) || errors.Is(err, ErrMaxToolRounds) {
 			if _, rerr := r.stream.History().CloseUnanswered(); rerr != nil {
 				r.err = errors.Join(err, fmt.Errorf("agent: repair history: %w", rerr))
 			}
@@ -97,7 +98,15 @@ func (r *AgentRun) turnBody(initial *events.ModelRequest, _ *context.Context) (e
 
 	// Tool-call loop: ends when the model stops requesting tools or a final=true
 	// tool forced the response (Python parity: while tool_calls and not response_force).
+	// WithMaxToolRounds (when > 0) stops the loop after that many executed
+	// rounds — an unbounded loop lets a hostile tool result spin paid LLM calls
+	// forever (AGO-DEVIATION: Python has no cap; audit H-11).
+	rounds := 0
 	for len(resp.ToolCalls.Calls) > 0 && !resp.ResponseForce {
+		rounds++
+		if r.maxToolRounds > 0 && rounds > r.maxToolRounds {
+			return events.ModelResponse{}, fmt.Errorf("%w (budget %d)", ErrMaxToolRounds, r.maxToolRounds)
+		}
 		tce := resp.ToolCalls
 		// The executor runs inline inside this Send: tool goroutines emit
 		// ToolResultsEvent, whose subscriber is the LLM trigger; the next

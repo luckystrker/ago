@@ -45,8 +45,9 @@ type TurnResult struct {
 // requests that arrive while a reply is awaited (session/request_permission,
 // elicitation/create, and the mediated fs/* and terminal/* when FS is set)
 // are answered inline from the Permission / Elicit policies and the
-// filesystem root; a client that sends anything else gets method-not-found
-// rather than a hang.
+// filesystem root — fs/write_text_file and terminal/create additionally ride
+// the Permission policy themselves, since they act on the client's disk; a
+// client that sends anything else gets method-not-found rather than a hang.
 //
 // AGO-DEVIATION: the exported operations carry no context.Context (the porting
 // brief pins the signatures); they run on context.Background().
@@ -54,7 +55,14 @@ type Bridge struct {
 	// Permission decides the agent's session/request_permission requests.
 	// A nil policy — or a false answer — denies. An allowed request selects
 	// the agent's first allow_once/allow_always option (Python parity:
-	// permissions.resolve_permission_option_id).
+	// permissions.resolve_permission_option_id). The same policy also gates
+	// the mediated fs/write_text_file and terminal/create requests: they
+	// modify the client's disk and spawn local processes, so they take the
+	// same consent as any other consequential action.
+	//
+	// AGO-DEVIATION: Python's bridge answers the mediated fs/terminal requests
+	// without a policy gate; routing them through Permission is the fix for
+	// enabling FS silently enabling terminals.
 	Permission func(toolCall, input string) bool
 
 	// Elicit decides the agent's elicitation/create questions: the answer text
@@ -72,7 +80,22 @@ type Bridge struct {
 	// working directory — Python parity: config.fs_root or config.cwd). nil,
 	// the default, refuses every fs/* and terminal/* request with
 	// method-not-found: nothing is ever advertised that does not work.
+	// Enabling FS does not by itself allow writes or terminal creation: those
+	// still need a Permission answer that allows them.
 	FS *FSConfig
+
+	// ExchangeTimeout caps one exchange — writing a request and waiting for
+	// its reply. Zero (the default, Python parity: the bridge has no
+	// timeouts) waits forever. When the deadline passes the agent subprocess
+	// is killed and the exchange fails with ErrTimeout: the wait reads the
+	// agent's stdout directly, and closing a dead pipe from the outside is
+	// the only way it unblocks. A Bridge whose exchange timed out answers
+	// later operations with ErrProtocol/ErrClosed. Set it on the Bridge after
+	// NewBridge; the initialize handshake NewBridge runs itself is not
+	// capped.
+	//
+	// AGO-DEVIATION: no exchange deadline upstream; opt-in here.
+	ExchangeTimeout time.Duration
 
 	// Info is what the agent advertised in the initialize handshake.
 	Info AgentInfo
@@ -142,7 +165,7 @@ func (b *Bridge) start(cmdName string, args []string, env []string) error {
 			b.stop()
 			return fmt.Errorf("acp: resolve fs root: %w", rerr)
 		}
-		b.terms = newTerminalManager(root)
+		b.terms = newTerminalManager(root, b.FS.TerminalInheritEnv)
 	}
 
 	// Handshake: version offer, client capabilities, client identity. The
@@ -359,7 +382,10 @@ func (b *Bridge) stop() {
 	}
 }
 
-// exchange writes one request and reads its reply. Caller holds b.mu.
+// exchange writes one request and reads its reply. Caller holds b.mu. When
+// ExchangeTimeout is set, the deadline kills the agent on expiry — the reply
+// wait blocks in the scanner's read, so the process dying is what unblocks
+// it — and the failure is reported as ErrTimeout.
 func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string) (json.RawMessage, error) {
 	b.writeMu.Lock()
 	err := writeLine(b.stdin, rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
@@ -367,7 +393,22 @@ func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string)
 	if err != nil {
 		return nil, err
 	}
-	return b.readReply(id, chunks)
+	if b.ExchangeTimeout <= 0 {
+		return b.readReply(id, chunks)
+	}
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(b.ExchangeTimeout, func() {
+		timedOut.Store(true)
+		if b.cmd != nil && b.cmd.Process != nil {
+			_ = b.cmd.Process.Kill()
+		}
+	})
+	defer timer.Stop()
+	res, err := b.readReply(id, chunks)
+	if err != nil && timedOut.Load() {
+		return nil, fmt.Errorf("%w: no reply to request %d (%s) within %s", ErrTimeout, id, method, b.ExchangeTimeout)
+	}
+	return res, err
 }
 
 // readReply scans until the reply with wantID arrives. Everything else the
@@ -454,6 +495,10 @@ func (b *Bridge) answerRequest(id int64, method string, params json.RawMessage) 
 			resp.Error = rpcErr(codeInvalidParams, "fs/write_text_file params: %v", err)
 			break
 		}
+		if rpcErr := b.permitted("fs/write_text_file: "+p.Path, params); rpcErr != nil {
+			resp.Error = rpcErr
+			break
+		}
 		if rpcErr := b.fsWrite(p); rpcErr != nil {
 			resp.Error = rpcErr
 		} else {
@@ -463,6 +508,10 @@ func (b *Bridge) answerRequest(id int64, method string, params json.RawMessage) 
 		var p createTerminalParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			resp.Error = rpcErr(codeInvalidParams, "terminal/create params: %v", err)
+			break
+		}
+		if rpcErr := b.permitted("terminal/create: "+terminalTitle(p), params); rpcErr != nil {
+			resp.Error = rpcErr
 			break
 		}
 		if res, rpcErr := b.fsCreateTerminal(p); rpcErr != nil {
@@ -522,6 +571,29 @@ func (b *Bridge) answerRequest(id int64, method string, params json.RawMessage) 
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
 	_ = writeLine(b.stdin, resp)
+}
+
+// permitted consults the Permission policy for a mediated request that acts
+// on the client's side of the wire — writing a file, launching a command.
+// These arrive as fs/terminal method calls, not session/request_permission
+// requests, so without this gate they would execute on the strength of FS
+// being set alone. A nil policy denies, like it does for permissions: nothing
+// is allowed on the user's behalf.
+//
+// AGO-DEVIATION: Python's bridge executes the mediated fs/terminal requests
+// directly; the policy gate is this port's fix.
+func (b *Bridge) permitted(title string, rawInput json.RawMessage) *rpcError {
+	if b.Permission == nil || !b.Permission(title, string(rawInput)) {
+		return rpcErr(codeInvalidRequest, "%s was denied by the permission policy", title)
+	}
+	return nil
+}
+
+// terminalTitle names the command a terminal/create would run, for the
+// Permission policy: the command and its arguments, the way a permission
+// request's toolCall title names the action.
+func terminalTitle(p createTerminalParams) string {
+	return strings.TrimSpace(p.Command + " " + strings.Join(p.Args, " "))
 }
 
 // permissionAnswer resolves the agent's request (Python parity:

@@ -51,7 +51,9 @@ func (w *EventLogWriter) AppendEvent(streamID string, ev events.Event) error {
 // Persist rewrites logs/<streamID>.jsonl with the given events, one JSON line
 // per event (Python parity: EventLogWriter.persist — the agent writes the whole
 // stream history at the end of each ask, so the file always holds the full
-// transcript even when a continuation reuses the stream).
+// transcript even when a continuation reuses the stream). The rewrite goes
+// through Store.Write, so on DiskStore it is atomic (temp+rename): a reader or
+// crash never sees a half-replaced transcript (audit L-22).
 func (w *EventLogWriter) Persist(streamID string, evs []events.Event) error {
 	buf := make([]byte, 0, 256*len(evs))
 	for _, ev := range evs {

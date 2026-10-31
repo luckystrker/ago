@@ -133,6 +133,34 @@ func TestCodeRunnerLanguageRestriction(t *testing.T) {
 	}
 }
 
+func TestCodeRunnerDescriptionStatesNoIsolation(t *testing.T) {
+	// The description is the model's contract (security audit 2026-10-31,
+	// C-2): the local backend has no sandbox, so claiming one invites the
+	// model to run destructive snippets it believes are disposable.
+	r, err := NewLocalCodeRunner()
+	if err != nil {
+		t.Fatalf("NewLocalCodeRunner: %v", err)
+	}
+	defer r.Close()
+	_, cx := newTestContext()
+	schemas, err := r.Schemas(cx)
+	if err != nil || len(schemas) != 1 {
+		t.Fatalf("schemas = %v, %v", schemas, err)
+	}
+	sch, ok := schemas[0].(toolsSchema)
+	if !ok {
+		t.Fatalf("schema type %T", schemas[0])
+	}
+	if strings.Contains(strings.ToLower(sch.Description), "sandbox") {
+		t.Fatalf("description claims a sandbox: %q", sch.Description)
+	}
+	for _, want := range []string{"without isolation", "not a security boundary", "human approval"} {
+		if !strings.Contains(sch.Description, want) {
+			t.Fatalf("description = %q, want it to contain %q", sch.Description, want)
+		}
+	}
+}
+
 func TestCodeRunnerWorkdirAndClose(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalCodeRunner(WithCodeWorkdir(dir))

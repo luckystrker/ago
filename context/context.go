@@ -9,6 +9,7 @@ package context
 import (
 	stdcontext "context"
 	"errors"
+	"math"
 	"reflect"
 	"sync"
 	"time"
@@ -33,8 +34,9 @@ type Context struct {
 	// ToolCallID is set while a tool executes (parity: Python tool_call_id).
 	ToolCallID string
 
-	mu   sync.RWMutex
-	hook hitl.HumanHook
+	mu      sync.RWMutex
+	hook    hitl.HumanHook
+	turnCtx stdcontext.Context
 }
 
 func New(s stream.Stream) *Context {
@@ -169,6 +171,7 @@ func (c *Context) Clone() *Context {
 		Stream:     c.Stream,
 		ToolCallID: c.ToolCallID,
 		hook:       c.hook,
+		turnCtx:    c.turnCtx,
 	}
 	cc.Dependencies = make(map[string]any, len(c.Dependencies))
 	for k, v := range c.Dependencies {
@@ -188,6 +191,31 @@ func (c *Context) WithToolCallID(id string) *Context {
 	cc := c.Clone()
 	cc.ToolCallID = id
 	return cc
+}
+
+// SetTurnContext installs the cancellable std-context of the turn currently
+// owning the conversation. Middleware hooks carry no stdlib context parameter,
+// so this is the channel through which turn cancellation reaches code that
+// only sees the conversation context — most importantly Context.Ask callers
+// waiting on a human answer (audit M-26). The agent sets it when a turn scope
+// opens; a nil ctx clears it.
+func (c *Context) SetTurnContext(ctx stdcontext.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.turnCtx = ctx
+}
+
+// TurnContext returns the installed turn context, or stdcontext.Background()
+// when no turn is running. The result is never nil, so callers can hand it
+// straight to operations that honor cancellation; outside a turn it is simply
+// not cancellable.
+func (c *Context) TurnContext() stdcontext.Context {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.turnCtx == nil {
+		return stdcontext.Background()
+	}
+	return c.turnCtx
 }
 
 // --- human-in-the-loop ------------------------------------------------------
@@ -217,6 +245,10 @@ func (c *Context) Hook() hitl.HumanHook {
 // NotProvidedError, hook failure → FailedError (even at the deadline — Python:
 // only the wait can produce a timeout), deadline → TimeoutError.
 func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (string, error) {
+	// The timeout travels inside an event that untrusted participants can
+	// construct; NaN/Inf/negative values must not reach the deadline
+	// arithmetic below (audit L-19).
+	req.Timeout = sanitizeTimeout(req.Timeout)
 	if req.ID == "" {
 		r := events.NewHumanInputRequest(req.Content, req.Timeout)
 		r.Base = req.Base
@@ -227,9 +259,14 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 		return "", &hitl.NotProvidedError{Detail: "request: " + req.Content}
 	}
 	if req.Timeout > 0 {
-		var cancel stdcontext.CancelFunc
-		ctx, cancel = stdcontext.WithTimeout(ctx, time.Duration(req.Timeout*float64(time.Second)))
-		defer cancel()
+		// A finite but huge value can still overflow the float→Duration
+		// conversion (its result is undefined): anything unrepresentable is
+		// treated as no deadline, leaving turn cancellation as the backstop.
+		if d := time.Duration(req.Timeout * float64(time.Second)); d > 0 {
+			var cancel stdcontext.CancelFunc
+			ctx, cancel = stdcontext.WithTimeout(ctx, d)
+			defer cancel()
+		}
 	}
 
 	// The answer is consumed through the stream, so the wait must be subscribed
@@ -334,6 +371,17 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 	}
 }
 
+// sanitizeTimeout normalizes a request timeout that may come from untrusted
+// data: NaN, infinities and negatives map to 0 (no deadline), because a
+// float-to-Duration conversion of an infinity is undefined and a negative
+// deadline is indistinguishable from an already-expired one.
+func sanitizeTimeout(t float64) float64 {
+	if math.IsNaN(t) || math.IsInf(t, 0) || t < 0 {
+		return 0
+	}
+	return t
+}
+
 // humanRequest extracts the request behind an event: ToolApprovalRequest embeds
 // HumanInputRequest, and Go type identity keeps the embedded value from matching
 // a direct assertion.
@@ -348,11 +396,16 @@ func humanRequest(ev events.Event) (*events.HumanInputRequest, bool) {
 }
 
 // answerCondition matches the HumanMessage answering a request with the given id.
+// AsValue tolerates both event forms: a value-form HumanMessage (e.g. after a
+// marshal round-trip) would panic a direct pointer assertion.
 func answerCondition(parentID string) events.Condition {
 	return events.AllOf(
 		events.TypeOf[events.HumanMessage](),
 		events.Equal(func(ev events.Event) string {
-			return ev.(*events.HumanMessage).ParentID
+			if hm, ok := events.AsValue(ev).(events.HumanMessage); ok {
+				return hm.ParentID
+			}
+			return ""
 		}, parentID),
 	)
 }

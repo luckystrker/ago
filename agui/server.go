@@ -44,6 +44,7 @@ type serverConfig struct {
 	retention      Retention
 	requireProof   bool
 	stateSnapshots bool
+	guard          *Guard
 	now            func() time.Time
 }
 
@@ -64,6 +65,11 @@ func WithResumeProof() ServerOption { return func(c *serverConfig) { c.requirePr
 // the start of every run (Python parity: AGUIStream serving with state
 // snapshots).
 func WithStateSnapshots() ServerOption { return func(c *serverConfig) { c.stateSnapshots = true } }
+
+// WithGuard sets the access control and limits the served endpoint applies
+// (see NewGuard). Without one the default limits still apply: a 16 MiB body and
+// eight concurrent POST exchanges, no token, no origin check.
+func WithGuard(g *Guard) ServerOption { return func(c *serverConfig) { c.guard = g } }
 
 // WithClock sets the clock retention deadlines are read off, for tests that
 // would otherwise have to outlast a retention bound to reach one (Python
@@ -129,7 +135,11 @@ func (s *Server) Close() { s.turns.releaseAll() }
 // it does not parse — and streams the run as SSE, beginning or resuming a turn.
 func (s *Server) Handler(a *agent.Agent) http.Handler {
 	caps := s.capabilitiesFor(a)
-	return handlerFor(caps, s.exchange(a))
+	guard := s.cfg.guard
+	if guard == nil {
+		guard = NewGuard()
+	}
+	return handlerFor(caps, s.exchange(a), guard)
 }
 
 // capabilitiesFor is what the served agent tells a client it can do (Python

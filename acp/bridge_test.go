@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The Bridge tests re-exec this test binary as a stub ACP agent: when the env
@@ -26,7 +28,18 @@ const (
 	roleFS       = "acp-fs-probe-agent"
 	roleTerm     = "acp-term-probe-agent"
 	roleTermEcho = "acp-term-echo"
+	roleTermSpam = "acp-term-output-spam"
+	roleTermEnv  = "acp-term-env-probe"
+	roleSilent   = "acp-silent-agent"
 	roleMCPServe = "acp-fake-mcp-server"
+
+	// Child-process env keys the roles read beyond roleEnv: the file the MCP
+	// server stub touches on exit (the gateway-close test's proof), how many
+	// bytes the output-spam role prints, and the parent-only secret the env
+	// whitelist must keep out of a terminal child (audit H-6).
+	markerEnv       = "AGO_ACP_TEST_EXIT_MARKER"
+	spamBytesEnv    = "AGO_ACP_TEST_SPAM_BYTES"
+	parentSecretEnv = "AGO_ACP_TEST_PARENT_SECRET"
 )
 
 func TestMain(m *testing.M) {
@@ -47,10 +60,71 @@ func TestMain(m *testing.M) {
 		// A one-shot terminal payload: print and exit 0.
 		fmt.Fprint(os.Stdout, "term-ok\n")
 		os.Exit(0)
+	case roleTermSpam:
+		// A one-shot terminal payload: print the requested number of bytes
+		// and exit — more than the default capture cap, to prove the cap.
+		n := 0
+		if v, err := strconv.Atoi(os.Getenv(spamBytesEnv)); err == nil {
+			n = v
+		}
+		if n <= 0 {
+			n = defaultTerminalOutputLimit
+		}
+		os.Stdout.Write([]byte(strings.Repeat("x", n)))
+		os.Exit(0)
+	case roleTermEnv:
+		// A one-shot terminal payload: report whether a parent-only secret
+		// (outside the whitelist) and a whitelisted variable reached this
+		// process — the env-whitelist regression (audit H-6).
+		if os.Getenv(parentSecretEnv) != "" {
+			fmt.Fprint(os.Stdout, "secret-leaked\n")
+		} else {
+			fmt.Fprint(os.Stdout, "secret-absent\n")
+		}
+		if os.Getenv("PATH") != "" {
+			fmt.Fprint(os.Stdout, "path-present\n")
+		} else {
+			fmt.Fprint(os.Stdout, "path-absent\n")
+		}
+		os.Exit(0)
+	case roleSilent:
+		runSilentAgent(os.Stdin, os.Stdout)
 	case roleMCPServe:
 		runFakeMCPServer(os.Stdin, os.Stdout)
 	default:
 		os.Exit(m.Run())
+	}
+}
+
+// runSilentAgent answers the handshake and then goes quiet: every later
+// request is never answered while the process stays alive — the hung agent
+// the exchange-timeout test waits out. The park rides a timer so the runtime's
+// deadlock detector leaves the process alone.
+func runSilentAgent(in io.Reader, out io.Writer) {
+	w := bufio.NewWriter(out)
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 0, 64*1024), scanBuffer)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var req childRequest
+		if err := json.Unmarshal([]byte(line), &req); err != nil || req.ID == nil {
+			continue
+		}
+		if req.Method == "initialize" {
+			childReply(w, *req.ID, map[string]any{
+				"protocolVersion":   protocolVersion,
+				"agentCapabilities": map[string]any{},
+				"agentInfo":         map[string]any{"name": "silent-agent", "version": "1.0"},
+			})
+			continue
+		}
+		select {
+		case <-time.After(time.Hour):
+			return
+		}
 	}
 }
 

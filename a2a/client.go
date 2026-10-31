@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Client is a transport-level A2A client: agent-card discovery plus the
@@ -34,7 +35,9 @@ type Client struct {
 // ClientOption configures a Client.
 type ClientOption func(*Client)
 
-// WithHTTPClient replaces the underlying *http.Client (timeouts, proxies).
+// WithHTTPClient replaces the underlying *http.Client entirely — transport,
+// proxies and Timeout; the default client caps every exchange at
+// defaultHTTPTimeout, a custom one is the caller's policy alone.
 func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) { c.http = hc }
 }
@@ -67,13 +70,17 @@ func WithExtensions(uris ...string) ClientOption {
 	return func(c *Client) { c.extensions = append(c.extensions, uris...) }
 }
 
+// defaultHTTPTimeout bounds every exchange of the built-in client so a hung
+// server cannot pin the calling goroutine forever.
+const defaultHTTPTimeout = 120 * time.Second
+
 // NewClient builds a Client against the server at baseURL (for example
 // "http://localhost:8000"). The JSON-RPC endpoint is baseURL + "/".
 func NewClient(baseURL string, opts ...ClientOption) *Client {
 	c := &Client{
 		base:     strings.TrimSuffix(baseURL, "/"),
 		cardPath: DefaultCardPath,
-		http:     &http.Client{},
+		http:     &http.Client{Timeout: defaultHTTPTimeout},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -97,7 +104,10 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 		return nil, fmt.Errorf("%w: agent card responded %d", ErrTransport, resp.StatusCode)
 	}
 	var card AgentCard
-	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
+	// The card is bytes from a remote, unauthenticated endpoint: cap the
+	// read like every other body this package touches, or a hostile server
+	// streams an endless "card" into the decoder.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRequestBody)).Decode(&card); err != nil {
 		return nil, fmt.Errorf("%w: decode agent card: %v", ErrWire, err)
 	}
 	return &card, nil

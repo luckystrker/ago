@@ -268,9 +268,13 @@ func unwrapDDGHref(href string) string {
 	return href
 }
 
+// htmlTagRe matches one HTML tag in a parsed fragment; package-level so
+// stripHTML does not recompile the pattern on every call.
+var htmlTagRe = regexp.MustCompile(`(?s)<[^>]*>`)
+
 // stripHTML removes tags and unescapes entities from a parsed HTML fragment.
 func stripHTML(s string) string {
-	s = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(s, "")
+	s = htmlTagRe.ReplaceAllString(s, "")
 	return strings.TrimSpace(html.UnescapeString(s))
 }
 

@@ -410,6 +410,143 @@ func TestExecutorTimeout(t *testing.T) {
 	}
 }
 
+// TestExecutorDefaultToolTimeoutSettlesStuckCall pins L-12: a tool without a
+// timeout of its own cannot block the turn forever — the executor's default
+// timeout settles the call as an error while the stuck execution finishes in the
+// background, and later turns still work.
+func TestExecutorDefaultToolTimeoutSettlesStuckCall(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	release := make(chan struct{})
+	ftStuck := mustFunctionTool(t, "stuck", "", func() string {
+		<-release
+		return "late"
+	})
+	ftQuick := mustFunctionTool(t, "quick", "", func() string { return "ok" })
+	ex := NewExecutor(WithDefaultToolTimeout(50 * time.Millisecond))
+	if _, err := ex.Register(cx, []Tool{ftStuck, ftQuick},
+		map[string]bool{"stuck": true, "quick": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "stuck", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	results := rec.last(t, "ToolResultsEvent").(events.ToolResultsEvent)
+	if len(results.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results.Results))
+	}
+	tev := rec.ofType(t, "ToolErrorEvent")
+	if len(tev) != 1 {
+		t.Fatalf("want one ToolErrorEvent, got %v", eventTypes(rec.snapshot()))
+	}
+	if got := tev[0].(events.ToolErrorEvent).Error; got != "Tool 'stuck' timed out after 0.05 seconds" {
+		t.Fatalf("timeout text = %q", got)
+	}
+
+	// The stream and the executor stay usable while the stuck call is still
+	// running; releasing it afterwards must not deadlock anything.
+	close(release)
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "2", Name: "quick", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send after timeout: %v", err)
+	}
+	results = rec.last(t, "ToolResultsEvent").(events.ToolResultsEvent)
+	if got := partText(results.Results[0].Result.Parts[0]); got != "ok" {
+		t.Fatalf("quick result = %q, want ok", got)
+	}
+}
+
+// TestExecutorDefaultTimeoutZeroDisablesLimit: with the default timeout off, a
+// slow tool settles by itself (no executor-imposed bound).
+func TestExecutorDefaultTimeoutZeroDisablesLimit(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	ft := mustFunctionTool(t, "slow", "", func() string {
+		time.Sleep(50 * time.Millisecond)
+		return "made it"
+	})
+	ex := NewExecutor(WithDefaultToolTimeout(0))
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"slow": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "slow", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	results := rec.last(t, "ToolResultsEvent").(events.ToolResultsEvent)
+	if got := partText(results.Results[0].Result.Parts[0]); got != "made it" {
+		t.Fatalf("content = %q, want the tool's own result", got)
+	}
+	for _, ev := range rec.snapshot() {
+		if events.AsValue(ev).EventType() == "ToolErrorEvent" {
+			t.Fatalf("no executor timeout expected: %v", eventTypes(rec.snapshot()))
+		}
+	}
+}
+
+// TestExecutorNegativeDefaultTimeoutNormalized: a negative option value means
+// "no limit", not a panic or an instant timeout.
+func TestExecutorNegativeDefaultTimeoutNormalized(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	ft := mustFunctionTool(t, "slow", "", func() string {
+		time.Sleep(30 * time.Millisecond)
+		return "fine"
+	})
+	ex := NewExecutor(WithDefaultToolTimeout(-time.Second))
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"slow": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "slow", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	results := rec.last(t, "ToolResultsEvent").(events.ToolResultsEvent)
+	if got := partText(results.Results[0].Result.Parts[0]); got != "fine" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+// TestExecutorDefaultTimeoutBoundsLongerToolTimeout: the executor bound is
+// outermost — a per-tool timeout set beyond it still settles at the executor's
+// deadline.
+func TestExecutorDefaultTimeoutBoundsLongerToolTimeout(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	ft := mustFunctionTool(t, "sleepy", "", func() string {
+		time.Sleep(300 * time.Millisecond)
+		return "late"
+	}, WithTimeout(10*time.Second))
+	ex := NewExecutor(WithDefaultToolTimeout(50 * time.Millisecond))
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"sleepy": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "sleepy", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	tev := rec.ofType(t, "ToolErrorEvent")
+	if len(tev) != 1 {
+		t.Fatalf("want one ToolErrorEvent, got %v", eventTypes(rec.snapshot()))
+	}
+	if got := tev[0].(events.ToolErrorEvent).Error; got != "Tool 'sleepy' timed out after 0.05 seconds" {
+		t.Fatalf("timeout text = %q, want the executor's 0.05 seconds bound", got)
+	}
+}
+
+// TestDefaultToolTimeoutValue pins the documented default.
+func TestDefaultToolTimeoutValue(t *testing.T) {
+	if DefaultToolTimeout != 120*time.Second {
+		t.Fatalf("DefaultToolTimeout = %v, want 2m", DefaultToolTimeout)
+	}
+}
+
 func TestExecutorMiddlewareCanShortCircuit(t *testing.T) {
 	s, cx := newTestContext()
 	rec := newCollector(s)

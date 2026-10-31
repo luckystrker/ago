@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -9,6 +10,26 @@ import (
 	"sort"
 	"strings"
 )
+
+// Store files carry full conversation transcripts, so the tree must stay
+// readable only by the owning user (audit L-7/L-22).
+//
+// AGO-DEVIATION: Python's disk backend creates files with default umask
+// permissions (group/world-readable); AGo pins owner-only modes as a
+// hardening measure from the security audit.
+const (
+	dirPerm  fs.FileMode = 0o700
+	filePerm fs.FileMode = 0o600
+)
+
+// tmpPrefix marks in-flight temporaries of atomic writes inside the store
+// tree; they are removed when the write completes or fails.
+const tmpPrefix = ".ago-tmp-"
+
+// ErrDeleteRoot is returned by Delete when asked to remove the store root
+// itself. Wiping the whole store is a deliberate maintenance operation, not
+// something a Store call with the root path may do (audit L-22).
+var ErrDeleteRoot = errors.New("knowledge: refusing to delete the store root")
 
 // DiskStore is a Store backed by the local filesystem under one root directory.
 // Virtual paths map to real files under root; directories are created on write.
@@ -37,7 +58,8 @@ func NewDiskStore(root string) *DiskStore {
 }
 
 // resolve maps a virtual path to an absolute filesystem path under root,
-// refusing paths that would escape it ("..", absolute drive prefixes, ...).
+// refusing paths that would escape it ("..", absolute drive prefixes, symlinked
+// components pointing outside, ...).
 func (d *DiskStore) resolve(path string) (string, error) {
 	rel := strings.TrimPrefix(normalizePath(path), "/")
 	target := d.root
@@ -54,11 +76,70 @@ func (d *DiskStore) resolve(path string) (string, error) {
 	}
 	// Join already cleans, so any ".." that survived normalization collapses
 	// here; the relative walk back to root catches the escape.
-	back, err := filepath.Rel(absRoot, absTarget)
-	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+	if err := checkWithin(absRoot, absTarget); err != nil {
+		return "", traversalErr(path)
+	}
+	// Lexical containment is not enough once the tree exists: a symlink stored
+	// under the root can point outside it and every I/O would follow it. Resolve
+	// the symlinks of the longest existing prefix and re-check containment on
+	// the real location; components that do not exist yet cannot be symlinks
+	// (racing their creation afterwards is the caller's TOCTOU, not ours).
+	//
+	// AGO-DEVIATION: Python's disk backend has no symlink resolution; AGo
+	// rejects paths whose existing components resolve outside the root
+	// (audit L-22).
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Root not created yet: the lexical check above already bounds the
+			// path and there is nothing to resolve.
+			return absTarget, nil
+		}
+		return "", err
+	}
+	real, err := resolveExisting(absTarget)
+	if err != nil {
+		// Unresolvable path (e.g. a symlink loop): fail closed.
+		return "", err
+	}
+	if err := checkWithin(realRoot, real); err != nil {
 		return "", traversalErr(path)
 	}
 	return absTarget, nil
+}
+
+// checkWithin reports an error unless target is root itself or under it.
+func checkWithin(root, target string) error {
+	back, err := filepath.Rel(root, target)
+	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("target outside root")
+	}
+	return nil
+}
+
+// resolveExisting evaluates the symlinks of the longest existing prefix of
+// path. The lexical remainder consists only of components that do not exist
+// yet and therefore cannot redirect the path. When nothing exists, the path is
+// returned unchanged.
+func resolveExisting(path string) (string, error) {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	prefix := path
+	for {
+		parent := filepath.Dir(prefix)
+		if parent == prefix {
+			return path, nil // filesystem root reached: nothing exists to resolve
+		}
+		prefix = parent
+		if real, err := filepath.EvalSymlinks(prefix); err == nil {
+			return real, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
 }
 
 func (d *DiskStore) stat(target string) (fs.FileInfo, error) {
@@ -90,19 +171,45 @@ func (d *DiskStore) Read(path string) ([]byte, error) {
 }
 
 // Write replaces the file at path, creating parent directories, and notifies
-// watchers with the virtual path.
+// watchers with the virtual path. The replacement is atomic: data lands in a
+// temporary file next to the target (same directory, so rename never crosses a
+// filesystem) and is renamed over it — readers never see a half-written file,
+// and a failed write leaves the previous content intact (audit L-22).
+//
+// AGO-DEVIATION: Python's disk backend writes in place; AGo writes
+// temp+rename for crash-safe replacement.
 func (d *DiskStore) Write(path string, data []byte) error {
 	norm := normalizePath(path)
 	target, err := d.resolve(path)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return err
 	}
-	if err := os.WriteFile(target, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
+	if err != nil {
 		return err
 	}
+	// CreateTemp already grants 0600: transcripts stay owner-only.
+	renamed := false
+	defer func() {
+		if !renamed {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), target); err != nil {
+		return err
+	}
+	renamed = true
 	d.ch.notify(norm)
 	return nil
 }
@@ -137,8 +244,16 @@ func (d *DiskStore) List(dir string) ([]string, error) {
 
 // Delete removes the file (or directory tree) at path; a missing path is a
 // no-op. Empty parent directories are pruned up to the root (Python parity).
+// Deleting the store root ("/") is refused with ErrDeleteRoot — one careless
+// call must not wipe every transcript the store holds (audit L-22).
+//
+// AGO-DEVIATION: Python's disk backend happily deletes its root directory;
+// AGo refuses the root path.
 func (d *DiskStore) Delete(path string) error {
 	norm := normalizePath(path)
+	if norm == "/" {
+		return fmt.Errorf("%w: %s", ErrDeleteRoot, path)
+	}
 	target, err := d.resolve(path)
 	if err != nil {
 		return err
@@ -201,10 +316,10 @@ func (d *DiskStore) Append(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), dirPerm); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_APPEND, filePerm)
 	if err != nil {
 		return err
 	}

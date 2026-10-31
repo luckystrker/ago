@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckystrker/ago/internal/httpx"
 	"github.com/luckystrker/ago/internal/sse"
 )
 
@@ -43,6 +44,11 @@ func parseAbsoluteURL(raw string) (*url.URL, error) {
 // forever).
 const defaultExchangeTimeout = 30 * time.Second
 
+// maxJSONResponseBytes caps one buffered JSON-RPC answer: a hostile endpoint
+// must not be able to exhaust memory through an endless body. SSE answers are
+// consumed line-capped by the scanner instead.
+const maxJSONResponseBytes int64 = 8 << 20
+
 // newHTTPTransport validates the config and builds the header set: custom headers
 // first, then the derived Bearer token when no Authorization entry exists
 // (Python parity: _resolve_config).
@@ -71,7 +77,15 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	// reading an SSE response body), while Python's httpx timeout is per-phase
 	// (connect/read/write); a server answering slowly but steadily is cut off
 	// at the cap here.
-	return &httpTransport{url: cfg.URL, headers: headers, client: &http.Client{Timeout: timeout}}, nil
+	//
+	// Custom headers (Authorization, x-api-key, ...) must not follow a
+	// redirect to another host — the stdlib strips only a small fixed set —
+	// so the redirect policy strips everything non-safelisted at the host
+	// boundary; same-host hops keep the headers.
+	return &httpTransport{url: cfg.URL, headers: headers, client: &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: httpx.RedirectStripCredentials.CheckRedirect(),
+	}}, nil
 }
 
 func hasAuthorizationHeader(headers map[string]string) bool {
@@ -138,9 +152,12 @@ func (t *httpTransport) call(ctx context.Context, id int64, method string, param
 		return t.callOverSSE(resp.Body, id)
 	default:
 		// application/json (the declared branch) or a server that omits the header.
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONResponseBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("%w: read response: %v", ErrProtocol, err)
+		}
+		if int64(len(body)) > maxJSONResponseBytes {
+			return nil, fmt.Errorf("%w: JSON response exceeds %d bytes", ErrProtocol, maxJSONResponseBytes)
 		}
 		return decodeResponse(body, id)
 	}

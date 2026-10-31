@@ -158,9 +158,11 @@ func TestStreamParksInputRequired(t *testing.T) {
 }
 
 // TestClientToolsWithoutCallback fails the turn honestly when tool results
-// arrive but no HandleToolResults is configured.
+// arrive but no HandleToolResults is configured. The wire error is the fixed
+// internal message; the explanation rides the failed task record.
 func TestClientToolsWithoutCallback(t *testing.T) {
-	srv := NewServer(ServerConfig{Card: testCard(false), Handle: echoHandler})
+	store := &recordingStore{MemoryTaskStore: NewMemoryTaskStore()}
+	srv := NewServer(ServerConfig{Card: testCard(false), Handle: echoHandler, Store: store})
 	msg := BuildToolResultMessage("task-x", "ctx-x", []ToolResultEntry{{ID: "c1", Name: "calc", Content: "1"}}, nil)
 	body, err := json.Marshal(map[string]any{"message": msg})
 	if err != nil {
@@ -170,8 +172,25 @@ func TestClientToolsWithoutCallback(t *testing.T) {
 	if env.Error == nil {
 		t.Fatalf("results without HandleToolResults succeeded, want error")
 	}
-	if !strings.Contains(env.Error.Message, "HandleToolResults") {
-		t.Fatalf("error = %+v", env.Error)
+	if env.Error.Code != codeInternalError || strings.Contains(env.Error.Message, "HandleToolResults") {
+		t.Fatalf("wire error = %+v, want the fixed internal message", env.Error)
+	}
+
+	store.mu.Lock()
+	ids := append([]string(nil), store.ids...)
+	store.mu.Unlock()
+	if len(ids) != 1 {
+		t.Fatalf("stored ids = %v, want the one task of the failed turn", ids)
+	}
+	task, err := store.Get(context.Background(), ids[0])
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if task.Status.State != TaskStateFailed || task.Status.Message == nil {
+		t.Fatalf("stored task = %+v, want failed with a status message", task)
+	}
+	if !strings.Contains(textOfMessage(task.Status.Message), "HandleToolResults") {
+		t.Fatalf("stored failure text = %q, want the HandleToolResults explanation", textOfMessage(task.Status.Message))
 	}
 }
 

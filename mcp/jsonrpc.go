@@ -21,6 +21,9 @@ var (
 	ErrToolCall = errors.New("mcp: remote tool failed")
 	// ErrClosed reports an operation on a closed Client.
 	ErrClosed = errors.New("mcp: client is closed")
+	// ErrTimeout reports an exchange that exceeded its deadline: the transport
+	// tears the connection down and the session must be re-established.
+	ErrTimeout = errors.New("mcp: exchange timed out")
 )
 
 // errSessionExpired marks a transport whose server-side session is gone (HTTP 404);

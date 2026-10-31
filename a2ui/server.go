@@ -2,7 +2,10 @@ package a2ui
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,6 +61,9 @@ type Server struct {
 	catalogID       string
 	encoding        Encoding
 	logger          Logger
+	authToken       string
+	maxBody         int64
+	turns           chan struct{}
 }
 
 // ServerOption configures a Server.
@@ -97,14 +103,70 @@ func WithLogger(l Logger) ServerOption {
 	return func(s *Server) { s.logger = l }
 }
 
+// WithAuthToken turns on the endpoint's access boundary: every request must
+// present "Authorization: Bearer <token>", anything else is answered 401
+// before the body is read. The comparison is constant-time over SHA-256
+// digests, so neither the token nor its length leaks through timing.
+//
+// Without a token the server does no auth checks and assumes a loopback /
+// reverse-proxy trust boundary — anyone who can reach the port can drive the
+// prompt handler. Actions marked AuthorizedOnly only ever run on requests
+// that passed this check, so they never run on a token-less server.
+// AGO-DEVIATION: hardening for non-loopback exposure; Python's a2ui REST
+// server has no auth option.
+func WithAuthToken(token string) ServerOption {
+	return func(s *Server) { s.authToken = token }
+}
+
+// The limits a Server applies when nothing is configured: a body of 16 MiB
+// and eight POST turns at once — the same defaults the agui Guard uses
+// (audit M-23). Large enough that an ordinary A2UI request (full state each
+// turn) never notices them, small enough that one client cannot spend the
+// server's memory or its LLM budget on its own.
+//
+// AGO-DEVIATION: Python's a2ui REST server buffers the body and runs turns
+// without limits; AGo caps both (security audit 2026-10-31, M-23).
+const (
+	defaultMaxBodyBytes       int64 = 16 << 20
+	defaultMaxConcurrentTurns       = 8
+)
+
+// WithMaxBodyBytes caps one request body at max bytes: past it the request
+// fails 413 instead of being buffered whole. A non-positive max keeps the
+// default.
+func WithMaxBodyBytes(max int64) ServerOption {
+	return func(s *Server) {
+		if max > 0 {
+			s.maxBody = max
+		}
+	}
+}
+
+// WithMaxConcurrentTurns caps how many POST turns are served at once; the
+// next one gets 429 instead of a prompt-handler (LLM) call of its own. A
+// non-positive n keeps the default.
+func WithMaxConcurrentTurns(n int) ServerOption {
+	return func(s *Server) {
+		if n > 0 {
+			s.turns = make(chan struct{}, n)
+		}
+	}
+}
+
 // Logger is the minimal logging seam the server uses; nil disables logging.
 type Logger interface {
 	Printf(format string, args ...any)
 }
 
-// NewServer builds an A2UI HTTP server.
+// NewServer builds an A2UI HTTP server with the default limits: a 16 MiB
+// body and eight concurrent POST turns, no token (see WithMaxBodyBytes,
+// WithMaxConcurrentTurns, WithAuthToken).
 func NewServer(opts ...ServerOption) *Server {
-	s := &Server{version: VersionV1, catalogID: DefaultCatalogID, encoding: EncodingSSE}
+	s := &Server{
+		version: VersionV1, catalogID: DefaultCatalogID, encoding: EncodingSSE,
+		maxBody: defaultMaxBodyBytes,
+		turns:   make(chan struct{}, defaultMaxConcurrentTurns),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -122,9 +184,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	authorized := false
+	if s.authToken != "" {
+		if !s.authorizedRequest(r) {
+			writeJSONError(w, http.StatusUnauthorized, "missing or invalid authorization token")
+			return
+		}
+		authorized = true
+	}
+	// One POST is one turn through the prompt handler — the slot covers the
+	// whole exchange, so the model call counts against the cap; the next
+	// request over the cap is answered, never queued (audit M-23).
+	select {
+	case s.turns <- struct{}{}:
+		defer func() { <-s.turns }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusTooManyRequests, "too many concurrent requests")
+		return
+	}
+	// The cap stops the read at the limit; the excess is never buffered.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "could not read request body")
+		// A body past the cap is refused for its size, not for its shape.
+		status, msg := http.StatusBadRequest, "could not read request body"
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status, msg = http.StatusRequestEntityTooLarge, "request body exceeds the allowed size"
+		}
+		writeJSONError(w, status, msg)
 		return
 	}
 	messages, a2ui, status, errMsg := parseRequestBody(body)
@@ -134,7 +223,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Trailing user messages are the turn's plain text input; any other role
-	// must be one the contract knows (request.py _map_messages).
+	// must be one the contract knows (request.py _map_messages). The content
+	// is client-controlled and lands in an LLM prompt, so it passes through
+	// the same sanitizer the envelope rewrites use.
 	var userTexts []string
 	for _, raw := range messages {
 		var m userMessage
@@ -144,7 +235,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch m.Role {
 		case "user":
-			userTexts = append(userTexts, m.Content)
+			userTexts = append(userTexts, SanitizeForPrompt(m.Content))
 		case "system", "developer", "assistant":
 			// system/developer would prepend the model's prompt and assistant
 			// replays history; the prompt-handler seam here takes the
@@ -156,18 +247,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	prose, outMessages, dispatchErr := s.dispatch(r.Context(), a2ui, userTexts)
+	prose, outMessages, dispatchErr := s.dispatch(r.Context(), a2ui, userTexts, authorized)
 
-	w.Header().Set("Content-Type", s.encoding.mediaType())
-	w.WriteHeader(http.StatusOK)
-
-	flusher, _ := w.(http.Flusher)
-	writeFrame := func(frame string) {
-		_, _ = io.WriteString(w, frame)
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
+	// Response frames are fully serialized before the status is committed: a
+	// message that cannot reach the wire (non-JSON prop value) fails the
+	// request with a real status code instead of corrupting the stream.
+	var frames []string
 	proseFrame := func(text string) string {
 		// json.dumps({"text": text}) — default separators, ensure_ascii.
 		payload := escapeNonASCII(pyJSON(map[string]any{"text": text}))
@@ -176,34 +261,60 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return "event: text\ndata: " + payload + "\n\n"
 	}
-	messageFrame := func(m Message) string {
-		if s.encoding == EncodingJSONL {
-			return ToJSONL([]Message{m}) + "\n"
-		}
-		return "data: " + ToJSONL([]Message{m}) + "\n\n"
-	}
-
 	if prose != "" {
-		writeFrame(proseFrame(prose))
+		frames = append(frames, proseFrame(prose))
 	}
 	for _, m := range outMessages {
-		writeFrame(messageFrame(m))
+		line, err := ToJSONL([]Message{m})
+		if err != nil {
+			warnf(s.logger, "A2UI message serialization failed: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "could not serialize response message")
+			return
+		}
+		if s.encoding == EncodingJSONL {
+			frames = append(frames, line+"\n")
+		} else {
+			frames = append(frames, "data: "+line+"\n\n")
+		}
 	}
 	if dispatchErr != nil {
 		warnf(s.logger, "A2UI turn failed: %v", dispatchErr)
-		// The 200 is already sent; surface the failure as an error frame
-		// rather than tearing the connection down silently (rest.py).
+		// The turn failed after doing its job; surface the failure as an
+		// error frame rather than dropping it silently (rest.py).
 		payload := escapeNonASCII(pyJSON(map[string]any{"error": dispatchErr.Error()}))
 		if s.encoding == EncodingJSONL {
-			writeFrame(payload + "\n")
+			frames = append(frames, payload+"\n")
 		} else {
-			writeFrame("event: error\ndata: " + payload + "\n\n")
+			frames = append(frames, "event: error\ndata: "+payload+"\n\n")
 		}
-		return
+	} else if s.encoding == EncodingSSE {
+		frames = append(frames, "event: done\ndata: {}\n\n")
 	}
-	if s.encoding == EncodingSSE {
-		writeFrame("event: done\ndata: {}\n\n")
+
+	w.Header().Set("Content-Type", s.encoding.mediaType())
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	for _, frame := range frames {
+		_, _ = io.WriteString(w, frame)
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
+}
+
+// authorizedRequest reports whether r carries the server's bearer token.
+// Digests are compared (not the raw values) so the comparison is constant
+// time regardless of the presented length.
+func (s *Server) authorizedRequest(r *http.Request) bool {
+	const scheme = "bearer "
+	header := r.Header.Get("Authorization")
+	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+		return false
+	}
+	presented := sha256.Sum256([]byte(header[len(scheme):]))
+	expected := sha256.Sum256([]byte(s.authToken))
+	return subtle.ConstantTimeCompare(presented[:], expected[:]) == 1
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -260,8 +371,9 @@ func parseRequestBody(body []byte) (messages []json.RawMessage, a2ui []any, stat
 // every callAgentFunction are answered here; unregistered clicks, error
 // reports, function responses and user text go to the prompt handler. It
 // returns the turn's prose (if any) and the messages to emit, or the error
-// that produced an error frame.
-func (s *Server) dispatch(ctx context.Context, envelopes []any, userTexts []string) (prose string, out []Message, dispatchErr error) {
+// that produced an error frame. authorized reports whether the request
+// passed the auth-token check (always false without WithAuthToken).
+func (s *Server) dispatch(ctx context.Context, envelopes []any, userTexts []string, authorized bool) (prose string, out []Message, dispatchErr error) {
 	var prompts []string
 
 	for _, envelope := range envelopes {
@@ -270,6 +382,14 @@ func (s *Server) dispatch(ctx context.Context, envelopes []any, userTexts []stri
 		case IncomingActionKind:
 			action, registered := s.actions.Get(result.Action.Name)
 			if registered {
+				if action.AuthorizedOnly && !authorized {
+					// A privileged handler must not run for an anonymous
+					// request, and its click must not fall through to the
+					// LLM either — drop it.
+					warnf(s.logger, "Dropping A2UI action %q: it requires an authorized request.",
+						result.Action.Name)
+					continue
+				}
 				out = append(out, s.runServerAction(ctx, action, result.Action)...)
 				continue
 			}
@@ -282,7 +402,7 @@ func (s *Server) dispatch(ctx context.Context, envelopes []any, userTexts []stri
 		case IncomingFunctionCallKind:
 			// Answered on the server even when nothing is registered — the
 			// renderer is waiting; on v1.0 the answer always exists.
-			out = append(out, s.runAgentFunction(ctx, result.FunctionCall)...)
+			out = append(out, s.runAgentFunction(ctx, result.FunctionCall, authorized)...)
 		case IncomingFunctionResponseKind:
 			name := ""
 			if s.resolveFunction != nil {
@@ -351,18 +471,21 @@ func (s *Server) runServerAction(ctx context.Context, action Action, click *Inco
 // runAgentFunction answers a renderer's callAgentFunction (v1.0) with an
 // agentFunctionResponse correlated by functionCallId — always exactly one
 // (server_action.py run_agent_function): UNKNOWN_FUNCTION when nothing is
-// registered under that name or the catalog does not match,
-// INVALID_FUNCTION_CALL when the arguments do not fit, FUNCTION_FAILED when
-// the handler raised. Messages the handler returns are emitted ahead of the
-// response.
-func (s *Server) runAgentFunction(ctx context.Context, call *IncomingFunctionCall) (messages []Message) {
+// registered under that name, the catalog does not match, or an anonymous
+// request names a privileged (AuthorizedOnly) handler; INVALID_FUNCTION_CALL
+// when the arguments do not fit, FUNCTION_FAILED when the handler raised.
+// Messages the handler returns are emitted ahead of the response.
+func (s *Server) runAgentFunction(ctx context.Context, call *IncomingFunctionCall, authorized bool) (messages []Message) {
 	if !call.CatalogIDValid {
 		return []Message{FunctionResponseMessage(call.FunctionCallID, s.version, nil,
 			&FunctionError{Code: CodeInvalidCall,
 				Message: fmt.Sprintf("Invalid catalogId for function '%s'.", call.Call)})}
 	}
 	action, registered := s.actions.Get(call.Call)
-	if !registered || (call.CatalogID != "" && call.CatalogID != s.catalogID) {
+	// A privileged handler is answered as unknown so an anonymous caller
+	// cannot learn it exists, let alone run it.
+	if !registered || (call.CatalogID != "" && call.CatalogID != s.catalogID) ||
+		(action.AuthorizedOnly && !authorized) {
 		return []Message{FunctionResponseMessage(call.FunctionCallID, s.version, nil,
 			&FunctionError{Code: CodeUnknownFunction,
 				Message: fmt.Sprintf("Unknown function '%s'.", call.Call)})}

@@ -26,18 +26,25 @@ import (
 // Go constructor is named LocalCodeRunner so nobody wires model-written code to a
 // real shell by accident: this tool runs whatever the model sends on this machine.
 //
+// Security contract: there is no sandbox. The snippet comes from the model and
+// executes on this host with the tool's timeout, output cap and language list as
+// the only limits — real filesystem, real network, real credentials the child
+// environment carries. The tool is a convenience, not a security boundary; gate
+// it with human approval middleware and hand secrets only through WithCodeEnv.
+//
 // A CodeRunner is safe for concurrent use after construction. Close removes an
 // auto-created working directory (Python parity: LocalEnvironment cleanup=True).
 type CodeRunner struct {
-	toolName  string
-	workdir   string
-	autoDir   bool
-	timeout   time.Duration
-	env       map[string]string
-	maxOutput int
-	languages []string
-	pythonBin string
-	tool      *tools.FunctionTool
+	toolName   string
+	workdir    string
+	autoDir    bool
+	timeout    time.Duration
+	env        map[string]string
+	inheritEnv bool
+	maxOutput  int
+	languages  []string
+	pythonBin  string
+	tool       *tools.FunctionTool
 }
 
 var _ tools.Tool = (*CodeRunner)(nil)
@@ -82,8 +89,10 @@ func WithCodeTimeout(d time.Duration) CodeRunnerOption {
 	}
 }
 
-// WithCodeEnv adds environment variables merged over the parent environment for
-// every snippet (Python parity: LocalEnvironment env_vars).
+// WithCodeEnv adds environment variables merged over the inherited environment
+// for every snippet (Python parity: LocalEnvironment env_vars). Use this to pass
+// specific variables (a secret the snippet needs, an interpreter configuration)
+// instead of opening the whole parent environment.
 func WithCodeEnv(env map[string]string) CodeRunnerOption {
 	return func(r *CodeRunner) error {
 		for k, v := range env {
@@ -94,6 +103,15 @@ func WithCodeEnv(env map[string]string) CodeRunnerOption {
 		}
 		return nil
 	}
+}
+
+// WithCodeInheritEnv restores full parent-environment inheritance for every
+// snippet (the Python default). Opt-in only: the snippet comes from the model,
+// and with the full set one `os.environ` dump hands it every secret of this
+// process (API keys included). Without this option the child sees just the
+// whitelisted non-secret variables plus whatever WithCodeEnv passed.
+func WithCodeInheritEnv() CodeRunnerOption {
+	return func(r *CodeRunner) error { r.inheritEnv = true; return nil }
 }
 
 // WithCodeMaxOutput caps the reported output in characters (Python parity:
@@ -162,8 +180,14 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 			return nil, err
 		}
 	}
-	description := "Execute code in a sandboxed environment. Supported languages: " +
-		strings.Join(r.languages, ", ") + "."
+	// AGO-DEVIATION: Python's default description says "Execute code in a
+	// sandboxed environment"; the local backend has no sandbox, and the wording
+	// misleads the model into treating the host as isolated and disposable.
+	// AGo states the real contract instead (security audit 2026-10-31, C-2).
+	description := "Execute code directly on this machine in the working directory: " +
+		r.workdir + ". The snippet is model-controlled and runs without isolation, with full " +
+		"filesystem and network access. This tool is not a security boundary; every call " +
+		"requires human approval. Supported languages: " + strings.Join(r.languages, ", ") + "."
 	type codeArgs struct {
 		Code string `json:"code" agschema:"description=The code to execute,required"`
 		// Both fields are mandatory: untagged non-pointer fields become required
@@ -217,7 +241,7 @@ func (r *CodeRunner) run(code, language string) string {
 	if err != nil {
 		return err.Error()
 	}
-	return formatExit(runLocalCommand(argv, r.workdir, r.env, r.timeout, r.maxOutput))
+	return formatExit(runLocalCommand(argv, r.workdir, r.env, r.inheritEnv, r.timeout, r.maxOutput))
 }
 
 // argv builds the subprocess command for one snippet (Python parity:
@@ -312,7 +336,7 @@ func isExecutableFile(path string) bool {
 // shellWorks reports whether the shell executes a trivial command; the WSL
 // launcher stub fails here, printing its diagnostics and exiting non-zero.
 func shellWorks(shell string) bool {
-	return runLocalCommand([]string{shell, "-c", "exit 0"}, "", nil, shellProbeTimeout, defaultMaxOutput).ExitCode == 0
+	return runLocalCommand([]string{shell, "-c", "exit 0"}, "", nil, false, shellProbeTimeout, defaultMaxOutput).ExitCode == 0
 }
 
 // shellProbeTimeout bounds one findShell verification.

@@ -25,6 +25,12 @@ import (
 // ErrConfigNotProvided matches Python ConfigNotProvidedError: Ask/Run without a model config.
 var ErrConfigNotProvided = errors.New("agent: no model config provided (pass WithConfig)")
 
+// ErrMaxToolRounds is returned by a turn whose model kept requesting tools
+// after the WithMaxToolRounds budget of executed tool rounds ran out. The
+// transcript is repaired (unanswered calls closed) exactly as on a HITL
+// failure, so the stream stays usable for the next ask.
+var ErrMaxToolRounds = errors.New("agent: max tool rounds exceeded")
+
 // PromptHook produces dynamic system-prompt fragments per turn (Python parity:
 // the Agent.prompt() decorator on async hooks).
 type PromptHook func(ctx *context.Context) ([]string, error)
@@ -33,18 +39,19 @@ type PromptHook func(ctx *context.Context) ([]string, error)
 type Sendable = any
 
 type options struct {
-	cfg          config.ModelConfig
-	hitl         hitl.HumanHook
-	tools        []tools.Tool
-	middleware   []middleware.Factory
-	dependencies map[string]any
-	variables    map[string]any
-	schema       response.Proto
-	streamBase   stream.Stream
-	promptHooks  []PromptHook
-	fragments    []string
-	tasks        *TaskConfig
-	knowledge    *knowledge.Config
+	cfg           config.ModelConfig
+	hitl          hitl.HumanHook
+	tools         []tools.Tool
+	middleware    []middleware.Factory
+	dependencies  map[string]any
+	variables     map[string]any
+	schema        response.Proto
+	streamBase    stream.Stream
+	promptHooks   []PromptHook
+	fragments     []string
+	tasks         *TaskConfig
+	knowledge     *knowledge.Config
+	maxToolRounds int
 }
 
 // Option configures an Agent at construction.
@@ -67,6 +74,16 @@ func WithPromptFragments(fr ...string) Option {
 	return func(o *options) { o.fragments = append(o.fragments, fr...) }
 }
 func WithTasks(cfg TaskConfig) Option { return func(o *options) { t := cfg; o.tasks = &t } }
+
+// WithMaxToolRounds caps how many tool-call rounds one turn executes before it
+// stops with ErrMaxToolRounds. n <= 0 (the default) keeps the Python behavior:
+// the loop runs until the model stops requesting tools or a final=true tool
+// forces the response.
+//
+// AGO-DEVIATION: Python's tool loop is unbounded (ag2/agent.py `while True`);
+// AGo offers this opt-in cap because a hostile tool result can otherwise spin
+// paid LLM calls forever (audit H-11).
+func WithMaxToolRounds(n int) Option { return func(o *options) { o.maxToolRounds = n } }
 
 // WithPlugin applies a plugin's contributions at construction: its tools,
 // middleware, static fragments and prompt hooks join the agent's own, in that
@@ -97,10 +114,15 @@ func WithPlugin(p plugin.Plugin) Option {
 // Agent is a conversable LLM agent. A bare New(name, prompt, WithConfig(...)) is a
 // plain LLM loop; every harness feature is opt-in (Python parity: agent.py docstring).
 type Agent struct {
-	name  string
-	mu    sync.Mutex
-	opts  options
-	locks sync.Map // stream id -> *sync.Mutex: serializes concurrent asks on one stream
+	name string
+	mu   sync.Mutex
+	opts options
+	// turns serializes concurrent asks per stream. Entries carry a refcount so
+	// the map shrinks when the last turn on a stream finishes: agents asked over
+	// many fresh streams (delegations, resume) must not accumulate one mutex
+	// per stream id for the process lifetime (audit L-19).
+	turnsMu sync.Mutex
+	turns   map[string]*turnLock
 
 	// knowledge bootstraps once per agent (Python parity: _KnowledgeContext's
 	// bootstrapped flag + lock).
@@ -108,9 +130,17 @@ type Agent struct {
 	knowledgeBootstrapped bool
 }
 
+// turnLock is the per-stream mutex serializing concurrent asks. refs counts
+// runs that acquired it (including ones still waiting to Lock), so the entry
+// is deleted only when nobody can still be holding or waiting on it.
+type turnLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
 func New(name string, prompt string, opts ...Option) *Agent {
-	a := &Agent{name: name}
+	a := &Agent{name: name, turns: map[string]*turnLock{}}
 	a.opts.fragments = append(a.opts.fragments, prompt)
 	for _, o := range opts {
 		o(&a.opts)
@@ -143,10 +173,39 @@ func (a *Agent) PromptFragments() []string {
 	return out
 }
 
-// turnLock returns the per-stream mutex serializing concurrent asks.
-func (a *Agent) turnLock(streamID string) *sync.Mutex {
-	l, _ := a.locks.LoadOrStore(streamID, &sync.Mutex{})
-	return l.(*sync.Mutex)
+// acquireTurnLock takes the per-stream lock slot for a run: an existing entry
+// is shared (the run joins everyone else serializing on this stream), a missing
+// one is created. The refcount is taken under turnsMu before the caller can
+// block on the mutex, so a release that shrinks the count to zero can safely
+// delete the entry — no waiter can be left blocking on a mutex the map no
+// longer knows.
+func (a *Agent) acquireTurnLock(streamID string) *turnLock {
+	a.turnsMu.Lock()
+	defer a.turnsMu.Unlock()
+	if a.turns == nil {
+		a.turns = map[string]*turnLock{}
+	}
+	l, ok := a.turns[streamID]
+	if !ok {
+		l = &turnLock{}
+		a.turns[streamID] = l
+	}
+	l.refs++
+	return l
+}
+
+// releaseTurnLock unlocks the stream mutex and drops the run's slot. The entry
+// is deleted only when this was the last reference: the mutex is released
+// first, so a run arriving between the unlock and the map cleanup finds the
+// same entry and keeps serializing instead of racing on a fresh one.
+func (a *Agent) releaseTurnLock(streamID string, l *turnLock) {
+	l.mu.Unlock()
+	a.turnsMu.Lock()
+	defer a.turnsMu.Unlock()
+	l.refs--
+	if l.refs == 0 && a.turns[streamID] == l {
+		delete(a.turns, streamID)
+	}
 }
 
 // Ask runs one blocking turn and returns the reply (Python parity: agent.ask).
@@ -174,6 +233,11 @@ func (a *Agent) Run(_ stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
 
 // newRun builds a turn over an explicit stream. Continuations (AgentReply.ask)
 // reuse the reply's stream; fresh asks use the stream base or a new stream.
+//
+// The turn's input is stashed, not enqueued: it enters the inbox in Start, once
+// the per-stream turn lock is held. Parallel delegations over one stream base
+// would otherwise race — whichever sibling owns the lock drains the others'
+// objectives into its own prompt (audit M-25).
 func (a *Agent) newRun(s stream.Stream, msgs ...Sendable) (*AgentRun, error) {
 	run := &AgentRun{
 		agent:  a,
@@ -192,17 +256,15 @@ func (a *Agent) newRun(s stream.Stream, msgs ...Sendable) (*AgentRun, error) {
 	a.mu.Unlock()
 	// Per-turn input goes through the inbox so mid-turn enqueues merge uniformly.
 	if len(msgs) > 0 {
-		req := events.EnsureRequest(msgs...)
-		if err := s.Enqueue(req.Parts...); err != nil {
-			return nil, fmt.Errorf("agent: enqueue input: %w", err)
-		}
+		run.pendingInput = events.EnsureRequest(msgs...).Parts
 	}
 	return run, nil
 }
 
 // newRunOn continues a conversation on an existing stream, cloning the previous
 // turn's context so variables and dependencies carry over (Python parity:
-// AgentReply.ask / AgentReply.run).
+// AgentReply.ask / AgentReply.run). Like newRun, the input waits for the turn
+// lock (audit M-25).
 func (a *Agent) newRunOn(prev *context.Context, msgs ...Sendable) (*AgentRun, error) {
 	run := &AgentRun{
 		agent:  a,
@@ -212,10 +274,7 @@ func (a *Agent) newRunOn(prev *context.Context, msgs ...Sendable) (*AgentRun, er
 		wake:   make(chan struct{}, 1),
 	}
 	if len(msgs) > 0 {
-		req := events.EnsureRequest(msgs...)
-		if err := run.stream.Enqueue(req.Parts...); err != nil {
-			return nil, fmt.Errorf("agent: enqueue input: %w", err)
-		}
+		run.pendingInput = events.EnsureRequest(msgs...).Parts
 	}
 	return run, nil
 }

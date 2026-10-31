@@ -14,6 +14,7 @@ import (
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/tools"
 )
 
 // promptSpy is a model double recording the system prompt each call was handed
@@ -263,5 +264,229 @@ func TestFailedPromptHookReleasesStreamLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follow-up ask blocked: per-stream lock leaked by failed open")
+	}
+}
+
+// gatedConfig parks every model call until release is closed and records the
+// history each call saw. Unlike blockingClient it ignores the call context: the
+// tests below need a turn that cannot be interrupted through cancellation.
+type gatedConfig struct {
+	release chan struct{}
+	entered chan struct{}
+	mu      sync.Mutex
+	seen    [][]events.Event
+}
+
+func (g *gatedConfig) Provider() config.Provider                        { return "test" }
+func (g *gatedConfig) Model() string                                    { return "test" }
+func (g *gatedConfig) Create() (config.LLMClient, error)                { return g, nil }
+func (g *gatedConfig) Clone(map[string]any) (config.ModelConfig, error) { return g, nil }
+func (g *gatedConfig) Call(_ stdcontext.Context, evs []events.Event, _ *agocontext.Context, _ config.CallOptions) (*events.ModelResponse, error) {
+	cp := make([]events.Event, len(evs))
+	copy(cp, evs)
+	g.mu.Lock()
+	g.seen = append(g.seen, cp)
+	g.mu.Unlock()
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return textResp("gated"), nil
+}
+
+func (g *gatedConfig) histories() [][]events.Event {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([][]events.Event, len(g.seen))
+	copy(out, g.seen)
+	return out
+}
+
+// transcriptRequests renders the request texts one model call was handed.
+func transcriptRequests(evs []events.Event) string {
+	var b strings.Builder
+	for _, ev := range evs {
+		if mr, ok := events.AsValue(ev).(events.ModelRequest); ok {
+			for _, p := range mr.Parts {
+				if ti, ok := p.(*events.TextInput); ok {
+					b.WriteString(ti.Content)
+					b.WriteByte('\n')
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
+// TestResultHonorsCtxCancellation pins audit M-26: Result must give up when its
+// own context is cancelled, not only when the turn finishes — a caller must not
+// park forever on a turn stuck in a model call that ignores cancellation.
+func TestResultHonorsCtxCancellation(t *testing.T) {
+	g := &gatedConfig{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	a := New("a", "", WithConfig(g))
+
+	run, err := a.Run(stdcontext.Background(), "go")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if err := run.Start(stdcontext.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn never reached the model call")
+	}
+
+	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := run.Result(ctx)
+		errCh <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // let Result park in the wait
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, stdcontext.Canceled) {
+			t.Fatalf("Result after cancel = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Result ignored its context's cancellation")
+	}
+	close(g.release) // let the abandoned turn goroutine finish
+	run.Close()
+}
+
+// TestRunInputWaitsForStreamLock pins audit M-25: a run's input enters the
+// inbox only after its turn holds the per-stream lock, so a sibling delegation
+// blocked on a shared stream base cannot have its objective drained into the
+// running turn's prompt.
+func TestRunInputWaitsForStreamLock(t *testing.T) {
+	g := &gatedConfig{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	base := stream.NewMemoryStream()
+	a := New("a", "", WithConfig(g), WithStreamBase(base))
+
+	first, err := a.Run(stdcontext.Background(), "objective-A")
+	if err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	if err := first.Start(stdcontext.Background()); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn A never reached the model call")
+	}
+
+	second, err := a.Run(stdcontext.Background(), "objective-B")
+	if err != nil {
+		t.Fatalf("run B: %v", err)
+	}
+	if pending := base.Pending(); len(pending) != 0 {
+		t.Fatalf("input enqueued before its turn owns the stream lock: %d pending", len(pending))
+	}
+
+	close(g.release) // turn A finishes on its parked call
+	if _, err := first.Result(stdcontext.Background()); err != nil {
+		t.Fatalf("turn A: %v", err)
+	}
+	first.Close() // hands the per-stream lock over to the waiting sibling
+	if err := second.Start(stdcontext.Background()); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	if _, err := second.Result(stdcontext.Background()); err != nil {
+		t.Fatalf("turn B: %v", err)
+	}
+
+	hist := g.histories()
+	if len(hist) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(hist))
+	}
+	if got := transcriptRequests(hist[0]); !strings.Contains(got, "objective-A") || strings.Contains(got, "objective-B") {
+		t.Fatalf("turn A drained the sibling's input; requests seen:\n%s", got)
+	}
+	if got := transcriptRequests(hist[1]); !strings.Contains(got, "objective-B") {
+		t.Fatalf("turn B never saw its own objective; requests seen:\n%s", got)
+	}
+}
+
+// TestTurnLockMapShrinksAfterRuns pins audit L-19: the per-stream lock map must
+// not keep one mutex per stream after the last run on that stream finished —
+// agents asked over many fresh streams must not leak lock entries.
+func TestTurnLockMapShrinksAfterRuns(t *testing.T) {
+	a := New("a", "", WithConfig(agotest.NewTestConfig(textResp("ok"), textResp("ok"), textResp("ok"))))
+	for i := 0; i < 3; i++ {
+		if _, err := a.Ask(stdcontext.Background(), "hi"); err != nil {
+			t.Fatalf("ask %d: %v", i, err)
+		}
+	}
+	a.turnsMu.Lock()
+	n := len(a.turns)
+	a.turnsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("per-stream lock map kept %d entries after all runs finished", n)
+	}
+}
+
+// loopToolConfig answers every call with one tool request: the turn never
+// converges without a round cap.
+type loopToolConfig struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (l *loopToolConfig) Provider() config.Provider                        { return "test" }
+func (l *loopToolConfig) Model() string                                    { return "test" }
+func (l *loopToolConfig) Create() (config.LLMClient, error)                { return l, nil }
+func (l *loopToolConfig) Clone(map[string]any) (config.ModelConfig, error) { return l, nil }
+func (l *loopToolConfig) Call(_ stdcontext.Context, _ []events.Event, _ *agocontext.Context, _ config.CallOptions) (*events.ModelResponse, error) {
+	l.mu.Lock()
+	l.calls++
+	l.mu.Unlock()
+	return toolResp("tick", "{}"), nil
+}
+
+func (l *loopToolConfig) callCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+// TestMaxToolRoundsStopsLoop pins audit H-11: WithMaxToolRounds stops a turn
+// whose model keeps requesting tools, with ErrMaxToolRounds and a repaired
+// transcript (no unanswered tool calls left behind).
+func TestMaxToolRoundsStopsLoop(t *testing.T) {
+	tick, err := tools.NewFunctionTool("tick", "Ticks", func(args struct{}) (string, error) {
+		return "tock", nil
+	})
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	cfg := &loopToolConfig{}
+	a := New("a", "", WithConfig(cfg), WithTools(tick), WithMaxToolRounds(2))
+
+	run, err := a.Run(stdcontext.Background(), "go")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	defer run.Close()
+	_, err = run.Result(stdcontext.Background())
+	if !errors.Is(err, ErrMaxToolRounds) {
+		t.Fatalf("want ErrMaxToolRounds, got %v", err)
+	}
+	// Cap 2 = the initial call plus two executed rounds; the fourth model call
+	// never happens.
+	if got := cfg.callCount(); got != 3 {
+		t.Fatalf("model calls = %d, want 3", got)
+	}
+	evs, herr := run.Stream().History().GetEvents()
+	if herr != nil {
+		t.Fatalf("history: %v", herr)
+	}
+	if fixes := events.CloseUnansweredToolCalls(evs); len(fixes) != 0 {
+		t.Fatalf("transcript kept %d unanswered tool calls after the round cap", len(fixes))
 	}
 }

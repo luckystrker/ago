@@ -3,6 +3,7 @@ package otelx
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -293,6 +294,106 @@ func hasExceptionEvent(s tracetest.SpanStub) bool {
 		}
 	}
 	return false
+}
+
+// exceptionMessage returns the exception.message attribute of the first
+// exception event on the span, or "" when none was recorded.
+func exceptionMessage(s tracetest.SpanStub) string {
+	for _, ev := range s.Events {
+		if ev.Name != "exception" {
+			continue
+		}
+		for _, kv := range ev.Attributes {
+			if kv.Key == "exception.message" {
+				return kv.Value.AsString()
+			}
+		}
+	}
+	return ""
+}
+
+func TestTruncateMessage(t *testing.T) {
+	cyrillic := strings.Repeat("ж", 200) // 2 bytes per rune: cut lands mid-rune at odd limits
+	tests := []struct {
+		name  string
+		msg   string
+		limit int
+		want  string
+	}{
+		{name: "short unchanged", msg: "boom", limit: maxSpanErrorMessage, want: "boom"},
+		{name: "exactly at limit", msg: strings.Repeat("a", 32), limit: 32, want: strings.Repeat("a", 32)},
+		{name: "over limit cut", msg: strings.Repeat("a", 33), limit: 32, want: strings.Repeat("a", 32) + truncationSuffix},
+		{
+			// The byte cut at 33 falls inside a 2-byte rune; the cut must back
+			// off to a rune boundary so the recorded text stays valid UTF-8.
+			name:  "multibyte boundary",
+			msg:   cyrillic,
+			limit: 33,
+			want:  strings.Repeat("ж", 16) + truncationSuffix,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := truncateMessage(tt.msg, tt.limit); got != tt.want {
+				t.Errorf("truncateMessage(%q, %d) = %q, want %q", tt.msg, tt.limit, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSpanErrorMessagesTruncated: a tool error carrying a long text (as if a
+// response body were embedded) must reach the span capped at
+// maxSpanErrorMessage — both in the status description and the exception event.
+func TestSpanErrorMessagesTruncated(t *testing.T) {
+	const tail = "SENSITIVE-TAIL"
+	long := strings.Repeat("e", maxSpanErrorMessage+200) + tail
+
+	tp, sr := newRecorder(t)
+	tel := Middleware(tp)()
+	if _, err := tel.OnToolExecution(func(ev *events.ToolCallEvent, ctx *agocontext.Context) (events.Event, error) {
+		return events.ToolErrorEvent{ToolResultEvent: events.ToolResultEvent{ParentID: ev.ID}, Error: long}, nil
+	}, &events.ToolCallEvent{ID: "call-1", Name: "lookup"}, nil); err != nil {
+		t.Fatalf("OnToolExecution: %v", err)
+	}
+
+	span := findSpan(t, ended(sr), spanTool)
+	want := strings.Repeat("e", maxSpanErrorMessage) + truncationSuffix
+	if span.Status.Description != want {
+		t.Errorf("status description len %d, want %d bytes ending in suffix", len(span.Status.Description), len(want))
+	}
+	if msg := exceptionMessage(span); msg != want {
+		t.Errorf("exception message len %d, want %d bytes ending in suffix", len(msg), len(want))
+	}
+	if strings.Contains(span.Status.Description, tail) || strings.Contains(exceptionMessage(span), tail) {
+		t.Errorf("span error text leaks the truncated tail")
+	}
+}
+
+// TestSpanPipelineErrorTruncated: the same cap applies to provider errors
+// returned by the pipeline (endSpan path).
+func TestSpanPipelineErrorTruncated(t *testing.T) {
+	const tail = "SENSITIVE-TAIL"
+	long := strings.Repeat("p", maxSpanErrorMessage+100) + tail
+
+	tp, sr := newRecorder(t)
+	tel := Middleware(tp)()
+	if _, err := tel.OnLLMCall(func(evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
+		return nil, errors.New(long)
+	}, nil, nil); err == nil {
+		t.Fatal("OnLLMCall error swallowed")
+	}
+
+	span := findSpan(t, ended(sr), spanLLM)
+	want := strings.Repeat("p", maxSpanErrorMessage) + truncationSuffix
+	if span.Status.Description != want {
+		t.Errorf("status description len %d, want %d bytes ending in suffix", len(span.Status.Description), len(want))
+	}
+	if msg := exceptionMessage(span); msg != want {
+		t.Errorf("exception message len %d, want %d bytes ending in suffix", len(msg), len(want))
+	}
+	if strings.Contains(span.Status.Description, tail) || strings.Contains(exceptionMessage(span), tail) {
+		t.Errorf("span error text leaks the truncated tail")
+	}
 }
 
 // TestMiddlewareConcurrentToolExecution exercises the parent bookkeeping under

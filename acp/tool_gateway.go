@@ -3,6 +3,7 @@ package acp
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 
 	"github.com/luckystrker/ago/mcp"
@@ -33,6 +34,11 @@ type MCPServer struct {
 // declared.
 var ErrServerNotFound = errors.New("acp: no such MCP server")
 
+// ErrServerNotAllowed reports a declared MCP server the configuration refuses
+// to dial: a stdio command outside the allowlist, or a URL whose scheme is not
+// http/https.
+var ErrServerNotAllowed = errors.New("acp: MCP server not allowed")
+
 // ErrServerNotDeclaredable reports a Bridge-side session/new declaring an MCP
 // server the subset cannot announce to a subprocess agent.
 var ErrUndeclarableServer = errors.New("acp: MCP server cannot be declared to an ACP agent")
@@ -45,13 +51,21 @@ var ErrUndeclarableServer = errors.New("acp: MCP server cannot be declared to an
 //
 // A ToolGateway is safe for concurrent use; operations serialize per server
 // (one exchange in flight per ago/mcp client). Close it when the session is
-// done — Serve tears its sessions' gateways down with the connection; a
-// standalone gateway's owner calls Close.
+// done: a gateway owned by a served Session is closed when the connection
+// ends (and when session/load replaces the declarations); a standalone
+// gateway's owner calls Close.
 type ToolGateway struct {
 	mu      sync.Mutex
 	clients map[string]*mcp.Client
 	servers map[string]MCPServer
-	closed  bool
+	// allowedCommands, when non-empty, is the set of stdio command strings a
+	// declaration may launch; anything else fails its first dial instead of
+	// spawning. Wired from ServeConfig.AllowedMCPCommands.
+	//
+	// AGO-DEVIATION: no allowlist upstream — Python dials whatever the client
+	// declared; this is opt-in defense-in-depth for the serve role.
+	allowedCommands []string
+	closed          bool
 }
 
 // NewToolGateway builds a gateway over the declared servers. Nothing is
@@ -88,8 +102,14 @@ func (g *ToolGateway) client(server string) (*mcp.Client, error) {
 		err error
 	)
 	if decl.URL != "" {
+		if err := validateServerURL(decl.URL); err != nil {
+			return nil, fmt.Errorf("%w: %q: %v", ErrServerNotAllowed, server, err)
+		}
 		c, err = mcp.New(&mcp.MCPServerConfig{URL: decl.URL, Headers: decl.Headers})
 	} else {
+		if !g.commandAllowed(decl.Command) {
+			return nil, fmt.Errorf("%w: %q: command %q is not in the allowlist", ErrServerNotAllowed, server, decl.Command)
+		}
 		c, err = mcp.New(&mcp.MCPStdioConfig{Command: decl.Command, Args: decl.Args, Env: envList(decl.Env)})
 	}
 	if err != nil {
@@ -107,6 +127,43 @@ func envList(env map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+// commandAllowed reports whether command is one the configuration lets a
+// stdio declaration launch. An empty allowlist allows any command (Python
+// parity: there is no upstream allowlist; ServeConfig.AllowedMCPCommands is
+// the opt-in).
+func (g *ToolGateway) commandAllowed(command string) bool {
+	if len(g.allowedCommands) == 0 {
+		return true
+	}
+	for _, allowed := range g.allowedCommands {
+		if command == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// validateServerURL accepts only http/https endpoints: the URL a client
+// declares is dialed by this process, so every other scheme (file:, unix
+// sockets, ...) is refused rather than opened. A URL without a host cannot be
+// an MCP endpoint either.
+//
+// AGO-DEVIATION: no scheme validation upstream — Python passes the declared
+// URL to the transport as-is; this is a dial-side barrier.
+func validateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme %q is not http/https", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("no host")
+	}
+	return nil
 }
 
 // Call invokes tool on the named server with args and returns the result's

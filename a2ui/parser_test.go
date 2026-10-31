@@ -31,9 +31,18 @@ type serverResponse struct {
 
 func serve(t *testing.T, srv *Server, body string) serverResponse {
 	t.Helper()
+	return serveWithAuth(t, srv, body, "")
+}
+
+// serveWithAuth is serve with an Authorization header ("" sends none).
+func serveWithAuth(t *testing.T, srv *Server, body, authz string) serverResponse {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, "/a2ui", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if authz != "" {
+		req.Header.Set("Authorization", authz)
 	}
 	rec := &recorder{header: make(http.Header)}
 	srv.ServeHTTP(rec, req)

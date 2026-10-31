@@ -19,6 +19,12 @@ import (
 // the local backend only; Docker/Daytona backends are deferred, see
 // docs/DECISIONS.md).
 //
+// Security contract: the command line comes from the model and executes on this
+// host without isolation — real filesystem, real network, real credentials the
+// child environment carries. The tool is a convenience, not a security
+// boundary; the block patterns are advisory and bypassable. Gate it with human
+// approval middleware and hand secrets only through WithShellEnv.
+//
 // A ShellTool is safe for concurrent use after construction: every call runs its
 // own subprocess and the configuration is immutable. Close removes an auto-created
 // working directory; a caller-supplied workdir is never deleted.
@@ -29,6 +35,7 @@ type ShellTool struct {
 	autoDir     bool
 	timeout     time.Duration
 	env         map[string]string
+	inheritEnv  bool
 	maxOutput   int
 	blocked     []string
 	tool        *tools.FunctionTool
@@ -83,8 +90,10 @@ func WithShellTimeout(d time.Duration) ShellOption {
 	}
 }
 
-// WithShellEnv adds environment variables merged over the parent environment for
-// every command (Python parity: LocalEnvironment env_vars).
+// WithShellEnv adds environment variables merged over the inherited environment
+// for every command (Python parity: LocalEnvironment env_vars). Use this to pass
+// specific variables (a secret the command needs, a runner configuration) instead
+// of opening the whole parent environment.
 func WithShellEnv(env map[string]string) ShellOption {
 	return func(s *ShellTool) error {
 		for k, v := range env {
@@ -95,6 +104,15 @@ func WithShellEnv(env map[string]string) ShellOption {
 		}
 		return nil
 	}
+}
+
+// WithShellInheritEnv restores full parent-environment inheritance for every
+// command (the Python default). Opt-in only: the command line comes from the
+// model, and with the full set one `env` hands it every secret of this process
+// (API keys included). Without this option the child sees just the whitelisted
+// non-secret variables plus whatever WithShellEnv passed.
+func WithShellInheritEnv() ShellOption {
+	return func(s *ShellTool) error { s.inheritEnv = true; return nil }
 }
 
 // WithShellMaxOutput caps the reported output in characters; the excess is cut
@@ -153,7 +171,14 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 	}
 	description := s.description
 	if description == "" {
-		description = "Execute a shell command in the working directory: " + s.workdir
+		// AGO-DEVIATION: Python's default description names only the workdir;
+		// AGo's default also states the execution contract, because the model
+		// reads this text and must not assume an isolated or disposable
+		// environment (security audit 2026-10-31, C-1).
+		description = "Execute an arbitrary shell command on this machine in the working directory: " +
+			s.workdir + ". The command is model-controlled and runs without isolation, with full " +
+			"filesystem and network access. This tool is not a security boundary; every call " +
+			"requires human approval."
 	}
 	type shellArgs struct {
 		Command string `json:"command" agschema:"description=The shell command to run,required"`
@@ -176,7 +201,7 @@ func (s *ShellTool) run(command string) string {
 			return fmt.Sprintf("Command not allowed: %q", command)
 		}
 	}
-	res := runLocalCommand(shellArgv(command), s.workdir, s.env, s.timeout, s.maxOutput)
+	res := runLocalCommand(shellArgv(command), s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
 	return formatExit(res)
 }
 

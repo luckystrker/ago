@@ -67,7 +67,7 @@ func (s *Server) restMessageSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if outcome.handleErr != nil {
-		writeRESTError(w, http.StatusInternalServerError, codeInternalError, outcome.handleErr.Error())
+		writeRESTError(w, http.StatusInternalServerError, codeInternalError, msgInternalError)
 		return
 	}
 	// A refused commit answers with the stored Task record: the turn lost

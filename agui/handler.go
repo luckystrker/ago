@@ -1,12 +1,15 @@
 package agui
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -26,6 +29,11 @@ type HandlerConfig struct {
 	// gets one RUN_ERROR from the handler (Python parity: serve_exchange's
 	// not-ended path).
 	Run func(ctx context.Context, input RunAgentInput, emit func(Event)) error
+
+	// Guard is the endpoint's access control and limits (see NewGuard). Nil
+	// still applies the default limits — a 16 MiB body, eight concurrent POST
+	// exchanges — with no token and no origin check.
+	Guard *Guard
 }
 
 // Handler serves the AG-UI endpoint over net/http (Python parity: asgi.py
@@ -41,22 +49,174 @@ func Handler(cfg HandlerConfig) http.Handler {
 	if run == nil {
 		run = func(context.Context, RunAgentInput, func(Event)) error { return nil }
 	}
+	guard := cfg.Guard
+	if guard == nil {
+		guard = NewGuard()
+	}
 	return handlerFor(caps, func(ctx context.Context, input RunAgentInput, ex *exchange) error {
 		return run(ctx, input, ex.emit)
-	})
+	}, guard)
 }
+
+// The limits a Guard applies when nothing is configured: a body of 16 MiB and
+// eight POST exchanges at once. Large enough that an ordinary run input never
+// notices them, small enough that one client cannot spend the server's memory
+// or its LLM budget on its own.
+const (
+	defaultMaxBodyBytes      int64 = 16 << 20
+	defaultMaxConcurrentRuns       = 8
+)
+
+// Guard is the access control and the resource limits of an AG-UI endpoint: a
+// bearer token, an origin allow-list for state-changing requests, a cap on one
+// request body, and a cap on POST exchanges served at once. Build it with
+// NewGuard; the limits always apply, the access checks only when configured.
+//
+// A Guard may be shared by several handlers; its run slots are shared too.
+// Safe for concurrent use.
+type Guard struct {
+	token   string
+	origins map[string]bool // empty → no origin check
+	maxBody int64
+	sem     chan struct{}
+}
+
+// GuardOption configures a Guard at construction.
+type GuardOption func(*Guard)
+
+// WithAuthToken requires every request to carry token as an HTTP bearer token
+// ("Authorization: Bearer <token>"), GET included: the capabilities answer
+// names the served agent, which is not public wallpaper. The value is compared
+// in constant time; ConstantTimeCompare returns early on a length mismatch,
+// which reveals the token's length — not a secret worth hiding.
+func WithAuthToken(token string) GuardOption {
+	return func(g *Guard) {
+		if token != "" {
+			g.token = token
+		}
+	}
+}
+
+// WithAllowedOrigins refuses a state-changing request — anything but GET —
+// whose Origin header names an origin not in the list. A browser sends Origin
+// on every cross-site POST, a mode "no-cors" fetch included, so a page
+// elsewhere cannot drive this server's runs or read their cost; a request
+// without Origin is not a browser and passes — from such clients the token is
+// the barrier. Origins match exactly, "scheme://host:port".
+func WithAllowedOrigins(origins ...string) GuardOption {
+	return func(g *Guard) {
+		set := make(map[string]bool, len(origins))
+		for _, o := range origins {
+			set[o] = true
+		}
+		g.origins = set
+	}
+}
+
+// WithMaxBodyBytes caps one request body at max bytes: past it the request
+// fails 413 instead of being buffered whole. A non-positive max keeps the
+// default.
+func WithMaxBodyBytes(max int64) GuardOption {
+	return func(g *Guard) {
+		if max > 0 {
+			g.maxBody = max
+		}
+	}
+}
+
+// WithMaxConcurrentRuns caps how many POST exchanges are served at once; the
+// next one gets 429 instead of a goroutine and an LLM call of its own. A
+// non-positive n keeps the default.
+//
+// The slot covers one HTTP exchange, not a turn's whole life: a run that pauses
+// on an interrupt ends its exchange and frees its slot while the turn waits.
+// Counting the wait would let one client pin every slot with questions nobody
+// answers.
+func WithMaxConcurrentRuns(n int) GuardOption {
+	return func(g *Guard) {
+		if n > 0 {
+			g.sem = make(chan struct{}, n)
+		}
+	}
+}
+
+// NewGuard builds a Guard with the default limits: a 16 MiB body and eight
+// concurrent POST exchanges, no token, no origin check.
+func NewGuard(opts ...GuardOption) *Guard {
+	g := &Guard{
+		maxBody: defaultMaxBodyBytes,
+		sem:     make(chan struct{}, defaultMaxConcurrentRuns),
+	}
+	for _, o := range opts {
+		o(g)
+	}
+	return g
+}
+
+// authorize applies the access options — the token to every method, the origin
+// allow-list to the state-changing ones — answering the request itself and
+// reporting false when it refused it.
+func (g *Guard) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if g.token != "" {
+		got, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !bearer || subtle.ConstantTimeCompare([]byte(got), []byte(g.token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "a bearer token is required"})
+			return false
+		}
+	}
+	if len(g.origins) > 0 && r.Method != http.MethodGet {
+		if origin := r.Header.Get("Origin"); origin != "" && !g.origins[origin] {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "origin not allowed"})
+			return false
+		}
+	}
+	return true
+}
+
+// beginRun takes a run slot for one POST exchange, answering the request with
+// 429 when none is left.
+func (g *Guard) beginRun(w http.ResponseWriter) bool {
+	select {
+	case g.sem <- struct{}{}:
+		return true
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many concurrent runs"})
+		return false
+	}
+}
+
+// endRun returns a slot taken by beginRun.
+func (g *Guard) endRun() { <-g.sem }
 
 // handlerFor builds the endpoint: GET answers with the capabilities JSON, POST
 // streams one exchange.
-func handlerFor(caps func() AgentCapabilities, serve exchangeFunc) http.Handler {
+func handlerFor(caps func() AgentCapabilities, serve exchangeFunc, guard *Guard) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !guard.authorize(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, caps())
 		case http.MethodPost:
+			if !guard.beginRun(w) {
+				return
+			}
+			defer guard.endRun()
+			// The cap stops the read at the limit; the excess is never
+			// buffered.
+			r.Body = http.MaxBytesReader(w, r.Body, guard.maxBody)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid AG-UI RunAgentInput body"})
+				// A body past the cap is refused for its size, not for its
+				// shape.
+				status, msg := http.StatusBadRequest, "invalid AG-UI RunAgentInput body"
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					status, msg = http.StatusRequestEntityTooLarge, "request body exceeds the allowed size"
+				}
+				writeJSON(w, status, map[string]string{"error": msg})
 				return
 			}
 			input, err := ReadRunInput(body)
@@ -153,10 +313,35 @@ func serveExchangeEx(w http.ResponseWriter, r *http.Request, input RunAgentInput
 		ended     = make(chan struct{})
 	)
 	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+	// dropEvent forgets an event that cannot go on the wire. A dropped
+	// terminal still ends the exchange: nothing behind it can repair a stream
+	// whose end was the thing dropped, and the waiters would otherwise wait
+	// for an end that never comes.
+	dropEvent := func(e Event, why string, err error) {
+		attrs := []any{"event", e.eventType(), "reason", why}
+		if err != nil {
+			attrs = append(attrs, "err", err)
+		}
+		slog.Error("agui: dropping an event", attrs...)
+		if isTerminal(e) {
+			endedFlag.Store(true)
+			endedOnce.Do(func() { close(ended) })
+		}
+	}
 	emit := func(e Event) {
 		raw, err := json.Marshal(e)
 		if err != nil {
-			slog.Error("agui: dropping an event that does not encode", "event", e.eventType(), "err", err)
+			dropEvent(e, "does not encode", err)
+			return
+		}
+		// The frame a break would split is the last line of defense, not the
+		// first: json.Marshal compacts MarshalJSON output, so today a literal
+		// CR or LF cannot reach here — an invalid one is refused above, and an
+		// insignificant one is compacted away. The check holds for any future
+		// writer of frames that does not go through the compactor (security
+		// audit L-16).
+		if breaksFrame(raw) {
+			dropEvent(e, "would split its SSE frame", nil)
 			return
 		}
 		terminal := isTerminal(e)
@@ -242,6 +427,17 @@ read:
 
 // RunFunc drives one POSTed run (HandlerConfig.Run).
 type RunFunc func(ctx context.Context, input RunAgentInput, emit func(Event)) error
+
+// breaksFrame reports whether the encoded form of an event carries a literal CR
+// or LF. An SSE data line ends at either byte, so such a payload would split
+// its own frame — and whatever followed the break could pose as a field or a
+// frame of its own, a "data: ..." line an injector shapes (security audit
+// L-16). json.Marshal compacts the output of MarshalJSON, so a literal break
+// does not reach the wire today; this is the invariant that keeps it so
+// whichever writer comes next.
+func breaksFrame(raw []byte) bool {
+	return bytes.IndexByte(raw, '\n') >= 0 || bytes.IndexByte(raw, '\r') >= 0
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

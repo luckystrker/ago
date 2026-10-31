@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/luckystrker/ago/agent"
 	"github.com/luckystrker/ago/config"
@@ -38,12 +39,29 @@ const dynamicBaseDescription = "Create an ephemeral dynamic agent from a spec (n
 // dependencies and variables, and bridges HITL to the caller's hook (see
 // docs/DECISIONS.md for the wording deviations this composition carries).
 //
-// A DynamicAgentFactory is safe for concurrent use after construction; every
-// call spawns its own child agent.
+// The middleware the registering parent carries is inherited by every spawned
+// child (see Register and the AGO-DEVIATION note in run): the parent's
+// Approval, limiters and other gates wrap the child's tool calls too.
+//
+// A DynamicAgentFactory is safe for concurrent use; every call spawns its own
+// child agent. The middleware snapshot taken at Register (see below) is the
+// only mutable state and is guarded by a mutex.
 type DynamicAgentFactory struct {
 	cfg  config.ModelConfig
 	pool map[string]tools.Tool
 	tool *tools.FunctionTool
+
+	// agentOpts are caller-supplied agent options applied to every spawned
+	// child (set once at construction, read-only afterwards).
+	agentOpts []agent.Option
+
+	// inherited snapshots the middleware instances the parent's tool executor
+	// registered the factory with (agent's run scope passes its per-turn
+	// instances to every tool's Register). They are re-attached to each spawned
+	// child so the parent's gates — Approval included — cover the child's tool
+	// calls, not only the parent's own.
+	mu        sync.Mutex
+	inherited []middleware.Middleware
 }
 
 var _ tools.Tool = (*DynamicAgentFactory)(nil)
@@ -54,6 +72,7 @@ type DynamicOption func(*dynamicOptions) error
 type dynamicOptions struct {
 	name        string
 	description string
+	agentOpts   []agent.Option
 }
 
 // WithDynamicName overrides the tool name (default create_and_run_agent; Python
@@ -75,6 +94,21 @@ func WithDynamicDescription(description string) DynamicOption {
 	return func(o *dynamicOptions) error { o.description = description; return nil }
 }
 
+// WithDynamicOption adds an agent.Option applied to every agent the factory
+// spawns, after the factory's own WithConfig and before the spec's response
+// schema (wire data from the spec keeps priority). Use it to pin behavior on
+// children the parent does not carry itself — a different model config,
+// dependencies, extra middleware.
+func WithDynamicOption(opt agent.Option) DynamicOption {
+	return func(o *dynamicOptions) error {
+		if opt == nil {
+			return nil
+		}
+		o.agentOpts = append(o.agentOpts, opt)
+		return nil
+	}
+}
+
 // NewDynamicAgentFactory builds the create_and_run_agent tool. cfg is the model
 // config every spawned child runs on; pool is the tool set the spec may pick
 // from by name. The pool's names and descriptions are appended to the tool
@@ -90,7 +124,7 @@ func NewDynamicAgentFactory(cfg config.ModelConfig, pool []tools.Tool, opts ...D
 			return nil, err
 		}
 	}
-	f := &DynamicAgentFactory{cfg: cfg, pool: map[string]tools.Tool{}}
+	f := &DynamicAgentFactory{cfg: cfg, pool: map[string]tools.Tool{}, agentOpts: o.agentOpts}
 	for _, t := range pool {
 		if t == nil {
 			continue
@@ -149,6 +183,7 @@ func (f *DynamicAgentFactory) run(spec spec.AgentSpec, objective string, cx *ago
 	}
 
 	opts := []agent.Option{agent.WithConfig(f.cfg)}
+	opts = append(opts, f.agentOpts...)
 	if spec.ResponseSchema != nil && len(spec.ResponseSchema.Schema) > 0 {
 		// Python parity: spec.to_agent attaches the spec's response schema.
 		opts = append(opts, agent.WithResponseSchema(response.RawSchema(
@@ -156,6 +191,23 @@ func (f *DynamicAgentFactory) run(spec spec.AgentSpec, objective string, cx *ago
 			response.WithRawName(spec.ResponseSchema.Name),
 			response.WithRawDescription(spec.ResponseSchema.Description),
 		)))
+	}
+	// AGO-DEVIATION: Python's dynamic handler rebuilds the child from the spec
+	// and the config only, so the parent's middleware never wraps the spawned
+	// agent — one approval of create_and_run_agent then runs the whole pool
+	// unattended. AGo re-attaches the middleware instances the parent's run
+	// scope registered this factory with, so the parent's gates (Approval
+	// included) wrap the child's tool calls too. The instances are shared with
+	// the parent's turn instead of rebuilt from their factories: per-turn state
+	// such as Approval's "always" grants then applies uniformly, and the
+	// Middleware contract already requires instances to be safe for concurrent
+	// use.
+	if inherited := f.inheritedMiddleware(); len(inherited) > 0 {
+		factories := make([]middleware.Factory, len(inherited))
+		for i, inst := range inherited {
+			factories[i] = sharedInstance(inst)
+		}
+		opts = append(opts, agent.WithMiddleware(factories...))
 	}
 	child, err := spec.ToAgent(f.pool, opts...)
 	if err != nil {
@@ -326,7 +378,31 @@ func (f *DynamicAgentFactory) Schemas(cx *agocontext.Context) ([]any, error) {
 	return f.tool.Schemas(cx)
 }
 
-// Register subscribes the factory on the conversation stream.
+// Register subscribes the factory on the conversation stream and snapshots mw —
+// the middleware instances of the registering agent's current turn (the agent's
+// run scope passes them to every tool it registers). Each child spawned later
+// re-runs them around its own tool calls; see the AGO-DEVIATION note in run.
+// A Register with an empty mw (direct, executor-less registration) clears the
+// snapshot: without a registering parent there is nothing to inherit, and a
+// caller can still pin middleware per-child through WithDynamicOption.
 func (f *DynamicAgentFactory) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
+	snapshot := append([]middleware.Middleware(nil), mw...)
+	f.mu.Lock()
+	f.inherited = snapshot
+	f.mu.Unlock()
 	return f.tool.Register(cx, mw)
+}
+
+// inheritedMiddleware returns a copy of the middleware snapshot taken at the
+// last Register.
+func (f *DynamicAgentFactory) inheritedMiddleware() []middleware.Middleware {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]middleware.Middleware(nil), f.inherited...)
+}
+
+// sharedInstance turns an already-built instance into the Factory the agent
+// options take, so every consumer shares one instance (see run).
+func sharedInstance(m middleware.Middleware) middleware.Factory {
+	return func() middleware.Middleware { return m }
 }
