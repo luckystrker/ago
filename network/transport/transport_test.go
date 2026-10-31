@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,5 +187,58 @@ func TestLocalLinkOverflow(t *testing.T) {
 	}
 	if err := b.Send(Frame{Kind: FramePing, To: "a"}); !errors.Is(err, ErrLinkOverflow) {
 		t.Fatalf("second send: want ErrLinkOverflow, got %v", err)
+	}
+}
+
+// Concurrent Send and Close on the same link must never panic. Close must
+// not close the recipient's inbox channel: a push racing that close dies
+// with "send on closed channel" (audit M-9), so shutdown is signalled by
+// done only and push selects on it. Any single Send outcome — success,
+// ErrLinkOverflow or ErrLinkClosed — is fine; the assertion is that all
+// iterations complete without a panic or a blocked sender. Run with -race
+// for the memory-race view.
+func TestLocalLinkConcurrentCloseSend(t *testing.T) {
+	const iterations = 200
+	const senders = 4
+	const sendsPerSender = 50
+	var wg sync.WaitGroup
+	for i := 0; i < iterations; i++ {
+		ll := NewLocalLink(WithLinkBuffer(2))
+		a, err := ll.Dial("a")
+		if err != nil {
+			t.Fatalf("iter %d: dial a: %v", i, err)
+		}
+		b, err := ll.Dial("b")
+		if err != nil {
+			t.Fatalf("iter %d: dial b: %v", i, err)
+		}
+
+		// A start barrier lines the senders and the closer up so the bursts
+		// of sends actually overlap Close instead of finishing before it.
+		start := make(chan struct{})
+		wg.Add(senders + 1)
+		for s := 0; s < senders; s++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				for n := 0; n < sendsPerSender; n++ {
+					// Must not block either: the inbox is bounded, so a
+					// send with no room reports overflow instead of waiting.
+					_ = a.Send(Frame{Kind: FramePing, From: "a", To: "b"})
+				}
+			}()
+		}
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = b.Close()
+		}()
+		close(start)
+		wg.Wait()
+
+		// Also closes a: frees the addresses for the next iteration.
+		if err := ll.Close(); err != nil {
+			t.Fatalf("iter %d: switch close: %v", i, err)
+		}
 	}
 }

@@ -64,6 +64,10 @@ var (
 	ErrProtocol = errors.New("acp: protocol error")
 	// ErrClosed reports an operation on a closed Bridge.
 	ErrClosed = errors.New("acp: bridge is closed")
+	// ErrTimeout reports a Bridge exchange that outlived
+	// Bridge.ExchangeTimeout; the agent subprocess was killed to unblock the
+	// wait, so the Bridge is no longer usable for further exchanges.
+	ErrTimeout = errors.New("acp: exchange timed out")
 )
 
 // killAfter bounds a subprocess shutdown: closing stdin lets a well-behaved

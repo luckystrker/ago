@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -225,8 +227,14 @@ func TestServerMessageSendRoundTrip(t *testing.T) {
 	}
 }
 
-func TestServerMessageSendCarriesClientIDs(t *testing.T) {
-	h := NewServer(ServerConfig{Card: testCard(false), Handle: echoHandler}).Handler()
+// TestServerMessageSendIgnoresClientTaskID: a task id the store does not know
+// names no record — the server mints its own UUID for a new task, so a client
+// cannot pre-select (or later continue) a record by guessing ids. The
+// client-supplied contextId still threads the conversation, and a send that
+// quotes the server-minted id continues that task.
+func TestServerMessageSendIgnoresClientTaskID(t *testing.T) {
+	store := NewMemoryTaskStore()
+	h := NewServer(ServerConfig{Card: testCard(false), Handle: echoHandler, Store: store}).Handler()
 	body := `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-user","taskId":"t-42","contextId":"c-42","parts":[{"kind":"text","text":"hi"}]}}}`
 	envelope := postRPC(t, h, body)
 	if envelope.Error != nil {
@@ -234,19 +242,99 @@ func TestServerMessageSendCarriesClientIDs(t *testing.T) {
 	}
 	var reply Message
 	_ = json.Unmarshal(envelope.Result, &reply)
-	if reply.TaskID != "t-42" || reply.ContextID != "c-42" {
-		t.Fatalf("client-supplied ids not honored: taskId=%q contextId=%q", reply.TaskID, reply.ContextID)
+	if reply.TaskID == "" || reply.TaskID == "t-42" {
+		t.Fatalf("new task id = %q, want a server-minted UUID (not the client's)", reply.TaskID)
+	}
+	if reply.ContextID != "c-42" {
+		t.Fatalf("contextId = %q, want the client-supplied c-42", reply.ContextID)
+	}
+
+	// The store holds the task under the server id, not the client's.
+	if _, err := store.Get(context.Background(), "t-42"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("Get client-chosen id: err = %v, want ErrTaskNotFound", err)
+	}
+	task, err := store.Get(context.Background(), reply.TaskID)
+	if err != nil {
+		t.Fatalf("Get server id: %v", err)
+	}
+	if task.ID != reply.TaskID || len(task.History) != 1 {
+		t.Fatalf("stored task = %s, history %d", task.ID, len(task.History))
+	}
+
+	// Quoting the server id continues the same task.
+	cont := `{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"message":{"role":"user","taskId":"` + reply.TaskID + `","contextId":"c-42","parts":[{"kind":"text","text":"again"}]}}}`
+	envelope = postRPC(t, h, cont)
+	if envelope.Error != nil {
+		t.Fatalf("continuation: %s", envelope.Error)
+	}
+	_ = json.Unmarshal(envelope.Result, &reply)
+	if reply.TaskID != task.ID {
+		t.Fatalf("continuation task id = %q, want %q", reply.TaskID, task.ID)
+	}
+	continued, err := store.Get(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("Get continued: %v", err)
+	}
+	if len(continued.History) != 2 {
+		t.Fatalf("continued history = %d messages, want 2", len(continued.History))
 	}
 }
 
+// recordingStore notes every written id, so a test can find the server-minted
+// id of a task whose wire reply carries none (a failed turn answers a fixed
+// internal error, not a record).
+type recordingStore struct {
+	*MemoryTaskStore
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *recordingStore) note(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ids = append(s.ids, id)
+}
+
+func (s *recordingStore) Save(ctx context.Context, task *Task) error {
+	s.note(task.ID)
+	return s.MemoryTaskStore.Save(ctx, task)
+}
+
+func (s *recordingStore) Upsert(ctx context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error) {
+	stored, err := s.MemoryTaskStore.Upsert(ctx, id, mutate)
+	if err == nil && stored != nil {
+		s.note(stored.ID)
+	}
+	return stored, err
+}
+
 func TestServerMessageSendHandleErrorRecordsFailedTask(t *testing.T) {
-	store := NewMemoryTaskStore()
+	store := &recordingStore{MemoryTaskStore: NewMemoryTaskStore()}
 	h := NewServer(ServerConfig{Card: testCard(false), Handle: failingHandler, Store: store}).Handler()
 	body := `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","taskId":"t-9","parts":[{"kind":"text","text":"x"}]}}}`
-	postRPC(t, h, body)
-	task, err := store.Get(context.Background(), "t-9")
+	envelope := postRPC(t, h, body)
+
+	// The wire error is the fixed internal message: the handler's error chain
+	// is server-internal detail and stays off the wire.
+	if envelope.Error == nil || envelope.Error.Code != codeInternalError {
+		t.Fatalf("want internal error, got %+v", envelope.Error)
+	}
+	if envelope.Error.Message != msgInternalError {
+		t.Fatalf("wire message = %q, want the fixed %q", envelope.Error.Message, msgInternalError)
+	}
+
+	store.mu.Lock()
+	ids := append([]string(nil), store.ids...)
+	store.mu.Unlock()
+	if len(ids) != 1 {
+		t.Fatalf("stored task ids = %v, want exactly the one server-minted id", ids)
+	}
+	task, err := store.Get(context.Background(), ids[0])
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
+	}
+	if task.ID == "t-9" {
+		t.Fatalf("stored under the client-chosen id %q, want a server-minted one", task.ID)
 	}
 	if task.Status.State != TaskStateFailed {
 		t.Fatalf("task state = %q, want failed", task.Status.State)
@@ -254,6 +342,8 @@ func TestServerMessageSendHandleErrorRecordsFailedTask(t *testing.T) {
 	if task.Status.Message == nil || len(task.Status.Message.Parts) != 1 {
 		t.Fatalf("failed status message = %+v", task.Status.Message)
 	}
+	// The stored record keeps the full text for the operator; only the wire
+	// error is fixed.
 	if tp, ok := task.Status.Message.Parts[0].(*TextPart); !ok || tp.Text != "boom" {
 		t.Fatalf("failure text = %#v", task.Status.Message.Parts[0])
 	}
@@ -510,5 +600,101 @@ func TestServerMessageStreamDisabled(t *testing.T) {
 	}
 	if envelope.Error == nil || envelope.Error.Code != codeUnsupportedOperation {
 		t.Fatalf("want code %d, got %+v", codeUnsupportedOperation, envelope.Error)
+	}
+}
+
+// TestServerAuthorizeHookRejects: a rejecting Authorize hook answers 403 with
+// a fixed message before any dispatch — the handler never runs, on the RPC,
+// REST and card surfaces alike; the hook's error text stays off the wire.
+// An accepting hook leaves the exchange untouched.
+func TestServerAuthorizeHookRejects(t *testing.T) {
+	var handled int32
+	handle := func(ctx context.Context, msg *Message) (*Message, error) {
+		atomic.AddInt32(&handled, 1)
+		return echoHandler(ctx, msg)
+	}
+	reject := func(r *http.Request) error { return errors.New("missing bearer token") }
+	h := NewServer(ServerConfig{Card: testCard(false), Handle: handle, Authorize: reject}).Handler()
+
+	// The JSON-RPC surface is gated.
+	req := httptest.NewRequest(http.MethodPost, rpcPath, strings.NewReader(messageSendBody("hi", `1`)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("RPC: status = %d, want 403", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "bearer") {
+		t.Fatalf("rejection body leaked hook error text: %q", rec.Body.String())
+	}
+	if atomic.LoadInt32(&handled) != 0 {
+		t.Fatal("handler ran for a rejected request")
+	}
+
+	// The REST twin and card discovery are gated too.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RESTTasksPath, strings.NewReader(`{}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("REST: status = %d, want 403", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, DefaultCardPath, nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("card: status = %d, want 403", rec.Code)
+	}
+
+	// An accepting hook is transparent: the exchange runs and replies.
+	accept := NewServer(ServerConfig{Card: testCard(false), Handle: handle, Authorize: func(*http.Request) error { return nil }}).Handler()
+	envelope := postRPC(t, accept, messageSendBody("hi", `2`))
+	if envelope.Error != nil {
+		t.Fatalf("accepting hook: %s", envelope.Error)
+	}
+	if n := atomic.LoadInt32(&handled); n != 1 {
+		t.Fatalf("handler ran %d times, want 1 (only the accepted request)", n)
+	}
+}
+
+// TestServerAllowedHostsAndOrigins: a configured Host allowlist admits only
+// the declared hosts (case-insensitively, port included), and a configured
+// Origin allowlist fences browser requests — an Origin header must match,
+// while requests without one (server-to-server clients) pass.
+func TestServerAllowedHostsAndOrigins(t *testing.T) {
+	h := NewServer(ServerConfig{
+		Card:           testCard(false),
+		Handle:         echoHandler,
+		AllowedHosts:   []string{"ago.example:8080", "AGO.example"},
+		AllowedOrigins: []string{"https://app.example"},
+	}).Handler()
+
+	send := func(host, origin string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://"+host+rpcPath, strings.NewReader(messageSendBody("hi", `1`)))
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := send("ago.example:8080", ""); code != http.StatusOK {
+		t.Fatalf("allowed host: status = %d, want 200", code)
+	}
+	if code := send("ago.EXAMPLE:8080", "https://APP.example"); code != http.StatusOK {
+		t.Fatalf("allowed host/origin (case): status = %d, want 200", code)
+	}
+	if code := send("evil.example", ""); code != http.StatusForbidden {
+		t.Fatalf("rebinding host: status = %d, want 403", code)
+	}
+	if code := send("ago.example:8080", "https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-origin browser request: status = %d, want 403", code)
+	}
+	// No allowlist configured: everything passes (loopback default).
+	open := NewServer(ServerConfig{Card: testCard(false), Handle: echoHandler}).Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://wherever.example"+rpcPath, strings.NewReader(messageSendBody("hi", `1`)))
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	open.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ungated server: status = %d, want 200", rec.Code)
 	}
 }

@@ -354,6 +354,11 @@ func runFakeMCPServer(in io.Reader, out io.Writer) {
 			childError(w, *req.ID, -32601, "method not found")
 		}
 	}
+	// The disconnect test's proof: this process writes the marker once its
+	// stdin closes — i.e. once the owning gateway was closed.
+	if marker := os.Getenv(markerEnv); marker != "" {
+		_ = os.WriteFile(marker, []byte("exited"), 0o644)
+	}
 }
 
 // --- the client-side tests --------------------------------------------------------
@@ -456,7 +461,13 @@ func TestBridgeLoadReceivesReplay(t *testing.T) {
 // BridgeState.read_text_file/write_text_file + _confine).
 func TestBridgeFSMediated(t *testing.T) {
 	root := t.TempDir()
-	b := newRoleBridge(t, roleFS, func(br *Bridge) { br.FS = &FSConfig{Root: root} })
+	// fs/write_text_file rides the Permission policy; allow it so this test
+	// exercises the filesystem, not the gate (TestBridgeFSWriteRequiresPermission
+	// covers the denial).
+	b := newRoleBridge(t, roleFS, func(br *Bridge) {
+		br.FS = &FSConfig{Root: root}
+		br.Permission = func(toolCall, input string) bool { return true }
+	})
 	id, err := b.SessionNew(t.TempDir())
 	if err != nil {
 		t.Fatalf("SessionNew: %v", err)
@@ -512,7 +523,13 @@ func TestBridgeTerminalMediated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	b := newRoleBridge(t, roleTerm, func(br *Bridge) { br.FS = &FSConfig{Root: root} })
+	// terminal/create rides the Permission policy; allow it so this test
+	// exercises the terminals, not the gate (TestBridgeTerminalRequiresPermission
+	// covers the denial).
+	b := newRoleBridge(t, roleTerm, func(br *Bridge) {
+		br.FS = &FSConfig{Root: root}
+		br.Permission = func(toolCall, input string) bool { return true }
+	})
 	id, err := b.SessionNew(t.TempDir())
 	if err != nil {
 		t.Fatalf("SessionNew: %v", err)
@@ -584,5 +601,240 @@ func TestBridgeToolGatewayViaStdio(t *testing.T) {
 	// Undeclared server, unknown client state.
 	if _, err := NewToolGateway(nil).Call("demo", "echo", nil); !errors.Is(err, ErrServerNotFound) {
 		t.Errorf("gateway on an empty declaration set = %v, want ErrServerNotFound", err)
+	}
+}
+
+// TestBridgeTerminalRequiresPermission: terminal/create rides the Permission
+// policy — a nil policy or a false answer refuses the request and no command
+// runs, exactly as a session/request_permission is denied (the mediated
+// methods act on this side of the wire, so they take the same consent).
+func TestBridgeTerminalRequiresPermission(t *testing.T) {
+	root := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cases := map[string]func(string, string) bool{
+		"nil policy":  nil,
+		"deny answer": func(string, string) bool { return false },
+	}
+	for name, policy := range cases {
+		b := newRoleBridge(t, roleTerm, func(br *Bridge) {
+			br.FS = &FSConfig{Root: root}
+			br.Permission = policy
+		})
+		id, err := b.SessionNew(t.TempDir())
+		if err != nil {
+			t.Fatalf("%s: SessionNew: %v", name, err)
+		}
+		out, err := b.Prompt(id, exe+"|"+roleTermEcho)
+		if err != nil {
+			t.Fatalf("%s: Prompt: %v", name, err)
+		}
+		if !strings.Contains(out, fmt.Sprintf("create-failed:map[error:%d]", codeInvalidRequest)) {
+			t.Errorf("%s: transcript %q misses the invalid-request refusal", name, out)
+		}
+		if strings.Contains(out, "term:term-") || strings.Contains(out, "out:term-ok") {
+			t.Errorf("%s: a terminal was created without permission: %q", name, out)
+		}
+	}
+}
+
+// TestBridgeFSWriteRequiresPermission: fs/write_text_file rides the Permission
+// policy — a denying answer leaves the disk untouched, and the policy sees the
+// path it was asked about and the raw request.
+func TestBridgeFSWriteRequiresPermission(t *testing.T) {
+	root := t.TempDir()
+	var askedTool, askedInput string
+	b := newRoleBridge(t, roleFS, func(br *Bridge) {
+		br.FS = &FSConfig{Root: root}
+		br.Permission = func(toolCall, input string) bool {
+			if strings.HasPrefix(toolCall, "fs/write_text_file") {
+				askedTool, askedInput = toolCall, input
+			}
+			return false
+		}
+	})
+	id, err := b.SessionNew(t.TempDir())
+	if err != nil {
+		t.Fatalf("SessionNew: %v", err)
+	}
+	out, err := b.Prompt(id, root)
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if !strings.Contains(out, fmt.Sprintf("write-err:%d", codeInvalidRequest)) {
+		t.Errorf("transcript %q misses the write refusal code %d", out, codeInvalidRequest)
+	}
+	if _, err := os.Stat(filepath.Join(root, "nested", "written.txt")); !os.IsNotExist(err) {
+		t.Errorf("the denied write reached the disk (stat err = %v)", err)
+	}
+	if !strings.Contains(askedTool, "written.txt") || !strings.Contains(askedInput, "written-by-agent") {
+		t.Errorf("policy saw tool=%q input=%q, want the write path and content", askedTool, askedInput)
+	}
+}
+
+// TestBridgeExchangeTimeout: a hung agent — handshake answered, the next
+// request never — fails the exchange with ErrTimeout once ExchangeTimeout is
+// set, instead of parking the caller forever. The subprocess is killed to
+// unblock the wait.
+func TestBridgeExchangeTimeout(t *testing.T) {
+	b := newRoleBridge(t, roleSilent, func(br *Bridge) { br.ExchangeTimeout = 300 * time.Millisecond })
+	if id, err := b.SessionNew(t.TempDir()); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("SessionNew = %q, %v; want ErrTimeout", id, err)
+	}
+	// The killed agent tears down cleanly.
+	if err := b.Close(); err != nil {
+		t.Errorf("Close after a timed-out exchange: %v", err)
+	}
+}
+
+// TestBridgeDefaultTerminalOutputLimit: a terminal whose create request sets
+// no outputByteLimit still caps the captured output at the default — an unset
+// limit must not mean an unbounded buffer.
+func TestBridgeDefaultTerminalOutputLimit(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	m := newTerminalManager(t.TempDir(), false)
+	id, rpcErr := m.create(createTerminalParams{
+		Command: exe,
+		Env: []envVariable{
+			{Name: roleEnv, Value: roleTermSpam},
+			{Name: spamBytesEnv, Value: "2500000"}, // 2.5 MiB, no explicit limit
+		},
+	})
+	if rpcErr != nil {
+		t.Fatalf("terminal create: %v", rpcErr)
+	}
+	if _, rpcErr := m.wait(id); rpcErr != nil {
+		t.Fatalf("terminal wait: %v", rpcErr)
+	}
+	res, rpcErr := m.output(id)
+	if rpcErr != nil {
+		t.Fatalf("terminal output: %v", rpcErr)
+	}
+	if len(res.Output) != defaultTerminalOutputLimit {
+		t.Errorf("captured %d bytes without a requested limit, want the default cap %d",
+			len(res.Output), defaultTerminalOutputLimit)
+	}
+	if !res.Truncated {
+		t.Error("output beyond the default cap must be marked truncated")
+	}
+}
+
+// TestTerminalManagerEnvWhitelist: a terminal child starts from the shared
+// toolpacks whitelist — a parent-only secret stays out of its environment
+// (audit H-6, the acp/terminal.go half) while a whitelisted variable (PATH)
+// and the per-request env both reach it.
+func TestTerminalManagerEnvWhitelist(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	t.Setenv(parentSecretEnv, "parent-secret-value")
+	m := newTerminalManager(t.TempDir(), false)
+	id, rpcErr := m.create(createTerminalParams{
+		Command: exe,
+		Env:     []envVariable{{Name: roleEnv, Value: roleTermEnv}},
+	})
+	if rpcErr != nil {
+		t.Fatalf("terminal create: %v", rpcErr)
+	}
+	if _, rpcErr := m.wait(id); rpcErr != nil {
+		t.Fatalf("terminal wait: %v", rpcErr)
+	}
+	res, rpcErr := m.output(id)
+	if rpcErr != nil {
+		t.Fatalf("terminal output: %v", rpcErr)
+	}
+	for _, want := range []string{"secret-absent", "path-present"} {
+		if !strings.Contains(res.Output, want) {
+			t.Errorf("terminal output %q misses %q: the whitelist did not hold", res.Output, want)
+		}
+	}
+	if strings.Contains(res.Output, "secret-leaked") {
+		t.Errorf("terminal output %q carries the parent-only secret: the whitelist leaked", res.Output)
+	}
+}
+
+// TestToolGatewayAllowlist: with an allowlist wired, a stdio declaration
+// naming a command outside it fails its first dial instead of spawning; the
+// allowed entry still dials.
+func TestToolGatewayAllowlist(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	gw := NewToolGateway([]MCPServer{
+		{Name: "ok", Command: exe, Env: map[string]string{roleEnv: roleMCPServe}},
+		{Name: "nope", Command: "definitely-not-allowed"},
+	})
+	gw.allowedCommands = []string{exe}
+	t.Cleanup(gw.Close)
+	if _, err := gw.Call("ok", "echo", map[string]any{"msg": "hi"}); err != nil {
+		t.Fatalf("allowed command dial: %v", err)
+	}
+	if _, err := gw.Call("nope", "echo", nil); !errors.Is(err, ErrServerNotAllowed) {
+		t.Errorf("disallowed command = %v, want ErrServerNotAllowed", err)
+	}
+}
+
+// TestToolGatewayURLScheme: HTTP declarations are dialed to http/https
+// endpoints only — every other scheme is refused before any transport sees
+// the URL.
+func TestToolGatewayURLScheme(t *testing.T) {
+	gw := NewToolGateway([]MCPServer{
+		{Name: "fs", URL: "file:///etc/passwd"},
+		{Name: "ftp", URL: "ftp://127.0.0.1/mcp"},
+		{Name: "hostless", URL: "http://"},
+	})
+	t.Cleanup(gw.Close)
+	for _, name := range []string{"fs", "ftp", "hostless"} {
+		if _, err := gw.Call(name, "echo", nil); !errors.Is(err, ErrServerNotAllowed) {
+			t.Errorf("Call(%q) = %v, want ErrServerNotAllowed", name, err)
+		}
+	}
+}
+
+// TestBridgeFSSymlinkEscape: a symlink under the root pointing outside it is
+// refused by both mediated file methods — confine resolves it up front, and
+// the os.Root handle re-resolves at open time, so the class stays closed even
+// when a swapped component lands between the two checks (audit M-21). An
+// in-root symlink still reads through: confinement, not a symlink ban.
+func TestBridgeFSSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ok.txt"), []byte("fine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(filepath.Dir(root), "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(root, "leak.txt")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "ok.txt"), filepath.Join(root, "inner.txt")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	b := &Bridge{FS: &FSConfig{Root: root}}
+
+	if _, rpcErr := b.fsRead(readTextFileParams{Path: "leak.txt"}); rpcErr == nil || rpcErr.Code != codeResourceNotFound {
+		t.Errorf("fsRead via an escaping symlink = %v, want resource-not-found", rpcErr)
+	}
+	if rpcErr := b.fsWrite(writeTextFileParams{Path: "leak.txt", Content: "x"}); rpcErr == nil || rpcErr.Code != codeResourceNotFound {
+		t.Errorf("fsWrite via an escaping symlink = %v, want resource-not-found", rpcErr)
+	}
+	if got, rpcErr := b.fsRead(readTextFileParams{Path: "inner.txt"}); rpcErr != nil || got.Content != "fine" {
+		t.Errorf("fsRead via an in-root symlink = %q, %v; want the target content", got.Content, rpcErr)
+	}
+	// Plain paths still work through the root handle: write into a new
+	// subdirectory, read it back.
+	if rpcErr := b.fsWrite(writeTextFileParams{Path: "nested/file.txt", Content: "written"}); rpcErr != nil {
+		t.Fatalf("fsWrite through the root handle: %v", rpcErr)
+	}
+	if got, rpcErr := b.fsRead(readTextFileParams{Path: "nested/file.txt"}); rpcErr != nil || got.Content != "written" {
+		t.Errorf("fsRead after write = %q, %v", got.Content, rpcErr)
 	}
 }

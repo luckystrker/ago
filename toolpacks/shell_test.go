@@ -135,6 +135,14 @@ func TestShellToolSchema(t *testing.T) {
 	if _, ok := props["command"]; !ok {
 		t.Fatalf("schema properties = %v, want command", sch.Parameters)
 	}
+	// The default description is the model's contract (security audit
+	// 2026-10-31, C-1): it must state the real execution semantics, not a
+	// sandbox that does not exist.
+	for _, want := range []string{"without isolation", "not a security boundary", "human approval"} {
+		if !strings.Contains(sch.Description, want) {
+			t.Fatalf("description = %q, want it to contain %q", sch.Description, want)
+		}
+	}
 }
 
 // quoteGo renders s as a JSON string literal.

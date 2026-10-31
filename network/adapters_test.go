@@ -185,6 +185,58 @@ func TestWorkflowAdapterStaticRouting(t *testing.T) {
 	}
 }
 
+func TestWorkflowAdapterHandoffTargetMustParticipate(t *testing.T) {
+	h := newTestHub(t)
+	a, b := registerTwo(t, h)
+	rec := newRecorder()
+	rec.attach(h, a, true)
+	rec.attach(h, b, true)
+
+	graph := TransitionGraph{
+		Initial:     a,
+		Transitions: []Transition{{When: Always{}, To: AgentTarget{AgentID: b}}},
+	}
+	ch, err := h.CreateChannel(ChannelManifest{
+		Type:  TypeWorkflow,
+		Knobs: map[string]any{"graph": graph.ToDict()},
+	}, []string{a, b})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A pre-resolved handoff to an agent outside the channel is rejected:
+	// the hub would never accept that agent's sends, so the channel would
+	// stall until its TTL.
+	before, _ := h.ReadWAL(ch.ID)
+	pkt := NewPacketEnvelope(ch.ID, a, "", "take over",
+		WithPacketRouting(map[string]any{"kind": "handoff", "target": "stranger"}))
+	if _, err := h.Send(pkt); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("handoff to non-participant must be rejected, got %v", err)
+	}
+	// The rejected envelope left the folded state untouched.
+	got, _ := h.Channel(ch.ID)
+	st := got.AdapterState.(*workflowState)
+	if st.Expected != a || st.TurnCount != 0 {
+		t.Fatalf("state after rejected handoff: expected=%q turns=%d", st.Expected, st.TurnCount)
+	}
+	if after, _ := h.ReadWAL(ch.ID); len(after) != len(before) {
+		t.Fatalf("rejected handoff leaked into the WAL: %d → %d envelopes", len(before), len(after))
+	}
+
+	// A handoff to a real participant routes directly.
+	pkt = NewPacketEnvelope(ch.ID, a, "", "take over",
+		WithPacketRouting(map[string]any{"kind": "handoff", "target": b}))
+	if _, err := h.Send(pkt); err != nil {
+		t.Fatalf("handoff to participant: %v", err)
+	}
+	got, _ = h.Channel(ch.ID)
+	st = got.AdapterState.(*workflowState)
+	if st.Expected != b || st.TurnCount != 1 {
+		t.Fatalf("state after handoff: expected=%q turns=%d", st.Expected, st.TurnCount)
+	}
+	_ = rec
+}
+
 func TestWorkflowAdapterContext(t *testing.T) {
 	h := newTestHub(t)
 	a, b := registerTwo(t, h)

@@ -34,6 +34,26 @@ var ErrNoActiveTask = errors.New("network: no active task on the context")
 // carries no per-turn depth, so the consult always rides one hop deep.
 const contextDelegationDepth = 1
 
+// clientTimeoutCapSeconds is the ceiling on the LLM-requested timeout of the
+// blocking client tools (tasks wait, delegate). The timeout arrives in
+// model-controlled arguments; without a ceiling one call parks the agent for
+// hours. It is a variable only so tests can lower it without waiting a real
+// quarter hour.
+// AGO-DEVIATION: Python AG2 honours any requested timeout; AGo caps it.
+var clientTimeoutCapSeconds = 900.0
+
+// clampTimeout defaults a missing timeout (300s) and enforces
+// clientTimeoutCapSeconds.
+func clampTimeout(secs float64) float64 {
+	if secs <= 0 {
+		return 300
+	}
+	if secs > clientTimeoutCapSeconds {
+		return clientTimeoutCapSeconds
+	}
+	return secs
+}
+
 // ClientTools builds the five LLM tools over the hub for the calling
 // agent. Install them on an agent the usual way (agent.WithTools /
 // spec tool pool).
@@ -63,13 +83,14 @@ func ClientTools(hc *HubClient, self *AgentClient) ([]tools.Tool, error) {
 		return nil, err
 	}
 	tasks, err := tools.NewFunctionTool("tasks",
-		"Task lifecycle.\n"+
+		fmt.Sprintf("Task lifecycle.\n"+
 			"progress: args payload — requires an active task (started with task.Start)\n"+
 			"complete: args result? — requires an active task\n"+
 			"list:     args scope=\"own\"|\"all\", state=\"active\"|\"all\", limit\n"+
 			"status:   args task_id\n"+
-			"wait:     args task_id, timeout (seconds, default 300)\n"+
+			"wait:     args task_id, timeout (seconds, default 300, capped at %gs)\n"+
 			"cancel:   args task_id, reason? — posts a cancel_request the owner may honour",
+			clientTimeoutCapSeconds),
 		self.tasksLifecycle(hc),
 		tools.WithSource("network:tasks"))
 	if err != nil {
@@ -85,11 +106,12 @@ func ClientTools(hc *HubClient, self *AgentClient) ([]tools.Tool, error) {
 		return nil, err
 	}
 	delegate, err := tools.NewFunctionTool("delegate",
-		"Open a one-shot consulting channel with target and return its reply.\n"+
+		fmt.Sprintf("Open a one-shot consulting channel with target and return its reply.\n"+
 			"target: peer name (or agent_id) to consult\n"+
 			"prompt: the question or request to send\n"+
 			"capability: optional capability tag, recorded as a channel knob\n"+
-			"timeout: max seconds to wait for the reply (default 300)",
+			"timeout: max seconds to wait for the reply (default 300, capped at %gs)",
+			clientTimeoutCapSeconds),
 		self.delegateConsult(hc),
 		tools.WithSource("network:delegate"))
 	if err != nil {
@@ -257,12 +279,23 @@ func (a *AgentClient) channelsLifecycle(hc *HubClient) func(channelsArgs) (any, 
 			if id == "" {
 				return "Error: close requires `channel_id`", nil
 			}
+			ch, err := hub.Channel(id)
+			if err != nil {
+				return fmt.Sprintf("Error: channel %q not found", id), nil
+			}
+			// Closing is as privileged as info — a channel the caller does
+			// not sit in is not theirs to end (audit M-8).
+			//
+			// AGO-DEVIATION: Python's channels close closes any channel id;
+			// AGo gates it on participation like info.
+			if !ch.hasParticipant(a.AgentID()) {
+				return fmt.Sprintf("Error: not a participant of channel %q", id), nil
+			}
 			if err := hub.CloseChannel(id, "closed_by_agent"); err != nil {
 				return fmt.Sprintf("Error: close failed: %v", err), nil
 			}
-			ch, _ := hub.Channel(id)
 			state := ""
-			if ch != nil {
+			if ch, err := hub.Channel(id); err == nil {
 				state = string(ch.State)
 			}
 			return map[string]any{"channel_id": id, "state": state, "close_reason": "closed_by_agent"}, nil
@@ -358,6 +391,9 @@ func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.
 				limit = 20
 			}
 			metas := hub.Tasks(owner, args.State != "all")
+			if owner == "" {
+				metas = participantTasks(hub, metas, a.AgentID())
+			}
 			if len(metas) > limit {
 				metas = metas[:limit]
 			}
@@ -379,10 +415,7 @@ func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.
 			if args.TaskID == "" {
 				return "Error: wait requires `task_id`", nil
 			}
-			timeout := args.Timeout
-			if timeout <= 0 {
-				timeout = 300
-			}
+			timeout := clampTimeout(args.Timeout)
 			deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 			for {
 				md, err := hub.Task(args.TaskID)
@@ -440,6 +473,31 @@ func taskSummary(md task.Metadata) map[string]any {
 		"error":      md.Error,
 		"channel_id": md.ChannelID,
 	}
+}
+
+// participantTasks narrows a hub-wide task listing (tasks list scope=all) to
+// the tasks the caller may legitimately see: their own, plus those riding a
+// channel they participate in. Metadata of strangers' tasks — titles,
+// payloads of results — is not directory information (audit M-8).
+//
+// AGO-DEVIATION: Python's tasks list scope=all passes no owner filter and
+// returns every task the hub mirrors; AGo gates it on ownership or channel
+// participation.
+func participantTasks(hub *Hub, metas []task.Metadata, agentID string) []task.Metadata {
+	out := make([]task.Metadata, 0, len(metas))
+	for _, md := range metas {
+		if md.OwnerID == agentID {
+			out = append(out, md)
+			continue
+		}
+		if md.ChannelID == "" {
+			continue
+		}
+		if ch, err := hub.Channel(md.ChannelID); err == nil && ch.hasParticipant(agentID) {
+			out = append(out, md)
+		}
+	}
+	return out
 }
 
 // --- context ------------------------------------------------------------------
@@ -568,6 +626,23 @@ type delegateArgs struct {
 // tool namespace for part of the target name (Python parity).
 const functionsNamespacePrefix = "functions."
 
+// The delegate reply is observed by re-reading the channel WAL, which copies
+// the whole accepted log per poll; the interval therefore grows instead of
+// re-copying the WAL 50 times a second for the full wait. delegatePollStart
+// keeps a fresh consult snappy, delegatePollMax bounds reply latency.
+const (
+	delegatePollStart = 20 * time.Millisecond
+	delegatePollMax   = 500 * time.Millisecond
+)
+
+// nextPollInterval doubles the poll delay up to delegatePollMax.
+func nextPollInterval(d time.Duration) time.Duration {
+	if next := d * 2; next < delegatePollMax {
+		return next
+	}
+	return delegatePollMax
+}
+
 // delegateCandidates lists target resolution candidates, most literal
 // first (Python parity: _target_candidates).
 func delegateCandidates(target string) []string {
@@ -636,14 +711,12 @@ func (a *AgentClient) delegateConsult(hc *HubClient) func(delegateArgs) (any, er
 			return fmt.Sprintf("Error: prompt send failed: %v", err), nil
 		}
 
-		timeout := args.Timeout
-		if timeout <= 0 {
-			timeout = 300
-		}
+		timeout := clampTimeout(args.Timeout)
 		deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 		reply := ""
 		timedOut := true
 		channelClosed := ""
+		poll := delegatePollStart
 		for time.Now().Before(deadline) {
 			wal, err := hub.ReadWAL(ch.ID)
 			if err != nil {
@@ -668,7 +741,8 @@ func (a *AgentClient) delegateConsult(hc *HubClient) func(delegateArgs) (any, er
 			if reply != "" || channelClosed != "" {
 				break
 			}
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(poll)
+			poll = nextPollInterval(poll)
 		}
 		a.ResumeHandler(ch.ID)
 

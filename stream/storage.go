@@ -69,13 +69,41 @@ type History struct {
 	mu       sync.Mutex
 	streamID string
 	storage  Storage
+	// cap is the maximum number of retained events; 0 = unlimited (Python
+	// parity). When set, appends evict the oldest events so the transcript
+	// cannot grow without bound (audit M-28).
+	cap int
 }
 
+// NewHistory creates a transcript over storage.
 func NewHistory(streamID string, storage Storage) *History {
 	if storage == nil {
 		storage = NewMemoryStorage()
 	}
 	return &History{streamID: streamID, storage: storage}
+}
+
+// SetCap limits how many events the transcript retains (n <= 0 = unlimited).
+// Excess events are dropped from the head on the next write.
+func (h *History) SetCap(n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cap = n
+}
+
+// Cap returns the retention limit (0 = unlimited).
+func (h *History) Cap() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cap
+}
+
+// evict trims next to the newest h.cap events (no-op when unlimited).
+func (h *History) evict(next []events.Event) []events.Event {
+	if h.cap > 0 && len(next) > h.cap {
+		return next[len(next)-h.cap:]
+	}
+	return next
 }
 
 // GetEvents returns a snapshot of the transcript.
@@ -89,7 +117,7 @@ func (h *History) GetEvents() ([]events.Event, error) {
 func (h *History) Replace(evs []events.Event) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.storage.SetHistory(h.streamID, evs)
+	return h.storage.SetHistory(h.streamID, h.evict(evs))
 }
 
 // Append adds already-persisted events without re-dispatching (resume, repair).
@@ -100,7 +128,7 @@ func (h *History) Append(evs ...events.Event) error {
 	if err != nil {
 		return err
 	}
-	return h.storage.SetHistory(h.streamID, append(existing, evs...))
+	return h.storage.SetHistory(h.streamID, h.evict(append(existing, evs...)))
 }
 
 // Drop clears the transcript.

@@ -339,3 +339,71 @@ func TestServerStreamRefusedAfterCancel(t *testing.T) {
 		t.Fatalf("stored state = %q, want canceled", stored.Status.State)
 	}
 }
+
+// updaterOnlyStore hides MemoryTaskStore's Upsert behind a TaskStore +
+// TaskUpdater surface: the server must keep updates atomic through Update
+// while the first commit falls back to the per-task-mutex create.
+type updaterOnlyStore struct{ inner *MemoryTaskStore }
+
+func (u updaterOnlyStore) Save(ctx context.Context, task *Task) error { return u.inner.Save(ctx, task) }
+func (u updaterOnlyStore) Get(ctx context.Context, id string) (*Task, error) {
+	return u.inner.Get(ctx, id)
+}
+func (u updaterOnlyStore) Delete(ctx context.Context, id string) error {
+	return u.inner.Delete(ctx, id)
+}
+func (u updaterOnlyStore) Update(ctx context.Context, id string, mutate func(*Task) (*Task, error)) (*Task, error) {
+	return u.inner.Update(ctx, id, mutate)
+}
+
+var (
+	_ TaskStore   = updaterOnlyStore{}
+	_ TaskUpdater = updaterOnlyStore{}
+)
+
+// TestServerFirstCommitConcurrent drives the create side of the commit race:
+// several turns open the same absent task id at once. The create runs under
+// the same atomicity guarantee as an update — the store's upsert when it has
+// one, the per-task mutex otherwise — so every turn's outcome lands instead
+// of resolving last-write-wins.
+func TestServerFirstCommitConcurrent(t *testing.T) {
+	t.Run("upsert-store", func(t *testing.T) {
+		testFirstCommitConcurrent(t, NewMemoryTaskStore())
+	})
+	t.Run("updater-without-upsert", func(t *testing.T) {
+		testFirstCommitConcurrent(t, updaterOnlyStore{inner: NewMemoryTaskStore()})
+	})
+	t.Run("plain-store", func(t *testing.T) {
+		testFirstCommitConcurrent(t, plainStore{inner: NewMemoryTaskStore()})
+	})
+}
+
+func testFirstCommitConcurrent(t *testing.T, store TaskStore) {
+	t.Helper()
+	srv := NewServer(ServerConfig{Card: testCard(false), Store: store})
+	const writers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			task := &Task{ID: "t-race", Status: TaskStatus{State: TaskStateWorking}}
+			_, _, err := srv.updateOrCreateTask(context.Background(), task, func(current *Task) bool {
+				current.History = append(current.History,
+					*NewMessage(RoleUser, NewTextPart(fmt.Sprintf("m%d", n))))
+				return true
+			})
+			if err != nil {
+				t.Errorf("writer %d: %v", n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	stored, err := store.Get(context.Background(), "t-race")
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if len(stored.History) != writers {
+		t.Fatalf("history len = %d, want %d (parallel first commits lost outcomes)", len(stored.History), writers)
+	}
+}

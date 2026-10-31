@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -165,8 +166,7 @@ func (t *telemetry) OnToolExecution(next middleware.ToolExecFunc, ev *events.Too
 	// parity: isinstance(result, ToolErrorEvent)).
 	if err == nil {
 		if msg, failed := toolErrorMessage(result); failed {
-			span.RecordError(errors.New(msg))
-			span.SetStatus(codes.Error, msg)
+			recordError(span, msg)
 		}
 	}
 	endSpan(span, err)
@@ -189,13 +189,50 @@ func toolErrorMessage(result events.Event) (string, bool) {
 	return "", false
 }
 
+// maxSpanErrorMessage caps the error text written into a span. Provider and
+// tool errors routinely embed fragments of request/response bodies, and span
+// exports are not guaranteed to be authenticated or encrypted in transit —
+// everything past the cap is dropped so a backend never receives full bodies
+// (audit finding L-9).
+//
+// AGO-DEVIATION: Python AG2's telemetry middleware records the exception
+// verbatim; AGo truncates the message before recording (security: response
+// bodies leaking through span exports).
+const maxSpanErrorMessage = 512
+
+// truncationSuffix marks a message cut by truncateMessage, so a reader of the
+// span knows the text was capped and is not the full error.
+const truncationSuffix = "…[truncated]"
+
+// truncateMessage shortens msg to at most limit bytes, cutting on a rune
+// boundary so the result stays valid UTF-8, and marks the cut. Messages within
+// the limit pass through unchanged.
+func truncateMessage(msg string, limit int) string {
+	if len(msg) <= limit {
+		return msg
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + truncationSuffix
+}
+
+// recordError marks the span failed with the exception event and Error status
+// both carrying the message capped at maxSpanErrorMessage — the raw text may
+// embed response-body fragments the trace backend must not receive.
+func recordError(span trace.Span, msg string) {
+	msg = truncateMessage(msg, maxSpanErrorMessage)
+	span.RecordError(errors.New(msg))
+	span.SetStatus(codes.Error, msg)
+}
+
 // endSpan closes a hook span: a pipeline error is recorded as an exception
 // event with the span status set to Error; success leaves the status Unset
 // (the OTel convention for a span that did its job).
 func endSpan(span trace.Span, err error) {
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err.Error())
 	}
 	span.End()
 }

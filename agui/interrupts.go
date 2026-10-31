@@ -89,8 +89,9 @@ func issueProof() string {
 	b := make([]byte, proofBytes)
 	if _, err := rand.Read(b); err != nil {
 		// The process entropy pool is the only source; a failure here is beyond
-		// serving. An absent proof reads as missing, which a non-required check
-		// accepts.
+		// serving. An absent proof reads as missing, which a required check
+		// refuses — the run fails closed rather than running on a secret that
+		// never existed.
 		slog.Error("agui: issuing an interrupt proof", "err", err)
 		return ""
 	}
@@ -110,15 +111,23 @@ func withProof(m map[string]any) map[string]any {
 
 // checkProof verifies the proof a resume entry carries against the one its
 // interrupt was issued with. A proof that is present must be the one issued;
-// one that is absent is refused only when required — a standard client copies
-// nothing from an interrupt's metadata (Python parity: check_proof).
+// one that is absent from the resume is refused only when required — a standard
+// client copies nothing from an interrupt's metadata (Python parity:
+// check_proof).
+//
+// AGO-DEVIATION: Python's check_proof also accepts a required resume when
+// neither side carries a proof, so an interrupt issued through a failed
+// entropy source is answered by a resume that merely repeats the empty
+// envelope. AGo fails closed: a required proof must exist on both sides and
+// match — nothing was proved when there was no secret to present (security
+// audit L-16).
 func checkProof(entry ResumeEntry, interrupt Interrupt, required bool) error {
 	entryProof, entryHas := proofIn(entry.Metadata)
 	interruptProof, interruptHas := proofIn(interrupt.Metadata)
 	if !required && !entryHas {
 		return nil
 	}
-	if entryHas != interruptHas || subtle.ConstantTimeCompare([]byte(entryProof), []byte(interruptProof)) != 1 {
+	if !entryHas || !interruptHas || subtle.ConstantTimeCompare([]byte(entryProof), []byte(interruptProof)) != 1 {
 		return fmt.Errorf("%w: the resume for interrupt %s does not carry the proof it was issued with", errNotProven, interrupt.ID)
 	}
 	return nil
@@ -126,14 +135,19 @@ func checkProof(entry ResumeEntry, interrupt Interrupt, required bool) error {
 
 // proofIn reads the proof out of a metadata envelope. A malformed proof and a
 // missing one are one case when a proof is required: both mean nothing was
-// proved (Python parity: _proof_in).
+// proved (Python parity: _proof_in). An empty value is a missing one too — a
+// real proof is 32 random bytes, and the empty envelope is what a failed
+// issueProof leaves behind.
 func proofIn(metadata map[string]any) (string, bool) {
 	envelope, ok := metadata[metadataKey].(map[string]any)
 	if !ok {
 		return "", false
 	}
 	p, ok := envelope[proofKey].(string)
-	return p, ok
+	if !ok || p == "" {
+		return "", false
+	}
+	return p, true
 }
 
 // answerFrom reads the answer a resume entry carries, as the string the waiting

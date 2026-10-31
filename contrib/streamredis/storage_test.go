@@ -1,7 +1,10 @@
 package streamredis
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"sync"
 	"testing"
@@ -204,5 +207,87 @@ func TestIntegratesWithCoreStreamHistory(t *testing.T) {
 	}
 	if len(again) != 3 || again[2].EventType() != "MessageEnqueued" {
 		t.Errorf("fresh history = %v, want 3 events ending MessageEnqueued", again)
+	}
+}
+
+func TestTimeoutDefaultAndOption(t *testing.T) {
+	s, _ := newTestStorage(t)
+	if s.timeout != DefaultTimeout {
+		t.Errorf("default timeout = %s, want %s", s.timeout, DefaultTimeout)
+	}
+	s2, _ := newTestStorage(t, WithTimeout(5*time.Second))
+	if s2.timeout != 5*time.Second {
+		t.Errorf("WithTimeout(5s) = %s, want 5s", s2.timeout)
+	}
+	// Zero or negative restores the default instead of removing the deadline.
+	for _, d := range []time.Duration{0, -time.Second} {
+		s3, _ := newTestStorage(t, WithTimeout(d))
+		if s3.timeout != DefaultTimeout {
+			t.Errorf("WithTimeout(%s) = %s, want default %s", d, s3.timeout, DefaultTimeout)
+		}
+	}
+}
+
+// startHungRedis listens on loopback, accepts connections and never speaks the
+// Redis protocol — a hung server. Held connections are closed on stop.
+func startHungRedis(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	stop := make(chan struct{})
+	t.Cleanup(func() {
+		ln.Close()
+		close(stop)
+	})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				<-stop
+				c.Close()
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// L-26: every Redis call must run under its own deadline. The client is built
+// the way go-redis documents for blocking setups: client-level read/write
+// timeouts off (ReadTimeout -1 → 0 = no socket timeout) plus
+// ContextTimeoutEnabled, so the per-call context deadline is the only bound —
+// without it a hung server blocks the caller forever. Calls must fail fast
+// with the context error instead.
+func TestHungRedisDeadline(t *testing.T) {
+	addr := startHungRedis(t)
+	rdb := redis.NewClient(&redis.Options{
+		Addr:                  addr,
+		DialTimeout:           5 * time.Second,
+		ReadTimeout:           -1, // client-level timeouts off: the deadline under test is the storage's
+		WriteTimeout:          -1,
+		ContextTimeoutEnabled: true, // go-redis applies the ctx deadline to the socket only with this on
+	})
+	t.Cleanup(func() { rdb.Close() })
+	s := NewStorage(rdb, WithTimeout(200*time.Millisecond))
+
+	start := time.Now()
+	err := s.SaveEvent("hung", &events.TextInput{Content: "x"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SaveEvent on hung redis: err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("SaveEvent took %s to fail; deadline was 200ms", elapsed)
+	}
+
+	start = time.Now()
+	if _, err := s.GetHistory("hung"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetHistory on hung redis: err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("GetHistory took %s to fail; deadline was 200ms", elapsed)
 	}
 }

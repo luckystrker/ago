@@ -164,15 +164,18 @@ type localConn struct {
 	closeOnce sync.Once
 }
 
+// push never blocks and must be safe against a concurrent Close. Closing
+// the inbox instead of (or with) done would turn this select into a panic
+// ("send on closed channel"), so the inbox channel is never closed: done is
+// the only shutdown signal, and whichever case this select picks, the send
+// targets an open channel. A frame that loses the race to done is dropped
+// along with the link — Recv drains the inbox once and then reports closed.
 func (c *localConn) push(f Frame) error {
-	select {
-	case <-c.done:
-		return ErrLinkClosed
-	default:
-	}
 	select {
 	case c.inbox <- f:
 		return nil
+	case <-c.done:
+		return ErrLinkClosed
 	default:
 		return ErrLinkOverflow
 	}
@@ -195,10 +198,7 @@ func (c *localConn) Send(f Frame) error {
 // the link closes.
 func (c *localConn) Recv(ctx context.Context) (Frame, error) {
 	select {
-	case f, ok := <-c.inbox:
-		if !ok {
-			return Frame{}, ErrLinkClosed
-		}
+	case f := <-c.inbox:
 		return f, nil
 	case <-ctx.Done():
 		return Frame{}, ctx.Err()
@@ -206,10 +206,7 @@ func (c *localConn) Recv(ctx context.Context) (Frame, error) {
 		// Drain whatever landed before shutdown so no delivered frame is
 		// lost by a racing Close.
 		select {
-		case f, ok := <-c.inbox:
-			if !ok {
-				return Frame{}, ErrLinkClosed
-			}
+		case f := <-c.inbox:
 			return f, nil
 		default:
 			return Frame{}, ErrLinkClosed
@@ -218,6 +215,11 @@ func (c *localConn) Recv(ctx context.Context) (Frame, error) {
 }
 
 // Close unregisters the link and wakes every Recv. Idempotent.
+//
+// Only done is closed here. The inbox must stay open: push runs without any
+// lock and a send racing close(inbox) would panic; with done as the sole
+// shutdown signal, Recv reports closure after draining and the buffered
+// inbox is garbage-collected together with the conn.
 func (c *localConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.sw.mu.Lock()
@@ -226,7 +228,6 @@ func (c *localConn) Close() error {
 		}
 		c.sw.mu.Unlock()
 		close(c.done)
-		close(c.inbox)
 	})
 	return nil
 }

@@ -4,7 +4,7 @@ import "fmt"
 
 // SentinelPath marks a store that has already been bootstrapped. It holds the
 // actor name that ran the bootstrap (Python parity: _KnowledgeContext writes
-// "/.initialized" with the agent name before running the bootstrap).
+// "/.initialized" with the agent name).
 const SentinelPath = "/.initialized"
 
 // StoreBootstrap initializes a store with a starting structure. It runs once
@@ -74,15 +74,23 @@ func (b DefaultBootstrap) Bootstrap(store Store, actorName string) error {
 }
 
 // BootstrapOnce runs b on store unless SentinelPath marks the store
-// initialized. The sentinel (holding actorName) is written before the layout,
-// so a concurrent second caller never duplicates the bootstrap (Python parity:
-// _KnowledgeContext.enter — same order, same file).
+// initialized. The sentinel (holding actorName) is written after the layout:
+// a bootstrap that dies midway leaves no sentinel, so the next run redoes the
+// idempotent layout instead of settling for a half-initialized store.
+//
+// AGO-DEVIATION: Python's _KnowledgeContext writes the sentinel before the
+// bootstrap to fence concurrent callers; AGo writes it last, trading that
+// fence (concurrent bootstraps are serialized by LockedStore, and the layout
+// writes are idempotent and atomic) for crash-safe layout creation.
 func BootstrapOnce(store Store, actorName string, b StoreBootstrap) error {
 	if store.Exists(SentinelPath) {
 		return nil
 	}
+	if err := b.Bootstrap(store, actorName); err != nil {
+		return err
+	}
 	if err := store.Write(SentinelPath, []byte(actorName)); err != nil {
 		return fmt.Errorf("knowledge: write bootstrap sentinel: %w", err)
 	}
-	return b.Bootstrap(store, actorName)
+	return nil
 }

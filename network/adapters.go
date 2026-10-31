@@ -331,6 +331,19 @@ func (WorkflowAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, err
 		return Routing{}, fmt.Errorf("%w: workflow %s has terminated", ErrProtocol, ch.ID)
 	}
 
+	// A pre-resolved handoff target must be a channel member: the hub
+	// rejects sends from non-participants, so Expected would point at an
+	// agent that can never speak, bricking the channel until its TTL. The
+	// check runs before the fold so a rejected envelope leaves the adapter
+	// state untouched. AGO-DEVIATION: Python trusts the tool's pick.
+	p := decodePacket(env)
+	if p.Routing["kind"] == "handoff" {
+		if target, _ := p.Routing["target"].(string); target != "" && !ch.hasParticipant(target) {
+			return Routing{}, fmt.Errorf("%w: workflow %s handoff target %q is not a participant",
+				ErrProtocol, ch.ID, target)
+		}
+	}
+
 	// Fold: bookkeeping advances first, then routing resolves against the
 	// post-fold state (transitions see the incremented turn count).
 	st.TurnCount++
@@ -340,7 +353,6 @@ func (WorkflowAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, err
 
 	// Apply packet context mutations BEFORE selection so a same-packet set
 	// is visible to conditions (atomic update + speaker advance).
-	p := decodePacket(env)
 	if env.EventType == EnvPacket {
 		for _, k := range p.ContextUpdates.Delete {
 			delete(st.ContextVars, k)

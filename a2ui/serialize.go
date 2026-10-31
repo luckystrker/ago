@@ -1,6 +1,7 @@
 package a2ui
 
 import (
+	"fmt"
 	"strings"
 	"unicode/utf16"
 )
@@ -8,18 +9,22 @@ import (
 // ToJSONL serializes messages to canonical JSONL (serialize.py): one compact
 // JSON object per line, no trailing newline, empty input → empty string. It is
 // the single canonical encoding; every transport frame builds on it.
-func ToJSONL(messages []Message) string {
+//
+// A message fails to marshal when it has no/ambiguous payload or carries a
+// value encoding/json cannot express (a func, a channel, …) in Props,
+// DataModel, Metadata or a FunctionResponse value — a caller bug, reported as
+// an error instead of a panic: the input comes from handler returns, which the
+// server cannot vet at compile time.
+func ToJSONL(messages []Message) (string, error) {
 	lines := make([]string, 0, len(messages))
 	for i := range messages {
 		b, err := messages[i].MarshalJSON()
 		if err != nil {
-			// MarshalJSON only fails on a caller bug (no/ambiguous payload);
-			// surface it loudly instead of emitting a broken line.
-			panic(err)
+			return "", fmt.Errorf("a2ui: message %d: %w", i, err)
 		}
 		lines = append(lines, escapeNonASCII(string(b)))
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), nil
 }
 
 // escapeNonASCII rewrites every non-ASCII rune as \uXXXX (surrogate pairs

@@ -34,20 +34,24 @@ type AgentRun struct {
 	// reentry holds a non-ModelRequest resume trigger sent after subscriptions
 	// are in place (Resume parity).
 	reentry events.Event
+	// pendingInput is the turn's own input, enqueued by Start once the
+	// per-stream lock is held (audit M-25).
+	pendingInput []events.Input
 
 	reply *AgentReply
 	err   error
 
 	// scope state (set by Start, used by the turn goroutine)
-	lock      *sync.Mutex
-	subs      []stream.SubID
-	instances []middleware.Middleware
-	llm       config.LLMClient
-	resolved  *tools.ResolvedTools
-	schema    response.Proto
-	turnCtx   stdcontext.Context
-	cancel    stdcontext.CancelFunc
-	wake      chan struct{}
+	lock          *turnLock
+	subs          []stream.SubID
+	instances     []middleware.Middleware
+	llm           config.LLMClient
+	resolved      *tools.ResolvedTools
+	schema        response.Proto
+	turnCtx       stdcontext.Context
+	cancel        stdcontext.CancelFunc
+	wake          chan struct{}
+	maxToolRounds int
 	// scanStart is the transcript length recorded before the resume trigger was
 	// sent, so the turn loop starts scanning at the right position.
 	scanStart  int
@@ -71,13 +75,18 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	a.mu.Unlock()
 
 	// The turn runs on a cancellable context so Close can stop an in-flight
-	// turn (Python parity: AgentRun.__aexit__ cancels an unfinished task).
+	// turn (Python parity: AgentRun.__aexit__ cancels an unfinished task). The
+	// same context is installed on the conversation context, so hooks that see
+	// no stdlib parameter (middleware, tools asking a human) still follow turn
+	// cancellation (audit M-26).
 	r.turnCtx, r.cancel = stdcontext.WithCancel(ctx)
+	r.cx.SetTurnContext(r.turnCtx)
+	r.maxToolRounds = opts.maxToolRounds
 
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
 	// the per-stream turn lock in _turn_scope).
-	r.lock = a.turnLock(r.stream.ID())
-	r.lock.Lock()
+	r.lock = a.acquireTurnLock(r.stream.ID())
+	r.lock.mu.Lock()
 	// A failed scope entry releases everything the scope took, so a forgotten
 	// Close after a Start error cannot strand the stream for later asks
 	// (Python parity: the _turn_scope async-with releases the lock when the
@@ -88,6 +97,16 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 			r.Close()
 		}
 	}()
+
+	// The turn's input enters the inbox only now, under the lock: a sibling
+	// delegation blocked on this stream must not have its objective drained by
+	// the turn that owns the lock (audit M-25).
+	if len(r.pendingInput) > 0 {
+		if err := r.stream.Enqueue(r.pendingInput...); err != nil {
+			return fmt.Errorf("agent: enqueue input: %w", err)
+		}
+		r.pendingInput = nil
+	}
 
 	// Model config → client (Python parity: _prepare_turn).
 	cfg := opts.cfg
@@ -223,11 +242,17 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 
 // Result waits for the turn to finish and returns the reply (idempotent; the same
 // failure is re-raised, Python parity). Starts the turn when Start was not called.
+// The wait honors ctx: a caller that gives up gets ctx.Err() instead of parking
+// forever on a turn whose goroutine ignores cancellation (audit M-26).
 func (r *AgentRun) Result(ctx stdcontext.Context) (*AgentReply, error) {
 	if err := r.Start(ctx); err != nil {
 		return nil, err
 	}
-	<-r.done
+	select {
+	case <-r.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -256,7 +281,10 @@ func (r *AgentRun) Close() {
 			r.stream.Unsubscribe(id)
 		}
 		if r.lock != nil {
-			r.lock.Unlock()
+			// Releases the mutex and the run's map slot; the entry survives
+			// while other runs still serialize on this stream (audit L-19).
+			r.agent.releaseTurnLock(r.stream.ID(), r.lock)
+			r.lock = nil
 		}
 	})
 }

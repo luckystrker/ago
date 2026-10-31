@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
@@ -12,16 +13,52 @@ import (
 	"github.com/luckystrker/ago/stream"
 )
 
+// DefaultToolTimeout bounds the settlement of one tool call when the tool sets
+// no limit of its own. Without it a tool that never returns (or never sends a
+// result) blocks its turn forever: the stream dispatches subscribers
+// synchronously, so the executor itself is stuck inside Send.
+//
+// AGO-DEVIATION: the Python executor applies no default; AGo bounds every call
+// at the executor so one hung tool cannot hang the conversation. A tool that
+// legitimately needs longer gets it via WithDefaultToolTimeout (0 disables the
+// limit). See docs/DECISIONS.md.
+const DefaultToolTimeout = 120 * time.Second
+
 // Executor drives tool calls on a conversation stream (Python parity:
 // ag2/tools/executor.py). Per turn, Register subscribes the batch handler on
 // ToolCallsEvent, registers every tool, and installs the not-found fallback. Each
 // call is executed on its own goroutine; a hitl failure abandons the batch and
-// propagates (it is never recorded as a tool result). An Executor is stateless and
-// safe for concurrent use.
-type Executor struct{}
+// propagates (it is never recorded as a tool result). An Executor is immutable
+// after construction and safe for concurrent use.
+type Executor struct {
+	defaultTimeout time.Duration
+}
 
-// NewExecutor creates an executor.
-func NewExecutor() *Executor { return &Executor{} }
+// ExecutorOption configures NewExecutor.
+type ExecutorOption func(*Executor)
+
+// WithDefaultToolTimeout bounds how long one call may take to settle (sending
+// the call and awaiting its result). d <= 0 disables the limit; a negative d is
+// normalized to 0. The bound is outermost: a per-tool WithTimeout shorter than
+// d still fires first with its own error, while the executor settles calls that
+// exceed d — including calls of tools with no timeout of their own.
+func WithDefaultToolTimeout(d time.Duration) ExecutorOption {
+	return func(e *Executor) {
+		e.defaultTimeout = d
+		if e.defaultTimeout < 0 {
+			e.defaultTimeout = 0
+		}
+	}
+}
+
+// NewExecutor creates an executor bounded by DefaultToolTimeout per call.
+func NewExecutor(opts ...ExecutorOption) *Executor {
+	e := &Executor{defaultTimeout: DefaultToolTimeout}
+	for _, o := range opts {
+		o(e)
+	}
+	return e
+}
 
 // Register wires the executor for one turn: the batch handler for ToolCallsEvent,
 // then each tool's own subscription (with the agent's middleware instances), then the
@@ -214,8 +251,46 @@ func finalContent(r events.ToolResult) (string, error) {
 
 // executeCall runs one call: it waits for the call's settlement while sending the
 // call event, so the tool's subscriber can answer during the dispatch (Python
-// parity: stream.get opened before the send).
+// parity: stream.get opened before the send). The executor's default timeout
+// wraps the whole settlement: the running tool cannot be interrupted (same
+// semantics as the per-tool WithTimeout), but the turn moves on with the call
+// settled as an error while the stuck execution finishes in the background.
 func (e *Executor) executeCall(cx *agocontext.Context, call events.ToolCallEvent, abandoned <-chan struct{}) (events.Event, error) {
+	if e.defaultTimeout <= 0 {
+		return e.awaitCall(cx, call, abandoned)
+	}
+	type outcome struct {
+		ev  events.Event
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		ev, err := e.awaitCall(cx, call, abandoned)
+		done <- outcome{ev: ev, err: err}
+	}()
+	timer := time.NewTimer(e.defaultTimeout)
+	defer timer.Stop()
+	select {
+	case o := <-done:
+		return o.ev, o.err
+	case <-abandoned:
+		return nil, errAbandoned
+	case <-timer.C:
+		// Same contract as the per-tool timeout and the not-found fallback: the
+		// error event flows on the stream (history, observers) and is returned
+		// as the call's outcome for the batch. The stuck execution still holds
+		// the call's subscription, so its result may flow on the stream later —
+		// it is discarded here, but observers see it arrive after the timeout.
+		timeoutErr := events.FromErrorCall(call, fmt.Errorf("Tool '%s' timed out after %g seconds", call.Name, e.defaultTimeout.Seconds()))
+		if err := cx.Send(timeoutErr); err != nil {
+			return nil, fmt.Errorf("tools: send timeout result for %s: %w", call.Name, err)
+		}
+		return timeoutErr, nil
+	}
+}
+
+// awaitCall sends the call event and waits for the event that settles it.
+func (e *Executor) awaitCall(cx *agocontext.Context, call events.ToolCallEvent, abandoned <-chan struct{}) (events.Event, error) {
 	s := cx.Stream
 	ch := make(chan events.Event, 4)
 	sub := s.Subscribe(func(ev events.Event) error {

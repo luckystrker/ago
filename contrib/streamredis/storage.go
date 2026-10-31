@@ -23,6 +23,7 @@ package streamredis
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -36,13 +37,25 @@ var _ stream.Storage = (*Storage)(nil)
 // DefaultPrefix is the Redis key prefix (Python RedisStorage default).
 const DefaultPrefix = "ag2:stream"
 
+// DefaultTimeout bounds every Redis call. A deadline here is the storage's own
+// guarantee: the injected client may come with client-level timeouts disabled
+// (a common setup for blocking commands), and without a per-call deadline one
+// hung Redis would block the caller forever. Caveat inherited from go-redis
+// v9: the deadline reaches the socket only when the injected client has
+// ContextTimeoutEnabled set (or its own read/write timeouts, the default 3s);
+// a client with both disabled ignores any context deadline.
+const DefaultTimeout = 30 * time.Second
+
 // Storage persists stream transcripts in Redis.
 type Storage struct {
 	rdb    redis.UniversalClient
 	prefix string
-	// The core Storage protocol methods carry no context; every Redis call uses
-	// this background context (AGO-DEVIATION, interface parity constraint).
-	ctx context.Context
+	// The core Storage protocol methods carry no context (AGO-DEVIATION,
+	// interface parity constraint: Python's protocol is likewise context-free),
+	// so every Redis call runs under a fresh context derived from base with the
+	// per-call deadline timeout.
+	base    context.Context
+	timeout time.Duration
 }
 
 // Option configures a Storage.
@@ -53,19 +66,37 @@ func WithPrefix(prefix string) Option {
 	return func(s *Storage) { s.prefix = prefix }
 }
 
+// WithTimeout overrides the per-call Redis deadline (default DefaultTimeout).
+// A zero or negative duration restores the default.
+func WithTimeout(d time.Duration) Option {
+	return func(s *Storage) {
+		if d > 0 {
+			s.timeout = d
+		}
+	}
+}
+
 // NewStorage builds a storage over an injected client. The caller keeps
 // ownership: closing the client is the caller's job.
 func NewStorage(rdb redis.UniversalClient, opts ...Option) *Storage {
 	s := &Storage{
-		rdb:    rdb,
-		prefix: DefaultPrefix,
-		ctx:    context.Background(),
+		rdb:     rdb,
+		prefix:  DefaultPrefix,
+		base:    context.Background(),
+		timeout: DefaultTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 	s.prefix = strings.TrimRight(s.prefix, ":")
 	return s
+}
+
+// callCtx returns the context for one Redis call (or one transactional
+// pipeline): base with the deadline attached. Each call gets its own cancel so
+// timers are never leaked across calls.
+func (s *Storage) callCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.base, s.timeout)
 }
 
 // key maps a stream id to its Redis list key: "{prefix}:{stream_id}".
@@ -77,13 +108,17 @@ func (s *Storage) SaveEvent(streamID string, ev events.Event) error {
 	if err != nil {
 		return err
 	}
-	return s.rdb.RPush(s.ctx, s.key(streamID), data).Err()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	return s.rdb.RPush(ctx, s.key(streamID), data).Err()
 }
 
 // GetHistory returns the whole transcript; an unknown stream id yields an empty
 // slice (LRANGE over a missing key is empty, memory-storage parity).
 func (s *Storage) GetHistory(streamID string) ([]events.Event, error) {
-	raw, err := s.rdb.LRange(s.ctx, s.key(streamID), 0, -1).Result()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	raw, err := s.rdb.LRange(ctx, s.key(streamID), 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +135,8 @@ func (s *Storage) GetHistory(streamID string) ([]events.Event, error) {
 
 // SetHistory atomically replaces the transcript: events are marshaled before any
 // Redis command is issued, then DEL + RPUSH... run in one transactional pipeline,
-// so a reader never observes a half-written list.
+// so a reader never observes a half-written list. The whole pipeline shares one
+// deadline: it is a single replacement from the caller's perspective.
 func (s *Storage) SetHistory(streamID string, evs []events.Event) error {
 	payload := make([][]byte, len(evs))
 	for i, ev := range evs {
@@ -110,17 +146,21 @@ func (s *Storage) SetHistory(streamID string, evs []events.Event) error {
 		}
 		payload[i] = data
 	}
+	ctx, cancel := s.callCtx()
+	defer cancel()
 	key := s.key(streamID)
 	pipe := s.rdb.TxPipeline()
-	pipe.Del(s.ctx, key)
+	pipe.Del(ctx, key)
 	for _, data := range payload {
-		pipe.RPush(s.ctx, key, data)
+		pipe.RPush(ctx, key, data)
 	}
-	_, err := pipe.Exec(s.ctx)
+	_, err := pipe.Exec(ctx)
 	return err
 }
 
 // DropHistory removes the transcript; dropping an unknown stream id is a no-op.
 func (s *Storage) DropHistory(streamID string) error {
-	return s.rdb.Del(s.ctx, s.key(streamID)).Err()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	return s.rdb.Del(ctx, s.key(streamID)).Err()
 }

@@ -64,6 +64,13 @@ type MemoryStream struct {
 	nextSub SubID
 	pending []*events.ModelRequest
 	history *History
+	// inboxCap bounds the pending queue (0 = unlimited, Python parity); when
+	// set, an Enqueue past the cap evicts the oldest pending request (audit
+	// M-28).
+	inboxCap int
+	// transcriptCap is remembered until the History exists, then applied as
+	// its retention cap (see WithTranscriptCap).
+	transcriptCap int
 	// storageOpt carries the WithStorage argument until the stream id is final
 	// and the History can be built (see WithStorage).
 	storageOpt Storage
@@ -91,6 +98,17 @@ func WithPersistAll() MemoryOption { return func(m *MemoryStream) { m.persistAll
 // WithLogger sets the logger for subscriber errors (default: slog default).
 func WithLogger(l *slog.Logger) MemoryOption { return func(m *MemoryStream) { m.logger = l } }
 
+// WithInboxCap bounds the pending inbox: once it holds n requests, the next
+// Enqueue evicts the oldest. n <= 0 (the default) keeps the inbox unlimited
+// (Python parity). Model limiters still decide what the model sees; this cap
+// only stops unbounded memory growth (audit M-28).
+func WithInboxCap(n int) MemoryOption { return func(m *MemoryStream) { m.inboxCap = n } }
+
+// WithTranscriptCap bounds the durable transcript: writes past n events evict
+// the oldest. n <= 0 (the default) keeps the transcript unlimited (Python
+// parity) (audit M-28).
+func WithTranscriptCap(n int) MemoryOption { return func(m *MemoryStream) { m.transcriptCap = n } }
+
 func NewMemoryStream(opts ...MemoryOption) *MemoryStream {
 	m := &MemoryStream{logger: slog.Default()}
 	for _, o := range opts {
@@ -105,6 +123,9 @@ func NewMemoryStream(opts ...MemoryOption) *MemoryStream {
 			storage = NewMemoryStorage()
 		}
 		m.history = NewHistory(m.id, storage)
+	}
+	if m.transcriptCap > 0 {
+		m.history.SetCap(m.transcriptCap)
 	}
 	return m
 }
@@ -174,10 +195,14 @@ func (m *MemoryStream) historyAppend(ev events.Event) error {
 }
 
 // Enqueue appends a ModelRequest to the inbox and announces MessageEnqueued.
+// When an inbox cap is set and the queue is full, the oldest request is evicted.
 func (m *MemoryStream) Enqueue(parts ...events.Input) error {
 	req := &events.ModelRequest{Parts: parts}
 	m.mu.Lock()
 	m.pending = append(m.pending, req)
+	if m.inboxCap > 0 && len(m.pending) > m.inboxCap {
+		m.pending = m.pending[len(m.pending)-m.inboxCap:]
+	}
 	m.mu.Unlock()
 	return m.Send(&events.MessageEnqueued{})
 }
@@ -223,21 +248,42 @@ func (m *MemoryStream) Unsubscribe(id SubID) {
 }
 
 // Get waits for the first incoming event matching c, honoring ctx cancellation.
+// Matching events are buffered on an unbounded queue, so a burst larger than
+// any fixed channel capacity cannot silently drop the event the caller waits
+// for — an answer to a HITL question must survive any burst (audit L-21).
 func (m *MemoryStream) Get(ctx context.Context, c events.Condition) (events.Event, error) {
-	ch := make(chan events.Event, 4)
+	var (
+		mu   sync.Mutex
+		buf  []events.Event
+		wake = make(chan struct{}, 1)
+	)
 	id := m.Subscribe(func(ev events.Event) error {
+		mu.Lock()
+		buf = append(buf, ev)
+		mu.Unlock()
 		select {
-		case ch <- ev:
+		case wake <- struct{}{}:
 		default:
 		}
 		return nil
 	}, SubscribeOptions{Condition: c})
 	defer m.Unsubscribe(id)
-	select {
-	case ev := <-ch:
-		return ev, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for {
+		mu.Lock()
+		var ev events.Event
+		found := len(buf) > 0
+		if found {
+			ev, buf = buf[0], buf[1:]
+		}
+		mu.Unlock()
+		if found {
+			return ev, nil
+		}
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 

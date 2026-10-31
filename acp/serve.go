@@ -86,6 +86,18 @@ type ServeConfig struct {
 	// usage updates at all; docs/DECISIONS.md D-056).
 	ContextWindow int
 
+	// AllowedMCPCommands, when non-empty, is the allowlist of command strings
+	// a client's stdio MCP declaration may launch through the session
+	// gateway: a declaration naming anything else fails its first tool call
+	// instead of spawning the process. Empty (the default) allows any
+	// declared command.
+	//
+	// AGO-DEVIATION: no allowlist upstream — Python dials whatever the client
+	// declared; a declaration is "context, not authorization" there. This is
+	// opt-in defense-in-depth: a declaration comes from the peer, and the
+	// process it names runs on this side.
+	AllowedMCPCommands []string
+
 	// OnSession, when set, is called with the session handle during
 	// session/new, before the response (Python parity: the ACPAgent on_session
 	// observer). A handler that needs the outbound permission/elicitation
@@ -114,14 +126,34 @@ type Session struct {
 // Gateway returns a proxy for the session's declared MCP servers, or nil when
 // the client declared none. Tool calls made through it travel over the
 // ago/mcp client (one connection per declared server, dialed lazily on the
-// first call). The returned gateway belongs to the session; Serve tears it
-// down with the connection.
+// first call). The returned gateway belongs to the session: it is closed when
+// the connection ends, and again when a session/load replaces the
+// declarations.
 func (s *Session) Gateway() *ToolGateway {
 	if s == nil || len(s.MCPServers) == 0 {
 		return nil
 	}
-	s.gatewayOnce.Do(func() { s.gateway = NewToolGateway(s.MCPServers) })
+	s.gatewayOnce.Do(func() {
+		s.gateway = NewToolGateway(s.MCPServers)
+		if s.conn != nil {
+			s.gateway.allowedCommands = s.conn.cfg.AllowedMCPCommands
+		}
+	})
 	return s.gateway
+}
+
+// closeGateway closes the session's gateway, if one was built. The Once is run
+// (not the field merely read) so a value another goroutine published through
+// Gateway() is seen safely; a gateway built afterwards (a stashed session
+// used past the connection) is its builder's to close.
+func (s *Session) closeGateway() {
+	if s == nil {
+		return
+	}
+	s.gatewayOnce.Do(func() {})
+	if s.gateway != nil {
+		s.gateway.Close()
+	}
 }
 
 // RequestPermission raises the protocol's session/request_permission request
@@ -332,20 +364,30 @@ func serveIO(in io.Reader, out io.Writer, cfg ServeConfig) error {
 	c.in = sc
 
 	go c.readLoop()
-	for req := range c.cmds {
-		result, rpcErr := c.dispatch(req.Method, req.Params)
-		resp := rpcResponse{JSONRPC: "2.0", ID: *req.ID}
-		if rpcErr != nil {
-			resp.Error = rpcErr
-		} else {
-			resp.Result = result
+	runErr := func() error {
+		for req := range c.cmds {
+			result, rpcErr := c.dispatch(req.Method, req.Params)
+			resp := rpcResponse{JSONRPC: "2.0", ID: *req.ID}
+			if rpcErr != nil {
+				resp.Error = rpcErr
+			} else {
+				resp.Result = result
+			}
+			if err := c.write(resp); err != nil {
+				return err
+			}
 		}
-		if err := c.write(resp); err != nil {
-			return err
-		}
+		<-c.readDone
+		return c.readErr
+	}()
+	// The sessions' gateways own sockets and stdio MCP subprocesses that must
+	// not outlive the connection, whatever ended it — a client disconnect, a
+	// write failure, a read error; closing them here tears those down with
+	// the wire.
+	for _, s := range c.sessions {
+		s.closeGateway()
 	}
-	<-c.readDone
-	return c.readErr
+	return runErr
 }
 
 // readLoop parses incoming lines and routes them: replies to the exchange
@@ -617,7 +659,10 @@ func (c *serveConn) loadSession(params json.RawMessage) (any, *rpcError) {
 		return nil, rpcErr(codeResourceNotFound, "acp-session:%s", p.SessionID)
 	}
 	// Refresh what the request carries (Python parity: the live-session
-	// branch of load_session).
+	// branch of load_session). The gateway built over the old declarations is
+	// closed first: its connections and stdio subprocesses belong to the
+	// replaced declaration set and must not leak past it.
+	session.closeGateway()
 	session.CWD = p.CWD
 	session.MCPServers = p.MCPServers
 	session.gatewayOnce = sync.Once{}

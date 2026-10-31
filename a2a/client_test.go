@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestClientEndToEnd drives Client against a real Server mounted on
@@ -180,6 +181,51 @@ func TestClientRejectsTaskResultForSendMessage(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "working") {
 		t.Fatalf("error should name the task state, got: %v", err)
+	}
+}
+
+// The built-in client must carry a timeout: without one a hung server pins
+// the calling goroutine forever. The default is a structural property, so it
+// is asserted on the field (waiting out 120 s in a unit test is not viable).
+func TestClientDefaultTimeout(t *testing.T) {
+	c := NewClient("http://127.0.0.1:1")
+	if got := c.http.Timeout; got != defaultHTTPTimeout {
+		t.Fatalf("default client Timeout = %v, want %v", got, defaultHTTPTimeout)
+	}
+}
+
+// WithHTTPClient replaces the client wholesale: its (shorter) timeout must
+// govern the exchange, not the default.
+func TestClientWithHTTPClientReplacesTimeout(t *testing.T) {
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // hold the card request open until the client gives up
+	}))
+	defer hang.Close()
+
+	custom := &http.Client{Timeout: 100 * time.Millisecond}
+	start := time.Now()
+	_, err := NewClient(hang.URL, WithHTTPClient(custom)).AgentCard(context.Background())
+	if !errors.Is(err, ErrTransport) {
+		t.Fatalf("err = %v, want ErrTransport", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("custom timeout ignored: AgentCard took %v", elapsed)
+	}
+}
+
+// A card larger than maxRequestBody must fail to decode instead of feeding
+// the decoder an unbounded stream. The body is valid JSON in full, so only
+// the LimitReader can turn it into a decode error.
+func TestClientAgentCardSizeLimit(t *testing.T) {
+	oversize := `{"name":"` + strings.Repeat("a", maxRequestBody) + `"}`
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(oversize))
+	}))
+	defer httpSrv.Close()
+
+	_, err := NewClient(httpSrv.URL).AgentCard(context.Background())
+	if !errors.Is(err, ErrWire) {
+		t.Fatalf("err = %v, want ErrWire for a card over %d bytes", err, maxRequestBody)
 	}
 }
 

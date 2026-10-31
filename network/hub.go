@@ -164,7 +164,9 @@ func (w *FileWAL) Append(rec WALRecord) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// The WAL carries full conversation transcripts: owner-only. AGO-DEVIATION:
+	// Python's KnowledgeStore-backed WAL leaves the mode to the umask (0644).
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

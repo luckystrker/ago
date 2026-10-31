@@ -2,6 +2,7 @@ package response
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -201,5 +202,61 @@ func TestSchemaOfErrors(t *testing.T) {
 				t.Errorf("SchemaOf(%v) expected an error, got none", tt.typ)
 			}
 		})
+	}
+}
+
+// Recursive types that reach themselves through a slice element or a map value
+// (not a struct field) must fail with an error, not exhaust the stack.
+func TestSchemaOfRecursiveCollectionsError(t *testing.T) {
+	type sliceSelf []sliceSelf
+	type mapSelf map[string]mapSelf
+	type tree struct {
+		Kids []tree `json:"kids"`
+	}
+	type ptrTree struct {
+		Kids []*ptrTree `json:"kids"`
+	}
+	tests := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"slice of itself", reflect.TypeOf(sliceSelf(nil))},
+		{"map of itself", reflect.TypeOf(mapSelf(nil))},
+		{"struct field slice of itself", reflect.TypeOf(tree{})},
+		{"struct field pointer slice of itself", reflect.TypeOf(ptrTree{})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := SchemaOf(tt.typ)
+			if err == nil {
+				t.Fatalf("SchemaOf(%v) unexpectedly succeeded: %v", tt.typ, got)
+			}
+			if !strings.Contains(err.Error(), "recursive") {
+				t.Errorf("SchemaOf(%v) error should mention recursion, got: %v", tt.typ, err)
+			}
+		})
+	}
+}
+
+// The cycle guard must not misfire on the same non-recursive type used twice.
+func TestSchemaOfRepeatedTypeOK(t *testing.T) {
+	type row struct {
+		A []int `json:"a"`
+		B []int `json:"b"`
+	}
+	got, err := SchemaOf(reflect.TypeOf(row{}))
+	if err != nil {
+		t.Fatalf("SchemaOf(row) error: %v", err)
+	}
+	want := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"a": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+			"b": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+		},
+		"required": []string{},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SchemaOf(row) =\n%v\nwant\n%v", got, want)
 	}
 }

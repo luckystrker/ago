@@ -69,20 +69,70 @@ type TaskUpdater interface {
 	Update(ctx context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error)
 }
 
+// TaskUpserter is the optional TaskStore extension for the atomic first
+// commit. Creating a task's record is the same read-modify-write cycle as
+// updating it — two parallel turns opening one id, or a store eviction
+// landing mid-turn, must not resolve as last-write-wins — but the record does
+// not exist yet, so TaskUpdater cannot express it. Stores that can run the
+// create-or-update cycle under their own lock implement Upsert; the server
+// detects them by assertion and otherwise serializes the cycle itself with a
+// per-task mutex.
+type TaskUpserter interface {
+	// Upsert applies mutate to the stored record for id atomically, creating
+	// it when absent: mutate then receives nil and returns the record to
+	// store. Everything else matches Update — the copy is owned by mutate,
+	// the result comes back by deep copy, a mutate error aborts the write
+	// and is returned verbatim.
+	Upsert(ctx context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error)
+}
+
+// defaultMaxTasks bounds the MemoryTaskStore record count: one task history
+// can carry a full request body (8 MiB), so an unbounded remote-facing store
+// is a remote OOM primitive.
+const defaultMaxTasks = 1000
+
 // MemoryTaskStore is the in-memory TaskStore. Safe for concurrent use. Tasks
 // are stored by deep copy and returned by deep copy, so callers never share
 // mutable state with the store.
+//
+// The record count is bounded (defaultMaxTasks by default): storing a new id
+// beyond the cap evicts the oldest created record (FIFO — saving an existing
+// id does not renew its position). A working task can be evicted mid-turn;
+// the next commit re-creates the record through the upsert path, trading a
+// history reset on the evicted id for a store that cannot grow without end.
+//
+// AGO-DEVIATION: the a2a-sdk InMemoryTaskStore AG2 defaults to is unbounded;
+// AGo caps it by default because the store is writable by any remote peer.
 type MemoryTaskStore struct {
-	mu    sync.RWMutex
-	tasks map[string]*Task
+	mu       sync.RWMutex
+	tasks    map[string]*Task
+	inserted []string // creation order of the live ids, for FIFO eviction
+	maxTasks int      // <= 0: unbounded
 }
 
-var _ TaskUpdater = (*MemoryTaskStore)(nil)
+var (
+	_ TaskUpdater  = (*MemoryTaskStore)(nil)
+	_ TaskUpserter = (*MemoryTaskStore)(nil)
+)
 
-// NewMemoryTaskStore builds an empty in-memory TaskStore (parity: the a2a-sdk
-// InMemoryTaskStore that AG2's server defaults to).
-func NewMemoryTaskStore() *MemoryTaskStore {
-	return &MemoryTaskStore{tasks: make(map[string]*Task)}
+// MemoryTaskStoreOption configures a MemoryTaskStore at construction.
+type MemoryTaskStoreOption func(*MemoryTaskStore)
+
+// WithMaxTasks caps the record count at n: storing a new task id beyond the
+// cap evicts the oldest created record (FIFO). n <= 0 lifts the cap.
+func WithMaxTasks(n int) MemoryTaskStoreOption {
+	return func(s *MemoryTaskStore) { s.maxTasks = n }
+}
+
+// NewMemoryTaskStore builds an empty in-memory TaskStore bounded at
+// defaultMaxTasks records; pass WithMaxTasks to change or lift the cap
+// (parity: the a2a-sdk InMemoryTaskStore that AG2's server defaults to).
+func NewMemoryTaskStore(opts ...MemoryTaskStoreOption) *MemoryTaskStore {
+	s := &MemoryTaskStore{tasks: make(map[string]*Task), maxTasks: defaultMaxTasks}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Save implements TaskStore.
@@ -99,8 +149,27 @@ func (s *MemoryTaskStore) Save(_ context.Context, task *Task) error {
 	if s.tasks == nil {
 		s.tasks = make(map[string]*Task)
 	}
+	if _, exists := s.tasks[clone.ID]; !exists {
+		s.evictLocked(1)
+		s.inserted = append(s.inserted, clone.ID)
+	}
 	s.tasks[clone.ID] = clone
 	return nil
+}
+
+// evictLocked drops the oldest created records until room exists for n new
+// ones. Ids already removed by Delete are skipped lazily; the insert order
+// slice is consumed from the front, so its memory stays proportional to the
+// live record count. Caller holds s.mu.
+func (s *MemoryTaskStore) evictLocked(n int) {
+	if s.maxTasks <= 0 {
+		return
+	}
+	for room := s.maxTasks - len(s.tasks) - n; room < 0 && len(s.inserted) > 0; room = s.maxTasks - len(s.tasks) - n {
+		oldest := s.inserted[0]
+		s.inserted = s.inserted[1:]
+		delete(s.tasks, oldest)
+	}
 }
 
 // Get implements TaskStore.
@@ -158,7 +227,57 @@ func (s *MemoryTaskStore) Update(_ context.Context, id string, mutate func(store
 	return fresh, nil
 }
 
-// Delete implements TaskStore.
+// Upsert implements TaskUpserter: like Update, but a missing record is
+// created — mutate receives nil and its return value is stored. The read (or
+// the absence), the mutate call and the write all happen under one Lock
+// hold, so the first commit of an id is as atomic as any continuation of it.
+func (s *MemoryTaskStore) Upsert(_ context.Context, id string, mutate func(stored *Task) (*Task, error)) (*Task, error) {
+	if id == "" {
+		return nil, fmt.Errorf("%w: task with empty id", ErrWire)
+	}
+	if mutate == nil {
+		return nil, fmt.Errorf("%w: nil mutate", ErrWire)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var current *Task
+	if stored, ok := s.tasks[id]; ok {
+		clone, err := cloneTask(stored)
+		if err != nil {
+			return nil, err
+		}
+		current = clone
+	}
+	updated, err := mutate(current)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		return nil, fmt.Errorf("%w: upsert of task %s produced no record", ErrWire, id)
+	}
+	clone, err := cloneTask(updated)
+	if err != nil {
+		return nil, err
+	}
+	if s.tasks == nil {
+		s.tasks = make(map[string]*Task)
+	}
+	if _, exists := s.tasks[id]; !exists {
+		s.evictLocked(1)
+		s.inserted = append(s.inserted, id)
+	}
+	s.tasks[id] = clone
+	// Return a fresh copy: the caller owns the result and must not share
+	// mutable state with the stored record (the same invariant Get keeps).
+	fresh, err := cloneTask(clone)
+	if err != nil {
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// Delete implements TaskStore. The id stays in the insertion order until
+// eviction skips it lazily.
 func (s *MemoryTaskStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

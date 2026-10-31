@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/luckystrker/ago/internal/sse"
@@ -30,12 +32,127 @@ type Client struct {
 	MaxRetries int
 	// Timeout caps a non-streaming request when HTTP is nil (0 = no cap).
 	Timeout time.Duration
+	// MaxResponseBytes caps the buffered response body read by PostJSON
+	// (0 → DefaultMaxResponseBytes, negative → no cap). A hostile or broken
+	// endpoint must not be able to exhaust memory through an endless body.
+	// Streaming responses are consumed incrementally and are not affected.
+	MaxResponseBytes int64
+	// Redirect selects the redirect policy for the one-shot client built when
+	// HTTP is nil. A caller-supplied HTTP client keeps its own CheckRedirect —
+	// attach Redirect.CheckRedirect() to it for the same behavior.
+	Redirect RedirectPolicy
 }
 
 // NewClient returns a client with SDK-default retry behavior
-// (4 retries — Python parity: OpenAI DEFAULT_MAX_RETRIES) and no timeout.
+// (4 retries — Python parity: OpenAI DEFAULT_MAX_RETRIES), the default
+// response-body cap and the credential-stripping redirect policy.
 func NewClient() *Client {
 	return &Client{MaxRetries: 4}
+}
+
+// DefaultMaxResponseBytes caps a buffered (non-streaming) response body read
+// by this package when the client sets no limit: 8 MiB, the repo-wide norm
+// for HTTP payloads. Streaming bodies are consumed incrementally by the SSE
+// scanner and are not capped here.
+const DefaultMaxResponseBytes int64 = 8 << 20
+
+// ErrResponseTooLarge reports a buffered response body over the configured
+// MaxResponseBytes; match with errors.Is.
+var ErrResponseTooLarge = errors.New("httpx: response body exceeds the size limit")
+
+// RedirectPolicy selects how requests follow HTTP redirects across host
+// boundaries. Provider credentials travel in custom headers (Authorization,
+// x-api-key, x-goog-api-key, arbitrary per-config headers), and the Go
+// stdlib strips only Authorization, Www-Authenticate, Cookie and Cookie2 on
+// a host change — the rest would reach whatever host a redirect names.
+//
+// AGO-DEVIATION: Python provider SDKs sit on httpx, which does not follow
+// redirects by default; the Go stdlib does. AGo keeps following redirects
+// (gateways legitimately bounce requests, e.g. http→https on the same host)
+// but strips credentials at the host boundary and offers a strict no-cross-
+// host mode.
+type RedirectPolicy int
+
+const (
+	// RedirectStripCredentials follows cross-host redirects but drops every
+	// request header outside safelistedHeaders on the hop, so credentials
+	// cannot reach a different host: an endpoint answering 307 → its own
+	// domain must not receive the API key.
+	RedirectStripCredentials RedirectPolicy = iota
+	// RedirectSameHost blocks any redirect whose target host name or port
+	// differs from the original request's; the request fails instead.
+	RedirectSameHost
+)
+
+// AGO-DEVIATION: Python provider SDKs sit on httpx, which does not follow
+// redirects at all by default; the Go stdlib does. AGo keeps following
+// redirects (gateways legitimately bounce requests, e.g. http→https) but
+// strips credentials at the host boundary and keeps an explicit strict mode.
+var _ = struct{}{}
+
+// safelistedHeaders may cross a host boundary: they carry no credentials.
+// Mirrors the Fetch spec's CORS-safelisted request headers plus the fields
+// the transport itself manages; Content-Type must survive so a 307/308
+// re-POST stays parseable on the receiving side.
+var safelistedHeaders = map[string]bool{
+	"Accept":           true,
+	"Accept-Encoding":  true,
+	"Accept-Language":  true,
+	"Content-Language": true,
+	"Content-Length":   true,
+	"Content-Type":     true,
+	"Range":            true,
+	"User-Agent":       true,
+}
+
+// maxRedirectHops bounds the redirect chain. A custom CheckRedirect replaces
+// the stdlib default checker, including its built-in stop, so the policy must
+// enforce its own.
+const maxRedirectHops = 10
+
+// CheckRedirect returns the policy as an http.Client CheckRedirect function;
+// assign it to a custom client for the same behavior.
+func (p RedirectPolicy) CheckRedirect() func(req *http.Request, via []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if len(via) >= maxRedirectHops {
+			return fmt.Errorf("httpx: stopped after %d redirects", maxRedirectHops)
+		}
+		if sameAuthority(via[0].URL, req.URL) {
+			return nil
+		}
+		if p == RedirectSameHost {
+			return fmt.Errorf("httpx: redirect from %s to %s changes the host", via[0].URL.Host, req.URL.Host)
+		}
+		for k := range req.Header {
+			if !safelistedHeaders[http.CanonicalHeaderKey(k)] {
+				req.Header.Del(k)
+			}
+		}
+		return nil
+	}
+}
+
+// sameAuthority reports whether two URLs target the same host name and port;
+// implicit ports resolve by scheme, so a scheme upgrade on the same host
+// (http→https) is not a host change.
+func sameAuthority(a, b *url.URL) bool {
+	return strings.EqualFold(a.Hostname(), b.Hostname()) && effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }
 
 // retryBaseDelay and maxRetryDelay shape the exponential backoff. Vars so tests
@@ -121,7 +238,7 @@ func (c *Client) do(ctx context.Context, url string, headers map[string]string, 
 	}
 	client := c.HTTP
 	if client == nil {
-		client = &http.Client{}
+		client = &http.Client{CheckRedirect: c.Redirect.CheckRedirect()}
 		if !stream {
 			client.Timeout = c.Timeout
 		}
@@ -156,8 +273,13 @@ func (c *Client) PostJSON(ctx context.Context, url string, headers map[string]st
 			}
 			return 0, nil, fmt.Errorf("httpx: request failed after %d attempt(s): %w", attempt+1, err)
 		}
-		data, readErr := io.ReadAll(resp.Body)
+		data, readErr := c.readBody(resp.Body)
 		resp.Body.Close()
+		if errors.Is(readErr, ErrResponseTooLarge) {
+			// A completed answer over the cap is a fact about the server, not
+			// a transient failure — retrying cannot shrink it.
+			return resp.StatusCode, nil, readErr
+		}
 		if readErr != nil {
 			if attempt < c.MaxRetries && ctx.Err() == nil && sleepCtx(ctx, backoff(attempt)) == nil {
 				continue // body read interrupted: retry with a fresh attempt
@@ -245,6 +367,26 @@ func (c *Client) PostJSONStream(ctx context.Context, url string, headers map[str
 func drainAndClose(body io.ReadCloser) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4096))
 	body.Close()
+}
+
+// readBody reads a buffered response body up to the client's cap; a body over
+// the cap fails with ErrResponseTooLarge instead of exhausting memory.
+func (c *Client) readBody(r io.Reader) ([]byte, error) {
+	limit := c.MaxResponseBytes
+	if limit == 0 {
+		limit = DefaultMaxResponseBytes
+	}
+	if limit < 0 {
+		return io.ReadAll(r)
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return data, nil
 }
 
 // snippet renders the first bytes of an error body for an error message.

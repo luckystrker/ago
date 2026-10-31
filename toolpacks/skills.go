@@ -169,7 +169,11 @@ func (st *SkillsToolkit) load(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	raw, err := os.ReadFile(filepath.Join(s.dir, "SKILL.md"))
+	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, "SKILL.md"))
+	if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(target)
 	if err != nil {
 		return "", err
 	}
@@ -217,11 +221,39 @@ func (st *SkillsToolkit) readResource(name, resource string) (string, error) {
 	if !known {
 		return "", fmt.Errorf("resource %q not found in %s", resource, s.dir)
 	}
-	b, err := os.ReadFile(filepath.Join(s.dir, clean))
+	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, clean))
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(target)
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// resolveWithinDir resolves path — already lexically confined to dir — to its
+// real location, refusing a symlink whose target lies outside dir. The skill
+// directory is disk the model may write to through other tools, so a planted
+// symlink (a resource pointing at ~/.ssh/id_rsa) must not turn a resource read
+// into an arbitrary-file read; an unresolvable target (a symlink loop, a
+// dangling link) fails closed (security audit 2026-10-31, M-18).
+//
+// AGO-DEVIATION: Python's LocalRuntime reads after a lexical clean only; AGo
+// resolves the existing symlink components the way knowledge/disk.go does.
+func resolveWithinDir(dir, path string) (string, error) {
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if real != realDir && !strings.HasPrefix(real, realDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes the skill directory", path)
+	}
+	return real, nil
 }
 
 // parseFrontmatter extracts `key: value` lines from a `---`-fenced block (the

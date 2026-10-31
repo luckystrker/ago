@@ -3,10 +3,12 @@ package agui
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckystrker/ago/agent"
 	"github.com/luckystrker/ago/config"
@@ -458,4 +460,236 @@ func equalTypes(got, want []EventType) bool {
 		}
 	}
 	return true
+}
+
+// finishingRun is a HandlerConfig.Run that ends its run at once, for tests that
+// only need the request to reach the run at all.
+func finishingRun() func(context.Context, RunAgentInput, func(Event)) error {
+	return func(ctx context.Context, input RunAgentInput, emit func(Event)) error {
+		emit(NewRunFinishedEvent(input.ThreadID, input.RunID))
+		return nil
+	}
+}
+
+// do runs one request against url and reports the status, discarding the body.
+func do(t *testing.T, method, url, body, auth, origin string) int {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, rdr)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// A configured token is asked of every method — GET included — and only the
+// exact bearer token passes.
+func TestGuardAuthToken(t *testing.T) {
+	ts := httptest.NewServer(Handler(HandlerConfig{Run: finishingRun(), Guard: NewGuard(WithAuthToken("s3cret"))}))
+	defer ts.Close()
+
+	cases := []struct {
+		auth string
+		want int
+	}{
+		{"", http.StatusUnauthorized},
+		{"Bearer wrong", http.StatusUnauthorized},
+		{"s3cret", http.StatusUnauthorized}, // the scheme is part of the check
+		{"Bearer s3cret", http.StatusOK},
+	}
+	for _, c := range cases {
+		if code := do(t, http.MethodGet, ts.URL, "", c.auth, ""); code != c.want {
+			t.Fatalf("GET with %q: status = %d, want %d", c.auth, code, c.want)
+		}
+		if code := do(t, http.MethodPost, ts.URL, runBody, c.auth, ""); code != c.want {
+			t.Fatalf("POST with %q: status = %d, want %d", c.auth, code, c.want)
+		}
+	}
+}
+
+// The origin allow-list applies to state-changing requests only: a browser's
+// cross-site POST is refused, a GET never is, and a request without Origin —
+// not a browser — passes.
+func TestGuardAllowedOrigins(t *testing.T) {
+	ts := httptest.NewServer(Handler(HandlerConfig{
+		Run:   finishingRun(),
+		Guard: NewGuard(WithAllowedOrigins("http://good.example")),
+	}))
+	defer ts.Close()
+
+	if code := do(t, http.MethodPost, ts.URL, runBody, "", "http://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-site POST: status = %d, want 403", code)
+	}
+	if code := do(t, http.MethodPost, ts.URL, runBody, "", "http://good.example"); code != http.StatusOK {
+		t.Fatalf("allowed POST: status = %d, want 200", code)
+	}
+	if code := do(t, http.MethodPost, ts.URL, runBody, "", ""); code != http.StatusOK {
+		t.Fatalf("POST without Origin: status = %d, want 200", code)
+	}
+	if code := do(t, http.MethodGet, ts.URL, "", "", "http://evil.example"); code != http.StatusOK {
+		t.Fatalf("GET with a foreign origin: status = %d, want 200 — GET is not state-changing", code)
+	}
+}
+
+// A body past the configured cap is refused 413, and one under it is served.
+func TestGuardBodyCap(t *testing.T) {
+	ts := httptest.NewServer(Handler(HandlerConfig{
+		Run:   finishingRun(),
+		Guard: NewGuard(WithMaxBodyBytes(1024)),
+	}))
+	defer ts.Close()
+
+	if code := do(t, http.MethodPost, ts.URL, runBody, "", ""); code != http.StatusOK {
+		t.Fatalf("a body under the cap: status = %d, want 200", code)
+	}
+	big := runBody + strings.Repeat(" ", 2048)
+	if code := do(t, http.MethodPost, ts.URL, big, "", ""); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a body past the cap: status = %d, want 413", code)
+	}
+}
+
+// The body cap is a default, not an option: a handler built with no Guard at
+// all still refuses a body past 16 MiB.
+func TestGuardDefaultBodyCap(t *testing.T) {
+	ts := httptest.NewServer(Handler(HandlerConfig{Run: finishingRun()}))
+	defer ts.Close()
+
+	big := strings.Repeat("x", 16<<20+1)
+	if code := do(t, http.MethodPost, ts.URL, big, "", ""); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a 16 MiB+ body with no Guard configured: status = %d, want 413", code)
+	}
+}
+
+// The run semaphore caps concurrent POST exchanges: the next POST gets 429
+// while the cap is held, and passes again once the slot is returned.
+func TestGuardConcurrentRuns(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ts := httptest.NewServer(Handler(HandlerConfig{
+		Guard: NewGuard(WithMaxConcurrentRuns(1)),
+		Run: func(ctx context.Context, input RunAgentInput, emit func(Event)) error {
+			emit(NewRunStartedEvent(input.ThreadID, input.RunID))
+			started <- struct{}{}
+			<-release
+			emit(NewRunFinishedEvent(input.ThreadID, input.RunID))
+			return nil
+		},
+	}))
+	defer ts.Close()
+
+	first := make(chan int, 1)
+	go func() {
+		first <- do(t, http.MethodPost, ts.URL, runBody, "", "")
+	}()
+	<-started // the first exchange holds the only slot
+
+	if code := do(t, http.MethodPost, ts.URL, runBody, "", ""); code != http.StatusTooManyRequests {
+		t.Fatalf("a second concurrent run: status = %d, want 429", code)
+	}
+	close(release)
+	if code := <-first; code != http.StatusOK {
+		t.Fatalf("the first run: status = %d, want 200", code)
+	}
+
+	// The slot is returned after the exchange ends; a poll rather than a fixed
+	// sleep because the server releases it on its side of the response.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if code := do(t, http.MethodPost, ts.URL, runBody, "", ""); code == http.StatusOK {
+			return
+		} else if code != http.StatusTooManyRequests {
+			t.Fatalf("a run after release: status = %d, want 200", code)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the run slot was not returned after the exchange ended")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The frame check: any literal CR or LF in an event's encoded form reads as a
+// break, wherever it sits — a data line ends at either byte (security audit
+// L-16).
+func TestBreaksFrame(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{`{"type":"RUN_FINISHED"}`, false},
+		{"{\"a\":1,\n\"b\":2}", true}, // LF between tokens
+		{"{\"a\":1,\r\"b\":2}", true}, // CR between tokens
+		{"{\"a\":\"x\", \"b\":\n\r2}", true},
+		{`{"text":"escaped \n stays inside the JSON string"}`, false},
+	}
+	for _, c := range cases {
+		if got := breaksFrame([]byte(c.raw)); got != c.want {
+			t.Fatalf("breaksFrame(%q) = %v, want %v", c.raw, got, c.want)
+		}
+	}
+}
+
+// A Raw payload carrying a literal line break never reaches the wire as a
+// split frame (security audit L-16): json's compaction strips a break that
+// sits between tokens — the event passes as one whole frame — and its
+// validation refuses a break inside a JSON string, dropping the event; the
+// frame check stands behind both for any writer that skips the compactor.
+func TestRawFrameLineBreaks(t *testing.T) {
+	runEmitting := func(payload []byte) ([]Event, [][]byte) {
+		h := Handler(HandlerConfig{
+			Run: func(ctx context.Context, input RunAgentInput, emit func(Event)) error {
+				emit(Raw{Payload: payload})
+				emit(NewRunFinishedEvent(input.ThreadID, input.RunID))
+				return nil
+			},
+		})
+		return postRun(t, h, runBody)
+	}
+
+	t.Run("a break between tokens is compacted away, one whole frame passes", func(t *testing.T) {
+		payload := []byte("{\n\"type\":\"STEP_STARTED\",\"stepName\":\"s1\"}")
+		if !json.Valid(payload) {
+			t.Fatal("setup: payload must be valid JSON")
+		}
+		evs, raw := runEmitting(payload)
+		if got := eventTypes(evs); !equalTypes(got, []EventType{"STEP_STARTED", EventRunFinished}) {
+			t.Fatalf("types = %v, want the Raw then RUN_FINISHED", got)
+		}
+		if strings.Contains(string(raw[0]), "\n") || strings.Contains(string(raw[0]), "\r") {
+			t.Fatalf("a literal line break on the wire: %q", raw[0])
+		}
+	})
+
+	t.Run("a break inside a JSON string refuses the event, nothing of it is written", func(t *testing.T) {
+		payload := []byte("{\"type\":\"STEP_STARTED\",\"text\":\"a\nb\"}")
+		if json.Valid(payload) {
+			t.Fatal("setup: payload must be invalid JSON")
+		}
+		evs, raw := runEmitting(payload)
+		if got := eventTypes(evs); !equalTypes(got, []EventType{EventRunFinished}) {
+			t.Fatalf("types = %v, want only RUN_FINISHED — the unframeable Raw must not reach the wire", got)
+		}
+		for _, frame := range raw {
+			if strings.Contains(string(frame), "STEP_STARTED") {
+				t.Fatalf("frame-splitting payload on the wire: %s", frame)
+			}
+		}
+	})
 }

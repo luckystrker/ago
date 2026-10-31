@@ -7,3 +7,9 @@ benchmarks/results_*.json
 dist/
 .idea/
 .vscode/
+
+# Secret and key material — must never land in history or releases.
+.env
+.env.*
+*.pem
+*.key

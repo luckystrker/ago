@@ -214,6 +214,16 @@ func pyTypeName(v any) string {
 	}
 }
 
+// extendPath returns path + part as a fresh slice. A plain append would
+// reuse the parent's backing array whenever it has spare capacity, so two
+// sibling failures would share one buffer and each would overwrite the
+// other's last segment — every stored leaf path must be independently owned.
+func extendPath(path []any, part any) []any {
+	out := make([]any, len(path), len(path)+1)
+	copy(out, path)
+	return append(out, part)
+}
+
 // check validates instance against schema and returns the leaf failures with
 // paths from the instance root. doc is the document schema was reached from
 // (its "#/..." refs resolve inside it).
@@ -276,7 +286,7 @@ func (v *validator) check(instance any, schema any, doc map[string]any, path []a
 		names := sortedKeys(instanceMap)
 		for _, key := range names {
 			if sub, ok := props[key]; ok {
-				leaves = append(leaves, v.check(instanceMap[key], sub, doc, append(path, key))...)
+				leaves = append(leaves, v.check(instanceMap[key], sub, doc, extendPath(path, key))...)
 			}
 		}
 		if addl, ok := sm["additionalProperties"].(bool); ok && !addl {
@@ -284,7 +294,7 @@ func (v *validator) check(instance any, schema any, doc map[string]any, path []a
 				if _, declared := props[key]; declared {
 					continue
 				}
-				leaves = append(leaves, leaf{append(path, key),
+				leaves = append(leaves, leaf{extendPath(path, key),
 					fmt.Sprintf("additional property '%s' is not allowed", key), "additionalProperties"})
 			}
 		}
@@ -292,7 +302,7 @@ func (v *validator) check(instance any, schema any, doc map[string]any, path []a
 
 	if items, ok := sm["items"]; ok && isList {
 		for i, item := range instanceList {
-			leaves = append(leaves, v.check(item, items, doc, append(path, i))...)
+			leaves = append(leaves, v.check(item, items, doc, extendPath(path, i))...)
 		}
 	}
 	if min, ok := sm["minItems"].(float64); ok && isList && float64(len(instanceList)) < min {

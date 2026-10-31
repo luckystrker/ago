@@ -7,8 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/luckystrker/ago/internal/uuid"
 )
@@ -74,6 +78,56 @@ var ErrPushConfigNotFound = fmt.Errorf("%w: push config", ErrTaskNotFound)
 // ErrPushValidation reports a push config the server refuses at set time: an
 // empty URL or one the configured URL validator rejects.
 var ErrPushValidation = fmt.Errorf("a2a: invalid push notification config")
+
+// DefaultPushURLValidator is the webhook gate the server applies when
+// ServerConfig.PushURLValidator is nil. It accepts only http/https URLs whose
+// host is not an internal target: loopback (127/8, ::1), private (10/8,
+// 172.16/12, 192.168/16, fc00::/7), link-local (169.254/16, fe80::/10),
+// unspecified (0.0.0.0, ::), the IPv4-mapped forms of all of those, the name
+// "localhost" (including *.localhost) and bare numeric shorthands such as
+// "127.1" or "2130706433" are refused. A configured PushURLValidator replaces
+// this policy wholesale.
+//
+// Hostnames that need DNS are not resolved: resolution at set time races the
+// delivery-time lookup (the address can change in between) and would require
+// network access in contexts that have none. Deployments that must pin
+// resolved addresses install their own validator.
+//
+// AGO-DEVIATION: the a2a-sdk leaves push URL validation off unless the app
+// supplies one; AGo denies internal targets by default because the URL comes
+// from an untrusted caller while the server POSTs the full task record to it.
+func DefaultPushURLValidator(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := u.Hostname() // strips the port and IPv6 brackets
+	if host == "" {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSuffix(host, "."))
+	if name == "localhost" || strings.HasSuffix(name, ".localhost") {
+		return false
+	}
+	// An IPv6 zone ("fe80::1%eth0") is link-local by construction; strip it
+	// so ParseIP sees the address instead of failing.
+	if i := strings.IndexByte(name, '%'); i >= 0 {
+		name = name[:i]
+	}
+	if ip := net.ParseIP(name); ip != nil {
+		return !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified())
+	}
+	// Digits-and-dots only ("127.1", "2130706433"): ambiguous numeric
+	// address forms that many resolvers expand to an IP; real DNS labels
+	// never look like this. Other inet_aton spellings (hex, octal) are not
+	// covered — pinning those needs a resolving validator.
+	for _, c := range name {
+		if (c < '0' || c > '9') && c != '.' {
+			return true
+		}
+	}
+	return false
+}
 
 // MemoryPushConfigStore is the in-memory PushConfigStore. Safe for
 // concurrent use; configs are returned by value.
@@ -146,6 +200,28 @@ func (s *MemoryPushConfigStore) Delete(_ context.Context, taskID, configID strin
 // transition, independent of the reply).
 type PushSender func(ctx context.Context, taskID string, cfg PushConfig, task *Task) error
 
+// pushSendTimeout caps one webhook delivery end to end — dial, redirects and
+// body drain — so a wedged or malicious webhook cannot pin the push goroutine
+// (and the marshalled task it holds) forever.
+const pushSendTimeout = 30 * time.Second
+
+// pushHTTPClient delivers push notifications. Redirects are followed only
+// within the original host: the URL was validated at set time, and a
+// cross-host hop would send the task record and the auth headers to a target
+// nobody approved.
+var pushHTTPClient = &http.Client{
+	Timeout: pushSendTimeout,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("push: stopped after 10 redirects")
+		}
+		if req.URL.Host != via[len(via)-1].URL.Host {
+			return fmt.Errorf("push webhook redirected to a different host %q", req.URL.Host)
+		}
+		return nil
+	},
+}
+
 // DefaultPushSender POSTs the task record to cfg.URL as
 // application/a2a+json, with the token on HeaderPushToken and the config's
 // authentication credentials on Authorization when set.
@@ -172,8 +248,13 @@ func DefaultPushSender(ctx context.Context, taskID string, cfg PushConfig, task 
 		}
 		req.Header.Set("Authorization", scheme+" "+cfg.Authentication.Credentials)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pushHTTPClient.Do(req)
 	if err != nil {
+		// A refused redirect still returns the redirect response; its body
+		// is closed but closing again is safe and releases the connection.
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -186,14 +267,38 @@ func DefaultPushSender(ctx context.Context, taskID string, cfg PushConfig, task 
 // time, the body decoded as a Task, the callback invoked with it. Build with
 // NewPushReceiver.
 type PushReceiver struct {
-	token    string
-	callback func(ctx context.Context, task *Task) error
+	token string
+	// noTokenCheck is set only through the WithoutPushTokenValidation
+	// option; an empty token without it fails closed instead.
+	noTokenCheck bool
+	callback     func(ctx context.Context, task *Task) error
 }
 
-// NewPushReceiver builds a webhook receiver validating token (empty token
-// disables validation) and handing every decoded task to callback.
-func NewPushReceiver(token string, callback func(ctx context.Context, task *Task) error) *PushReceiver {
-	return &PushReceiver{token: token, callback: callback}
+// PushReceiverOption customizes a PushReceiver built by NewPushReceiver.
+type PushReceiverOption func(*PushReceiver)
+
+// WithoutPushTokenValidation disables the X-A2A-Token check on incoming
+// pushes. Opt in only when the receiver sits behind another authentication
+// layer: validation turns off solely through this option, never as a side
+// effect of an empty token.
+//
+// AGO-DEVIATION: both the a2a-sdk and the earlier AGo contract treated an
+// empty token as "accept every push"; a forgotten token silently opened the
+// webhook, so AGo now fails closed and requires the explicit opt-out.
+func WithoutPushTokenValidation() PushReceiverOption {
+	return func(r *PushReceiver) { r.noTokenCheck = true }
+}
+
+// NewPushReceiver builds a webhook receiver validating the X-A2A-Token header
+// against token in constant time and handing every decoded task to callback.
+// An empty token is not a usable secret: such a receiver rejects every push
+// with 401 unless WithoutPushTokenValidation is passed.
+func NewPushReceiver(token string, callback func(ctx context.Context, task *Task) error, opts ...PushReceiverOption) *PushReceiver {
+	r := &PushReceiver{token: token, callback: callback}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // ServeHTTP implements http.Handler.
@@ -203,9 +308,15 @@ func (r *PushReceiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.token != "" && subtle.ConstantTimeCompare([]byte(req.Header.Get(HeaderPushToken)), []byte(r.token)) != 1 {
-		http.Error(w, "push token mismatch", http.StatusUnauthorized)
-		return
+	if !r.noTokenCheck {
+		if r.token == "" {
+			http.Error(w, "push receiver has no token configured", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(req.Header.Get(HeaderPushToken)), []byte(r.token)) != 1 {
+			http.Error(w, "push token mismatch", http.StatusUnauthorized)
+			return
+		}
 	}
 	body, err := io.ReadAll(io.LimitReader(req.Body, maxRequestBody))
 	if err != nil {
@@ -250,7 +361,14 @@ func (s *Server) servePushSet(ctx context.Context, w http.ResponseWriter, req *r
 		writeRPCError(w, req.ID, &RPCError{Code: codeInvalidParams, Message: "params.taskId and params.pushNotificationConfig.url are required"})
 		return
 	}
-	if s.cfg.PushURLValidator != nil && !s.cfg.PushURLValidator(params.Config.URL) {
+	// A nil PushURLValidator falls back to the SSRF gate, not to accept-all:
+	// the URL is client-supplied and the server will POST the task record to
+	// it. A configured validator fully replaces the default policy.
+	validator := s.cfg.PushURLValidator
+	if validator == nil {
+		validator = DefaultPushURLValidator
+	}
+	if !validator(params.Config.URL) {
 		writeRPCError(w, req.ID, &RPCError{Code: codeInvalidParams, Message: "push url rejected by the server validator"})
 		return
 	}
@@ -267,11 +385,40 @@ func (s *Server) servePushSet(ctx context.Context, w http.ResponseWriter, req *r
 	writeRPCResult(w, req.ID, stored)
 }
 
+// pushSecretMask replaces secret values in server responses.
+const pushSecretMask = "***"
+
+// maskPushConfig returns a copy of cfg with the token and the authentication
+// credentials replaced by pushSecretMask. The stored config is not touched:
+// PushAuthentication is cloned, not shared, so deliveries keep sending the
+// real secret.
+//
+// AGO-DEVIATION: push.py's get/list return the stored config verbatim; AGo
+// masks secrets in responses because tasks/pushNotificationConfig/get is a
+// read surface anyone who knows the task id can call, and the round-tripped
+// token/credentials would leak the webhook's auth to that caller.
+func maskPushConfig(cfg PushConfig) PushConfig {
+	if cfg.Token != "" {
+		cfg.Token = pushSecretMask
+	}
+	if cfg.Authentication != nil && cfg.Authentication.Credentials != "" {
+		auth := *cfg.Authentication
+		auth.Credentials = pushSecretMask
+		cfg.Authentication = &auth
+	}
+	return cfg
+}
+
 // servePushGet handles tasks/pushNotificationConfig/get: params
-// {taskId, id} → the config (parity: push.py get_push_notification_config).
+// {taskId, id} → the config (parity: push.py get_push_notification_config;
+// secrets masked — see maskPushConfig).
 func (s *Server) servePushGet(ctx context.Context, w http.ResponseWriter, req *rpcRequest) {
 	cfg, rpcErr := s.pushConfigOp(ctx, w, req, func(ctx context.Context, taskID, configID string) (any, error) {
-		return s.cfg.PushStore.Get(ctx, taskID, configID)
+		stored, err := s.cfg.PushStore.Get(ctx, taskID, configID)
+		if err != nil {
+			return nil, err
+		}
+		return maskPushConfig(stored), nil
 	})
 	if rpcErr == nil {
 		writeRPCResult(w, req.ID, cfg)
@@ -279,10 +426,19 @@ func (s *Server) servePushGet(ctx context.Context, w http.ResponseWriter, req *r
 }
 
 // servePushList handles tasks/pushNotificationConfig/list: params {taskId} →
-// {configs: [...]} (parity: push.py list_push_notification_configs).
+// {configs: [...]} (parity: push.py list_push_notification_configs; secrets
+// masked — see maskPushConfig).
 func (s *Server) servePushList(ctx context.Context, w http.ResponseWriter, req *rpcRequest) {
 	cfgs, rpcErr := s.pushConfigOp(ctx, w, req, func(ctx context.Context, taskID, _ string) (any, error) {
-		return s.cfg.PushStore.List(ctx, taskID)
+		stored, err := s.cfg.PushStore.List(ctx, taskID)
+		if err != nil {
+			return nil, err
+		}
+		masked := make([]PushConfig, len(stored))
+		for i, cfg := range stored {
+			masked[i] = maskPushConfig(cfg)
+		}
+		return masked, nil
 	})
 	if rpcErr == nil {
 		writeRPCResult(w, req.ID, map[string]any{"configs": cfgs})

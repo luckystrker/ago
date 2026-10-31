@@ -3,7 +3,6 @@ package mcpserver
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +17,9 @@ const stdioScanBuffer = 8 << 20 // 8 MiB
 // client disconnects (stdin EOF returns nil) — the transport local clients
 // (Claude Desktop, Cursor, the MCP Inspector) speak, and the same no-framing
 // dialect the ago/mcp stdio client speaks. One request runs at a time: a slow
-// Ask blocks the loop, which is the stdio transport's whole concurrency story.
+// Ask blocks the loop, which is the stdio transport's whole concurrency
+// story. Each exchange runs on its own deadline (ServerConfig.CallTimeout),
+// so a hung handler fails its own reply instead of pinning the loop forever.
 //
 // Garbled lines are skipped rather than fatal: a chatty banner must not kill
 // the session, and the next valid request still gets its reply.
@@ -53,7 +54,9 @@ func (s *Server) serveIO(in io.Reader, out io.Writer) error {
 			}
 			continue
 		}
-		reply := s.handle(context.Background(), &req)
+		ctx, cancel := s.callCtx()
+		reply := s.handle(ctx, &req)
+		cancel()
 		if reply == nil {
 			continue // a notification: never answered
 		}

@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 )
@@ -94,7 +95,10 @@ func (a *StaticTokenAuth) Authenticate(methodID string, meta map[string]any) err
 			supplied, _ = nested["token"].(string)
 		}
 	}
-	if supplied != a.token {
+	// Constant-time: a plain == on the supplied token would leak how many
+	// leading bytes matched through response timing (same rationale as the
+	// agui interrupt token check).
+	if subtle.ConstantTimeCompare([]byte(supplied), []byte(a.token)) != 1 {
 		return fmt.Errorf("%w: invalid token", ErrAuthenticationFailed)
 	}
 	return nil

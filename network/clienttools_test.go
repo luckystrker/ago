@@ -424,3 +424,163 @@ func TestDelegateToolTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestClampTimeout(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want float64
+	}{
+		{-5, 300},  // missing/negative → default
+		{0, 300},   //
+		{300, 300}, // in-range values pass through
+		{0.3, 0.3}, //
+		{900, 900}, // the cap itself is allowed
+		{901, 900}, // above the cap is clamped
+		{3600, 900},
+		{1e9, 900},
+	}
+	for _, tc := range cases {
+		if got := clampTimeout(tc.in); got != tc.want {
+			t.Fatalf("clampTimeout(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestClientToolsTimeoutCap exercises the cap end-to-end with the ceiling
+// lowered to one second, so a multi-hour request must return in ~1s.
+func TestClientToolsTimeoutCap(t *testing.T) {
+	prev := clientTimeoutCapSeconds
+	clientTimeoutCapSeconds = 1
+	t.Cleanup(func() { clientTimeoutCapSeconds = prev })
+
+	// wait: the task never completes, so the capped timeout is the only way
+	// the call returns.
+	h, _, alice, set := clientToolsFixture(t)
+	_ = h.ObserveTask(task.Metadata{TaskID: "tk-cap", OwnerID: alice.AgentID(), State: task.StateRunning,
+		Spec: task.Spec{Title: "grind"}})
+	start := time.Now()
+	got := callTool(t, set, "tasks", `{"action":"wait","task_id":"tk-cap","timeout":3600}`)
+	elapsed := time.Since(start)
+	if s, _ := got.(string); !strings.Contains(s, `did not complete within 1s`) {
+		t.Fatalf("wait must report the capped timeout, got %q", got)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("capped wait took %v; the 3600s request was not clamped", elapsed)
+	}
+
+	// delegate: bob never answers; the same ceiling applies.
+	hc := NewHubClient(h)
+	bob, err := hc.Register("bob-consult", WithAgentFunc(func(msg string) (string, error) { return "", nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bob.Close() })
+	consultant, err := hc.Register("carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { consultant.Close() })
+	consultSet, err := ClientTools(hc, consultant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = callTool(t, consultSet, "delegate", `{"target":"bob-consult","prompt":"hello?","timeout":7200}`)
+	if s, _ := got.(string); !strings.Contains(s, "timed out after 1s") {
+		t.Fatalf("delegate must report the capped timeout, got %q", got)
+	}
+}
+
+func TestDelegatePollIntervalBackoff(t *testing.T) {
+	if delegatePollStart != 20*time.Millisecond {
+		t.Fatalf("poll start = %v, want 20ms", delegatePollStart)
+	}
+	want := []time.Duration{
+		40 * time.Millisecond, 80 * time.Millisecond, 160 * time.Millisecond,
+		320 * time.Millisecond, 500 * time.Millisecond, 500 * time.Millisecond,
+	}
+	got := make([]time.Duration, 0, len(want))
+	d := delegatePollStart
+	for range want {
+		d = nextPollInterval(d)
+		got = append(got, d)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("poll schedule = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestChannelsToolCloseRequiresParticipant: close is gated on participation
+// like info — a channel the caller does not sit in is not theirs to end, and
+// a refused close leaves it alive (audit M-8).
+func TestChannelsToolCloseRequiresParticipant(t *testing.T) {
+	h, hc, _, set := clientToolsFixture(t)
+	carol, err := hc.Register("carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { carol.Close() })
+
+	bob, err := h.Passport("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := carol.CreateChannel(ChannelManifest{Type: TypeConversation}, bob.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := callTool(t, set, "channels", `{"action":"close","channel_id":"`+ch.ID+`"}`)
+	if s, _ := got.(string); !strings.Contains(s, "not a participant") {
+		t.Fatalf("close by a non-participant = %v, want the refusal", got)
+	}
+	after, err := h.Channel(ch.ID)
+	if err != nil || after.State.Terminal() {
+		t.Fatalf("the refused close still ended the channel: state=%v err=%v", after.State, err)
+	}
+}
+
+// TestTasksToolScopeAllParticipantFilter: scope=all lists the caller's own
+// tasks and those riding a channel the caller sits in; strangers' task
+// metadata — owner, title, result — is not directory information (audit M-8).
+func TestTasksToolScopeAllParticipantFilter(t *testing.T) {
+	h, hc, alice, set := clientToolsFixture(t)
+	carol, err := hc.Register("carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { carol.Close() })
+
+	bob, err := h.Passport("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chIn, err := alice.CreateChannel(ChannelManifest{Type: TypeConversation}, bob.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chOut, err := carol.CreateChannel(ChannelManifest{Type: TypeConversation}, bob.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = h.ObserveTask(task.Metadata{TaskID: "tk-own", OwnerID: alice.AgentID(),
+		State: task.StateRunning, Spec: task.Spec{Title: "own"}})
+	_ = h.ObserveTask(task.Metadata{TaskID: "tk-shared", OwnerID: bob.AgentID, ChannelID: chIn.ID,
+		State: task.StateRunning, Spec: task.Spec{Title: "shared"}})
+	_ = h.ObserveTask(task.Metadata{TaskID: "tk-foreign", OwnerID: bob.AgentID, ChannelID: chOut.ID,
+		State: task.StateRunning, Spec: task.Spec{Title: "foreign"}})
+	_ = h.ObserveTask(task.Metadata{TaskID: "tk-orphan", OwnerID: bob.AgentID,
+		State: task.StateRunning, Spec: task.Spec{Title: "orphan"}})
+
+	got := callTool(t, set, "tasks", `{"action":"list","scope":"all"}`)
+	list := toolResultList(t, got)
+	ids := make(map[string]bool, len(list))
+	for _, m := range list {
+		ids[m["task_id"].(string)] = true
+	}
+	if len(list) != 2 || !ids["tk-own"] || !ids["tk-shared"] {
+		t.Fatalf("scope=all = %v, want exactly tk-own and tk-shared", list)
+	}
+}

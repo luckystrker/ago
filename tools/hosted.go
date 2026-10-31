@@ -15,6 +15,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 
 	agocontext "github.com/luckystrker/ago/context"
@@ -720,6 +721,38 @@ type MCPServerToolSchema struct {
 
 // SchemaType returns the provider-neutral tool type.
 func (MCPServerToolSchema) SchemaType() string { return MCPServerToolName }
+
+// mcpSecretMask replaces secret values in a serialized hosted MCP schema (the
+// same convention as the push-secret mask in the a2a package).
+const mcpSecretMask = "***"
+
+// MarshalJSON renders the schema's diagnostic form: the bearer token and every
+// header value are masked, so an event or log that serializes the schema never
+// carries the MCP server's credentials. Header keys stay visible — they are what
+// diagnostics need; the values are where credentials ride, so all of them are
+// masked, not only obviously secret names. The provider wire request is
+// unaffected: the provider mappers read the struct fields directly and never
+// marshal the schema.
+//
+// AGO-DEVIATION: Python serializes this schema with plaintext secrets; AGo masks
+// them because schemas travel as opaque values that any event/log surface may
+// serialize. See docs/DECISIONS.md.
+func (s MCPServerToolSchema) MarshalJSON() ([]byte, error) {
+	// Alias type so json.Marshal does not recurse into this method.
+	type plain MCPServerToolSchema
+	out := plain(s)
+	if s.AuthorizationToken != "" {
+		out.AuthorizationToken = mcpSecretMask
+	}
+	if s.Headers != nil {
+		masked := make(map[string]string, len(s.Headers))
+		for k := range s.Headers {
+			masked[k] = mcpSecretMask
+		}
+		out.Headers = masked
+	}
+	return json.Marshal(out)
+}
 
 // MCPServerOption configures NewMCPServer.
 type MCPServerOption func(*MCPServerTool)

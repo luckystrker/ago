@@ -25,6 +25,11 @@ set -eu
 REPO_URL="${AGO_INSTALL_REPO_URL:-https://github.com/luckystrker/ago}"
 
 DRY_RUN="${DRY_RUN:-}"
+# AGO_SKIP_CHECKSUM=1 is the only way to install when checksums.txt cannot
+# be fetched: the archive is then unpacked with no integrity check at all,
+# so the opt-in is explicit and loudly warned. A present-but-mismatching
+# digest is always fatal and cannot be skipped.
+AGO_SKIP_CHECKSUM="${AGO_SKIP_CHECKSUM:-}"
 REQUESTED_VERSION=""
 REQUESTED_DIR="${AGO_INSTALL_DIR:-}"
 VERSION=""
@@ -54,6 +59,10 @@ Options:
 Environment:
   AGO_INSTALL_DIR   Same as --dir=DIR.
   DRY_RUN=1         Print the steps without downloading or installing.
+  AGO_SKIP_CHECKSUM=1
+                    Install even when checksums.txt cannot be downloaded.
+                    NO sha256 verification happens — an explicit, unsafe
+                    opt-in; a mismatching checksum still aborts the install.
 
 What it does:
   1. Detects OS and architecture (linux/darwin/windows x amd64/arm64).
@@ -308,8 +317,13 @@ ago-install:   git clone ${REPO_URL}.git && go build -o ago ./cmd/ago"
 
   if download_to "${CHECKSUM_URL}" "${TMP}/checksums.txt"; then
     verify_checksum "${TMP}/${ARCHIVE}" "${TMP}/checksums.txt"
+  elif [ "${AGO_SKIP_CHECKSUM}" = "1" ]; then
+    warn "AGO_SKIP_CHECKSUM=1: installing ${ARCHIVE} WITHOUT sha256 verification"
+    warn "the downloaded archive is untrusted; verify it yourself or unset AGO_SKIP_CHECKSUM"
   else
-    warn "checksums.txt is unavailable for ${VERSION}; skipping the sha256 verification"
+    die "checksums.txt is unavailable for ${VERSION}; refusing to install an unverified archive
+ago-install: set AGO_SKIP_CHECKSUM=1 to install anyway (no verification), or build from source:
+ago-install:   git clone ${REPO_URL}.git && go build -o ago ./cmd/ago"
   fi
 
   info "extracting ${ARCHIVE}"

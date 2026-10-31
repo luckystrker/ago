@@ -522,6 +522,15 @@ Envelope event types: `ag2.msg.text`, `ag2.packet`, `ag2.channel.*`, `ag2.task.*
 `ag2.expectation.violated` (keep the wire vocabulary). TransitionGraph targets/conditions per spec.
 WAL via knowledge.EventLogWriter.
 
+**Trust boundary: the hub is one trust domain.** Envelope identity is self-declared — a
+`Passport`'s `Name`/`Auth` are asserted by the sender and validated by nothing inside the
+hub (`network/identity.go`), and every access decision derives from that name. Within a
+single process this is by design. The moment a bridge carries envelopes across a process
+or network boundary (e.g. `contrib/wslink`) or third-party code writes into the hub, a
+forged sender name grants the forger that agent's full authority. Such deployments must
+authenticate at the boundary — a signature or token on each envelope, or a
+"link → allowed AgentID" mapping — before envelopes enter the hub.
+
 ### package `mcp`
 
 Minimal MCP client: JSON-RPC 2.0 over stdio (`os/exec`) and streamable HTTP; `initialize`,

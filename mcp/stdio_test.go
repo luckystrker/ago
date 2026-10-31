@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,9 +25,18 @@ import (
 const stdioServerEnv = "AGO_MCP_TEST_STDIO_SERVER"
 const stdioTokenEnv = "MCP_TEST_TOKEN"
 
+// With the silent flag the stub consumes stdin but never answers: a hung MCP
+// server for the exchange-deadline regressions. It exits on stdin EOF so a
+// transport close does not wait out killAfter.
+const stdioSilentEnv = "AGO_MCP_TEST_STDIO_SILENT"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(stdioServerEnv) == "1" {
-		runStdioServer(os.Stdin, os.Stdout)
+		if os.Getenv(stdioSilentEnv) == "1" {
+			io.Copy(io.Discard, os.Stdin)
+		} else {
+			runStdioServer(os.Stdin, os.Stdout)
+		}
 		return
 	}
 	os.Exit(m.Run())
@@ -366,5 +376,111 @@ func TestStdioBadCommand(t *testing.T) {
 	t.Cleanup(func() { cl.Close() })
 	if _, err := cl.Initialize(); err == nil {
 		t.Fatal("Initialize with a missing executable must fail")
+	}
+}
+
+// --- exchange deadline and cancellation ------------------------------------------
+
+// TestStdioExchangeTimeout is the regression for the deadline-less stdio
+// transport: a subprocess that never answered blocked the read — and, under the
+// client lock, every later operation and the whole agent turn — forever. The
+// deadline mirrors the HTTP branch (Python's connection_timeout=30s).
+func TestStdioExchangeTimeout(t *testing.T) {
+	t.Run("deadline defaults and overrides", func(t *testing.T) {
+		tr, err := newStdioTransport(&MCPStdioConfig{Command: "x"})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.timeout != defaultExchangeTimeout {
+			t.Fatalf("default timeout = %v, want %v", tr.timeout, defaultExchangeTimeout)
+		}
+		tr, err = newStdioTransport(&MCPStdioConfig{Command: "x", Timeout: 250 * time.Millisecond})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.timeout != 250*time.Millisecond {
+			t.Fatalf("timeout = %v, want 250ms", tr.timeout)
+		}
+		tr, err = newStdioTransport(&MCPStdioConfig{Command: "x", Timeout: -1})
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if tr.timeout != 0 {
+			t.Fatalf("timeout = %v, want 0 (no cap)", tr.timeout)
+		}
+	})
+	t.Run("hung server fails the call fast and frees the client", func(t *testing.T) {
+		cfg := stdioTestConfig(t, func(c *MCPStdioConfig) {
+			c.Timeout = 150 * time.Millisecond
+			c.Env = append(c.Env, stdioSilentEnv+"=1")
+		})
+		cl, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { cl.Close() })
+
+		start := time.Now()
+		if _, err := cl.CallTool("echo", nil); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("CallTool on a hung server = %v, want ErrTimeout", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("CallTool took %v, want a fast timeout failure", elapsed)
+		}
+		// The timed-out subprocess was killed and the session dropped: the
+		// follow-up respawns one and times out the same fast way instead of
+		// queueing behind the dead exchange.
+		start = time.Now()
+		if _, err := cl.CallTool("echo", nil); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("follow-up CallTool = %v, want ErrTimeout after the session rebuild", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("follow-up CallTool took %v, want a fast timeout failure", elapsed)
+		}
+	})
+}
+
+// TestStdioCloseCancelsExchange: closing the transport mid-exchange wakes the
+// waiting caller with ErrClosed instead of leaving it on the pipe until the
+// deadline.
+func TestStdioCloseCancelsExchange(t *testing.T) {
+	// The cap is the safety net: if close stops cancelling, the test fails on
+	// the elapsed check rather than hanging for the full default deadline.
+	cfg := stdioTestConfig(t, func(c *MCPStdioConfig) {
+		c.Timeout = 30 * time.Second
+		c.Env = append(c.Env, stdioSilentEnv+"=1")
+	})
+	tr, err := newStdioTransport(cfg)
+	if err != nil {
+		t.Fatalf("transport: %v", err)
+	}
+	if err := tr.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	type outcome struct {
+		res json.RawMessage
+		err error
+	}
+	out := make(chan outcome, 1)
+	go func() {
+		res, err := tr.call(context.Background(), 1, "tools/list", nil)
+		out <- outcome{res, err}
+	}()
+	// Let the exchange reach the waiting select, then close underneath it.
+	time.Sleep(150 * time.Millisecond)
+	start := time.Now()
+	if err := tr.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case got := <-out:
+		if !errors.Is(got.err, ErrClosed) {
+			t.Errorf("call = %v, want ErrClosed", got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("close did not cancel the hanging exchange")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("close+cancel took %v, want a prompt shutdown", elapsed)
 	}
 }

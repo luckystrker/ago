@@ -213,3 +213,93 @@ func TestREPLStreamingPrintsBodyWithoutChunks(t *testing.T) {
 		t.Errorf("output %q misses the final body", out.String())
 	}
 }
+
+// errEscConfig always fails with an error whose text embeds an OSC 52
+// clipboard-write sequence — provider errors can echo untrusted response
+// bodies (audit H-10 covers the error line too).
+type errEscConfig struct{}
+
+func (e errEscConfig) Provider() config.Provider { return "test" }
+func (e errEscConfig) Model() string             { return "err-esc" }
+func (e errEscConfig) Clone(m map[string]any) (config.ModelConfig, error) {
+	return e, nil
+}
+func (e errEscConfig) Create() (config.LLMClient, error) { return e, nil }
+func (e errEscConfig) Call(ctx stdcontext.Context, messages []events.Event, conv *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
+	return nil, errors.New("upstream 500: \x1b]52;c;cHaste\x1b\\ echoed")
+}
+
+// TestREPLErrorLineSanitized: the error report on out must not carry escape
+// bytes even though the underlying error text does.
+func TestREPLErrorLineSanitized(t *testing.T) {
+	a := agent.New("helper", "", agent.WithConfig(errEscConfig{}))
+
+	var out bytes.Buffer
+	if err := REPL(a, strings.NewReader("hi\n/exit\n"), &out); err != nil {
+		t.Fatalf("repl: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("output %q leaks escape bytes on the error line", got)
+	}
+	if !strings.Contains(got, "upstream 500") {
+		t.Errorf("output %q loses the error text itself", got)
+	}
+}
+
+// TestREPLReplySanitized: a blocking turn whose answer embeds an OSC 52
+// clipboard write (both ST and BEL forms) and CSI color codes prints the text
+// without any control bytes.
+func TestREPLReplySanitized(t *testing.T) {
+	cfg := agotest.NewTestConfig(textResp("Sure\x1b]52;c;aGVsbG8=\x1b\\ \x1b[31mred\x1b[0m\x1b]0;pwn\x07done"))
+	a := agent.New("helper", "", agent.WithConfig(cfg))
+
+	var out bytes.Buffer
+	if err := REPL(a, strings.NewReader("hi\n/exit\n"), &out); err != nil {
+		t.Fatalf("repl: %v", err)
+	}
+	got := out.String()
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Errorf("output %q leaks escape/control bytes", got)
+	}
+	if !strings.Contains(got, "Sure reddone") {
+		t.Errorf("output %q loses visible reply text", got)
+	}
+}
+
+// streamingClip streams an OSC 52 clipboard write split across three deltas —
+// the realistic streaming shape, where the sequence arrives cut in the middle.
+type streamingClip struct{}
+
+func (c *streamingClip) Provider() config.Provider { return "test" }
+func (c *streamingClip) Model() string             { return "clip-model" }
+func (c *streamingClip) Clone(m map[string]any) (config.ModelConfig, error) {
+	return c, nil
+}
+func (c *streamingClip) Create() (config.LLMClient, error) { return c, nil }
+func (c *streamingClip) Call(ctx stdcontext.Context, messages []events.Event, conv *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
+	for _, part := range []string{"answer\x1b]5", "2;c;aGVsbG8=\x1b", "\\ done"} {
+		if err := conv.Send(&events.ModelMessageChunk{Content: part}); err != nil {
+			return nil, err
+		}
+	}
+	return &events.ModelResponse{Message: &events.ModelMessage{Content: "answer done"}}, nil
+}
+
+// TestREPLStreamingSanitizesSplitOSC52: the streaming path must swallow a
+// sequence even when the provider's chunking cuts it into pieces.
+func TestREPLStreamingSanitizesSplitOSC52(t *testing.T) {
+	a := agent.New("helper", "", agent.WithConfig(&streamingClip{}))
+
+	var out bytes.Buffer
+	if err := REPL(a, strings.NewReader("hi\n/exit\n"), &out, WithStreaming()); err != nil {
+		t.Fatalf("repl: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "\x1b") || strings.Contains(got, "aGVsbG8=") {
+		t.Errorf("output %q leaks escape bytes or the clipboard payload", got)
+	}
+	if !strings.Contains(got, "answer done") {
+		t.Errorf("output %q loses the visible text", got)
+	}
+}

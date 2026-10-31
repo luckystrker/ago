@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -39,6 +40,17 @@ var _ knowledge.Store = (*Store)(nil)
 
 // DefaultPrefix is the Redis key prefix (Python RedisKnowledgeStore default).
 const DefaultPrefix = "ag2:knowledge"
+
+// DefaultTimeout bounds every Redis call (a multi-command mutation — Write,
+// Delete — shares one deadline for the whole mutation). A deadline here is the
+// store's own guarantee: the injected client may come with client-level
+// timeouts disabled (a common setup for blocking commands), and without a
+// per-call deadline one hung Redis would block the caller forever. Caveat
+// inherited from go-redis v9: the deadline reaches the socket only when the
+// injected client has ContextTimeoutEnabled set (or its own read/write
+// timeouts, the default 3s); a client with both disabled ignores any context
+// deadline.
+const DefaultTimeout = 30 * time.Second
 
 // appendScript appends the payload and bumps the version/index in one server-side
 // step, so independent connections cannot interleave (Python _APPEND_SCRIPT).
@@ -62,9 +74,12 @@ type Store struct {
 	// asyncio.Lock parity); the Lua-script append needs no such lock.
 	writeMu sync.Mutex
 	ch      watchers
-	// The core Store protocol methods carry no context; every Redis call uses
-	// this background context (AGO-DEVIATION, interface parity constraint).
-	ctx context.Context
+	// The core Store protocol methods carry no context (AGO-DEVIATION,
+	// interface parity constraint: Python's protocol is likewise context-free),
+	// so every Redis call runs under a fresh context derived from base with the
+	// per-call deadline timeout.
+	base    context.Context
+	timeout time.Duration
 }
 
 // Option configures a Store.
@@ -75,13 +90,24 @@ func WithPrefix(prefix string) Option {
 	return func(s *Store) { s.keyPrefix = prefix }
 }
 
+// WithTimeout overrides the per-call Redis deadline (default DefaultTimeout).
+// A zero or negative duration restores the default.
+func WithTimeout(d time.Duration) Option {
+	return func(s *Store) {
+		if d > 0 {
+			s.timeout = d
+		}
+	}
+}
+
 // NewStore builds a store over an injected client. The caller keeps ownership:
 // closing the client (and flushing its keys) is the caller's job.
 func NewStore(rdb redis.UniversalClient, opts ...Option) *Store {
 	s := &Store{
 		rdb:       rdb,
 		keyPrefix: DefaultPrefix,
-		ctx:       context.Background(),
+		base:      context.Background(),
+		timeout:   DefaultTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -93,13 +119,22 @@ func NewStore(rdb redis.UniversalClient, opts ...Option) *Store {
 	return s
 }
 
+// callCtx returns the context for one Redis call (or one multi-command mutation
+// like Write/Delete): base with the deadline attached. Each call gets its own
+// cancel so timers are never leaked across calls.
+func (s *Store) callCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.base, s.timeout)
+}
+
 // key maps a virtual path to its Redis string key: "{prefix}:{path}".
 func (s *Store) key(path string) string { return s.keyPrefix + ":" + path }
 
 // Read returns the content at path, or knowledge.ErrNotFound.
 func (s *Store) Read(path string) ([]byte, error) {
 	norm := normalizePath(path)
-	data, err := s.rdb.Get(s.ctx, s.key(norm)).Bytes()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	data, err := s.rdb.Get(ctx, s.key(norm)).Bytes()
 	if err == redis.Nil {
 		return nil, notFoundErr(path)
 	}
@@ -111,16 +146,19 @@ func (s *Store) Read(path string) ([]byte, error) {
 
 // Write stores data at path (directories are implicit) and notifies watchers.
 // Version bump, content write and index update are three commands like Python's
-// write, serialized here by the instance write lock.
+// write, serialized here by the instance write lock and sharing one deadline
+// (the mutation is atomic from the caller's perspective).
 func (s *Store) Write(path string, data []byte) error {
 	norm := normalizePath(path)
+	ctx, cancel := s.callCtx()
+	defer cancel()
 	s.writeMu.Lock()
-	version, err := s.rdb.Incr(s.ctx, s.versionKey).Result()
+	version, err := s.rdb.Incr(ctx, s.versionKey).Result()
 	if err == nil {
-		err = s.rdb.Set(s.ctx, s.key(norm), data, 0).Err()
+		err = s.rdb.Set(ctx, s.key(norm), data, 0).Err()
 	}
 	if err == nil {
-		err = s.rdb.ZAdd(s.ctx, s.indexKey, redis.Z{Score: float64(version), Member: norm}).Err()
+		err = s.rdb.ZAdd(ctx, s.indexKey, redis.Z{Score: float64(version), Member: norm}).Err()
 	}
 	s.writeMu.Unlock()
 	if err != nil {
@@ -130,9 +168,11 @@ func (s *Store) Write(path string, data []byte) error {
 	return nil
 }
 
-// indexSnapshot returns the (path → version) pairs of the whole index.
-func (s *Store) indexSnapshot() (map[string]int64, error) {
-	zs, err := s.rdb.ZRangeWithScores(s.ctx, s.indexKey, 0, -1).Result()
+// indexSnapshot returns the (path → version) pairs of the whole index. The
+// caller supplies the mutation-scoped context so a multi-command mutation reads
+// the index under the same deadline it writes under.
+func (s *Store) indexSnapshot(ctx context.Context) (map[string]int64, error) {
+	zs, err := s.rdb.ZRangeWithScores(ctx, s.indexKey, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +188,9 @@ func (s *Store) indexSnapshot() (map[string]int64, error) {
 // as empty (never an error), Python parity.
 func (s *Store) List(dir string) ([]string, error) {
 	prefix := dirPrefix(dir)
-	snapshot, err := s.indexSnapshot()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	snapshot, err := s.indexSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -173,13 +215,16 @@ func (s *Store) List(dir string) ([]string, error) {
 }
 
 // Delete removes path and everything under it, notifying once per removed path.
-// Deleting a missing path is a no-op.
+// Deleting a missing path is a no-op. The snapshot read and the key/index
+// removals share one deadline: one mutation from the caller's perspective.
 func (s *Store) Delete(path string) error {
 	norm := normalizePath(path)
 	prefix := strings.TrimSuffix(norm, "/") + "/"
 	var affected []string
+	ctx, cancel := s.callCtx()
+	defer cancel()
 	s.writeMu.Lock()
-	snapshot, err := s.indexSnapshot()
+	snapshot, err := s.indexSnapshot(ctx)
 	if err == nil {
 		for p := range snapshot {
 			if p == norm || strings.HasPrefix(p, prefix) {
@@ -192,8 +237,8 @@ func (s *Store) Delete(path string) error {
 			for i, p := range affected {
 				keys[i] = s.key(p)
 			}
-			if err = s.rdb.Del(s.ctx, keys...).Err(); err == nil {
-				err = s.rdb.ZRem(s.ctx, s.indexKey, s.toMembers(affected)).Err()
+			if err = s.rdb.Del(ctx, keys...).Err(); err == nil {
+				err = s.rdb.ZRem(ctx, s.indexKey, s.toMembers(affected)).Err()
 			}
 		}
 	}
@@ -218,12 +263,14 @@ func (s *Store) toMembers(paths []string) []interface{} {
 // Exists reports whether path is stored directly or has anything under it.
 func (s *Store) Exists(path string) bool {
 	norm := normalizePath(path)
-	n, err := s.rdb.Exists(s.ctx, s.key(norm)).Result()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	n, err := s.rdb.Exists(ctx, s.key(norm)).Result()
 	if err == nil && n > 0 {
 		return true
 	}
 	prefix := strings.TrimSuffix(norm, "/") + "/"
-	snapshot, err := s.indexSnapshot()
+	snapshot, err := s.indexSnapshot(ctx)
 	if err != nil {
 		return false
 	}
@@ -243,7 +290,9 @@ func (s *Store) Append(path string, data []byte) error {
 	norm := normalizePath(path)
 	// The offset Python returns (size after minus payload) is not part of the
 	// AGo Store protocol — the script's atomicity is what matters here.
-	_, err := s.append.Run(s.ctx, s.rdb, []string{s.key(norm), s.indexKey, s.versionKey}, data, norm).Result()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	_, err := s.append.Run(ctx, s.rdb, []string{s.key(norm), s.indexKey, s.versionKey}, data, norm).Result()
 	if err != nil {
 		return err
 	}
@@ -259,7 +308,9 @@ func (s *Store) ReadRange(path string, off, n int) ([]byte, error) {
 		return nil, &rangeError{path: path, off: off}
 	}
 	norm := normalizePath(path)
-	data, err := s.rdb.Get(s.ctx, s.key(norm)).Bytes()
+	ctx, cancel := s.callCtx()
+	defer cancel()
+	data, err := s.rdb.Get(ctx, s.key(norm)).Bytes()
 	if err == redis.Nil {
 		return nil, nil
 	}

@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -125,5 +126,39 @@ func TestBootstrapOnceSentinel(t *testing.T) {
 	}
 	if string(sentinel) != "alfred" {
 		t.Errorf("sentinel overwritten: %q", sentinel)
+	}
+}
+
+// flakyBootstrap fails on demand, to observe the sentinel ordering.
+type flakyBootstrap struct{ fail bool }
+
+func (f flakyBootstrap) Bootstrap(store Store, actorName string) error {
+	if f.fail {
+		return errors.New("bootstrap exploded")
+	}
+	return DefaultBootstrap{}.Bootstrap(store, actorName)
+}
+
+// TestBootstrapOnceSentinelAfterLayout proves the sentinel is the last write
+// (audit L-22): a bootstrap that fails midway leaves no sentinel, so the next
+// run retries the layout instead of settling for a half-initialized store.
+func TestBootstrapOnceSentinelAfterLayout(t *testing.T) {
+	store := NewMemoryStore()
+
+	if err := BootstrapOnce(store, "alfred", flakyBootstrap{fail: true}); err == nil {
+		t.Fatal("failing bootstrap: want error, got nil")
+	}
+	if store.Exists(SentinelPath) {
+		t.Fatal("sentinel written before the layout completed")
+	}
+
+	if err := BootstrapOnce(store, "alfred", flakyBootstrap{}); err != nil {
+		t.Fatalf("retry bootstrap: %v", err)
+	}
+	if !store.Exists(SentinelPath) {
+		t.Fatal("successful bootstrap must write the sentinel")
+	}
+	if !store.Exists("/SKILL.md") {
+		t.Fatal("successful bootstrap must write the layout")
 	}
 }

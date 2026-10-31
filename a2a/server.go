@@ -28,6 +28,12 @@ const rpcPath = "/"
 // below this, and the cap keeps a runaway client from pinning server memory.
 const maxRequestBody = 8 << 20 // 8 MiB
 
+// msgInternalError is the fixed text for wire errors whose real cause is
+// server-internal (a handler failure, a task-store fault): internal detail —
+// driver texts, resolved paths, handler error chains — stays off the wire.
+// The failed task record keeps the full text for the operator (tasks/get).
+const msgInternalError = "internal error"
+
 // ServerConfig wires a Server.
 type ServerConfig struct {
 	// Card is served verbatim from the discovery routes. Its
@@ -67,13 +73,34 @@ type ServerConfig struct {
 	// PushSender delivers a terminal task to one subscriber webhook; nil
 	// defaults to DefaultPushSender. Delivery is best-effort and asynchronous.
 	PushSender PushSender
-	// PushURLValidator rejects webhook URLs at set time; nil accepts every
-	// non-empty URL (parity: server.py push_url_validator, whose absence
-	// disables validation).
+	// PushURLValidator rejects webhook URLs at set time; nil defaults to
+	// DefaultPushURLValidator, which refuses loopback/private/link-local
+	// targets (SSRF gate). A custom func replaces the default policy
+	// wholesale — parity with server.py push_url_validator ends there:
+	// the a2a-sdk validates nothing unless the app supplies one.
 	PushURLValidator func(url string) bool
 	// Store persists tasks for tasks/get and tasks/cancel. Nil defaults to
 	// NewMemoryTaskStore.
 	Store TaskStore
+	// Authorize gates every request before dispatch — card, REST and JSON-RPC
+	// surfaces alike: returning a non-nil error rejects the request with 403
+	// and a fixed message, keeping the error text off the wire. Nil disables
+	// the check. The hook sees the raw request (body unconsumed), must be
+	// safe for concurrent use, and is the surface's only built-in auth point —
+	// any non-loopback exposure needs one.
+	Authorize func(r *http.Request) error
+	// AllowedHosts, when non-empty, admits only requests whose Host header
+	// matches one entry exactly (host or host:port, case-insensitive);
+	// anything else answers 403. This closes DNS-rebinding against loopback
+	// deployments, where a rebinding page reaches the server with its own
+	// Host. Nil disables the check.
+	AllowedHosts []string
+	// AllowedOrigins, when non-empty, requires every request carrying an
+	// Origin header (browsers send it cross-origin) to match one entry
+	// exactly (scheme://host[:port], case-insensitive). Requests without
+	// Origin — ordinary server-to-server clients — pass, so this is a
+	// browser-request fence, not authentication. Nil disables the check.
+	AllowedOrigins []string
 }
 
 // Server exposes one agent over A2A: agent-card discovery, the JSON-RPC
@@ -137,6 +164,9 @@ func (s *Server) Handler() http.Handler { return s }
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.admit(w, r) {
+		return
+	}
 	if s.serveREST(w, r) {
 		return
 	}
@@ -160,6 +190,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// admit applies the request gates — the Authorize hook, then the Host and
+// Origin allowlists — before any dispatch, reporting whether the request may
+// proceed. Every gate answers 403 with a fixed message: rejection reasons can
+// carry internal detail (hook errors, configured hosts) that has no business
+// on the wire. The gates are fail-closed: a set allowlist admits nothing
+// until a header matches.
+func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
+	if s.cfg.Authorize != nil {
+		if err := s.cfg.Authorize(r); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return false
+		}
+	}
+	if len(s.cfg.AllowedHosts) > 0 && !matchFold(r.Host, s.cfg.AllowedHosts) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	if origin := r.Header.Get("Origin"); len(s.cfg.AllowedOrigins) > 0 && origin != "" && !matchFold(origin, s.cfg.AllowedOrigins) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// matchFold reports whether s equals one of the allowed entries
+// case-insensitively. Host and Origin headers are matched whole (host or
+// host:port; scheme://host[:port]) — no prefix or suffix tricks, so a
+// "good.example" entry never admits "good.example.evil.io".
+func matchFold(s string, allowed []string) bool {
+	for _, a := range allowed {
+		if strings.EqualFold(s, a) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeJSON writes one JSON body with the given status. Discovery and
 // JSON-RPC replies use application/json; the REST transport overrides the
 // header to the binding media type (rest.go).
@@ -177,7 +244,7 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
 	if err != nil {
 		writeRPC(w, &rpcResponse{JSONRPC: "2.0", ID: idOr(nil), Error: &RPCError{
-			Code: codeInternalError, Message: "read request body: " + err.Error(),
+			Code: codeInternalError, Message: msgInternalError,
 		}})
 		return
 	}
@@ -258,23 +325,29 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, rpcErr *RPCError) 
 	writeRPC(w, &rpcResponse{JSONRPC: "2.0", ID: idOr(id), Error: rpcErr})
 }
 
-// newTask derives a Task from an incoming message: the client-supplied ids
-// win, missing ones are generated (parity: executor.py:89-90).
+// newTask derives a fresh Task from an incoming message. The task id is
+// always server-generated: accepting a client-supplied id for a task that
+// does not exist yet would let a peer pre-select the record it later
+// continues, reads and hijacks (guessable or leaked ids become keys to other
+// clients' exchanges), and pins one store record per attacker-chosen id.
+//
+// AGO-DEVIATION: the Python executor honors a client-supplied task id for
+// new tasks (executor.py:89-90); AGo always mints its own UUID so id
+// ownership stays server-side. The client-supplied contextId still threads
+// the conversation (parity kept there).
 func (s *Server) newTask(msg *Message) *Task {
-	id := msg.TaskID
-	if id == "" {
-		id = uuid.New()
-	}
 	contextID := msg.ContextID
 	if contextID == "" {
 		contextID = uuid.New()
 	}
-	return &Task{ID: id, ContextID: contextID, Status: TaskStatus{State: TaskStateWorking}}
+	return &Task{ID: uuid.New(), ContextID: contextID, Status: TaskStatus{State: TaskStateWorking}}
 }
 
 // loadOrCreateTask resolves the task a turn belongs to: a message carrying a
 // task id continues the stored record (the client-tools and HITL
-// continuations do exactly that), an unknown or absent id opens a fresh task.
+// continuations do exactly that), an unknown or absent id opens a fresh task
+// with a server-minted id — a task id the store does not know names no
+// record, so it cannot be resurrected or pre-created from the client side.
 func (s *Server) loadOrCreateTask(ctx context.Context, msg *Message) (*Task, error) {
 	if msg.TaskID != "" {
 		if task, err := s.store.Get(ctx, msg.TaskID); err == nil {
@@ -498,8 +571,9 @@ func (s *Server) lockTask(id string) func() {
 // failed record continues: an explicit new message on the same task id is a
 // client-driven continuation (parity: the executor keeps appending history
 // for whatever task id arrives). The first commit of a task not yet in the
-// store Saves it as-is: there is no stored state to merge with and nothing
-// to resurrect. Returns the record now in the store and whether the commit
+// store runs through the same atomic create-or-update cycle (see
+// updateOrCreateTask): there is no stored state to merge with and nothing to
+// resurrect. Returns the record now in the store and whether the commit
 // was refused.
 func (s *Server) commitTask(ctx context.Context, task *Task, msg *Message, reply *Message, state TaskState, handleErr error) (stored *Task, refused bool, err error) {
 	apply := func(current *Task) bool {
@@ -517,15 +591,87 @@ func (s *Server) commitTask(ctx context.Context, task *Task, msg *Message, reply
 		}
 		return true
 	}
-	stored, refused, err = s.updateTask(ctx, task.ID, apply)
-	if errors.Is(err, ErrTaskNotFound) {
+	return s.updateOrCreateTask(ctx, task, apply)
+}
+
+// updateOrCreateTask commits one turn against the record for task.ID with
+// the same atomicity as updateTask — including the first commit of a record
+// the store does not hold yet: the create and any parallel writer on the
+// same id (a sibling turn, a store eviction landing mid-turn) resolve under
+// one lock instead of last-write-wins. Stores implementing TaskUpserter run
+// the whole create-or-update under their own lock. TaskUpdater stores keep
+// every write to a live record on their atomic Update path — the per-task
+// mutex only fences the create, and a record another writer created in the
+// meantime is updated atomically, never replaced by a plain Save (which
+// shares no lock with the store's Update and would clobber it). Plain stores
+// run the whole cycle under the per-task mutex, the same one updateTask's
+// fallback uses. apply receives the fresh task from newTask when the record
+// is absent — its working state lets the commit proceed.
+func (s *Server) updateOrCreateTask(ctx context.Context, task *Task, apply func(current *Task) bool) (*Task, bool, error) {
+	if up, ok := s.store.(TaskUpserter); ok {
+		var refused bool
+		stored, err := up.Upsert(ctx, task.ID, func(current *Task) (*Task, error) {
+			if current == nil {
+				current = task
+			}
+			if !apply(current) {
+				refused = true
+			}
+			return current, nil
+		})
+		if err != nil {
+			return nil, refused, err
+		}
+		return stored, refused, nil
+	}
+	if _, ok := s.store.(TaskUpdater); ok {
+		for {
+			stored, refused, err := s.updateTask(ctx, task.ID, apply)
+			if !errors.Is(err, ErrTaskNotFound) {
+				return stored, refused, err
+			}
+			unlock := s.lockTask(task.ID)
+			_, getErr := s.store.Get(ctx, task.ID)
+			switch {
+			case getErr == nil:
+				// A parallel turn created the record: release and update it
+				// through the store's atomic path.
+				unlock()
+				continue
+			case !errors.Is(getErr, ErrTaskNotFound):
+				unlock()
+				return nil, false, getErr
+			}
+			apply(task)
+			if err := s.store.Save(ctx, task); err != nil {
+				unlock()
+				return nil, false, fmt.Errorf("save task: %w", err)
+			}
+			unlock()
+			return task, false, nil
+		}
+	}
+	unlock := s.lockTask(task.ID)
+	defer unlock()
+	current, err := s.store.Get(ctx, task.ID)
+	switch {
+	case err == nil:
+		if !apply(current) {
+			return current, true, nil
+		}
+		if err := s.store.Save(ctx, current); err != nil {
+			return nil, false, fmt.Errorf("save task: %w", err)
+		}
+		return current, false, nil
+	case errors.Is(err, ErrTaskNotFound):
 		apply(task)
 		if err := s.store.Save(ctx, task); err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("save task: %w", err)
 		}
 		return task, false, nil
+	default:
+		return nil, false, err
 	}
-	return stored, refused, err
 }
 
 // runHandle invokes the configured handler, mapping a nil handler to a
@@ -560,7 +706,7 @@ func (s *Server) messageSend(ctx context.Context, w http.ResponseWriter, req *rp
 		return
 	}
 	if outcome.handleErr != nil {
-		writeRPCError(w, req.ID, &RPCError{Code: codeInternalError, Message: outcome.handleErr.Error()})
+		writeRPCError(w, req.ID, &RPCError{Code: codeInternalError, Message: msgInternalError})
 		return
 	}
 	// A refused commit answers with the stored Task record — the turn lost
@@ -655,12 +801,15 @@ func (s *Server) cancelTask(ctx context.Context, id string) (*Task, *RPCError) {
 	return stored, nil
 }
 
-// storeError maps a TaskStore failure to its wire error.
+// storeError maps a TaskStore failure to its wire error. Store failure texts
+// (driver errors, ids, paths) are internal detail and stay off the wire:
+// not-found answers a fixed message, everything else the fixed internal
+// error.
 func storeError(err error) *RPCError {
 	if errors.Is(err, ErrTaskNotFound) {
-		return &RPCError{Code: codeTaskNotFound, Message: err.Error()}
+		return &RPCError{Code: codeTaskNotFound, Message: "task not found"}
 	}
-	return &RPCError{Code: codeInternalError, Message: err.Error()}
+	return &RPCError{Code: codeInternalError, Message: msgInternalError}
 }
 
 // messageStream serves message/stream as a Server-Sent Events body: each SSE

@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	agocontext "github.com/luckystrker/ago/context"
@@ -207,9 +208,11 @@ func TestHostedSchemaGoldenJSON(t *testing.T) {
 				WithBlockedTools([]string{"admin"}),
 				WithMCPServerHeaders(map[string]string{"X-Custom": "1"}),
 			),
-			want: `{"server_url":"https://mcp.example","server_label":"docs","authorization_token":"tok",` +
+			// Secrets are masked in the serialized form (MarshalJSON); the
+			// provider wire request still carries the real values.
+			want: `{"server_url":"https://mcp.example","server_label":"docs","authorization_token":"***",` +
 				`"description":"docs server","allowed_tools":["search","fetch"],"blocked_tools":["admin"],` +
-				`"headers":{"X-Custom":"1"}}`,
+				`"headers":{"X-Custom":"***"}}`,
 		},
 		{
 			name: "tool_search bm25",
@@ -344,6 +347,60 @@ func TestMCPServerConstructorValidation(t *testing.T) {
 	}
 	if _, err := NewMCPServer("https://mcp.example", ""); err == nil {
 		t.Fatal("empty server label must fail")
+	}
+}
+
+// TestMCPServerSchemaMarshalMasksSecrets pins the L-14 contract: the token and
+// the header values never appear in the schema's serialized form, while the
+// struct the provider mappers read keeps the real values.
+func TestMCPServerSchemaMarshalMasksSecrets(t *testing.T) {
+	tool := mustMCPServer(t, "https://mcp.example", "docs",
+		WithAuthorizationToken("tok-supersecret"),
+		WithMCPServerHeaders(map[string]string{"Authorization": "Bearer tok-supersecret", "X-Custom": "custom-value"}),
+	)
+	ss, err := tool.Schemas(nil)
+	if err != nil {
+		t.Fatalf("Schemas: %v", err)
+	}
+	for name, schema := range map[string]any{"value": ss[0], "pointer": &ss[0]} {
+		b, err := json.Marshal(schema)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		got := string(b)
+		for _, secret := range []string{"tok-supersecret", "Bearer", "custom-value"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("%s form leaks %q: %s", name, secret, got)
+			}
+		}
+		if !strings.Contains(got, `"authorization_token":"***"`) {
+			t.Fatalf("%s form: token not masked (set tokens must stay visible as masked): %s", name, got)
+		}
+		if !strings.Contains(got, `"Authorization":"***"`) || !strings.Contains(got, `"X-Custom":"***"`) {
+			t.Fatalf("%s form: header values not masked: %s", name, got)
+		}
+	}
+
+	// The wire path reads the struct fields; marshaling must not mutate them.
+	sch := ss[0].(MCPServerToolSchema)
+	if sch.AuthorizationToken != "tok-supersecret" {
+		t.Fatalf("marshal mutated the token: %q", sch.AuthorizationToken)
+	}
+	if sch.Headers["X-Custom"] != "custom-value" {
+		t.Fatalf("marshal mutated the headers: %v", sch.Headers)
+	}
+}
+
+// TestMCPServerSchemaMarshalOmitsAbsentSecrets: no token, no headers — nothing
+// secret-looking is invented in the serialized form.
+func TestMCPServerSchemaMarshalOmitsAbsentSecrets(t *testing.T) {
+	b, err := json.Marshal(MCPServerToolSchema{ServerURL: "https://mcp.example", ServerLabel: "docs"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	if strings.Contains(got, "authorization_token") || strings.Contains(got, "headers") {
+		t.Fatalf("absent secrets must stay omitted: %s", got)
 	}
 }
 

@@ -133,6 +133,11 @@ func TestPushDispatchOnCompletion(t *testing.T) {
 		Card:      testCard(false),
 		Handle:    echoHandler,
 		PushStore: NewMemoryPushConfigStore(),
+		// The webhook below is the test's own httptest listener on
+		// 127.0.0.1, which DefaultPushURLValidator rejects; this suite
+		// opts back in explicitly (a configured validator replaces the
+		// default policy wholesale).
+		PushURLValidator: func(string) bool { return true },
 	})
 	h := srv.Handler()
 
@@ -295,5 +300,245 @@ func TestClientPushConfigMethods(t *testing.T) {
 	_, err = client.GetPushConfig(context.Background(), sent.TaskID, stored.ID)
 	if !errors.Is(err, ErrTaskNotFound) {
 		t.Fatalf("get after delete err = %v, want ErrTaskNotFound", err)
+	}
+}
+
+// TestDefaultPushURLValidator pins the default SSRF gate: internal IP
+// literals, localhost names, unspecified addresses and numeric shorthands are
+// refused; public hosts and ordinary DNS names pass.
+func TestDefaultPushURLValidator(t *testing.T) {
+	reject := []string{
+		"http://127.0.0.1/",
+		"http://127.0.0.1:8080/push",
+		"http://127.255.255.255/",
+		"http://10.0.0.5/push",
+		"http://172.16.0.1/push",
+		"http://172.31.255.255/push",
+		"http://192.168.1.10/push",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://0.0.0.0/push",
+		"http://[::1]/push",
+		"http://[::]/push",
+		"http://[fc00::1]/push",
+		"http://[fd12:3456::1]/push",
+		"http://[fe80::1]/push",
+		"http://[fe80::1%25eth0]/push", // %25 is the wire form of a zone '%'
+		"http://[::ffff:127.0.0.1]/push",
+		"http://[::ffff:169.254.169.254]/push",
+		"http://localhost/push",
+		"http://LOCALHOST:9090/push",
+		"http://localhost./push",
+		"http://api.localhost/push",
+		"http://127.1/push",
+		"http://2130706433/push",
+		"ftp://hooks.example/push",
+		"file:///etc/passwd",
+		"not a url",
+		"",
+	}
+	for _, raw := range reject {
+		if DefaultPushURLValidator(raw) {
+			t.Errorf("DefaultPushURLValidator(%q) = true, want false", raw)
+		}
+	}
+	accept := []string{
+		"http://hooks.example/push",
+		"https://webhooks.example.com:8443/hook",
+		"http://8.8.8.8/push",
+		"http://172.32.0.1/push", // first block past 172.16/12
+		"http://172.15.255.255/push",
+		"http://[2600::1]/push",
+		"http://[::ffff:8.8.8.8]/push",
+		"http://2130706433.example.com/push", // digits, but a real label
+	}
+	for _, raw := range accept {
+		if !DefaultPushURLValidator(raw) {
+			t.Errorf("DefaultPushURLValidator(%q) = false, want true", raw)
+		}
+	}
+}
+
+// TestPushSetDefaultValidatorBlocksSSRF drives the gate through the mounted
+// server with no custom validator: the metadata endpoint and localhost are
+// refused with invalid-params, a public webhook passes.
+func TestPushSetDefaultValidatorBlocksSSRF(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Card:      testCard(false),
+		Handle:    echoHandler,
+		PushStore: NewMemoryPushConfigStore(),
+	})
+	h := srv.Handler()
+	sendEnv := postRPC(t, h, messageSendBody("hello", `"1"`))
+	var reply Message
+	if err := json.Unmarshal(sendEnv.Result, &reply); err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://127.0.0.1:9999/push",
+		"http://localhost/push",
+	} {
+		body := rpcBody(MethodPushSet, `{"taskId":"`+reply.TaskID+`","pushNotificationConfig":{"url":"`+url+`"}}`, `"2"`)
+		env := postRPC(t, h, body)
+		if env.Error == nil || env.Error.Code != codeInvalidParams {
+			t.Fatalf("set url %q = %+v, want invalid-params rejection", url, env.Error)
+		}
+	}
+	env := postRPC(t, h, rpcBody(MethodPushSet, `{"taskId":"`+reply.TaskID+`","pushNotificationConfig":{"url":"http://hooks.example/push"}}`, `"3"`))
+	if env.Error != nil {
+		t.Fatalf("set public url: %v", env.Error)
+	}
+}
+
+// TestPushConfigGetListMasksSecrets checks the read surface: get and list
+// return masked token/credentials, the set reply still carries what the
+// caller itself supplied, and the stored config keeps the real secret for
+// deliveries.
+func TestPushConfigGetListMasksSecrets(t *testing.T) {
+	store := NewMemoryPushConfigStore()
+	srv := NewServer(ServerConfig{
+		Card:      testCard(false),
+		Handle:    echoHandler,
+		PushStore: store,
+	})
+	h := srv.Handler()
+	sendEnv := postRPC(t, h, messageSendBody("hello", `"1"`))
+	var reply Message
+	if err := json.Unmarshal(sendEnv.Result, &reply); err != nil {
+		t.Fatal(err)
+	}
+	setBody := rpcBody(MethodPushSet, `{"taskId":"`+reply.TaskID+`","pushNotificationConfig":{"url":"http://hooks.example/push","token":"sekret","authentication":{"scheme":"bearer","credentials":"cred-tok"}}}`, `"2"`)
+	env := postRPC(t, h, setBody)
+	if env.Error != nil {
+		t.Fatalf("push set: %v", env.Error)
+	}
+	var stored PushConfig
+	if err := json.Unmarshal(env.Result, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Token != "sekret" || stored.Authentication == nil || stored.Authentication.Credentials != "cred-tok" {
+		t.Fatalf("set reply must echo the caller's own config, got %+v", stored)
+	}
+
+	env = postRPC(t, h, rpcBody(MethodPushGet, `{"taskId":"`+reply.TaskID+`","id":"`+stored.ID+`"}`, `"3"`))
+	if env.Error != nil {
+		t.Fatalf("push get: %v", env.Error)
+	}
+	var got PushConfig
+	if err := json.Unmarshal(env.Result, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "***" || got.Authentication == nil || got.Authentication.Credentials != "***" {
+		t.Fatalf("get returned unmasked config: %+v", got)
+	}
+	if got.Authentication.Scheme != "bearer" {
+		t.Fatalf("get masked the non-secret scheme: %+v", got.Authentication)
+	}
+
+	env = postRPC(t, h, rpcBody(MethodPushList, `{"taskId":"`+reply.TaskID+`"}`, `"4"`))
+	if env.Error != nil {
+		t.Fatalf("push list: %v", env.Error)
+	}
+	var listed struct {
+		Configs []PushConfig `json:"configs"`
+	}
+	if err := json.Unmarshal(env.Result, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Configs) != 1 {
+		t.Fatalf("listed %d configs, want 1", len(listed.Configs))
+	}
+	lc := listed.Configs[0]
+	if lc.Token != "***" || lc.Authentication == nil || lc.Authentication.Credentials != "***" {
+		t.Fatalf("list returned unmasked config: %+v", lc)
+	}
+
+	// The store keeps the real secret: masking must not corrupt delivery.
+	inStore, err := store.Get(context.Background(), reply.TaskID, stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inStore.Token != "sekret" || inStore.Authentication == nil || inStore.Authentication.Credentials != "cred-tok" {
+		t.Fatalf("store config was corrupted by response masking: %+v", inStore)
+	}
+}
+
+// TestPushReceiverEmptyTokenFailsClosed pins the receiver contract: an empty
+// token rejects every push (no silent fail-open) unless the explicit
+// WithoutPushTokenValidation option is passed.
+func TestPushReceiverEmptyTokenFailsClosed(t *testing.T) {
+	called := false
+	r := NewPushReceiver("", func(_ context.Context, task *Task) error {
+		called = true
+		return nil
+	})
+	body := `{"id":"task-1","contextId":"c","status":{"state":"completed"}}`
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/push", strings.NewReader(body)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no header, empty token: status %d, want 401", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/push", strings.NewReader(body))
+	req.Header.Set(HeaderPushToken, "anything")
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("supplied header, empty token: status %d, want 401", rec.Code)
+	}
+	if called {
+		t.Fatalf("callback ran on a push rejected for missing token configuration")
+	}
+
+	open := NewPushReceiver("", func(_ context.Context, task *Task) error {
+		called = true
+		return nil
+	}, WithoutPushTokenValidation())
+	rec = httptest.NewRecorder()
+	open.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/push", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit opt-out: status %d, want 200", rec.Code)
+	}
+	if !called {
+		t.Fatalf("callback did not run with validation explicitly disabled")
+	}
+}
+
+// TestDefaultPushSenderRedirectPolicy checks the delivery client: same-host
+// redirects are followed, cross-host redirects are refused, and the client is
+// configured with the 30s delivery timeout.
+func TestDefaultPushSenderRedirectPolicy(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hop-same", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/push", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/push", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	a := httptest.NewServer(mux)
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("cross-host redirect target was reached")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer b.Close()
+	mux.HandleFunc("/hop-cross", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, b.URL+"/push", http.StatusTemporaryRedirect)
+	})
+
+	task := &Task{ID: "task-1", ContextID: "ctx"}
+	if err := DefaultPushSender(context.Background(), "task-1", PushConfig{URL: a.URL + "/hop-same", Token: "t"}, task); err != nil {
+		t.Fatalf("same-host redirect delivery: %v", err)
+	}
+	err := DefaultPushSender(context.Background(), "task-1", PushConfig{URL: a.URL + "/hop-cross", Token: "t"}, task)
+	if err == nil {
+		t.Fatalf("cross-host redirect was followed")
+	}
+	if !strings.Contains(err.Error(), "different host") {
+		t.Fatalf("cross-host redirect error = %v, want host-refusal message", err)
+	}
+	if pushHTTPClient.Timeout != pushSendTimeout {
+		t.Fatalf("push client timeout = %v, want %v", pushHTTPClient.Timeout, pushSendTimeout)
 	}
 }

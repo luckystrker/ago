@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
@@ -22,12 +23,28 @@ type Strategy interface {
 const DefaultPrompt = "Summarize the following conversation history concisely, " +
 	"preserving key decisions, findings, and context:"
 
+// DefaultTimeout bounds one LLMStrategy summarization call when Timeout is
+// unset. Compaction runs inside the post-turn hook, so an unbounded
+// summarizer call would block an already-successful turn — and with it the
+// agent — indefinitely on a hung provider.
+//
+// AGO-DEVIATION: Python compaction applies no deadline of its own (its LLM
+// clients carry theirs); the Go HTTP stack defaults to no timeout, so AGo
+// bounds the call explicitly.
+const DefaultTimeout = 120 * time.Second
+
 // LLMStrategy summarizes via one model call over the rendered events. Client is
 // the summarizer; Prompt precedes the rendered history (empty → DefaultPrompt).
 // Safe for concurrent use (the struct is read-only at call time).
 type LLMStrategy struct {
 	Client config.LLMClient
 	Prompt string
+	// Timeout bounds the summarization call; zero selects DefaultTimeout.
+	// There is deliberately no "no timeout" setting: compaction runs after a
+	// successful turn and an unbounded call would hang that turn forever on a
+	// stuck provider. Raise the value for a legitimately slow summarizer;
+	// negative values are rejected by Summarize.
+	Timeout time.Duration
 }
 
 var _ Strategy = LLMStrategy{}
@@ -39,12 +56,21 @@ var _ Strategy = LLMStrategy{}
 //
 // AGO-DEVIATION: the call is headless — a nil conversation context, so provider
 // progress events (streaming chunks) are dropped. Python summarizes over a
-// throwaway MemoryStream to the same effect. Cancellation rides on
-// context.Background(): the middleware hooks carry no stdlib context (same
+// throwaway MemoryStream to the same effect. The middleware hooks carry no
+// stdlib context, so cancellation rides on context.Background() bounded by
+// Timeout (DefaultTimeout when unset): a hung provider surfaces as a
+// context.DeadlineExceeded error instead of blocking the turn forever (same
 // limitation as middleware.Retry).
 func (s LLMStrategy) Summarize(ctx *agocontext.Context, evs []events.Event) (string, error) {
 	if s.Client == nil {
 		return "", errors.New("compact: LLMStrategy needs a Client")
+	}
+	if s.Timeout < 0 {
+		return "", errors.New("compact: LLMStrategy.Timeout must not be negative")
+	}
+	timeout := s.Timeout
+	if timeout == 0 {
+		timeout = DefaultTimeout
 	}
 	rendered := make([]string, 0, len(evs))
 	for _, ev := range evs {
@@ -60,7 +86,9 @@ func (s LLMStrategy) Summarize(ctx *agocontext.Context, evs []events.Event) (str
 	req := &events.ModelRequest{
 		Parts: []events.Input{events.TextInput{Content: prompt + "\n\n" + strings.Join(rendered, "\n")}},
 	}
-	resp, err := s.Client.Call(context.Background(), []events.Event{req}, nil, config.CallOptions{})
+	callCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	resp, err := s.Client.Call(callCtx, []events.Event{req}, nil, config.CallOptions{})
 	if err != nil {
 		return "", fmt.Errorf("compact: summarizer call failed: %w", err)
 	}

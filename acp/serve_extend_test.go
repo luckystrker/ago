@@ -1,17 +1,21 @@
 package acp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/luckystrker/ago/agent"
 	"github.com/luckystrker/ago/config"
@@ -589,6 +593,251 @@ func TestServeToolGateway(t *testing.T) {
 	_ = json.Unmarshal(res, &plain)
 	if bag.get(plain.SessionID).Gateway() != nil {
 		t.Error("a session with no declared servers must have no gateway")
+	}
+}
+
+// TestServeToolGatewayAllowlist: ServeConfig.AllowedMCPCommands flows into the
+// sessions' gateways — the allowed command dials, a declaration naming
+// anything else fails its first call instead of spawning the process.
+func TestServeToolGatewayAllowlist(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	bag := newSessionBag()
+	var (
+		allowedText string
+		allowedErr  error
+		deniedErr   error
+	)
+	cfg := ServeConfig{
+		OnSession:          bag.capture,
+		AllowedMCPCommands: []string{exe},
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
+			gw := bag.get(sessionID).Gateway()
+			if gw == nil {
+				return "", fmt.Errorf("no gateway for the declared servers")
+			}
+			allowedText, allowedErr = gw.Call("ok", "echo", map[string]any{"msg": "hi"})
+			_, deniedErr = gw.Call("nope", "echo", nil)
+			return "done", nil
+		},
+	}
+	fc := startServe(t, func(in io.Reader, out io.Writer) error { return serveIO(in, out, cfg) })
+	_, _ = fc.call("initialize", map[string]any{"protocolVersion": protocolVersion})
+	res, rpcErr := fc.call("session/new", map[string]any{
+		"cwd": t.TempDir(),
+		"mcpServers": []map[string]any{
+			{"name": "ok", "command": exe, "env": map[string]string{roleEnv: roleMCPServe}},
+			{"name": "nope", "command": "not-an-allowed-command"},
+		},
+	})
+	if rpcErr != nil {
+		t.Fatalf("session/new with mcpServers: %v", rpcErr)
+	}
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(res, &created)
+	if _, rpcErr = fc.call("session/prompt", map[string]any{
+		"sessionId": created.SessionID,
+		"prompt":    []map[string]any{{"type": "text", "text": "go"}},
+	}); rpcErr != nil {
+		t.Fatalf("session/prompt: %v", rpcErr)
+	}
+	if allowedErr != nil {
+		t.Fatalf("allowed command dial: %v", allowedErr)
+	}
+	if allowedText != "stdio-mcp-hello" {
+		t.Errorf("allowed tool result = %q, want %q", allowedText, "stdio-mcp-hello")
+	}
+	if !errors.Is(deniedErr, ErrServerNotAllowed) {
+		t.Errorf("disallowed command = %v, want ErrServerNotAllowed", deniedErr)
+	}
+}
+
+// TestServeLoadClosesOldGateway: session/load replaces the declarations, and
+// the gateway built over the old ones is closed rather than dropped — its
+// connections and subprocesses belong to the replaced set.
+func TestServeLoadClosesOldGateway(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	bag := newSessionBag()
+	var old *ToolGateway
+	cfg := ServeConfig{
+		OnSession: bag.capture,
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
+			if gw := bag.get(sessionID).Gateway(); gw != nil {
+				old = gw
+				if _, err := gw.Call("demo", "echo", map[string]any{"msg": "hi"}); err != nil {
+					return "", err
+				}
+			}
+			return "done", nil
+		},
+	}
+	fc := startServe(t, func(in io.Reader, out io.Writer) error { return serveIO(in, out, cfg) })
+	_, _ = fc.call("initialize", map[string]any{"protocolVersion": protocolVersion})
+	res, rpcErr := fc.call("session/new", map[string]any{
+		"cwd":        t.TempDir(),
+		"mcpServers": []map[string]any{{"name": "demo", "command": exe, "env": map[string]string{roleEnv: roleMCPServe}}},
+	})
+	if rpcErr != nil {
+		t.Fatalf("session/new: %v", rpcErr)
+	}
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(res, &created)
+	if _, rpcErr = fc.call("session/prompt", map[string]any{
+		"sessionId": created.SessionID,
+		"prompt":    []map[string]any{{"type": "text", "text": "go"}},
+	}); rpcErr != nil {
+		t.Fatalf("session/prompt: %v", rpcErr)
+	}
+	if old == nil || old.closed {
+		t.Fatalf("gateway after the dialing prompt = %v (closed=%v), want open", old, old != nil && old.closed)
+	}
+	// Load the same session with no declarations: the old gateway must close.
+	if _, rpcErr = fc.call("session/load", map[string]any{
+		"sessionId": created.SessionID, "cwd": t.TempDir(),
+	}); rpcErr != nil {
+		t.Fatalf("session/load: %v", rpcErr)
+	}
+	if !old.closed {
+		t.Error("session/load left the replaced declarations' gateway open")
+	}
+	if gw := bag.get(created.SessionID).Gateway(); gw != nil {
+		t.Errorf("gateway after loading empty declarations = %v, want nil", gw)
+	}
+}
+
+// TestServeClosesGatewayOnDisconnect: when the client disconnects, serveIO
+// closes every session's gateway — the stdio MCP subprocess the handler dialed
+// exits with the connection instead of lingering until process exit. The
+// subprocess proves its own death by writing a marker file on the way out.
+func TestServeClosesGatewayOnDisconnect(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "subproc-exited")
+	bag := newSessionBag()
+	var callErr error
+	cfg := ServeConfig{
+		OnSession: bag.capture,
+		Handle: func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
+			gw := bag.get(sessionID).Gateway()
+			if gw == nil {
+				return "", fmt.Errorf("no gateway for the declared servers")
+			}
+			_, callErr = gw.Call("demo", "echo", map[string]any{"msg": "hi"})
+			return "done", nil
+		},
+	}
+
+	// A private harness: startServe's cleanup owns the client's stdin, and
+	// this test must close it itself to watch the disconnect path.
+	agentIn, agentInW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	agentOutR, agentOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serveIO(agentIn, agentOut, cfg) }()
+	t.Cleanup(func() {
+		agentInW.Close()
+		agentIn.Close()
+		agentOutR.Close()
+		agentOut.Close()
+	})
+	sc := bufio.NewScanner(agentOutR)
+	sc.Buffer(make([]byte, 0, 64*1024), scanBuffer)
+	call := func(id int64, method string, params any) (json.RawMessage, error) {
+		payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := agentInW.Write(append(payload, '\n')); err != nil {
+			return nil, err
+		}
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			var msg incoming
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			if msg.Method != "" || msg.ID == nil || *msg.ID != id {
+				continue // a session/update or a foreign reply
+			}
+			if msg.Error != nil {
+				return nil, msg.Error
+			}
+			return msg.Result, nil
+		}
+		return nil, fmt.Errorf("no reply to %s", method)
+	}
+
+	if _, err := call(1, "initialize", map[string]any{"protocolVersion": protocolVersion}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	res, err := call(2, "session/new", map[string]any{
+		"cwd": t.TempDir(),
+		"mcpServers": []map[string]any{
+			{"name": "demo", "command": exe, "env": map[string]string{roleEnv: roleMCPServe, markerEnv: marker}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(res, &created)
+	if _, err := call(3, "session/prompt", map[string]any{
+		"sessionId": created.SessionID,
+		"prompt":    []map[string]any{{"type": "text", "text": "go"}},
+	}); err != nil {
+		t.Fatalf("session/prompt: %v", err)
+	}
+	if callErr != nil {
+		t.Fatalf("gateway call: %v", callErr)
+	}
+
+	// The client walks away; the serve loop must return and close the
+	// sessions' gateways with it.
+	if err := agentInW.Close(); err != nil {
+		t.Fatalf("close client stdin: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveIO: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveIO did not return after the client disconnected")
+	}
+	if gw := bag.get(created.SessionID).gateway; gw == nil || !gw.closed {
+		t.Errorf("session gateway after disconnect = %v, want closed", gw)
+	}
+	// The dialed MCP subprocess died with the connection: its marker appears.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the MCP subprocess outlived the connection — the gateway was not closed")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

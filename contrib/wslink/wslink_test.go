@@ -1,6 +1,7 @@
 package wslink
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/luckystrker/ago/network/transport"
 )
@@ -215,4 +218,224 @@ func TestDialRefusesPlainHTTP(t *testing.T) {
 	if _, err := Dial(context.Background(), s.URL, nil); err == nil {
 		t.Fatal("dialing a non-WebSocket endpoint must fail")
 	}
+}
+
+// TestLargeFrameSurvivesReadLimit is the regression for audit M-14:
+// coder/websocket's built-in 32 KiB read limit made one legitimate large
+// frame (e.g. a WAL-replay batch) fail the read and kill the link. With
+// DefaultReadLimit applied on both ends, a 128 KiB payload (~171 KiB on
+// the wire after base64) must round-trip through the echo server —
+// exercising the server-side read on the way in and the client-side read
+// on the way back.
+func TestLargeFrameSurvivesReadLimit(t *testing.T) {
+	s := echoServer(t)
+	c, err := Dial(context.Background(), wsURL(s), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	f := transport.Frame{
+		Kind:    transport.FrameNotify,
+		From:    "alice",
+		To:      "bob",
+		Payload: bytes.Repeat([]byte("x"), 128<<10),
+	}
+	if err := c.Send(f); err != nil {
+		t.Fatalf("send large frame: %v", err)
+	}
+	recvCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, err := c.Recv(recvCtx)
+	if err != nil {
+		t.Fatalf("recv large frame: %v", err)
+	}
+	if !bytes.Equal(got.Payload, f.Payload) {
+		t.Fatalf("echo mangled the payload: got %d bytes, want %d", len(got.Payload), len(f.Payload))
+	}
+}
+
+// TestMessageTooLargeDistinctFromDisconnect is the other half of M-14: an
+// oversized inbound message must surface as ErrMessageTooLarge (with the
+// link still reported closed), while a plain peer hangup must not
+// masquerade as one.
+func TestMessageTooLargeDistinctFromDisconnect(t *testing.T) {
+	big := bytes.Repeat([]byte("y"), 256<<10)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = ServeWS(w, r, func(link transport.Link) {
+			raw := link.(*Conn)
+			_ = raw.ws.Write(context.Background(), websocket.MessageText, big)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = link.Recv(ctx) // hold the link open until the client drops it
+		})
+	}))
+	defer s.Close()
+
+	c, err := Dial(context.Background(), wsURL(s), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadLimit(64 << 10)
+
+	recvCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = c.Recv(recvCtx)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("oversized message must surface ErrMessageTooLarge, got %v", err)
+	}
+	if !errors.Is(err, transport.ErrLinkClosed) {
+		t.Fatalf("oversized message must still report the link as closed, got %v", err)
+	}
+
+	// Control case: a clean server-side hangup is a plain link closure.
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = ServeWS(w, r, func(link transport.Link) { _ = link.Close() })
+	}))
+	defer s2.Close()
+
+	c2, err := Dial(context.Background(), wsURL(s2), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	recvCtx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	_, err = c2.Recv(recvCtx2)
+	if !errors.Is(err, transport.ErrLinkClosed) {
+		t.Fatalf("peer hangup must surface transport.ErrLinkClosed, got %v", err)
+	}
+	if errors.Is(err, ErrMessageTooLarge) {
+		t.Fatal("peer hangup must not be reported as message-too-large")
+	}
+}
+
+func TestHandlerRequiresHandle(t *testing.T) {
+	if _, err := Handler(ServerConfig{}); err == nil {
+		t.Fatal("Handler must reject a config without Handle")
+	}
+}
+
+func TestHandlerBearerToken(t *testing.T) {
+	h, err := Handler(ServerConfig{
+		Token: "sekrit",
+		Handle: func(link transport.Link) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			for {
+				f, err := link.Recv(ctx)
+				if err != nil {
+					return
+				}
+				if err := link.Send(f); err != nil {
+					return
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(h)
+	defer s.Close()
+	url := wsURL(s)
+
+	// A plain HTTP request without credentials is refused before upgrade.
+	resp, err := http.Get(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401", resp.StatusCode)
+	}
+
+	// A WebSocket dial without a token fails the handshake with 401.
+	if _, err := Dial(context.Background(), url, nil); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("dial without token: err = %v, want handshake failure with 401", err)
+	}
+
+	// Wrong token: still 401.
+	bad := &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": []string{"Bearer nope"},
+	}}
+	if _, err := Dial(context.Background(), url, bad); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("dial with wrong token: err = %v, want handshake failure with 401", err)
+	}
+
+	// Correct token: the link works end to end.
+	good := &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": []string{"Bearer sekrit"},
+	}}
+	c, err := Dial(context.Background(), url, good)
+	if err != nil {
+		t.Fatalf("dial with correct token: %v", err)
+	}
+	defer c.Close()
+
+	f := transport.Frame{Kind: transport.FramePing, From: "alice"}
+	if err := c.Send(f); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	recvCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, err := c.Recv(recvCtx)
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if got.Kind != transport.FramePing || got.From != "alice" {
+		t.Fatalf("echo = %+v", got)
+	}
+}
+
+func TestHandlerMaxConns(t *testing.T) {
+	release := make(chan struct{})
+	h, err := Handler(ServerConfig{
+		MaxConns: 1,
+		Handle: func(link transport.Link) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = link.Recv(ctx) // hold the slot until the client goes away
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(h)
+	defer s.Close()
+	url := wsURL(s)
+	ctx := context.Background()
+
+	// First connection takes the only slot.
+	c1, err := Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+
+	// Second is refused with 503 before any upgrade work.
+	if _, err := Dial(ctx, url, nil); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("second dial: err = %v, want handshake failure with 503", err)
+	}
+
+	// Closing the first frees the slot; a retry loop papers over the race
+	// between the server observing the close and releasing the semaphore.
+	_ = c1.Close()
+	close(release)
+	var c2 *Conn
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c2, err = Dial(ctx, url, nil)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot did not free after close: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// release is already closed, so this handle returns as soon as the
+	// link drops; Server.Close in cleanup will not block.
+	_ = c2.Close()
 }

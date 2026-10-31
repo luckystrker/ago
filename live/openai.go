@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+
+	"github.com/luckystrker/ago/internal/httpx"
 )
 
 // quoteEscaper escapes a filename for a Content-Disposition header
@@ -24,6 +26,30 @@ var ErrAPI = errors.New("live: speech provider API error")
 // defaultBaseURL is the public OpenAI API root; BaseURL overrides it (tests
 // point it at httptest servers, proxies at gateways).
 const defaultBaseURL = "https://api.openai.com/v1"
+
+// defaultClient serves the transcriber and synthesizer when their Client
+// field is nil. It behaves like http.DefaultClient except that redirects to
+// another host drop every non-safelisted header: the Bearer key must not
+// reach whatever host a redirect names.
+var defaultClient = &http.Client{CheckRedirect: httpx.RedirectStripCredentials.CheckRedirect()}
+
+// maxResponseBytes caps a buffered provider answer. TTS returns raw audio, so
+// the cap sits well above the repo's 8 MiB JSON norm: 64 MiB holds over
+// twenty minutes of 24 kHz 16-bit PCM with headroom.
+const maxResponseBytes int64 = 64 << 20
+
+// readCapped reads a provider answer up to maxResponseBytes; a larger body is
+// an error instead of unbounded memory.
+func readCapped(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxResponseBytes {
+		return nil, fmt.Errorf("live: response body exceeds %d bytes", maxResponseBytes)
+	}
+	return data, nil
+}
 
 // baseMimeType strips parameters and lower-cases a media type
 // ("Audio/WAV; rate=16000" → "audio/wav").
@@ -89,7 +115,8 @@ type OpenAITranscriber struct {
 	Model string
 	// BaseURL is the API root; "" → https://api.openai.com/v1.
 	BaseURL string
-	// Client is the HTTP client; nil → http.DefaultClient.
+	// Client is the HTTP client; nil → the package default client (stdlib
+	// behavior plus credential stripping on cross-host redirects).
 	Client *http.Client
 	// Language is the optional ISO-639-1 hint of the input audio.
 	Language string
@@ -115,7 +142,7 @@ func (t *OpenAITranscriber) client() *http.Client {
 	if t.Client != nil {
 		return t.Client
 	}
-	return http.DefaultClient
+	return defaultClient
 }
 
 // Transcribe uploads the clip as multipart form data and returns the transcript
@@ -171,12 +198,15 @@ func (t *OpenAITranscriber) Transcribe(ctx stdcontext.Context, audio []byte, mim
 		return "", fmt.Errorf("live: openai transcribe: %w", err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("live: openai transcribe: read response: %w", err)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Only a snippet of an error body is ever reported — never buffer a
+		// giant one whole.
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("live: openai transcribe: %w: status %d: %s", ErrAPI, resp.StatusCode, snippet(data))
+	}
+	data, err := readCapped(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("live: openai transcribe: %w", err)
 	}
 	return strings.TrimSpace(string(data)), nil
 }
@@ -195,7 +225,8 @@ type OpenAISynthesizer struct {
 	Model string
 	// BaseURL is the API root; "" → https://api.openai.com/v1.
 	BaseURL string
-	// Client is the HTTP client; nil → http.DefaultClient.
+	// Client is the HTTP client; nil → the package default client (stdlib
+	// behavior plus credential stripping on cross-host redirects).
 	Client *http.Client
 	// Voice is the fallback voice when a call passes ""; "" → "alloy"
 	// (Python parity: TTSConfig's voice default).
@@ -235,7 +266,7 @@ func (s *OpenAISynthesizer) client() *http.Client {
 	if s.Client != nil {
 		return s.Client
 	}
-	return http.DefaultClient
+	return defaultClient
 }
 
 // Synthesize posts the JSON request and returns the raw audio bytes plus the
@@ -281,12 +312,15 @@ func (s *OpenAISynthesizer) Synthesize(ctx stdcontext.Context, text string, voic
 		return nil, "", fmt.Errorf("live: openai synthesize: %w", err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("live: openai synthesize: read response: %w", err)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Only a snippet of an error body is ever reported — never buffer a
+		// giant one whole.
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, "", fmt.Errorf("live: openai synthesize: %w: status %d: %s", ErrAPI, resp.StatusCode, snippet(data))
+	}
+	data, err := readCapped(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("live: openai synthesize: %w", err)
 	}
 
 	mimeType := baseMimeType(resp.Header.Get("Content-Type"))
