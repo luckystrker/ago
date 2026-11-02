@@ -33,6 +33,10 @@ func sampleEvents() []events.Event {
 		&events.ModelRequest{
 			Base:  events.Base{CreatedAt: now.Add(time.Second)},
 			Parts: []events.Input{&events.TextInput{Content: "part one"}, &events.DataInput{Data: map[string]any{"k": float64(1)}}},
+			// Origin always rides the wire and an empty in-memory origin
+			// normalizes to "user" on marshal, so a byte-identical round trip
+			// (reflect.DeepEqual) must set it explicitly.
+			Origin: events.OriginUser,
 		},
 		&events.BinaryInput{Base: events.Base{CreatedAt: now.Add(2 * time.Second)}, Data: []byte{0, 1, 255}, MediaType: "image/png", Kind: events.BinaryImage},
 		&events.MessageEnqueued{Base: events.Base{CreatedAt: now.Add(3 * time.Second)}},
