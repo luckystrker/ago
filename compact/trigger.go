@@ -37,12 +37,15 @@ func (t eventCountTrigger) ShouldTrigger(evs []events.Event, _ events.Usage) boo
 	return n > t.max
 }
 
-// TokenTrigger fires when the estimated token footprint of the conversational
-// events exceeds budget (Python parity: CompactTrigger.max_tokens with
-// chars_per_token=4 — events.EstimatedTokens' default). The reported usage
-// argument is ignored on purpose: the estimate tracks what the transcript
-// itself would cost, independent of how the provider bills it. budget <= 0
-// disables the trigger.
+// TokenTrigger fires when the estimated token footprint of the events exceeds
+// budget (Python parity: CompactTrigger.max_tokens with chars_per_token=4 —
+// events.EstimatedTokens' default). The estimate runs over every event, not
+// only conversational ones: a retained status observation never joins the
+// conversational span, yet its projected service view rides every model call,
+// so it must spend budget; telemetry (UsageEvent) weighs zero through
+// EstimatedTokens either way. The reported usage argument is ignored on
+// purpose: the estimate tracks what the transcript itself would cost,
+// independent of how the provider bills it. budget <= 0 disables the trigger.
 func TokenTrigger(budget int) Trigger { return tokenTrigger{budget: budget} }
 
 type tokenTrigger struct{ budget int }
@@ -53,7 +56,7 @@ func (t tokenTrigger) ShouldTrigger(evs []events.Event, _ events.Usage) bool {
 	}
 	total := 0
 	for _, ev := range evs {
-		if ev != nil && ev.Conversational() {
+		if ev != nil {
 			total += events.EstimatedTokens(ev, 0)
 		}
 	}

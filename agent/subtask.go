@@ -20,6 +20,16 @@ import (
 // agent.py TaskConfig). WithTasks(opts) gives the agent two tools — run_subtask
 // and run_subtasks — that spawn bare child Agents; the subtask tools never reach
 // the spawned children, so delegation cannot recurse by construction.
+//
+// Deprecated: TaskConfig and the auto-injected run_subtask/run_subtasks tools
+// are deprecated, following upstream AG2 (removal in 1.4.0). Construct worker
+// Agents explicitly and expose them via Agent.AsTool instead. The runtime
+// behavior is unchanged and stays supported until that removal.
+//
+// AGO-DEVIATION: Python flags TaskConfig with @deprecated (static analyzers
+// only, no runtime warning); AGo flags it with this doc comment — godoc and
+// staticcheck surface it, and no runtime warning is emitted either. The
+// behavior stays frozen at the v1.2.2 baseline until the removal decision.
 type TaskConfig struct {
 	// Config is the child model config; nil falls back to the parent's config.
 	Config config.ModelConfig

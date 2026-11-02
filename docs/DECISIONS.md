@@ -3007,3 +3007,171 @@ installed into that venv as the brief allows) in `a2ui/testdata/golden.json` via
 - [M-27] валидация источника HITL-ответов отложена (in-process доверие);
 - [I-2/I-7/I-8] границы доверия SyncVariables, client-side tools и hosted-инструментов задокументированы в README;
 - [L-5] доверие HTTP(S)_PROXY из окружения — стандартное поведение Go, задокументировано.
+
+## D-079 — 2026-11-03 — mcp: SSE event-size policy (max_sse_event_size) and its error surface
+
+Records the G9 MCP-client wave's deviations (rule 5). Python `MCPServerConfig.max_sse_event_size`
+(default `1_048_576`, `None` = no cap) bounds one SSE event — a tool result travels as a single
+event, so an oversized result fails the call instead of buffering without bound; the cap itself is
+an addition (Python has none, AGO-DEVIATION at `internal/sse/sse.go:108`).
+
+- **Int sentinels instead of `int | None`.** `MCPServerConfig.MaxSSEEventSize int`
+  (`mcp/config.go:35-42`) encodes Python's tri-state: `0` = default `1_048_576`, `> 0` = the
+  threshold in bytes, `< 0` = no cap (Python `None`); wired through `sse.WithMaxEventSize` /
+  `sse.WithUnlimitedEventSize` (`mcp/http.go:89-97`), same sentinel form as
+  `MCPServerConfig.Timeout`.
+- **Own error text inside `ErrProtocol`.** An oversize event surfaces as
+  `ErrProtocol: SSE stream: sse: event too large` — `internal/sse`'s sentinel `ErrEventTooLarge`
+  (`sse.go:25`) double-`%w`-wrapped into `ErrProtocol` (`mcp/http.go:209-213`;
+  `errors.Is(err, sse.ErrEventTooLarge)` is the detection contract) — instead of the upstream
+  SDK's "byte limit" wording.
+
+Gates `go build ./...`, `go test -count=1 ./internal/sse/... ./config/gemini/... ./mcp/...` green
+2026-11-03.
+
+## D-080 — 2026-11-03 — Statusbar DI: the callback reads the context itself (no fast_depends)
+
+Records the G14 statusbar wave's deviations (rule 5). Upstream `statusbar_middleware(func, ...,
+persist=False)` (`ag2/middleware/statusbar.py`, commits 07144b1a8 + 82b15120c) resolves
+fast_depends annotations — `Context`, `Inject()`, `Variable()`, `Depends()` — when it builds the
+DI callback, and keeps the dependencies open through an `AsyncExitStack` for the duration of the
+model call.
+
+- **`StatusCallback` is a plain function.** AGo's DI is a string-keyed map
+  (`context.Context.Dependencies`/`Variables`, `context/context.go:26-33`), so the middleware
+  takes `StatusCallback func(ctx *agocontext.Context) ([]events.Input, error)`
+  (`middleware/statusbar.go:23`) and the callback reads what it needs itself. No container
+  lifetimes: a dependency lives as long as the values the host put in the map.
+- **Cancellation through `ctx.TurnContext()`.** Middleware hooks carry no stdlib context, so a
+  long-running callback honors `ctx.TurnContext()` (the per-turn cancellable context,
+  `context/context.go:222-229`) — the same channel the approval middleware uses.
+- **Registration order replaces upstream's publication guard.** Upstream blocks
+  `persist=True` inside `RetryMiddleware` with the retry published-output guard (ADR 0028); AGo's
+  `Retry` has no such guard (see `middleware/retry.go`), so `Statusbar` must be registered
+  outside (before) `Retry` in the middleware list — one snapshot per logical call. Inside
+  `Retry` it publishes one observation per attempt (documented in `middleware/statusbar.go:44-48`).
+
+## D-081 — 2026-11-03 — Status projection: `ModelRequest.origin="service"` instead of a transient subclass
+
+Upstream projects a retained `StatusObservation` into a transient non-conversational
+`_StatusRequest` subclass of `ModelRequest` with `origin="service"` (`ag2/_model_input.py`,
+commit 82b15120c): transient/non-conversational flags keep the view out of every persistence and
+transcript sweep, while sizing still weighs it.
+
+- **AGo reuses `ModelRequest` + `OriginService`** (`events/model_input.go:26-35`,
+  `events.StatusRequest` / `events.ObservationRequest` / `events.ModelInputs`). The view only
+  ever lives in the in-memory event list of one model call — it is never sent to a stream, so it
+  can never become durable, and the flags would be dead weight. Provider mappers keep a single
+  `ModelRequest` case (`config/openaicompat.go` BuildMessages); sizing gives a plain request its
+  parts' weight already (`events/sizing.go:34-35`).
+- **`StatusObservation` itself** is non-transient (persisted — the last status must survive into
+  later calls) and non-conversational (compaction never summarizes it,
+  `compact/compact.go:184-193`; `EventCountTrigger` never counts it), but is sized like its
+  parts (`events/sizing.go` gate + case) because each projected copy rides one model call. The
+  compaction `TokenTrigger` sums over every event, not only conversational ones
+  (`compact/trigger.go:50-70`).
+- **Projection failure drops the observation.** `ModelInputs` deletes an observation whose parts
+  cannot round trip through the wire instead of forwarding it: its marshal form is already
+  broken and a provider mapping over it would poison the call
+  (`events/model_input.go:45-58`). Python deepcopy cannot fail for wire types, so upstream has
+  no counterpart for this path.
+- **`ModelRequest.Origin` predates this wave.** The field and the
+  user/service semantics arrived with wave 1 (ADR 0027 parity), so G14 added no field.
+
+## D-082 — 2026-11-03 — `describe()` not ported: middleware has no description surface in AGo
+
+Upstream's statusbar middleware advertises itself through `describe()` (commit 07144b1a8), part
+of the Python `Middleware` self-description surface. AGo's `middleware.Middleware`
+(`middleware/middleware.go:35-40`) has no `describe()` — there is no `MiddlewareDescription`
+anywhere in the port (the Python surface never crossed v0.7.0), so there is nothing to
+implement against; when a description surface is ported, `Statusbar` should report
+`source` (the callback's runtime function name) and the `persist` flag.
+
+Gates `go build ./...`, `go test -count=1 ./events/... ./middleware/... ./agent/... ./compact/...
+./testing/...` green 2026-11-03.
+
+## D-083 — 2026-11-02 — agent: `TaskConfig`/`WithTasks` deprecated (upstream 82bdfb480)
+
+Upstream deprecates `Agent(tasks=TaskConfig(...))` for removal in 1.4.0 (commit 82bdfb480, PR #3542),
+steering users to explicit worker agents exposed through `as_tool`. Owner decision: mirror upstream —
+the option keeps working unchanged at the v1.2.2 baseline behavior, and the actual removal becomes a
+separate owner decision when upstream 1.4.0 lands (UPSTREAM_CHANGES #8).
+
+- **The marker is a doc comment, not a runtime warning.** `WithTasks` (`agent/agent.go:80-88`) and
+  `TaskConfig` (`agent/subtask.go:24-33`) carry `Deprecated:` paragraphs that godoc and staticcheck
+  surface automatically. AGO-DEVIATION (mechanism, not behavior): Python's
+  `@deprecated(TASK_CONFIG_DEPRECATION)` decorator and the `DeprecationWarning` in `Agent.__init__`
+  have no idiomatic Go runtime counterpart — no warning is emitted at run time.
+- **Behavior is untouched:** the `run_subtask`/`run_subtasks` tools stay auto-injected every turn
+  (`agent/run.go:150`) and `IncludeTools` keeps filtering the child agent's inherited tools
+  (`agent/subtask.go:106-114`). The recommended replacement is already ported: `Agent.AsTool`
+  (`agent/agent.go:341`).
+
+Gates `go test -count=1 ./agent/...` green 2026-11-03.
+
+## D-084 — 2026-11-02 — agent: upstream `assembly=` deprecation has nothing to port; no `HaltCheckMiddleware`
+
+Upstream deprecates the `Agent(assembly=...)` parameter in favor of explicit middleware and extracts
+the private halt check into a public `HaltCheckMiddleware` (`ag2/middleware/halt.py`, commit
+4d5773e7b, PR #3545).
+
+- **The deprecation half has nothing to port.** AGo never had an `assembly=` parameter — middleware
+  composition is the core design (D-013) — so the port already sits at upstream's post-commit target
+  state; there is nothing to deprecate.
+- **The public `HaltCheckMiddleware` is a conscious difference, not an omission.** The built-in halt
+  covers the same behavior: the run subscribes to `HaltEvent` inside the turn scope
+  (`agent/run.go:205-213`) and the turn answers a halted turn with the synthetic
+  `"HALTED: <reason>"` model response in the LLM trigger (`agent/turn.go:157-163`). No user request
+  for a configurable halt exists; revisit on request or together with the 1.4.0 removal wave.
+
+Gates `go test -count=1 ./agent/...` green 2026-11-03.
+
+## D-085 — 2026-11-02 — events/stream: `RequestOrigin` in structural equality; `HistoryQuery` terminals are synchronous
+
+Records the request-origin/history-query wave's deviations (rule 5).
+
+- **`origin` participates in structural equality.** Python's `ModelRequest.origin` carries
+  `compare=False` — excluded from dataclass equality. Go has no such field metadata, so `==` and
+  `reflect.DeepEqual` include `Origin` (`events/input.go:114`). Rule: tests (and any code) comparing
+  requests structurally must set `Origin` explicitly on both sides (comment at
+  `events/input_test.go:95`). Dispatch and wire behavior are unaffected — the user/service split
+  only marks user-interval boundaries on the history (upstream ADR 0027 parity).
+- **`HistoryQuery` terminals are plain synchronous methods.** `All`/`First`/`Last`/`Count` take no
+  `context.Context` (`stream/query.go:57-101`): AGo's `Storage` is synchronous (D-004), so there is
+  no asynchronous wait to cancel, and Python's `all`/`first`/`last`/`count` are plain methods too.
+  Every terminal call reads a fresh snapshot from storage.
+
+Gates `go test -count=1 ./events/... ./stream/... ./context/...` green 2026-11-03.
+
+## D-086 — 2026-11-02 — toolpacks: an interrupted local command returns `ErrCommandInterrupted`, not a result
+
+Upstream (commit 153ef4cdd) stops the whole child process tree when the turn is cancelled; Python's
+interrupted exec re-raises `CancelledError` and produces no tool result at all.
+
+- **The sentinel stands in for the re-raise.** A Go tool function has no channel to cancel an
+  in-flight result, so a command stopped by turn cancellation returns `ErrCommandInterrupted`
+  (`toolpacks/exec.go:90-94`; `ErrSandboxClosed`/`ErrSandboxClosedWhileRunning` cover the `Close`
+  paths, `toolpacks/exec.go:96-103`). `FunctionTool`'s generic failure path turns it into a
+  `ToolErrorEvent` (`tools/function_tool.go:432`) — no normal `ToolResult` is produced for the
+  interrupted call, which is upstream's no-result outcome expressed at the event level.
+- **Cancellation reaches the whole process tree.** `runLocalCommand` takes the caller's context and
+  distinguishes its own deadline (the existing exit-124 `"Command timed out after %gs"` path) from
+  parent cancellation; `NewShellTool` and `NewLocalCodeRunner` pass `cx.TurnContext()` down
+  (`toolpacks/shell.go:216`, `toolpacks/coderunner.go:260`), and `Close` cancels every in-flight
+  command and waits for them before removing the workdir.
+
+Gates `go test -count=1 ./toolpacks/...` green 2026-11-03.
+
+## D-087 — 2026-11-02 — v0.8.0: upstream diff parts deliberately not ported (MCP dependency bumps, the Variable note, Gemini continuation SDK internals)
+
+- **The `max_sse_event_size` commit's N/A halves** (15c2a9411, PR #3559): the Python packaging bumps
+  (`mcp/mcp-types` 2.2→2.3, `httpx2` 2.9.1→2.10) do not apply to a zero-dependency core (D-003), and
+  the doc note "max_sse_event_size cannot be a Variable" has no counterpart — AGo config values are
+  plain values without the Variable indirection. The functional halves are recorded in D-079.
+- **Gemini `automatic_continuation`'s SDK internals** (d2274ff2d) invisible through the option's
+  surface stay unported: reconnecting a stream broken mid-hop (the google-genai SDK retries it three
+  times), the cross-hop timeout budget, and the SDK rewriting usage/finish_reason inside delivered
+  chunk events (AGo's chunk events carry neither) — recorded at `config/gemini/client.go:297-301`.
+
+Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./...` green 2026-11-03 (fresh full-module
+run: 48 packages ok, 0 failures).

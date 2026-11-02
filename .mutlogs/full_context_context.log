@@ -1,0 +1,25 @@
+target: context\context.go
+baseline: pass (go test -count=1 ./context)
+mutants: found 20 mutation point(s), evaluating 20
+mutant 1/20  SURVIVED context.go:105  == -> !=
+mutant 2/20  SURVIVED context.go:153  == -> !=
+mutant 3/20  KILLED   context.go:225  == -> !=
+mutant 4/20  KILLED   context.go:262  == -> !=
+mutant 5/20  KILLED   context.go:268  == -> !=
+mutant 6/20  SURVIVED context.go:271  > -> >=
+mutant 7/20  SURVIVED context.go:275  > -> >=
+mutant 8/20  KILLED   context.go:294  != -> ==
+mutant 9/20  KILLED   context.go:312  remove ! (timeout)
+mutant 10/20  SURVIVED context.go:312  || -> &&
+mutant 11/20  KILLED   context.go:312  != -> == (timeout)
+mutant 12/20  KILLED   context.go:318  != -> ==
+mutant 13/20  KILLED   context.go:320  == -> !=
+mutant 14/20  KILLED   context.go:323  == -> !=
+mutant 15/20  KILLED   context.go:326  != -> ==
+mutant 16/20  KILLED   context.go:345  != -> ==
+mutant 17/20  SURVIVED context.go:365  && -> ||
+mutant 18/20  SURVIVED context.go:389  || -> &&
+mutant 19/20  SURVIVED context.go:389  || -> &&
+mutant 20/20  SURVIVED context.go:389  < -> <=
+summary: total 20, killed 11, broken 0, survived 9
+{"total":20,"killed":11,"broken":0,"survived":[{"line":105,"desc":"== -> !="},{"line":153,"desc":"== -> !="},{"line":271,"desc":"> -> >="},{"line":275,"desc":"> -> >="},{"line":312,"desc":"|| -> &&"},{"line":365,"desc":"&& -> ||"},{"line":389,"desc":"|| -> &&"},{"line":389,"desc":"|| -> &&"},{"line":389,"desc":"< -> <="}]}

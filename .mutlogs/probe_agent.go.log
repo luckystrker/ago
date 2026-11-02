@@ -1,0 +1,6 @@
+target: agent\agent.go
+baseline: pass (go test -count=1 ./agent)
+mutants: found 36 mutation point(s), evaluating 1
+mutant 1/1  KILLED   agent.go:114  == -> !=
+summary: total 1, killed 1, broken 0, survived 0
+{"total":1,"killed":1,"broken":0,"survived":[]}

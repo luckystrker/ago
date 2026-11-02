@@ -1,0 +1,3 @@
+target: toolpacks\shell.go
+mutation: baseline go test did not pass (tests failed); mutation results would be meaningless
+exit status 1

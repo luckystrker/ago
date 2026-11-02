@@ -14,8 +14,12 @@ const binaryMediaTokens = 1000
 // video/document 2000). Used by compaction and token budgets, not for billing.
 func EstimatedTokens(ev Event, charsPerToken int) int {
 	// Telemetry never reaches the model, so it occupies no context budget
-	// (Python parity: sizing.py is_conversational → 0, before any floor).
-	if !ev.Conversational() {
+	// (Python parity: sizing.py is_conversational → 0, before any floor). A
+	// retained StatusObservation is the one exception: it is not
+	// conversational, but its projected service view rides every model call,
+	// so it carries its parts' weight (Python parity: sizing.py measures
+	// StatusObservation).
+	if _, isStatus := AsValue(ev).(StatusObservation); !isStatus && !ev.Conversational() {
 		return 0
 	}
 	if charsPerToken <= 0 {
@@ -36,6 +40,8 @@ func EstimatedTokens(ev Event, charsPerToken int) int {
 	case DrainedModelRequest:
 		// A Go type switch does not reach the embedded ModelRequest the way
 		// Python isinstance covers the subclass; size it identically.
+		est = estimateParts(e.Parts, charsPerToken)
+	case StatusObservation:
 		est = estimateParts(e.Parts, charsPerToken)
 	case ModelMessage:
 		est = len(e.Content) / charsPerToken

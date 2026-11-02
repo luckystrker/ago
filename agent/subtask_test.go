@@ -521,6 +521,66 @@ func TestSubtaskRollupFlattensNestedDelegation(t *testing.T) {
 	}
 }
 
+// TestSubtaskCustomChildPrompt pins the TaskConfig.Prompt wiring: the child
+// agent is built with the configured prompt, not silently replaced by the
+// default task prompt (Python parity: TaskConfig.prompt).
+func TestSubtaskCustomChildPrompt(t *testing.T) {
+	spy := &promptSpy{}
+	parentCfg := agotest.NewTestConfig(
+		toolResp("run_subtask", `{"task":"go"}`),
+		textResp("wrap"),
+	)
+	a := New("parent", "", WithConfig(parentCfg),
+		WithTasks(TaskConfig{Config: spy, Prompt: "CUSTOM-TASK-PROMPT"}))
+	if _, err := a.Ask(stdcontext.Background(), "delegate"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	got := spy.recorded()
+	if len(got) == 0 {
+		t.Fatal("the child never reached its model call")
+	}
+	p := strings.Join(got[0], ",")
+	if !strings.Contains(p, "CUSTOM-TASK-PROMPT") || strings.Contains(p, defaultTaskPrompt) {
+		t.Fatalf("child system prompt = [%s], want the configured prompt, not the default", p)
+	}
+}
+
+// TestSubtasksParallelHitlErrorPropagates pins the fan-out hitl semantics: when
+// a parallel run_subtasks sibling cannot reach a human, the whole call ends
+// with the hitl error (it must not degrade to "Error: ..." text) after both
+// delegations reported their TaskFailed (Python parity: gather everything,
+// then re-raise).
+func TestSubtasksParallelHitlErrorPropagates(t *testing.T) {
+	askHuman, err := tools.NewFunctionTool("ask_human", "Ask the human",
+		func(args struct {
+			Q string `json:"q"`
+		}, cx *agocontext.Context) (string, error) {
+			return cx.Input(stdcontext.Background(), args.Q, 0)
+		})
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	base := stream.NewMemoryStream()
+	parentCfg := agotest.NewTestConfig(
+		toolResp("run_subtasks", `{"tasks":["one","two"],"parallel":true}`),
+		textResp("never reached"),
+	)
+	childCfg := freshScriptConfig{script: []*events.ModelResponse{
+		toolResp("ask_human", `{"q":"ping?"}`),
+		textResp("saw pong"),
+	}}
+	a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
+		WithTasks(TaskConfig{Config: childCfg, ExtraTools: []tools.Tool{askHuman}}))
+	_, askErr := a.Ask(stdcontext.Background(), "fan out")
+	if !hitl.IsError(askErr) {
+		t.Fatalf("ask error = %v, want a hitl error ending the turn", askErr)
+	}
+	te := collectTaskEvents(t, base)
+	if len(te.failed) != 2 {
+		t.Fatalf("TaskFailed events = %d, want 2 (both siblings report before the re-raise)", len(te.failed))
+	}
+}
+
 // TestSubtaskToolFilters pins the allowlist semantics (Python
 // _filter_subtask_tools): nil IncludeTools inherits every parent tool, an empty
 // allowlist inherits none, and ExcludeTools applies after the allowlist.
@@ -559,6 +619,10 @@ func TestSubtaskToolFilters(t *testing.T) {
 		{"empty allowlist inherits none", withInclude(childNoTool(), []string{}), false, true},
 		{"exclude after nil allowlist", childNoToolWithExclude(), false, true},
 		{"allowlist passes echo", withInclude(childEcho(), []string{"echo"}), true, false},
+		// A child that calls the excluded tool must find it gone: the filter,
+		// not the tool, decides. The child still finishes (a missing tool is a
+		// not-found result, not a turn failure) and never runs echo.
+		{"exclude removes echo from a calling child", withExclude(childEcho(), []string{"echo"}), false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -589,6 +653,11 @@ func TestSubtaskToolFilters(t *testing.T) {
 
 func withInclude(tc TaskConfig, include []string) TaskConfig {
 	tc.IncludeTools = include
+	return tc
+}
+
+func withExclude(tc TaskConfig, exclude []string) TaskConfig {
+	tc.ExcludeTools = exclude
 	return tc
 }
 
@@ -954,6 +1023,51 @@ func TestSubtaskRollupPartialTotalTokens(t *testing.T) {
 			t.Fatalf("rollup total_tokens = %v, want 12", ue.Usage.TotalTokens)
 		}
 	})
+}
+
+// TestRollupUsageSkipsUnreportedUsage pins the voting gate of rollupUsage: a
+// UsageEvent whose token counts are all nil/zero is suppressed upstream by the
+// same Reported gate, so if one reaches the child transcript it must not vote
+// in the (Provider, Model) attribution and must not void the rollup's
+// total_tokens (Python parity: _sole_pair / _rollup_usage).
+func TestRollupUsageSkipsUnreportedUsage(t *testing.T) {
+	child := stream.NewMemoryStream()
+	reported := &events.UsageEvent{
+		Usage:    events.Usage{PromptTokens: events.I64(3), TotalTokens: events.I64(5)},
+		Kind:     events.UsageKindModelCall,
+		Provider: "prov",
+		Model:    "model",
+	}
+	unreported := &events.UsageEvent{
+		Usage:    events.Usage{},
+		Kind:     events.UsageKindModelCall,
+		Provider: "stray",
+		Model:    "stray-model",
+	}
+	for _, ev := range []*events.UsageEvent{reported, unreported} {
+		if err := child.Send(ev); err != nil {
+			t.Fatalf("seed child stream: %v", err)
+		}
+	}
+	parent := agocontext.New(stream.NewMemoryStream())
+	total, spent := rollupUsage(parent, "label", child, 0)
+	if !spent {
+		t.Fatal("rollup ignored the reported usage")
+	}
+	if total.PromptTokens == nil || *total.PromptTokens != 3 || total.TotalTokens == nil || *total.TotalTokens != 5 {
+		t.Fatalf("cumulative total = %+v, want the reported call only (prompt 3, total 5)", total)
+	}
+	te := collectTaskEvents(t, parent.Stream)
+	if len(te.rollups) != 1 {
+		t.Fatalf("rollups = %d, want 1", len(te.rollups))
+	}
+	ue := te.rollups[0]
+	if ue.Provider != "prov" || ue.Model != "model" {
+		t.Fatalf("attribution = %q/%q, want prov/model: an unreported usage must not vote", ue.Provider, ue.Model)
+	}
+	if ue.Usage.TotalTokens == nil || *ue.Usage.TotalTokens != 5 {
+		t.Fatalf("rollup total_tokens = %v, want 5: an unreported usage must not void it", ue.Usage.TotalTokens)
+	}
 }
 
 // freshScriptConfig hands every client its own replay of the same script from

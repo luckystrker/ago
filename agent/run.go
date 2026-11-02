@@ -100,9 +100,12 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 
 	// The turn's input enters the inbox only now, under the lock: a sibling
 	// delegation blocked on this stream must not have its objective drained by
-	// the turn that owns the lock (audit M-25).
+	// the turn that owns the lock (audit M-25). Public ask/run input is a user
+	// turn (Python parity: the input ModelRequest defaults to origin "user");
+	// because the input travels through the inbox (audit M-25), the origin is
+	// stamped here.
 	if len(r.pendingInput) > 0 {
-		if err := r.stream.Enqueue(r.pendingInput...); err != nil {
+		if err := r.stream.EnqueueOrigin(events.OriginUser, r.pendingInput...); err != nil {
 			return fmt.Errorf("agent: enqueue input: %w", err)
 		}
 		r.pendingInput = nil
@@ -259,8 +262,12 @@ func (r *AgentRun) Result(ctx stdcontext.Context) (*AgentReply, error) {
 	return r.reply, nil
 }
 
-// Enqueue adds input to the mid-turn inbox (Python parity: AgentRun.enqueue).
-func (r *AgentRun) Enqueue(parts ...events.Input) error { return r.stream.Enqueue(parts...) }
+// Enqueue adds input to the mid-turn inbox as a user turn (Python parity:
+// AgentRun.enqueue origin="user"): input from the requesting side belongs to
+// the user interval.
+func (r *AgentRun) Enqueue(parts ...events.Input) error {
+	return r.stream.EnqueueOrigin(events.OriginUser, parts...)
+}
 
 // Stream exposes the conversation stream.
 func (r *AgentRun) Stream() stream.Stream { return r.stream }

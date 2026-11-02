@@ -69,8 +69,18 @@ func (c *Context) Pending() []*events.ModelRequest { return c.Stream.Pending() }
 // Drain empties the inbox.
 func (c *Context) Drain() []*events.ModelRequest { return c.Stream.Drain() }
 
-// Enqueue appends input parts to the inbox.
+// Enqueue appends input parts to the inbox as service-origin input (Python
+// parity: ConversationContext.enqueue defaults to origin="service"): updates
+// from tools and background tasks must not open a new user interval. A bridge
+// forwarding an actual human message passes the user origin explicitly via
+// EnqueueOrigin.
 func (c *Context) Enqueue(parts ...events.Input) error { return c.Stream.Enqueue(parts...) }
+
+// EnqueueOrigin appends input parts tagged with the sender's origin (Python
+// parity: ConversationContext.enqueue(origin=...)).
+func (c *Context) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Input) error {
+	return c.Stream.EnqueueOrigin(origin, parts...)
+}
 
 // Send publishes an event on the conversation stream.
 func (c *Context) Send(ev events.Event) error { return c.Stream.Send(ev) }

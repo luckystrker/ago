@@ -32,6 +32,14 @@ type MCPServerConfig struct {
 	// response (Python parity: connection_timeout, default 30s). Zero means
 	// the default; a negative value removes the cap.
 	Timeout time.Duration
+	// MaxSSEEventSize caps one SSE event: a tool result travels as a single
+	// event, so an oversized result fails the call instead of buffering it
+	// (Python parity: max_sse_event_size, default 1_048_576). Zero means the
+	// default; a positive value is the threshold in bytes; a negative value
+	// removes the cap (Python None). Raise it only for a trusted server — a
+	// hostile endpoint can force the client to buffer memory by growing one
+	// event.
+	MaxSSEEventSize int
 }
 
 // MCPStdioConfig launches a local MCP server as a subprocess and speaks

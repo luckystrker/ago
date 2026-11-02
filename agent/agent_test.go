@@ -10,6 +10,7 @@ import (
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/hitl"
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
@@ -295,6 +296,80 @@ func TestHitlMissingHookRepairsHistory(t *testing.T) {
 	}
 }
 
+// TestHitlTimeoutRepairsTranscript pins the repair path for the rest of the
+// hitl family: a turn ended by a hitl timeout (hook slower than the request
+// deadline) still closes the unanswered tool calls, and a successful repair
+// adds no error text to the surfaced failure.
+func TestHitlTimeoutRepairsTranscript(t *testing.T) {
+	slow := func(args struct{}, cx *agocontext.Context) (string, error) {
+		// The request deadline (300ms) beats the hook (2s): TimeoutError.
+		return cx.Input(stdcontext.Background(), "slow human?", 300*time.Millisecond)
+	}
+	tool, err := tools.NewFunctionTool("risky", "Risky", slow)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	base := stream.NewMemoryStream()
+	hook := func(ctx stdcontext.Context, _ *events.HumanInputRequest) (*events.HumanMessage, error) {
+		time.Sleep(2 * time.Second) // ignores its deadline on purpose
+		return &events.HumanMessage{Content: "too late"}, nil
+	}
+	cfg := agotest.NewTestConfig(toolResp("risky", "{}"), textResp("never reached"))
+	a := New("a2", "", WithConfig(cfg), WithTools(tool), WithStreamBase(base), WithHitlHook(hook))
+	_, askErr := a.Ask(stdcontext.Background(), "go")
+	var te *hitl.TimeoutError
+	if !errors.As(askErr, &te) {
+		t.Fatalf("want *hitl.TimeoutError, got %v", askErr)
+	}
+	if strings.Contains(askErr.Error(), "repair history") {
+		t.Fatalf("a successful repair must not add error text: %v", askErr)
+	}
+	if fixed, _ := base.History().CloseUnanswered(); fixed != 0 {
+		t.Fatalf("history should already be repaired, found %d unanswered", fixed)
+	}
+	evs, _ := base.History().GetEvents()
+	closed := false
+	for _, ev := range evs {
+		if e, ok := events.AsValue(ev).(events.ToolResultEvent); ok && len(e.Result.Parts) > 0 &&
+			events.AsValue(e.Result.Parts[0]).(events.TextInput).Content == events.SentinelToolResult {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Fatal("sentinel repair result missing from history")
+	}
+}
+
+// TestWithPluginNilContributesNothing pins the documented contract: a nil
+// Plugin contributes nothing and must not panic the constructor.
+func TestWithPluginNilContributesNothing(t *testing.T) {
+	a := New("a", "base", WithPlugin(nil))
+	if got := strings.Join(a.PromptFragments(), ","); got != "base" {
+		t.Fatalf("prompt fragments = [%s], want [base]", got)
+	}
+	if ts := a.Tools(); len(ts) != 0 {
+		t.Fatalf("a nil plugin contributed %d tools", len(ts))
+	}
+}
+
+// TestSanitizeToolNameKeepsWordCharacters pins the character classes of the
+// delegation tool name: ASCII letters (both cases), digits and underscore pass
+// through, everything else becomes underscore. The boundary characters of
+// every range ('a', 'z', 'A', 'Z', '0', '9') must survive untouched.
+func TestSanitizeToolNameKeepsWordCharacters(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"aZ9_x-Y z", "aZ9_x_Y_z"}, // word chars kept; '-', ' ' replaced
+		{"aAzZ09_", "aAzZ09_"},     // each range boundary, both ends
+		{"db pro", "db_pro"},
+	}
+	for _, tc := range tests {
+		if got := sanitizeToolName(tc.in); got != tc.want {
+			t.Errorf("sanitizeToolName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestConcurrentAsksOnOneAgent(t *testing.T) {
 	// Concurrent asks on one agent (separate streams — the default) must not
 	// interfere. A shared stream base merges concurrent input by design (the
@@ -375,6 +450,59 @@ func (m *recMW) OnLLMCall(next middleware.LLMCallFunc, evs []events.Event, ctx *
 	resp, err := next(evs, ctx)
 	m.log(m.name + ":on_llm:out")
 	return resp, err
+}
+
+func (m *recMW) OnHumanInput(next middleware.HumanInputFunc, ev *events.HumanInputRequest, cx *agocontext.Context) (*events.HumanMessage, error) {
+	m.log(m.name + ":on_hitl:in")
+	msg, err := next(ev, cx)
+	m.log(m.name + ":on_hitl:out")
+	return msg, err
+}
+
+// TestMiddlewareOrderingOnHumanInput pins the HITL chain: the user hook is
+// wrapped with on_human_input middleware in registration order — first is
+// outermost, every registered middleware sees the question (Python parity: the
+// hook goes through the same middleware chain as the turn body).
+func TestMiddlewareOrderingOnHumanInput(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	rec := func(name string) middleware.Factory {
+		return func() middleware.Middleware {
+			return &recMW{name: name, order: &order, mu: &mu}
+		}
+	}
+	approve := func(args struct{}, cx *agocontext.Context) (string, error) {
+		return cx.Input(stdcontext.Background(), "purge?", 0)
+	}
+	tool, err := tools.NewFunctionTool("purge", "Purge", approve)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	hook := func(_ stdcontext.Context, _ *events.HumanInputRequest) (*events.HumanMessage, error) {
+		return &events.HumanMessage{Content: "yes"}, nil
+	}
+	cfg := agotest.NewTestConfig(toolResp("purge", "{}"), textResp("done"))
+	a := New("op", "", WithConfig(cfg), WithTools(tool), WithHitlHook(hook),
+		WithMiddleware(rec("first"), rec("second")))
+	reply, err := a.Ask(stdcontext.Background(), "clean up")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if reply.Body() != "done" {
+		t.Fatalf("body: %q", reply.Body())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var hitlOrder []string
+	for _, s := range order {
+		if strings.Contains(s, "on_hitl") {
+			hitlOrder = append(hitlOrder, s)
+		}
+	}
+	want := []string{"first:on_hitl:in", "second:on_hitl:in", "second:on_hitl:out", "first:on_hitl:out"}
+	if strings.Join(hitlOrder, ",") != strings.Join(want, ",") {
+		t.Fatalf("OnHumanInput order:\n got %v\nwant %v", hitlOrder, want)
+	}
 }
 
 func TestResumeFromToolResults(t *testing.T) {
@@ -523,5 +651,66 @@ func TestRunObservableAPI(t *testing.T) {
 	run.Close()
 	if len(chunks) != 1 || chunks[0] != "streamed" {
 		t.Fatalf("stream observer saw %v", chunks)
+	}
+}
+
+// TestStatusObservationProjectsIntoModelInput pins the model-input projection:
+// a StatusObservation seeded in the transcript reaches the scripted client as a
+// detached service-origin ModelRequest placed after the ToolResultsEvent it
+// followed — never as the observation itself.
+func TestStatusObservationProjectsIntoModelInput(t *testing.T) {
+	call := events.NewToolCallEvent("search")
+	obs := &events.StatusObservation{
+		Parts:  []events.Input{&events.TextInput{Content: "mode: research"}},
+		Source: "statusbar",
+	}
+	seed := []events.Event{
+		&events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: "q1"}}, Origin: events.OriginUser},
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "a1"}},
+		&events.ToolCallsEvent{Calls: []events.ToolCallEvent{call}},
+		&events.ToolResultsEvent{Results: []events.ToolResultEvent{events.FromResultCall(call, events.NewToolResult(false, "r"))}},
+		obs,
+	}
+	ms, err := stream.LoadHistory("status-projection", stream.NewMemoryStorage(), seed)
+	if err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+	cfg := agotest.NewTestConfig(textResp("done"))
+	a := New("worker", "", WithConfig(cfg), WithStreamBase(ms))
+	if _, err := a.Ask(stdcontext.Background(), "go"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+
+	calls := cfg.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("recorded %d calls, want 1", len(calls))
+	}
+	saw := calls[0]
+	if len(saw) != 6 {
+		t.Fatalf("model input has %d events, want 6 (seed + view + new request)", len(saw))
+	}
+	if _, ok := events.AsValue(saw[3]).(events.ToolResultsEvent); !ok {
+		t.Fatalf("event 3 = %T, want ToolResultsEvent (the view follows the tool round)", saw[3])
+	}
+	view, ok := saw[4].(*events.ModelRequest)
+	if !ok {
+		t.Fatalf("event 4 = %T, want the projected *ModelRequest", saw[4])
+	}
+	if view.Origin != events.OriginService {
+		t.Fatalf("view origin = %q, want %q", view.Origin, events.OriginService)
+	}
+	if len(view.Parts) != 1 {
+		t.Fatalf("view has %d parts, want 1", len(view.Parts))
+	}
+	if text, ok := events.AsValue(view.Parts[0]).(events.TextInput); !ok || text.Content != "mode: research" {
+		t.Fatalf("view part = %v, want the observation's text", view.Parts[0])
+	}
+	if _, ok := events.AsValue(saw[5]).(events.ModelRequest); !ok {
+		t.Fatalf("event 5 = %T, want the new user request", saw[5])
+	}
+	for i, ev := range saw {
+		if _, ok := events.AsValue(ev).(events.StatusObservation); ok {
+			t.Fatalf("event %d: the raw StatusObservation reached the model input", i)
+		}
 	}
 }

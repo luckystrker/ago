@@ -30,8 +30,12 @@ import (
 
 // DepKey is the context dependency id under which the active Task is stamped
 // for the duration of its life (Python parity: TaskInject resolves through it).
-// AGO-DEVIATION: Python uses "ag2.task"; AGo framework dependency keys use the
-// reserved "ag:" prefix of the context package. See docs/DECISIONS.md.
+// The slot is a single register shared by sibling tasks started on one context:
+// it holds the last task that entered and is still running, so a reader inside
+// an earlier sibling (TaskInject, network task progress/complete) resolves to
+// the latest active task. AGO-DEVIATION: Python uses "ag2.task"; AGo framework
+// dependency keys use the reserved "ag:" prefix of the context package.
+// See docs/DECISIONS.md.
 const DepKey = "ag:task"
 
 // State is the lifecycle state of a Task. Terminal states are immutable.
@@ -244,11 +248,16 @@ func parseTimeLenient(s string) time.Time {
 // Task is the lifecycle handle for a unit of work. Created via Start (the
 // Agent.task wrapper delegates here). Safe for concurrent use.
 type Task struct {
-	ctx        *agocontext.Context
-	store      CheckpointStore
-	resumed    []byte
-	hadPrevDep bool
-	prevDep    any
+	ctx     *agocontext.Context
+	store   CheckpointStore
+	resumed []byte
+	// prevDep is the task the "ag:task" slot held when this task entered,
+	// resolved past already-exited siblings (Python parity: _previous_dep +
+	// _nearest_active). It is written once in Start before the task is
+	// published to the slot, and every reader reached the task through the
+	// context dependency, whose mutex orders that write before any read — no
+	// extra lock.
+	prevDep *Task
 
 	mu      sync.Mutex
 	md      Metadata
@@ -294,9 +303,10 @@ func WithChannelID(id string) Option {
 }
 
 // Start opens a task: stamps "ag:task" into the context dependencies (keeping
-// any previous value for rollback), emits TaskStarted and leaves the task in
-// the running state. The context is required — standalone streams without a
-// conversation should build a Context over a fresh stream first.
+// the nearest still-running predecessor for rollback), emits TaskStarted and
+// leaves the task in the running state. The context is required — standalone
+// streams without a conversation should build a Context over a fresh stream
+// first.
 func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*Task, error) {
 	if ctx == nil {
 		return nil, errors.New("task: Start requires a conversation context")
@@ -329,8 +339,16 @@ func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*T
 	}
 	t.started = true
 
+	// The "ag:task" slot is a single register shared by sibling tasks on one
+	// context: entering keeps the last still-running predecessor, walking the
+	// chain past already-exited siblings, so a reader inside an earlier sibling
+	// resolves to the latest active task (Python parity: __aenter__ with
+	// _nearest_active). A non-*Task slot value counts as absent — the slot is
+	// reserved for the framework (upstream types it Task | None).
 	if prev, ok := ctx.Dependency(DepKey); ok {
-		t.hadPrevDep, t.prevDep = true, prev
+		if pt, isTask := prev.(*Task); isTask {
+			t.prevDep = nearestActive(pt)
+		}
 	}
 	ctx.SetDependency(DepKey, t)
 
@@ -603,19 +621,39 @@ func (t *Task) transition(state State, apply func(*Metadata)) (Metadata, transit
 	return snapshot, transitioned
 }
 
-// restoreDep hands the "ag:task" dependency back to its previous value — the
-// role of the Python context manager's __aexit__. AGO-DEVIATION: the context
-// package cannot delete keys, so with no previous value the key is set to nil;
+// restoreDep rolls the "ag:task" dependency back — the role of the Python
+// context manager's __aexit__. The slot is touched only while this task still
+// owns it: when a later sibling entered afterwards, the slot keeps that sibling
+// (Python parity: dependencies.get(_TASK_DEP_KEY) is self). Otherwise the slot
+// is restored to the nearest still-running predecessor, walking the chain past
+// exited tasks so later entries keep resolving. AGO-DEVIATION: the context
+// package cannot delete keys, so with no predecessor the key is set to nil;
 // readers must treat a nil dependency value as absent.
 func (t *Task) restoreDep() {
 	if t.ctx == nil {
 		return
 	}
-	if t.hadPrevDep {
-		t.ctx.SetDependency(DepKey, t.prevDep)
+	if cur, ok := t.ctx.Dependency(DepKey); !ok || cur != any(t) {
 		return
 	}
+	if next := nearestActive(t.prevDep); next != nil {
+		t.ctx.SetDependency(DepKey, next)
+		return
+	}
+	// Untyped nil, not a typed (*Task)(nil): the deviation contract is that a
+	// nil slot value reads as absent, and a typed nil would fail `dep != nil`.
 	t.ctx.SetDependency(DepKey, nil)
+}
+
+// nearestActive walks the previous-task chain past tasks that already reached a
+// terminal state (Python parity: _nearest_active, where _exited is the first
+// terminal transition — the Go analogue of __aexit__, see the package doc on
+// the context-manager deviation).
+func nearestActive(t *Task) *Task {
+	for t != nil && t.State().Terminal() {
+		t = t.prevDep
+	}
+	return t
 }
 
 func (t *Task) send(ev events.Event) error {

@@ -413,6 +413,10 @@ type genResponse struct {
 			Role  string    `json:"role"`
 		} `json:"content"`
 		FinishReason string `json:"finishReason"`
+		// ContinuationToken resumes a response the server truncated at its
+		// per-request token limit: an opaque base64 string that travels back
+		// verbatim as the top-level "continuationToken" of the next request.
+		ContinuationToken string `json:"continuationToken"`
 	} `json:"candidates"`
 	UsageMetadata *genUsage `json:"usageMetadata"`
 	ModelVersion  string    `json:"modelVersion"`

@@ -1,0 +1,6 @@
+target: toolpacks\coderunner.go
+baseline: pass (go test -count=1 ./toolpacks)
+mutants: found 41 mutation point(s), evaluating 1
+mutant 1/1  SURVIVED coderunner.go:66  == -> !=
+summary: total 1, killed 0, broken 0, survived 1
+{"total":1,"killed":0,"broken":0,"survived":[{"line":66,"desc":"== -> !="}]}

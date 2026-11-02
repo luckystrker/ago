@@ -15,6 +15,7 @@ import (
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/internal/sse"
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/stream"
 	"github.com/luckystrker/ago/tools"
@@ -502,6 +503,126 @@ func TestHTTPCallToolOverSSE(t *testing.T) {
 	}
 	if text, ok := events.AsValue(out.Parts[0]).(events.TextInput); !ok || text.Content != "via sse" {
 		t.Errorf("part 0 = %#v, want TextInput via sse", out.Parts[0])
+	}
+}
+
+// --- SSE event-size policy (MaxSSEEventSize) -------------------------------------
+
+// sseBigResultServer answers initialize as JSON and every tools/call with one
+// text/event-stream data line whose payload is padded to total bytes exactly
+// (a tool result travels as a single SSE event; the payload is what the SSE
+// scanner counts). bigResult must render the JSON-RPC success wrapper.
+func sseBigResultServer(t *testing.T, total int, bigResult func(id *int64, n int) []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var req fakeRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch req.Method {
+		case "initialize":
+			writeRPCResult(w, req.ID, map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{},
+				"serverInfo":      map[string]any{"name": "fake-mcp", "version": "1"},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			base := len(bigResult(req.ID, 0))
+			pad := total - base
+			if pad < 0 {
+				t.Errorf("payload budget %d is below the bare result (%d bytes)", total, base)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: %s\n\n", bigResult(req.ID, pad))
+		default:
+			writeRPCError(w, req.ID, -32601, "unknown method")
+		}
+	}))
+}
+
+// TestHTTPCallToolSSEEventSize pins the MaxSSEEventSize policy (Python parity:
+// max_sse_event_size, default 1_048_576): the default cap rejects an oversized
+// tool result with sse.ErrEventTooLarge inside ErrProtocol; a raised cap, a
+// removed cap and an exactly-at-the-cap event all pass (the scanner check is
+// strict >), and the zero value behaves like the explicit default.
+func TestHTTPCallToolSSEEventSize(t *testing.T) {
+	// bigResult renders the JSON-RPC success result with a text block of n
+	// "A"s; with n=0 it measures the wrapper overhead.
+	bigResult := func(id *int64, n int) []byte {
+		res, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": id,
+			"result": map[string]any{
+				"content": []map[string]any{{"type": "text", "text": strings.Repeat("A", n)}},
+				"isError": false,
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal result: %v", err)
+		}
+		return res
+	}
+
+	cases := []struct {
+		name    string
+		maxSSE  int
+		total   int
+		wantErr bool
+	}{
+		{"zero value = default cap rejects an oversized result", 0, (1 << 20) + 100, true},
+		{"explicit default cap rejects the same payload", 1 << 20, (1 << 20) + 100, true},
+		{"an exactly 1 MiB event passes the default cap", 0, 1 << 20, false},
+		{"raised cap passes the oversized result", 2 << 20, (1 << 20) + 100, false},
+		{"negative removes the cap", -1, (1 << 20) + 100, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hs := sseBigResultServer(t, tc.total, bigResult)
+			t.Cleanup(hs.Close)
+			cl, err := New(&MCPServerConfig{URL: hs.URL, MaxSSEEventSize: tc.maxSSE})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { cl.Close() })
+			out, err := cl.CallTool("big", nil)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("CallTool returned no error, want an oversize-event failure")
+				}
+				if !errors.Is(err, ErrProtocol) {
+					t.Fatalf("err = %v, want ErrProtocol in the chain", err)
+				}
+				if !errors.Is(err, sse.ErrEventTooLarge) {
+					t.Fatalf("err = %v, want sse.ErrEventTooLarge in the chain", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CallTool: %v", err)
+			}
+			if len(out.Parts) != 1 {
+				t.Fatalf("parts = %d, want 1", len(out.Parts))
+			}
+			text, ok := events.AsValue(out.Parts[0]).(events.TextInput)
+			if !ok {
+				t.Fatalf("part 0 = %T, want TextInput", out.Parts[0])
+			}
+			// The full padded text arrived: nothing but the server's "A"s.
+			if len(text.Content) == 0 || strings.Trim(text.Content, "A") != "" {
+				t.Fatalf("content is not the intact %d-byte text block (len %d)", tc.total, len(text.Content))
+			}
+			if tc.total > 1<<20 && len(text.Content) <= (1<<20)-512 {
+				t.Fatalf("content = %d chars, want the oversized result past the default cap", len(text.Content))
+			}
+		})
 	}
 }
 
