@@ -1,0 +1,45 @@
+target: toolpacks\coderunner.go
+baseline: pass (go test -count=1 ./toolpacks)
+mutants: found 41 mutation point(s), evaluating 40
+mutant 1/40  KILLED   coderunner.go:66  == -> !=
+mutant 2/40  KILLED   coderunner.go:80  != -> ==
+mutant 3/40  KILLED   coderunner.go:92  <= -> <
+mutant 4/40  KILLED   coderunner.go:107  == -> !=
+mutant 5/40  KILLED   coderunner.go:129  <= -> <
+mutant 6/40  KILLED   coderunner.go:143  == -> !=
+mutant 7/40  KILLED   coderunner.go:147  == -> !=
+mutant 8/40  KILLED   coderunner.go:160  == -> !=
+mutant 9/40  KILLED   coderunner.go:174  != -> ==
+mutant 10/40  KILLED   coderunner.go:187  != -> ==
+mutant 11/40  KILLED   coderunner.go:209  != -> ==
+mutant 12/40  KILLED   coderunner.go:241  == -> !=
+mutant 13/40  KILLED   coderunner.go:247  == -> !=
+mutant 14/40  KILLED   coderunner.go:252  remove !
+mutant 15/40  KILLED   coderunner.go:257  != -> ==
+mutant 16/40  KILLED   coderunner.go:261  != -> ==
+mutant 17/40  KILLED   coderunner.go:274  == -> !=
+mutant 18/40  KILLED   coderunner.go:277  == -> !=
+mutant 19/40  KILLED   coderunner.go:285  != -> ==
+mutant 20/40  KILLED   coderunner.go:292  != -> ==
+mutant 21/40  KILLED   coderunner.go:310  == -> !=
+mutant 22/40  SURVIVED coderunner.go:313  && -> ||
+mutant 23/40  SURVIVED coderunner.go:318  && -> ||
+mutant 24/40  KILLED   coderunner.go:331  == -> !=
+mutant 25/40  KILLED   coderunner.go:332  == -> !=
+mutant 26/40  KILLED   coderunner.go:337  == -> !=
+mutant 27/40  KILLED   coderunner.go:337  && -> ||
+mutant 28/40  KILLED   coderunner.go:350  != -> ==
+mutant 29/40  KILLED   coderunner.go:350  || -> &&
+mutant 30/40  KILLED   coderunner.go:350  remove !
+mutant 31/40  KILLED   coderunner.go:353  == -> !=
+mutant 32/40  KILLED   coderunner.go:353  || -> &&
+mutant 33/40  SURVIVED coderunner.go:353  != -> ==
+mutant 34/40  KILLED   coderunner.go:360  == -> !=
+mutant 35/40  SURVIVED coderunner.go:360  && -> ||
+mutant 36/40  KILLED   coderunner.go:360  == -> !=
+mutant 37/40  KILLED   coderunner.go:371  == -> !=
+mutant 38/40  KILLED   coderunner.go:375  == -> !=
+mutant 39/40  KILLED   coderunner.go:399  remove !
+mutant 40/40  KILLED   coderunner.go:399  || -> &&
+summary: total 40, killed 36, broken 0, survived 4
+{"total":40,"killed":36,"broken":0,"survived":[{"line":313,"desc":"&& -> ||"},{"line":318,"desc":"&& -> ||"},{"line":353,"desc":"!= -> =="},{"line":360,"desc":"&& -> ||"}]}

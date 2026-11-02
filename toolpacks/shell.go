@@ -26,8 +26,13 @@ import (
 // approval middleware and hand secrets only through WithShellEnv.
 //
 // A ShellTool is safe for concurrent use after construction: every call runs its
-// own subprocess and the configuration is immutable. Close removes an auto-created
-// working directory; a caller-supplied workdir is never deleted.
+// own subprocess and the configuration is immutable. A call runs under the
+// current turn context (upstream parity 153ef4cdd): canceling the turn kills the
+// running command tree, and the interrupted call reports ErrCommandInterrupted
+// instead of a result. Close stops every in-flight command and waits for it
+// before removing an auto-created working directory; a caller-supplied workdir
+// is never deleted. A call racing Close fails with ErrSandboxClosedWhileRunning,
+// a call that starts after Close with ErrSandboxClosed.
 type ShellTool struct {
 	toolName    string
 	description string
@@ -39,6 +44,7 @@ type ShellTool struct {
 	maxOutput   int
 	blocked     []string
 	tool        *tools.FunctionTool
+	sandbox     localSandbox
 }
 
 var _ tools.Tool = (*ShellTool)(nil)
@@ -183,7 +189,7 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 	type shellArgs struct {
 		Command string `json:"command" agschema:"description=The shell command to run,required"`
 	}
-	fn := func(args shellArgs) (string, error) { return s.run(args.Command), nil }
+	fn := func(args shellArgs, cx *agocontext.Context) (string, error) { return s.run(cx, args.Command) }
 	ft, err := tools.NewFunctionTool(s.toolName, description, fn)
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: shell tool: %w", err)
@@ -193,16 +199,25 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 }
 
 // run executes one command and returns the model-facing output (Python parity:
-// ShellAdapter.run — a refusal is an ordinary output line, not an error).
-func (s *ShellTool) run(command string) string {
+// ShellAdapter.run — a refusal is an ordinary output line, not an error). The
+// command runs under the current turn context: canceling the turn kills the
+// process tree and the interrupted call reports ErrCommandInterrupted; on a
+// closed tool the call reports ErrSandboxClosed.
+func (s *ShellTool) run(cx *agocontext.Context, command string) (string, error) {
+	if s.sandbox.isClosed() {
+		return "", ErrSandboxClosed
+	}
 	lower := strings.ToLower(command)
 	for _, p := range s.blocked {
 		if strings.Contains(lower, strings.ToLower(p)) {
-			return fmt.Sprintf("Command not allowed: %q", command)
+			return fmt.Sprintf("Command not allowed: %q", command), nil
 		}
 	}
-	res := runLocalCommand(shellArgv(command), s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
-	return formatExit(res)
+	res, err := s.sandbox.call(cx.TurnContext(), shellArgv(command), s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
+	if err != nil {
+		return "", err
+	}
+	return formatExit(res), nil
 }
 
 // shellArgv wraps the command for the platform shell.
@@ -222,10 +237,14 @@ func (s *ShellTool) DeclaredInCode() bool { return s.tool.DeclaredInCode() }
 // Workdir returns the directory commands run in.
 func (s *ShellTool) Workdir() string { return s.workdir }
 
-// Close removes an auto-created working directory; it is idempotent and leaves a
-// caller-supplied workdir alone (Python parity: LocalEnvironment cleanup, minus
-// the atexit backstop a Go library cannot register).
+// Close stops every in-flight command and waits for it, then removes an
+// auto-created working directory; it is idempotent and leaves a caller-supplied
+// workdir alone (Python parity: LocalSandbox.aclose — commands must be dead
+// before their workdir goes away, minus the atexit backstop a Go library cannot
+// register). A call that Close stopped reports ErrSandboxClosedWhileRunning; a
+// call that starts afterwards reports ErrSandboxClosed.
 func (s *ShellTool) Close() error {
+	s.sandbox.shutdown()
 	if !s.autoDir || s.workdir == "" {
 		return nil
 	}

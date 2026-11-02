@@ -2,6 +2,7 @@ package agent
 
 import (
 	stdcontext "context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/tools"
@@ -488,5 +490,157 @@ func TestMaxToolRoundsStopsLoop(t *testing.T) {
 	}
 	if fixes := events.CloseUnansweredToolCalls(evs); len(fixes) != 0 {
 		t.Fatalf("transcript kept %d unanswered tool calls after the round cap", len(fixes))
+	}
+}
+
+// TestTurnLockRefcountKeepsEntry pins the audit L-19 contract on the per-stream
+// lock map: the entry survives while other runs still serialize on it, is
+// dropped once the last reference releases, and a zero-value Agent lazily
+// creates its map. The mutex dance mirrors open(): every acquired reference
+// holds the mutex between its acquire and its release.
+func TestTurnLockRefcountKeepsEntry(t *testing.T) {
+	// Zero-value Agent: the lazy map initialization must hold.
+	var zero Agent
+	lz := zero.acquireTurnLock("s-zero")
+	lz.mu.Lock()
+	zero.releaseTurnLock("s-zero", lz)
+
+	a := New("a", "")
+	l1 := a.acquireTurnLock("s")
+	l1.mu.Lock() // run 1 owns the stream
+	l2 := a.acquireTurnLock("s") // run 2 joins the same entry, waits on the mutex
+	if l1 != l2 {
+		t.Fatal("concurrent runs on one stream must share the lock entry")
+	}
+	// Run 1 finishes while run 2 still serializes on the entry: it must survive,
+	// or a third run would start on a fresh lock and stop serializing with the
+	// run still in flight.
+	a.releaseTurnLock("s", l1)
+	l3 := a.acquireTurnLock("s")
+	if l3 != l2 {
+		t.Fatal("lock entry deleted while another run still serializes on it")
+	}
+	l3.mu.Lock()
+	a.releaseTurnLock("s", l2) // run 2 done
+	l3.mu.Lock()               // run 3's serialized section
+	a.releaseTurnLock("s", l3) // the last reference: the entry goes away
+	a.turnsMu.Lock()
+	n := len(a.turns)
+	a.turnsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("lock map kept %d entries after the last reference released", n)
+	}
+	// The next run gets a fresh entry (the old lock is still referenced here, so
+	// its address cannot be reused).
+	l4 := a.acquireTurnLock("s")
+	l4.mu.Lock()
+	if l4 == l2 {
+		t.Fatal("expected a fresh lock entry after the last reference dropped")
+	}
+	a.releaseTurnLock("s", l4)
+}
+
+// TestReplyContentWithSchema pins AgentReply.Content: with a response schema
+// the validated body comes back as raw JSON, without one the body is wrapped as
+// a JSON string, and a body outside the schema is rejected.
+func TestReplyContentWithSchema(t *testing.T) {
+	type qa struct {
+		Answer string `json:"answer"`
+	}
+	schema := response.NewSchema[qa]("qa", "Answer questions.")
+	ok := agotest.NewTestConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: `{"answer":"forty two"}`}})
+	a := New("a", "", WithConfig(ok), WithResponseSchema(schema))
+	r, err := a.Ask(stdcontext.Background(), "q")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	raw, err := r.Content()
+	if err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	if string(raw) != `{"answer":"forty two"}` {
+		t.Fatalf("content = %s, want the raw schema-validated JSON", raw)
+	}
+
+	bad := agotest.NewTestConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "not json"}})
+	b := New("b", "", WithConfig(bad), WithResponseSchema(schema))
+	rb, err := b.Ask(stdcontext.Background(), "q")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if _, err := rb.Content(); err == nil {
+		t.Fatal("Content must reject a body outside the response schema")
+	}
+}
+
+// TestReplyContentWithoutSchema pins the no-schema branch of AgentReply.Content:
+// without a response schema the body comes back wrapped as a JSON string value
+// (Python parity: the answer survives as JSON), still a non-nil payload.
+func TestReplyContentWithoutSchema(t *testing.T) {
+	cfg := agotest.NewTestConfig(textResp("plain answer"))
+	a := New("a", "", WithConfig(cfg))
+	r, err := a.Ask(stdcontext.Background(), "q")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	raw, err := r.Content()
+	if err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	var body string
+	if uerr := json.Unmarshal(raw, &body); uerr != nil {
+		t.Fatalf("Content returned %s: not a JSON string value (%v)", raw, uerr)
+	}
+	if body != "plain answer" {
+		t.Fatalf("Content decoded to %q, want the answer body", body)
+	}
+}
+
+// TestContentAsRetryBudget pins the retry count: retries=N allows exactly N
+// re-asks after the initial call, so an answer that never validates surfaces
+// the validation error after N+1 model calls — not one more.
+func TestContentAsRetryBudget(t *testing.T) {
+	type qa struct {
+		Answer string `json:"answer"`
+	}
+	schema := response.NewSchema[qa]("qa", "Answer questions.")
+	cfg := agotest.NewTestConfig(
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "nope"}},
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "still nope"}},
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "third nope"}},
+	)
+	a := New("a", "", WithConfig(cfg), WithResponseSchema(schema))
+	reply, err := a.Ask(stdcontext.Background(), "q")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if _, cerr := ContentAs[qa](stdcontext.Background(), reply, 1); cerr == nil {
+		t.Fatal("answers that never validate must surface the validation error")
+	}
+	if calls := len(cfg.Calls()); calls != 2 {
+		t.Fatalf("model calls = %d, want 2 (initial + one retry at retries=1)", calls)
+	}
+}
+
+// TestReplyRunContinuation pins AgentReply.Run: a continuation opens the next
+// turn on the same stream and returns a usable run handle.
+func TestReplyRunContinuation(t *testing.T) {
+	cfg := agotest.NewTestConfig(textResp("one"), textResp("two"))
+	a := New("a", "", WithConfig(cfg))
+	r1, err := a.Ask(stdcontext.Background(), "1")
+	if err != nil {
+		t.Fatalf("first ask: %v", err)
+	}
+	run, err := r1.Run(stdcontext.Background(), "2")
+	if err != nil {
+		t.Fatalf("reply run: %v", err)
+	}
+	defer run.Close()
+	r2, err := run.Result(stdcontext.Background())
+	if err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if r2.Body() != "two" {
+		t.Fatalf("continuation body = %q, want %q", r2.Body(), "two")
 	}
 }

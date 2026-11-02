@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	stdcontext "context"
 	"errors"
 	"os/exec"
 	"runtime"
@@ -82,7 +83,10 @@ func TestFilterWhitelistedEnv(t *testing.T) {
 func TestRunLocalCommandEnvWhitelistDefault(t *testing.T) {
 	t.Setenv("AGO_TEST_SECRET", secretValue)
 	t.Setenv("HOME", "ago-test-home") // whitelisted var with a known value
-	res := runLocalCommand(envDumpCmd(), "", nil, false, 10*time.Second, defaultMaxOutput)
+	res, err := runLocalCommand(stdcontext.Background(), envDumpCmd(), "", nil, false, 10*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if res.ExitCode != 0 {
 		t.Fatalf("exit code = %d, output = %q", res.ExitCode, res.Output)
 	}
@@ -96,7 +100,10 @@ func TestRunLocalCommandEnvWhitelistDefault(t *testing.T) {
 
 func TestRunLocalCommandEnvInheritAllOptIn(t *testing.T) {
 	t.Setenv("AGO_TEST_SECRET", secretValue)
-	res := runLocalCommand(envDumpCmd(), "", nil, true, 10*time.Second, defaultMaxOutput)
+	res, err := runLocalCommand(stdcontext.Background(), envDumpCmd(), "", nil, true, 10*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if res.ExitCode != 0 {
 		t.Fatalf("exit code = %d, output = %q", res.ExitCode, res.Output)
 	}
@@ -108,12 +115,18 @@ func TestRunLocalCommandEnvInheritAllOptIn(t *testing.T) {
 func TestRunLocalCommandEnvMergeOnTop(t *testing.T) {
 	t.Setenv("AGO_TEST_MERGED", "parent_value")
 	// An explicit value passes even when not whitelisted…
-	res := runLocalCommand(envDumpCmd(), "", map[string]string{"AGO_TEST_EXTRA": "extra_value"}, false, 10*time.Second, defaultMaxOutput)
+	res, err := runLocalCommand(stdcontext.Background(), envDumpCmd(), "", map[string]string{"AGO_TEST_EXTRA": "extra_value"}, false, 10*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if !strings.Contains(res.Output, "AGO_TEST_EXTRA=extra_value") {
 		t.Fatalf("merged variable not passed: %q", res.Output)
 	}
 	// …and wins over an inherited duplicate (os/exec keeps the last entry per key).
-	res = runLocalCommand(envDumpCmd(), "", map[string]string{"AGO_TEST_MERGED": "merged_value"}, true, 10*time.Second, defaultMaxOutput)
+	res, err = runLocalCommand(stdcontext.Background(), envDumpCmd(), "", map[string]string{"AGO_TEST_MERGED": "merged_value"}, true, 10*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if !strings.Contains(res.Output, "merged_value") || strings.Contains(res.Output, "parent_value") {
 		t.Fatalf("merged value did not override the inherited one: %q", res.Output)
 	}
@@ -256,7 +269,10 @@ func floodCmd() []string {
 func TestRunLocalCommandOutputBufferCap(t *testing.T) {
 	// maxOutput=1000 caps the buffer at 2000 bytes; the flood command emits
 	// ~85 KiB, so without the cap the buffer would hold all of it.
-	res := runLocalCommand(floodCmd(), "", nil, false, 30*time.Second, 1000)
+	res, err := runLocalCommand(stdcontext.Background(), floodCmd(), "", nil, false, 30*time.Second, 1000)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if res.ExitCode != 0 {
 		t.Fatalf("exit code = %d, output = %q", res.ExitCode, res.Output)
 	}
@@ -298,6 +314,21 @@ func listMatching(t *testing.T, listCmd []string) string {
 	return string(out)
 }
 
+// waitProbeRunning polls the probe listing until a matching process appears
+// (the command actually running) or the deadline passes. Only for the test
+// goroutine: listMatching fails the test on a hard listing error.
+func waitProbeRunning(t *testing.T, listCmd []string, name string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(name)) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	start, listCmd, ok := grandchildProbe()
 	if !ok {
@@ -307,7 +338,10 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
-	res := runLocalCommand(start, "", nil, false, 2*time.Second, defaultMaxOutput)
+	res, err := runLocalCommand(stdcontext.Background(), start, "", nil, false, 2*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
 	if res.ExitCode != 124 {
 		t.Fatalf("exit code = %d, want 124 (timeout), output = %q", res.ExitCode, res.Output)
 	}
@@ -319,6 +353,45 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	}
 }
 
+func TestRunLocalCommandCancelKillsTree(t *testing.T) {
+	start, listCmd, ok := grandchildProbe()
+	if !ok {
+		t.Skip("no process-listing tool on this platform")
+	}
+	// A stray matching process from outside the test would poison the verdict.
+	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+		t.Skip("a matching process is already running; cannot isolate the check")
+	}
+	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
+	defer cancel()
+	type outcome struct {
+		res execResult
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		// A timeout far beyond the test: the cancel, not the deadline, must
+		// stop the command.
+		res, err := runLocalCommand(ctx, start, "", nil, false, time.Minute, defaultMaxOutput)
+		ch <- outcome{res, err}
+	}()
+	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
+		t.Fatal("the probe process never appeared")
+	}
+	cancel()
+	select {
+	case o := <-ch:
+		if !errors.Is(o.err, ErrCommandInterrupted) {
+			t.Fatalf("err = %v, want ErrCommandInterrupted (output %q, exit %d)", o.err, o.res.Output, o.res.ExitCode)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runLocalCommand did not return after the parent cancel")
+	}
+	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
+		t.Fatalf("a grandchild survived the cancel kill:\n%s", out)
+	}
+}
+
 // nameOf extracts the process name the probe listings match on (ping.exe on
 // Windows, "sleep 60" elsewhere).
 func nameOf(start []string) string {
@@ -326,4 +399,84 @@ func nameOf(start []string) string {
 		return "ping.exe"
 	}
 	return "sleep 60"
+}
+
+// TestFilterWhitelistedEnvNameCase pins the name matching per platform: on
+// Windows the variable names are case-insensitive, so every casing of a
+// whitelisted name passes; elsewhere only the exact spelling does.
+func TestFilterWhitelistedEnvNameCase(t *testing.T) {
+	parent := []string{
+		"PATH=/upper",
+		"Path=/mixed",
+		"SECRET=leak",
+	}
+	got := filterWhitelistedEnv(parent)
+	kept := map[string]bool{}
+	for _, kv := range got {
+		k, _, _ := strings.Cut(kv, "=")
+		kept[k] = true
+	}
+	if runtime.GOOS == "windows" {
+		if !kept["PATH"] || !kept["Path"] {
+			t.Fatalf("mixed-case PATH dropped on Windows: %v", got)
+		}
+		if kept["SECRET"] {
+			t.Fatalf("the secret passed the whitelist: %v", got)
+		}
+	} else if !kept["PATH"] || kept["Path"] {
+		t.Fatalf("case-sensitive filter wrong on this platform: %v", got)
+	}
+}
+
+// TestBuildOutputNoTruncationAtExactCap pins the truncation boundary: output of
+// exactly maxOutput characters is not a truncation — the notice only appears
+// beyond the cap.
+func TestBuildOutputNoTruncationAtExactCap(t *testing.T) {
+	b := &limitedBuffer{limit: 200}
+	if _, err := b.Write([]byte(strings.Repeat("a", 50))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := buildOutput(b, 50); got != strings.Repeat("a", 50) {
+		t.Fatalf("output at the exact cap = %q, want the untouched 50 characters", got)
+	}
+}
+
+// TestRunLocalCommandZeroOptionsGetDefaults pins the default injection: a zero
+// timeout means the default bound (not an instant expiry) and a zero maxOutput
+// means the default cap (not "truncate everything away").
+func TestRunLocalCommandZeroOptionsGetDefaults(t *testing.T) {
+	argv := []string{"sh", "-c", "echo defaults_ok"}
+	if runtime.GOOS == "windows" {
+		argv = []string{"cmd", "/c", "echo defaults_ok"}
+	}
+	res, err := runLocalCommand(stdcontext.Background(), argv, "", nil, false, 0, 0)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit code = %d, output = %q", res.ExitCode, res.Output)
+	}
+	if !strings.Contains(res.Output, "defaults_ok") {
+		t.Fatalf("output = %q, want the command output without a zero cap", res.Output)
+	}
+	if strings.Contains(res.Output, "timed out") || strings.Contains(res.Output, "truncated") {
+		t.Fatalf("zero timeout/maxOutput must fall back to the defaults, got %q", res.Output)
+	}
+}
+
+// TestRunLocalCommandNotFoundIs127 pins the launch-failure classification: a
+// missing binary reports "Command not found" with exit code 127, not a generic
+// failure (Python parity: the missing interpreter path).
+func TestRunLocalCommandNotFoundIs127(t *testing.T) {
+	res, err := runLocalCommand(stdcontext.Background(),
+		[]string{"ago-definitely-missing-binary-xyz"}, "", nil, false, 10*time.Second, defaultMaxOutput)
+	if err != nil {
+		t.Fatalf("runLocalCommand: %v", err)
+	}
+	if res.ExitCode != 127 {
+		t.Fatalf("exit code = %d, want 127 (command not found), output = %q", res.ExitCode, res.Output)
+	}
+	if !strings.HasPrefix(res.Output, "Command not found") {
+		t.Fatalf("output = %q, want the Command not found classification", res.Output)
+	}
 }

@@ -1,0 +1,46 @@
+target: agent\subtask.go
+baseline: pass (go test -count=1 ./agent)
+mutants: found 41 mutation point(s), evaluating 41
+mutant 1/41  KILLED   subtask.go:79  == -> !=
+mutant 2/41  KILLED   subtask.go:92  == -> !=
+mutant 3/41  SURVIVED subtask.go:96  == -> !=
+mutant 4/41  KILLED   subtask.go:106  != -> ==
+mutant 5/41  KILLED   subtask.go:114  != -> ==
+mutant 6/41  KILLED   subtask.go:115  remove !
+mutant 7/41  SURVIVED subtask.go:128  > -> >=
+mutant 8/41  SURVIVED subtask.go:136  == -> !=
+mutant 9/41  KILLED   subtask.go:174  != -> ==
+mutant 10/41  KILLED   subtask.go:188  remove !
+mutant 11/41  SURVIVED subtask.go:188  || -> &&
+mutant 12/41  KILLED   subtask.go:188  remove !
+mutant 13/41  SURVIVED subtask.go:192  < -> <=
+mutant 14/41  KILLED   subtask.go:195  == -> !=
+mutant 15/41  KILLED   subtask.go:199  > -> >=
+mutant 16/41  KILLED   subtask.go:204  == -> !=
+mutant 17/41  KILLED   subtask.go:209  remove !
+mutant 18/41  KILLED   subtask.go:217  remove !
+mutant 19/41  KILLED   subtask.go:220  == -> !=
+mutant 20/41  KILLED   subtask.go:249  != -> ==
+mutant 21/41  KILLED   subtask.go:261  == -> !=
+mutant 22/41  KILLED   subtask.go:269  == -> !=
+mutant 23/41  KILLED   subtask.go:278  != -> ==
+mutant 24/41  KILLED   subtask.go:300  != -> ==
+mutant 25/41  KILLED   subtask.go:332  == -> !=
+mutant 26/41  KILLED   subtask.go:333  != -> ==
+mutant 27/41  KILLED   subtask.go:355  != -> ==
+mutant 28/41  KILLED   subtask.go:359  != -> ==
+mutant 29/41  KILLED   subtask.go:391  != -> ==
+mutant 30/41  KILLED   subtask.go:396  remove !
+mutant 31/41  KILLED   subtask.go:402  != -> ==
+mutant 32/41  KILLED   subtask.go:417  == -> !=
+mutant 33/41  KILLED   subtask.go:417  || -> &&
+mutant 34/41  KILLED   subtask.go:431  != -> ==
+mutant 35/41  KILLED   subtask.go:434  remove !
+mutant 36/41  SURVIVED subtask.go:449  != -> ==
+mutant 37/41  SURVIVED subtask.go:451  == -> !=
+mutant 38/41  KILLED   subtask.go:463  != -> ==
+mutant 39/41  KILLED   subtask.go:472  != -> ==
+mutant 40/41  KILLED   subtask.go:482  != -> ==
+mutant 41/41  KILLED   subtask.go:489  <= -> < (timeout)
+summary: total 41, killed 34, broken 0, survived 7
+{"total":41,"killed":34,"broken":0,"survived":[{"line":96,"desc":"== -> !="},{"line":128,"desc":"> -> >="},{"line":136,"desc":"== -> !="},{"line":188,"desc":"|| -> &&"},{"line":192,"desc":"< -> <="},{"line":449,"desc":"!= -> =="},{"line":451,"desc":"== -> !="}]}

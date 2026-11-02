@@ -1,0 +1,6 @@
+target: context\context.go
+baseline: pass (go test -count=1 ./context)
+mutants: found 20 mutation point(s), evaluating 1
+mutant 1/1  SURVIVED context.go:105  == -> !=
+summary: total 1, killed 0, broken 0, survived 1
+{"total":1,"killed":0,"broken":0,"survived":[{"line":105,"desc":"== -> !="}]}

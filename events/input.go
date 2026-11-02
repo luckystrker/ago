@@ -89,11 +89,29 @@ func (FileIdInput) Conversational() bool { return true }
 
 // --- request events --------------------------------------------------------
 
+// RequestOrigin marks who sent a request: an end-user turn or a service message
+// from the framework (tool updates, background tasks, inbox drains). It follows
+// the sender only: it never changes dispatch, the wire role of the request or
+// event identity (upstream ADR 0027 parity).
+type RequestOrigin string
+
+const (
+	// OriginUser marks a request that opens a new user interval (ask/run input).
+	OriginUser RequestOrigin = "user"
+	// OriginService marks a framework-originated request; it is the default of
+	// Stream.Enqueue / Context.Enqueue.
+	OriginService RequestOrigin = "service"
+)
+
 // ModelRequest is the user turn: a batch of input parts sent to the model.
 type ModelRequest struct {
 	Base
 	Parts    []Input        `json:"parts"`
 	Metadata map[string]any `json:"metadata,omitempty"`
+	// Origin records the sender. The zero value reads as user: legacy
+	// transcripts carry no origin and the Python field defaults to "user".
+	// Stream.EnqueueOrigin normalizes an empty origin to service instead.
+	Origin RequestOrigin `json:"origin"`
 }
 
 func (ModelRequest) EventType() string    { return "ModelRequest" }
@@ -123,6 +141,7 @@ func (MessageEnqueued) Conversational() bool { return false }
 type wireParts struct {
 	Parts    []json.RawMessage `json:"parts"`
 	Metadata map[string]any    `json:"metadata"`
+	Origin   RequestOrigin     `json:"origin"`
 	Base
 }
 
@@ -143,12 +162,19 @@ func (m ModelRequest) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Origin always rides the wire; an empty in-memory origin normalizes to the
+	// Python field default ("user") so legacy records stay legible.
+	origin := m.Origin
+	if origin == "" {
+		origin = OriginUser
+	}
 	return json.Marshal(struct {
 		Type     string            `json:"@type"`
 		Parts    []json.RawMessage `json:"parts"`
 		Metadata map[string]any    `json:"metadata,omitempty"`
+		Origin   RequestOrigin     `json:"origin"`
 		Base
-	}{"ModelRequest", parts, m.Metadata, m.Base})
+	}{"ModelRequest", parts, m.Metadata, origin, m.Base})
 }
 
 func (m *ModelRequest) UnmarshalJSON(data []byte) error {
@@ -160,7 +186,12 @@ func (m *ModelRequest) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	m.Base, m.Parts, m.Metadata = w.Base, parts, w.Metadata
+	// A record without origin is a legacy request: "user" there (Python field
+	// default).
+	if w.Origin == "" {
+		w.Origin = OriginUser
+	}
+	m.Base, m.Parts, m.Metadata, m.Origin = w.Base, parts, w.Metadata, w.Origin
 	return nil
 }
 
@@ -169,12 +200,19 @@ func (d DrainedModelRequest) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A drain is framework work by definition: the empty in-memory origin
+	// normalizes to "service" (the Python DrainedModelRequest default).
+	origin := d.Origin
+	if origin == "" {
+		origin = OriginService
+	}
 	return json.Marshal(struct {
 		Type     string            `json:"@type"`
 		Parts    []json.RawMessage `json:"parts"`
 		Metadata map[string]any    `json:"metadata,omitempty"`
+		Origin   RequestOrigin     `json:"origin"`
 		Base
-	}{"DrainedModelRequest", parts, d.Metadata, d.Base})
+	}{"DrainedModelRequest", parts, d.Metadata, origin, d.Base})
 }
 
 func (d *DrainedModelRequest) UnmarshalJSON(data []byte) error {
@@ -186,7 +224,12 @@ func (d *DrainedModelRequest) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	d.Base, d.Parts, d.Metadata = w.Base, parts, w.Metadata
+	// A drain without origin is a legacy final merge: "service" there (Python
+	// field default).
+	if w.Origin == "" {
+		w.Origin = OriginService
+	}
+	d.Base, d.Parts, d.Metadata, d.Origin = w.Base, parts, w.Metadata, w.Origin
 	return nil
 }
 

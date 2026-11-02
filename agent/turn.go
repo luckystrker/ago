@@ -241,16 +241,31 @@ func (r *AgentRun) historyLen() (int, error) {
 	return len(evs), nil
 }
 
-// mergeRequests folds pending inbox requests into one ModelRequest.
+// mergeRequests folds pending inbox requests into one ModelRequest. The merged
+// origin follows the "public request wins" rule as any-user: user origin beats
+// service, and an empty origin counts as user (the Python field default) —
+// Python parity for _drain_pending, observed behavior identical because every
+// user entry passes through the inbox.
 func mergeRequests(reqs []*events.ModelRequest) *events.ModelRequest {
 	merged := &events.ModelRequest{}
+	user := false
 	for _, req := range reqs {
 		merged.Parts = append(merged.Parts, req.Parts...)
+		if req.Origin == events.OriginUser || req.Origin == "" {
+			user = true
+		}
 		for k, v := range req.Metadata {
 			if merged.Metadata == nil {
 				merged.Metadata = map[string]any{}
 			}
 			merged.Metadata[k] = v
+		}
+	}
+	if len(reqs) > 0 {
+		if user {
+			merged.Origin = events.OriginUser
+		} else {
+			merged.Origin = events.OriginService
 		}
 	}
 	return merged

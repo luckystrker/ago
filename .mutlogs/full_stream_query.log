@@ -1,0 +1,23 @@
+target: stream\query.go
+baseline: pass (go test -count=1 ./stream)
+mutants: found 18 mutation point(s), evaluating 18
+mutant 1/18  KILLED   query.go:31  == -> !=
+mutant 2/18  KILLED   query.go:38  == -> !=
+mutant 3/18  KILLED   query.go:38  || -> &&
+mutant 4/18  KILLED   query.go:38  && -> ||
+mutant 5/18  KILLED   query.go:61  != -> ==
+mutant 6/18  KILLED   query.go:69  == -> !=
+mutant 7/18  KILLED   query.go:69  || -> &&
+mutant 8/18  KILLED   query.go:79  != -> ==
+mutant 9/18  KILLED   query.go:82  == -> !=
+mutant 10/18  KILLED   query.go:91  != -> ==
+mutant 11/18  KILLED   query.go:94  == -> !=
+mutant 12/18  KILLED   query.go:103  != -> ==
+mutant 13/18  KILLED   query.go:114  >= -> >
+mutant 14/18  KILLED   query.go:116  + -> -
+mutant 15/18  KILLED   query.go:131  == -> !=
+mutant 16/18  BROKEN   query.go:131  || -> && (compile error)
+mutant 17/18  KILLED   query.go:131  == -> !=
+mutant 18/18  KILLED   query.go:133  == -> !=
+summary: total 18, killed 17, broken 1, survived 0
+{"total":18,"killed":17,"broken":1,"survived":[]}

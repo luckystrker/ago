@@ -1,0 +1,43 @@
+target: stream\memory.go
+baseline: pass (go test -count=1 ./stream)
+mutants: found 38 mutation point(s), evaluating 38
+mutant 1/38  KILLED   memory.go:118  == -> !=
+mutant 2/38  KILLED   memory.go:121  == -> !=
+mutant 3/38  KILLED   memory.go:123  == -> !=
+mutant 4/38  SURVIVED memory.go:128  > -> >=
+mutant 5/38  KILLED   memory.go:154  remove !
+mutant 6/38  KILLED   memory.go:154  || -> &&
+mutant 7/38  KILLED   memory.go:154  remove !
+mutant 8/38  KILLED   memory.go:157  != -> ==
+mutant 9/38  KILLED   memory.go:167  != -> == (timeout)
+mutant 10/38  KILLED   memory.go:172  || -> &&
+mutant 11/38  KILLED   memory.go:172  remove !
+mutant 12/38  KILLED   memory.go:175  != -> ==
+mutant 13/38  KILLED   memory.go:175  && -> ||
+mutant 14/38  KILLED   memory.go:175  == -> !=
+mutant 15/38  KILLED   memory.go:184  == -> !=
+mutant 16/38  KILLED   memory.go:184  || -> &&
+mutant 17/38  KILLED   memory.go:188  && -> ||
+mutant 18/38  KILLED   memory.go:188  remove !
+mutant 19/38  KILLED   memory.go:210  == -> !=
+mutant 20/38  KILLED   memory.go:216  > -> >=
+mutant 21/38  KILLED   memory.go:216  && -> ||
+mutant 22/38  SURVIVED memory.go:216  > -> >=
+mutant 23/38  KILLED   memory.go:256  == -> !=
+mutant 24/38  KILLED   memory.go:257  + -> -
+mutant 25/38  KILLED   memory.go:287  > -> >=
+mutant 26/38  SURVIVED memory.go:309  != -> ==
+mutant 27/38  KILLED   memory.go:342  == -> !=
+mutant 28/38  KILLED   memory.go:344  != -> ==
+mutant 29/38  KILLED   memory.go:346  && -> ||
+mutant 30/38  KILLED   memory.go:363  == -> !=
+mutant 31/38  KILLED   memory.go:371  == -> !=
+mutant 32/38  KILLED   memory.go:379  != -> ==
+mutant 33/38  KILLED   memory.go:382  && -> ||
+mutant 34/38  KILLED   memory.go:382  == -> !=
+mutant 35/38  KILLED   memory.go:382  || -> &&
+mutant 36/38  KILLED   memory.go:392  == -> !=
+mutant 37/38  KILLED   memory.go:396  && -> ||
+mutant 38/38  KILLED   memory.go:403  != -> ==
+summary: total 38, killed 35, broken 0, survived 3
+{"total":38,"killed":35,"broken":0,"survived":[{"line":128,"desc":"> -> >="},{"line":216,"desc":"> -> >="},{"line":309,"desc":"!= -> =="}]}

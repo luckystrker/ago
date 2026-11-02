@@ -1,0 +1,20 @@
+target: toolpacks\shell.go
+baseline: pass (go test -count=1 ./toolpacks)
+mutants: found 15 mutation point(s), evaluating 15
+mutant 1/15  SURVIVED shell.go:58  == -> !=
+mutant 2/15  KILLED   shell.go:79  != -> ==
+mutant 3/15  SURVIVED shell.go:91  <= -> <
+mutant 4/15  SURVIVED shell.go:106  == -> !=
+mutant 5/15  SURVIVED shell.go:128  <= -> <
+mutant 6/15  KILLED   shell.go:147  == -> !=
+mutant 7/15  KILLED   shell.go:162  != -> ==
+mutant 8/15  KILLED   shell.go:174  != -> ==
+mutant 9/15  KILLED   shell.go:179  == -> !=
+mutant 10/15  KILLED   shell.go:194  != -> ==
+mutant 11/15  KILLED   shell.go:217  != -> ==
+mutant 12/15  KILLED   shell.go:225  == -> !=
+mutant 13/15  KILLED   shell.go:248  remove !
+mutant 14/15  SURVIVED shell.go:248  || -> &&
+mutant 15/15  KILLED   shell.go:248  == -> !=
+summary: total 15, killed 10, broken 0, survived 5
+{"total":15,"killed":10,"broken":0,"survived":[{"line":58,"desc":"== -> !="},{"line":91,"desc":"<= -> <"},{"line":106,"desc":"== -> !="},{"line":128,"desc":"<= -> <"},{"line":248,"desc":"|| -> &&"}]}

@@ -1,0 +1,47 @@
+target: toolpacks\coderunner.go
+baseline: pass (go test -count=1 ./toolpacks)
+mutants: found 41 mutation point(s), evaluating 41
+mutant 1/41  SURVIVED coderunner.go:66  == -> !=
+mutant 2/41  SURVIVED coderunner.go:80  != -> ==
+mutant 3/41  SURVIVED coderunner.go:92  <= -> <
+mutant 4/41  SURVIVED coderunner.go:107  == -> !=
+mutant 5/41  SURVIVED coderunner.go:129  <= -> <
+mutant 6/41  KILLED   coderunner.go:143  == -> !=
+mutant 7/41  KILLED   coderunner.go:147  == -> !=
+mutant 8/41  SURVIVED coderunner.go:160  == -> !=
+mutant 9/41  KILLED   coderunner.go:174  != -> ==
+mutant 10/41  KILLED   coderunner.go:187  != -> ==
+mutant 11/41  KILLED   coderunner.go:209  != -> ==
+mutant 12/41  KILLED   coderunner.go:241  == -> !=
+mutant 13/41  KILLED   coderunner.go:247  == -> !=
+mutant 14/41  KILLED   coderunner.go:252  remove !
+mutant 15/41  KILLED   coderunner.go:257  != -> ==
+mutant 16/41  KILLED   coderunner.go:261  != -> ==
+mutant 17/41  KILLED   coderunner.go:274  == -> !=
+mutant 18/41  KILLED   coderunner.go:277  == -> !=
+mutant 19/41  KILLED   coderunner.go:285  != -> ==
+mutant 20/41  SURVIVED coderunner.go:292  != -> ==
+mutant 21/41  SURVIVED coderunner.go:310  == -> !=
+mutant 22/41  SURVIVED coderunner.go:313  && -> ||
+mutant 23/41  SURVIVED coderunner.go:318  && -> ||
+mutant 24/41  SURVIVED coderunner.go:331  == -> !=
+mutant 25/41  SURVIVED coderunner.go:332  == -> !=
+mutant 26/41  KILLED   coderunner.go:337  == -> !=
+mutant 27/41  KILLED   coderunner.go:337  && -> ||
+mutant 28/41  KILLED   coderunner.go:350  != -> ==
+mutant 29/41  KILLED   coderunner.go:350  || -> &&
+mutant 30/41  SURVIVED coderunner.go:350  remove !
+mutant 31/41  SURVIVED coderunner.go:353  == -> !=
+mutant 32/41  SURVIVED coderunner.go:353  || -> &&
+mutant 33/41  SURVIVED coderunner.go:353  != -> ==
+mutant 34/41  SURVIVED coderunner.go:360  == -> !=
+mutant 35/41  SURVIVED coderunner.go:360  && -> ||
+mutant 36/41  KILLED   coderunner.go:360  == -> !=
+mutant 37/41  SURVIVED coderunner.go:371  == -> !=
+mutant 38/41  SURVIVED coderunner.go:375  == -> !=
+mutant 39/41  KILLED   coderunner.go:399  remove !
+mutant 40/41  KILLED   coderunner.go:399  || -> &&
+mutant 41/41  KILLED   coderunner.go:399  == -> !=
+summary: total 41, killed 21, broken 0, survived 20
+{"total":41,"killed":21,"broken":0,"survived":[{"line":66,"desc":"== -> !="},{"line":80,"desc":"!= -> =="},{"line":92,"desc":"<= -> <"},{"line":107,"desc":"== -> !="},{"line":129,"desc":"<= -> <"},{"line":160,"desc":"== -> !="},{"line":292,"desc":"!= -> =="},{"line":310,"desc":"== -> !="},{"line":313,"desc":"&& -> ||"},{"line":318,"desc":"&& -> ||"},{"line":331,"desc":"== -> !="},{"line":332,"desc":"== -> !="},{"line":350,"desc":"remove !"},{"line":353,"desc":"== -> !="},{"line":353,"desc":"|| -> &&"},{"line":353,"desc":"!= -> =="},{"line":360,"desc":"== -> !="},{"line":360,"desc":"&& -> ||"},{"line":371,"desc":"== -> !="},{"line":375,"desc":"== -> !="}]}
+HARNESS_RC=0

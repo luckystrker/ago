@@ -10,6 +10,7 @@ import (
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/hitl"
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
@@ -295,6 +296,80 @@ func TestHitlMissingHookRepairsHistory(t *testing.T) {
 	}
 }
 
+// TestHitlTimeoutRepairsTranscript pins the repair path for the rest of the
+// hitl family: a turn ended by a hitl timeout (hook slower than the request
+// deadline) still closes the unanswered tool calls, and a successful repair
+// adds no error text to the surfaced failure.
+func TestHitlTimeoutRepairsTranscript(t *testing.T) {
+	slow := func(args struct{}, cx *agocontext.Context) (string, error) {
+		// The request deadline (300ms) beats the hook (2s): TimeoutError.
+		return cx.Input(stdcontext.Background(), "slow human?", 300*time.Millisecond)
+	}
+	tool, err := tools.NewFunctionTool("risky", "Risky", slow)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	base := stream.NewMemoryStream()
+	hook := func(ctx stdcontext.Context, _ *events.HumanInputRequest) (*events.HumanMessage, error) {
+		time.Sleep(2 * time.Second) // ignores its deadline on purpose
+		return &events.HumanMessage{Content: "too late"}, nil
+	}
+	cfg := agotest.NewTestConfig(toolResp("risky", "{}"), textResp("never reached"))
+	a := New("a2", "", WithConfig(cfg), WithTools(tool), WithStreamBase(base), WithHitlHook(hook))
+	_, askErr := a.Ask(stdcontext.Background(), "go")
+	var te *hitl.TimeoutError
+	if !errors.As(askErr, &te) {
+		t.Fatalf("want *hitl.TimeoutError, got %v", askErr)
+	}
+	if strings.Contains(askErr.Error(), "repair history") {
+		t.Fatalf("a successful repair must not add error text: %v", askErr)
+	}
+	if fixed, _ := base.History().CloseUnanswered(); fixed != 0 {
+		t.Fatalf("history should already be repaired, found %d unanswered", fixed)
+	}
+	evs, _ := base.History().GetEvents()
+	closed := false
+	for _, ev := range evs {
+		if e, ok := events.AsValue(ev).(events.ToolResultEvent); ok && len(e.Result.Parts) > 0 &&
+			events.AsValue(e.Result.Parts[0]).(events.TextInput).Content == events.SentinelToolResult {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Fatal("sentinel repair result missing from history")
+	}
+}
+
+// TestWithPluginNilContributesNothing pins the documented contract: a nil
+// Plugin contributes nothing and must not panic the constructor.
+func TestWithPluginNilContributesNothing(t *testing.T) {
+	a := New("a", "base", WithPlugin(nil))
+	if got := strings.Join(a.PromptFragments(), ","); got != "base" {
+		t.Fatalf("prompt fragments = [%s], want [base]", got)
+	}
+	if ts := a.Tools(); len(ts) != 0 {
+		t.Fatalf("a nil plugin contributed %d tools", len(ts))
+	}
+}
+
+// TestSanitizeToolNameKeepsWordCharacters pins the character classes of the
+// delegation tool name: ASCII letters (both cases), digits and underscore pass
+// through, everything else becomes underscore. The boundary characters of
+// every range ('a', 'z', 'A', 'Z', '0', '9') must survive untouched.
+func TestSanitizeToolNameKeepsWordCharacters(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"aZ9_x-Y z", "aZ9_x_Y_z"}, // word chars kept; '-', ' ' replaced
+		{"aAzZ09_", "aAzZ09_"},     // each range boundary, both ends
+		{"db pro", "db_pro"},
+	}
+	for _, tc := range tests {
+		if got := sanitizeToolName(tc.in); got != tc.want {
+			t.Errorf("sanitizeToolName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestConcurrentAsksOnOneAgent(t *testing.T) {
 	// Concurrent asks on one agent (separate streams — the default) must not
 	// interfere. A shared stream base merges concurrent input by design (the
@@ -375,6 +450,59 @@ func (m *recMW) OnLLMCall(next middleware.LLMCallFunc, evs []events.Event, ctx *
 	resp, err := next(evs, ctx)
 	m.log(m.name + ":on_llm:out")
 	return resp, err
+}
+
+func (m *recMW) OnHumanInput(next middleware.HumanInputFunc, ev *events.HumanInputRequest, cx *agocontext.Context) (*events.HumanMessage, error) {
+	m.log(m.name + ":on_hitl:in")
+	msg, err := next(ev, cx)
+	m.log(m.name + ":on_hitl:out")
+	return msg, err
+}
+
+// TestMiddlewareOrderingOnHumanInput pins the HITL chain: the user hook is
+// wrapped with on_human_input middleware in registration order — first is
+// outermost, every registered middleware sees the question (Python parity: the
+// hook goes through the same middleware chain as the turn body).
+func TestMiddlewareOrderingOnHumanInput(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	rec := func(name string) middleware.Factory {
+		return func() middleware.Middleware {
+			return &recMW{name: name, order: &order, mu: &mu}
+		}
+	}
+	approve := func(args struct{}, cx *agocontext.Context) (string, error) {
+		return cx.Input(stdcontext.Background(), "purge?", 0)
+	}
+	tool, err := tools.NewFunctionTool("purge", "Purge", approve)
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	hook := func(_ stdcontext.Context, _ *events.HumanInputRequest) (*events.HumanMessage, error) {
+		return &events.HumanMessage{Content: "yes"}, nil
+	}
+	cfg := agotest.NewTestConfig(toolResp("purge", "{}"), textResp("done"))
+	a := New("op", "", WithConfig(cfg), WithTools(tool), WithHitlHook(hook),
+		WithMiddleware(rec("first"), rec("second")))
+	reply, err := a.Ask(stdcontext.Background(), "clean up")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if reply.Body() != "done" {
+		t.Fatalf("body: %q", reply.Body())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var hitlOrder []string
+	for _, s := range order {
+		if strings.Contains(s, "on_hitl") {
+			hitlOrder = append(hitlOrder, s)
+		}
+	}
+	want := []string{"first:on_hitl:in", "second:on_hitl:in", "second:on_hitl:out", "first:on_hitl:out"}
+	if strings.Join(hitlOrder, ",") != strings.Join(want, ",") {
+		t.Fatalf("OnHumanInput order:\n got %v\nwant %v", hitlOrder, want)
+	}
 }
 
 func TestResumeFromToolResults(t *testing.T) {

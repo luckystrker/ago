@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	stdcontext "context"
 	"errors"
 	"fmt"
 	"os"
@@ -32,8 +33,14 @@ import (
 // environment carries. The tool is a convenience, not a security boundary; gate
 // it with human approval middleware and hand secrets only through WithCodeEnv.
 //
-// A CodeRunner is safe for concurrent use after construction. Close removes an
-// auto-created working directory (Python parity: LocalEnvironment cleanup=True).
+// A CodeRunner is safe for concurrent use after construction. A call runs under
+// the current turn context (upstream parity 153ef4cdd): canceling the turn kills
+// the running snippet's process tree, and the interrupted call reports
+// ErrCommandInterrupted instead of a result. Close stops every in-flight snippet
+// and waits for it before removing an auto-created working directory (Python
+// parity: LocalEnvironment cleanup=True); a caller-supplied workdir is left
+// alone. A call racing Close fails with ErrSandboxClosedWhileRunning, a call
+// that starts after Close with ErrSandboxClosed.
 type CodeRunner struct {
 	toolName   string
 	workdir    string
@@ -45,6 +52,7 @@ type CodeRunner struct {
 	languages  []string
 	pythonBin  string
 	tool       *tools.FunctionTool
+	sandbox    localSandbox
 }
 
 var _ tools.Tool = (*CodeRunner)(nil)
@@ -194,7 +202,9 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 		// arguments (Python parity: run_code(code, language) with no defaults).
 		Language string `json:"language" agschema:"description=The language of the snippet,required"`
 	}
-	fn := func(args codeArgs) (string, error) { return r.run(args.Code, args.Language), nil }
+	fn := func(args codeArgs, cx *agocontext.Context) (string, error) {
+		return r.run(cx, args.Code, args.Language)
+	}
 	ft, err := tools.NewFunctionTool(r.toolName, description, fn)
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: code runner: %w", err)
@@ -219,12 +229,18 @@ func builtinCodeLanguage(lang string) string {
 
 // run executes one snippet (Python parity: CodeAdapter.run + SandboxCodeTool
 // run_code formatting). An unsupported language or a missing interpreter is an
-// ordinary output line, not a tool error.
-func (r *CodeRunner) run(code, language string) string {
+// ordinary output line, not a tool error. The snippet runs under the current
+// turn context: canceling the turn kills the process tree and the interrupted
+// call reports ErrCommandInterrupted; on a closed runner the call reports
+// ErrSandboxClosed.
+func (r *CodeRunner) run(cx *agocontext.Context, code, language string) (string, error) {
+	if r.sandbox.isClosed() {
+		return "", ErrSandboxClosed
+	}
 	lang := builtinCodeLanguage(language)
 	if lang == "" {
 		return fmt.Sprintf("Unsupported language: %q. Supported languages: %s.",
-			language, strings.Join(r.languages, ", "))
+			language, strings.Join(r.languages, ", ")), nil
 	}
 	allowed := false
 	for _, l := range r.languages {
@@ -235,13 +251,17 @@ func (r *CodeRunner) run(code, language string) string {
 	}
 	if !allowed {
 		return fmt.Sprintf("Language %q is not enabled. Supported languages: %s.",
-			language, strings.Join(r.languages, ", "))
+			language, strings.Join(r.languages, ", ")), nil
 	}
 	argv, err := r.argv(lang, code)
 	if err != nil {
-		return err.Error()
+		return err.Error(), nil
 	}
-	return formatExit(runLocalCommand(argv, r.workdir, r.env, r.inheritEnv, r.timeout, r.maxOutput))
+	res, err := r.sandbox.call(cx.TurnContext(), argv, r.workdir, r.env, r.inheritEnv, r.timeout, r.maxOutput)
+	if err != nil {
+		return "", err
+	}
+	return formatExit(res), nil
 }
 
 // argv builds the subprocess command for one snippet (Python parity:
@@ -284,7 +304,16 @@ func (r *CodeRunner) argv(lang, code string) ([]string, error) {
 // discovered through git.exe the way findPython applies Windows conventions.
 // Cached for the process lifetime: one probe per process, not per snippet.
 var findShell = sync.OnceValue(func() string {
-	dirs := shellDirs()
+	return pickShell(shellDirs())
+})
+
+// pickShell returns the first candidate in dirs that both exists as an
+// executable file and passes the execution probe, "" when none does. The two
+// checks are not interchangeable: the file check alone would elect a candidate
+// that exists but cannot run a snippet (the WSL launcher stub profile), the
+// probe alone would elect one that runs but is not the regular file the lookup
+// contract promises.
+func pickShell(dirs []string) string {
 	for _, name := range []string{"bash", "sh"} {
 		for _, dir := range dirs {
 			if runtime.GOOS == "windows" {
@@ -301,7 +330,7 @@ var findShell = sync.OnceValue(func() string {
 		}
 	}
 	return ""
-})
+}
 
 // shellDirs lists the directories searched for a shell, best candidate first:
 // the shell directories of a Git for Windows install ahead of PATH, where
@@ -336,7 +365,8 @@ func isExecutableFile(path string) bool {
 // shellWorks reports whether the shell executes a trivial command; the WSL
 // launcher stub fails here, printing its diagnostics and exiting non-zero.
 func shellWorks(shell string) bool {
-	return runLocalCommand([]string{shell, "-c", "exit 0"}, "", nil, false, shellProbeTimeout, defaultMaxOutput).ExitCode == 0
+	res, err := runLocalCommand(stdcontext.Background(), []string{shell, "-c", "exit 0"}, "", nil, false, shellProbeTimeout, defaultMaxOutput)
+	return err == nil && res.ExitCode == 0
 }
 
 // shellProbeTimeout bounds one findShell verification.
@@ -367,9 +397,14 @@ func (r *CodeRunner) DeclaredInCode() bool { return r.tool.DeclaredInCode() }
 // Workdir returns the directory snippets run in.
 func (r *CodeRunner) Workdir() string { return r.workdir }
 
-// Close removes an auto-created working directory; idempotent, and a
-// caller-supplied workdir is left alone.
+// Close stops every in-flight snippet and waits for it, then removes an
+// auto-created working directory; idempotent, and a caller-supplied workdir is
+// left alone (Python parity: LocalSandbox.aclose — commands must be dead before
+// their workdir goes away). A call that Close stopped reports
+// ErrSandboxClosedWhileRunning; a call that starts afterwards reports
+// ErrSandboxClosed.
 func (r *CodeRunner) Close() error {
+	r.sandbox.shutdown()
 	if !r.autoDir || r.workdir == "" {
 		return nil
 	}

@@ -1,0 +1,38 @@
+target: agent\run.go
+baseline: pass (go test -count=1 ./agent)
+mutants: found 33 mutation point(s), evaluating 33
+mutant 1/33  KILLED   run.go:96  remove !
+mutant 2/33  KILLED   run.go:107  > -> >=
+mutant 3/33  KILLED   run.go:108  != -> ==
+mutant 4/33  KILLED   run.go:116  == -> !=
+mutant 5/33  KILLED   run.go:120  != -> ==
+mutant 6/33  KILLED   run.go:129  != -> == (timeout)
+mutant 7/33  KILLED   run.go:137  == -> !=
+mutant 8/33  KILLED   run.go:141  != -> ==
+mutant 9/33  KILLED   run.go:152  != -> ==
+mutant 10/33  KILLED   run.go:172  != -> ==
+mutant 11/33  SURVIVED run.go:180  >= -> >
+mutant 12/33  KILLED   run.go:222  != -> ==
+mutant 13/33  KILLED   run.go:230  != -> ==
+mutant 14/33  KILLED   run.go:232  != -> == (timeout)
+mutant 15/33  KILLED   run.go:236  != -> ==
+mutant 16/33  KILLED   run.go:251  != -> ==
+mutant 17/33  KILLED   run.go:259  != -> ==
+mutant 18/33  KILLED   run.go:284  != -> ==
+mutant 19/33  KILLED   run.go:290  != -> == (timeout)
+mutant 20/33  SURVIVED run.go:323  != -> ==
+mutant 21/33  SURVIVED run.go:324  != -> ==
+mutant 22/33  SURVIVED run.go:330  != -> ==
+mutant 23/33  KILLED   run.go:341  == -> !=
+mutant 24/33  KILLED   run.go:347  == -> !=
+mutant 25/33  KILLED   run.go:349  != -> ==
+mutant 26/33  KILLED   run.go:352  != -> ==
+mutant 27/33  SURVIVED run.go:357  >= -> >
+mutant 28/33  KILLED   run.go:363  != -> ==
+mutant 29/33  KILLED   run.go:373  != -> ==
+mutant 30/33  SURVIVED run.go:389  != -> ==
+mutant 31/33  SURVIVED run.go:392  != -> ==
+mutant 32/33  KILLED   run.go:403  != -> ==
+mutant 33/33  KILLED   run.go:407  != -> ==
+summary: total 33, killed 26, broken 0, survived 7
+{"total":33,"killed":26,"broken":0,"survived":[{"line":180,"desc":">= -> >"},{"line":323,"desc":"!= -> =="},{"line":324,"desc":"!= -> =="},{"line":330,"desc":"!= -> =="},{"line":357,"desc":">= -> >"},{"line":389,"desc":"!= -> =="},{"line":392,"desc":"!= -> =="}]}

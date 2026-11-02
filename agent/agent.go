@@ -73,6 +73,18 @@ func WithPromptHook(h PromptHook) Option {
 func WithPromptFragments(fr ...string) Option {
 	return func(o *options) { o.fragments = append(o.fragments, fr...) }
 }
+
+// WithTasks enables the auto-injected run_subtask/run_subtasks delegation
+// tools (Python parity: Agent(tasks=TaskConfig(...))).
+//
+// Deprecated: TaskConfig and the auto-injected run_subtask/run_subtasks tools
+// are deprecated, following upstream AG2 (removal in 1.4.0). Construct worker
+// Agents explicitly and expose them via Agent.AsTool instead. The option keeps
+// working unchanged until that removal.
+//
+// AGO-DEVIATION: Python's Agent.__init__ emits one DeprecationWarning when
+// tasks is passed; AGo carries the marker as this doc comment (godoc and
+// staticcheck surface it) and does not emulate a runtime warning.
 func WithTasks(cfg TaskConfig) Option { return func(o *options) { t := cfg; o.tasks = &t } }
 
 // WithMaxToolRounds caps how many tool-call rounds one turn executes before it
@@ -298,7 +310,15 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 	defer run.Close()
 	switch last := events.AsValue(evs[len(evs)-1]).(type) {
 	case events.ModelRequest:
-		if err := s.Enqueue(last.Parts...); err != nil {
+		// Re-enter through the inbox with the recorded origin: a seed without
+		// origin is a user turn (the Python field default), and the service
+		// default of Enqueue would silently drop the re-entry out of the user
+		// interval.
+		origin := last.Origin
+		if origin == "" {
+			origin = events.OriginUser
+		}
+		if err := s.EnqueueOrigin(origin, last.Parts...); err != nil {
 			return nil, err
 		}
 	default:

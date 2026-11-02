@@ -3,6 +3,7 @@ package context
 import (
 	stdcontext "context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -22,6 +23,27 @@ func TestEnqueuePendingDrain(t *testing.T) {
 	}
 	if len(c.Drain()) != 1 {
 		t.Fatal("drain")
+	}
+}
+
+// TestEnqueueOriginForwarding pins the bridge contract: Enqueue stays service
+// (tool/background updates must not open a user interval), EnqueueOrigin
+// forwards the sender's origin to the stream inbox.
+func TestEnqueueOriginForwarding(t *testing.T) {
+	s := stream.NewMemoryStream()
+	c := New(s)
+	if err := c.EnqueueOrigin(events.OriginUser, &events.TextInput{Content: "human"}); err != nil {
+		t.Fatalf("enqueue origin: %v", err)
+	}
+	if err := c.Enqueue(&events.TextInput{Content: "tool"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	pending := s.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d requests, want 2", len(pending))
+	}
+	if pending[0].Origin != events.OriginUser || pending[1].Origin != events.OriginService {
+		t.Fatalf("origins = %q, %q; want user, service", pending[0].Origin, pending[1].Origin)
 	}
 }
 
@@ -260,7 +282,9 @@ func TestTurnContextCarried(t *testing.T) {
 // TestAskSanitizesUntrustedTimeout pins audit L-19: NaN, infinite and negative
 // timeouts coming from untrusted events must behave as "no deadline" instead of
 // corrupting the deadline arithmetic (a +Inf conversion to Duration is
-// undefined and effectively fires immediately).
+// undefined and effectively fires immediately). Zero counts too: 0 means "no
+// deadline", and so does a positive value small enough to truncate to a zero
+// Duration — a zero-Duration deadline would expire before the hook can answer.
 func TestAskSanitizesUntrustedTimeout(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -271,6 +295,8 @@ func TestAskSanitizesUntrustedTimeout(t *testing.T) {
 		{"neg-inf", math.Inf(-1)},
 		{"negative", -7},
 		{"huge-finite", 1e12}, // overflows the Duration conversion
+		{"zero", 0},
+		{"sub-nanosecond", 1e-10}, // Duration(1e-10 * time.Second) truncates to 0
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			answer := make(chan struct{})
@@ -318,5 +344,118 @@ func TestAskAppliesFiniteTimeout(t *testing.T) {
 	var te *hitl.TimeoutError
 	if !errors.As(err, &te) {
 		t.Fatalf("want *hitl.TimeoutError, got %v", err)
+	}
+}
+
+// TestZeroValueContextSetters pins the lazy map initialization: a zero-value
+// Context (not built by New) must accept SetDependency/SetVariable and report
+// the values back, instead of panicking on a nil map.
+func TestZeroValueContextSetters(t *testing.T) {
+	var c Context
+	c.SetDependency("dep", "v")
+	if v, ok := c.Dependency("dep"); !ok || v != "v" {
+		t.Fatalf("Dependency after SetDependency = (%v, %v), want (v, true)", v, ok)
+	}
+	c.SetVariable("var", 42)
+	if v, ok := c.Variable("var"); !ok || v != 42 {
+		t.Fatalf("Variable after SetVariable = (%v, %v), want (42, true)", v, ok)
+	}
+	c.AddPrompt("line")
+	if pl := c.PromptLines(); len(pl) != 1 || pl[0] != "line" {
+		t.Fatalf("PromptLines = %v, want [line]", pl)
+	}
+}
+
+// TestAskIgnoresForeignRequest pins the per-request routing: Ask's interrupt
+// subscription only claims the request it asked — a HumanInputRequest from
+// another participant must flow through untouched (not swallowed, not handed
+// to this Ask's hook) while the wait keeps listening for its own answer
+// (Python parity: the interrupter matches the request identity).
+func TestAskIgnoresForeignRequest(t *testing.T) {
+	s := stream.NewMemoryStream()
+	c := New(s)
+	calls := make(chan *events.HumanInputRequest, 4)
+	release := make(chan struct{})
+	c.SetHitlHook(func(_ stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
+		calls <- req
+		<-release
+		return &events.HumanMessage{Content: "ok", ParentID: req.ID}, nil
+	})
+	type outcome struct {
+		ans string
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		ans, err := c.Input(stdcontext.Background(), "mine", 0)
+		done <- outcome{ans, err}
+	}()
+	// The hook being called proves Ask's subscription is live: it runs inside
+	// the dispatch of Ask's own question.
+	select {
+	case req := <-calls:
+		if req.Content != "mine" {
+			t.Fatalf("hook called with %q before our own question", req.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook never called for our request")
+	}
+
+	// A foreign request (different id) crosses the stream while we wait.
+	foreign := events.NewHumanInputRequest("foreign", 0)
+	if err := s.Send(&foreign); err != nil {
+		t.Fatalf("send foreign: %v", err)
+	}
+	select {
+	case req := <-calls:
+		t.Fatalf("hook hijacked the foreign request %q", req.Content)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Not swallowed either: a request that nobody intercepts persists like any
+	// other event.
+	h, err := c.History()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	persisted := false
+	for _, ev := range h {
+		if hr, ok := ev.(*events.HumanInputRequest); ok && hr.Content == "foreign" {
+			persisted = true
+		}
+	}
+	if !persisted {
+		t.Fatal("the foreign request was swallowed by our Ask's subscriber")
+	}
+
+	close(release)
+	select {
+	case o := <-done:
+		if o.err != nil || o.ans != "ok" {
+			t.Fatalf("Ask = (%q, %v), want (ok, nil)", o.ans, o.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ask never returned after the hook answered")
+	}
+}
+
+// TestAskHookDeadlineExceededWithoutDeadlineIsFailure pins the classification
+// boundary: a hook failing with DeadlineExceeded of its OWN (no Ask-imposed
+// deadline is active) is a channel failure, not a wait timeout (Python parity:
+// only the wait produces HumanInputTimeoutError).
+func TestAskHookDeadlineExceededWithoutDeadlineIsFailure(t *testing.T) {
+	c := New(stream.NewMemoryStream())
+	c.SetHitlHook(func(_ stdcontext.Context, _ *events.HumanInputRequest) (*events.HumanMessage, error) {
+		// DeadlineExceeded of some inner operation, not of the Ask deadline —
+		// the Ask itself carries no timeout here.
+		return nil, fmt.Errorf("hook inner wait: %w", stdcontext.DeadlineExceeded)
+	})
+	_, err := c.Ask(stdcontext.Background(), &events.HumanInputRequest{Content: "q"})
+	var fe *hitl.FailedError
+	if !errors.As(err, &fe) {
+		t.Fatalf("want *hitl.FailedError, got %T %v", err, err)
+	}
+	var te *hitl.TimeoutError
+	if errors.As(err, &te) {
+		t.Fatalf("a hook's own DeadlineExceeded must not classify as TimeoutError, got %v", err)
 	}
 }

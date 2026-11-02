@@ -1,11 +1,18 @@
 package toolpacks
 
 import (
+	stdcontext "context"
+	"errors"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	agocontext "github.com/luckystrker/ago/context"
+	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/stream"
 	"github.com/luckystrker/ago/tools"
 )
 
@@ -164,4 +171,218 @@ func quoteGo(s string) string {
 		}
 	}
 	return string(append(b, '"'))
+}
+
+// --- Cancel and Close stop in-flight commands (upstream parity 153ef4cdd) -----
+
+// toolCallOutcome is the settlement of one tool call driven off the test
+// goroutine: the result/error event, or the machinery failure.
+type toolCallOutcome struct {
+	ev  events.Event
+	err error
+}
+
+// startToolCall fires one tool call on the stream and reports its settlement on
+// the returned channel — the callTool machinery minus t, because the goroutine
+// driving an in-flight call cannot touch the testing state. The returned stop
+// func unsubscribes; the caller must drain the channel before stopping.
+func startToolCall(cx *agocontext.Context, tool tools.Tool, name, args string) (<-chan toolCallOutcome, func(), error) {
+	subs, err := tool.Register(cx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	ch := make(chan toolCallOutcome, 1)
+	s := cx.Stream
+	sub := s.Subscribe(func(ev events.Event) error {
+		switch events.AsValue(ev).(type) {
+		case events.ToolResultEvent, events.ToolErrorEvent:
+			ch <- toolCallOutcome{ev: ev}
+		}
+		return nil
+	}, stream.SubscribeOptions{})
+	stop := func() {
+		for _, id := range subs {
+			cx.Stream.Unsubscribe(id)
+		}
+		s.Unsubscribe(sub)
+	}
+	go func() {
+		call := events.NewToolCallEvent(name)
+		call.Arguments = args
+		if err := s.Send(call); err != nil {
+			ch <- toolCallOutcome{err: err}
+		}
+	}()
+	return ch, stop, nil
+}
+
+// probeCommand renders a grandchildProbe argv as the shell command string the
+// ShellTool receives (the wrapper shell is the tool's own business).
+func probeCommand(start []string) string { return start[len(start)-1] }
+
+func TestShellToolTurnCancelKillsCommand(t *testing.T) {
+	start, listCmd, ok := grandchildProbe()
+	if !ok {
+		t.Skip("no process-listing tool on this platform")
+	}
+	// A stray matching process from outside the test would poison the verdict.
+	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+		t.Skip("a matching process is already running; cannot isolate the check")
+	}
+	s, err := NewShellTool()
+	if err != nil {
+		t.Fatalf("NewShellTool: %v", err)
+	}
+	defer s.Close()
+	_, cx := newTestContext()
+	turnCtx, cancelTurn := stdcontext.WithCancel(stdcontext.Background())
+	defer cancelTurn()
+	cx.SetTurnContext(turnCtx)
+	ch, stop, err := startToolCall(cx, s, s.Name(), `{"command":`+quoteGo(probeCommand(start))+`}`)
+	if err != nil {
+		t.Fatalf("startToolCall: %v", err)
+	}
+	defer stop()
+	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
+		t.Fatal("the command never started")
+	}
+	cancelTurn()
+	select {
+	case o := <-ch:
+		if o.err != nil {
+			t.Fatalf("call machinery: %v", o.err)
+		}
+		if got := resultPartText(t, o.ev); !strings.Contains(got, "interrupted") {
+			t.Fatalf("canceled call output = %q, want the interruption error", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the tool call did not return after the turn cancel")
+	}
+	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
+		t.Fatalf("a command survived the turn cancel:\n%s", out)
+	}
+}
+
+func TestShellToolCloseStopsRunningCommand(t *testing.T) {
+	start, listCmd, ok := grandchildProbe()
+	if !ok {
+		t.Skip("no process-listing tool on this platform")
+	}
+	// A stray matching process from outside the test would poison the verdict.
+	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+		t.Skip("a matching process is already running; cannot isolate the check")
+	}
+	s, err := NewShellTool()
+	if err != nil {
+		t.Fatalf("NewShellTool: %v", err)
+	}
+	_, cx := newTestContext()
+	ch, stop, err := startToolCall(cx, s, s.Name(), `{"command":`+quoteGo(probeCommand(start))+`}`)
+	if err != nil {
+		t.Fatalf("startToolCall: %v", err)
+	}
+	defer stop()
+	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
+		t.Fatal("the command never started")
+	}
+	// Close returns only once the command tree is dead and the workdir is gone.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
+		t.Fatalf("a command survived Close:\n%s", out)
+	}
+	if _, err := os.Stat(s.Workdir()); !os.IsNotExist(err) {
+		t.Fatalf("auto workdir survived Close: %v", err)
+	}
+	select {
+	case o := <-ch:
+		if o.err != nil {
+			t.Fatalf("call machinery: %v", o.err)
+		}
+		if got := resultPartText(t, o.ev); !strings.Contains(got, "closed while the command was running") {
+			t.Fatalf("interrupted call output = %q, want the closed-while-running error", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the in-flight call never settled after Close")
+	}
+	// A call after Close fails instead of starting work in a disposed sandbox.
+	if _, err := s.run(cx, "echo x"); !errors.Is(err, ErrSandboxClosed) {
+		t.Fatalf("run after Close: err = %v, want ErrSandboxClosed", err)
+	}
+}
+
+// TestShellToolNameOption pins the name override: a custom name lands on the
+// tool, an empty one is refused at construction (Python parity: the name kwarg).
+func TestShellToolNameOption(t *testing.T) {
+	if _, err := NewShellTool(WithShellName("")); err == nil {
+		t.Fatal("WithShellName(\"\") must be refused")
+	}
+	s, err := NewShellTool(WithShellName("my_shell"))
+	if err != nil {
+		t.Fatalf("NewShellTool with a name: %v", err)
+	}
+	defer s.Close()
+	if s.Name() != "my_shell" {
+		t.Fatalf("tool name = %q, want my_shell", s.Name())
+	}
+}
+
+// TestShellToolOptionValidation pins the option guards: a non-positive timeout,
+// an empty env key and a non-positive max_output are construction errors; their
+// valid counterparts pass.
+func TestShellToolOptionValidation(t *testing.T) {
+	if _, err := NewShellTool(WithShellTimeout(0)); err == nil {
+		t.Fatal("WithShellTimeout(0) must be refused")
+	}
+	if _, err := NewShellTool(WithShellTimeout(-time.Second)); err == nil {
+		t.Fatal("a negative timeout must be refused")
+	}
+	s, err := NewShellTool(WithShellTimeout(2 * time.Second))
+	if err != nil {
+		t.Fatalf("valid timeout refused: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := NewShellTool(WithShellEnv(map[string]string{"": "value"})); err == nil {
+		t.Fatal("an empty env key must be refused")
+	}
+	s2, err := NewShellTool(WithShellEnv(map[string]string{"AGO_TEST_VAR": "v"}))
+	if err != nil {
+		t.Fatalf("valid env refused: %v", err)
+	}
+	defer s2.Close()
+
+	if _, err := NewShellTool(WithShellMaxOutput(0)); err == nil {
+		t.Fatal("WithShellMaxOutput(0) must be refused")
+	}
+	s3, err := NewShellTool(WithShellMaxOutput(10))
+	if err != nil {
+		t.Fatalf("valid max_output refused: %v", err)
+	}
+	defer s3.Close()
+}
+
+// TestShellToolCallerWorkdirSurvivesClose pins the retention contract: a
+// caller-supplied workdir is never deleted by Close — only the auto-created
+// one is (Python parity: LocalSandbox.aclose cleans up its own temp dir).
+func TestShellToolCallerWorkdirSurvivesClose(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(marker, []byte("mine"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	s, err := NewShellTool(WithShellWorkdir(dir))
+	if err != nil {
+		t.Fatalf("NewShellTool: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("caller-supplied workdir removed by Close: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("caller files inside the workdir removed by Close: %v", err)
+	}
 }

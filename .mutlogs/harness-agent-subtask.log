@@ -1,0 +1,45 @@
+target: agent\subtask.go
+baseline: pass (go test -count=1 ./agent)
+mutants: found 41 mutation point(s), evaluating 40
+mutant 1/40  KILLED   subtask.go:79  == -> !=
+mutant 2/40  KILLED   subtask.go:92  == -> !=
+mutant 3/40  KILLED   subtask.go:96  == -> !=
+mutant 4/40  KILLED   subtask.go:106  != -> ==
+mutant 5/40  KILLED   subtask.go:114  != -> ==
+mutant 6/40  KILLED   subtask.go:115  remove !
+mutant 7/40  SURVIVED subtask.go:128  > -> >=
+mutant 8/40  KILLED   subtask.go:136  == -> !=
+mutant 9/40  KILLED   subtask.go:174  != -> ==
+mutant 10/40  KILLED   subtask.go:188  remove !
+mutant 11/40  SURVIVED subtask.go:188  || -> &&
+mutant 12/40  KILLED   subtask.go:188  remove !
+mutant 13/40  SURVIVED subtask.go:192  < -> <=
+mutant 14/40  KILLED   subtask.go:195  == -> !=
+mutant 15/40  KILLED   subtask.go:199  > -> >=
+mutant 16/40  KILLED   subtask.go:204  == -> !=
+mutant 17/40  KILLED   subtask.go:209  remove !
+mutant 18/40  KILLED   subtask.go:217  remove !
+mutant 19/40  KILLED   subtask.go:220  == -> !=
+mutant 20/40  KILLED   subtask.go:249  != -> ==
+mutant 21/40  KILLED   subtask.go:261  == -> !=
+mutant 22/40  KILLED   subtask.go:269  == -> !=
+mutant 23/40  KILLED   subtask.go:278  != -> ==
+mutant 24/40  KILLED   subtask.go:300  != -> ==
+mutant 25/40  KILLED   subtask.go:332  == -> !=
+mutant 26/40  KILLED   subtask.go:333  != -> ==
+mutant 27/40  KILLED   subtask.go:355  != -> ==
+mutant 28/40  KILLED   subtask.go:359  != -> ==
+mutant 29/40  KILLED   subtask.go:391  != -> ==
+mutant 30/40  KILLED   subtask.go:396  remove !
+mutant 31/40  KILLED   subtask.go:402  != -> ==
+mutant 32/40  KILLED   subtask.go:417  == -> !=
+mutant 33/40  KILLED   subtask.go:417  || -> &&
+mutant 34/40  KILLED   subtask.go:431  != -> ==
+mutant 35/40  KILLED   subtask.go:434  remove !
+mutant 36/40  KILLED   subtask.go:449  != -> ==
+mutant 37/40  KILLED   subtask.go:451  == -> !=
+mutant 38/40  KILLED   subtask.go:463  != -> ==
+mutant 39/40  KILLED   subtask.go:472  != -> ==
+mutant 40/40  KILLED   subtask.go:482  != -> ==
+summary: total 40, killed 37, broken 0, survived 3
+{"total":40,"killed":37,"broken":0,"survived":[{"line":128,"desc":"> -> >="},{"line":188,"desc":"|| -> &&"},{"line":192,"desc":"< -> <="}]}

@@ -39,6 +39,7 @@ type Stream interface {
 	Drain() []*events.ModelRequest
 	Send(ev events.Event) error
 	Enqueue(parts ...events.Input) error
+	EnqueueOrigin(origin events.RequestOrigin, parts ...events.Input) error
 	Subscribe(fn Subscriber, opts SubscribeOptions) SubID
 	Unsubscribe(id SubID)
 	Where(c events.Condition) Stream
@@ -194,10 +195,22 @@ func (m *MemoryStream) historyAppend(ev events.Event) error {
 	return m.history.Append(ev)
 }
 
-// Enqueue appends a ModelRequest to the inbox and announces MessageEnqueued.
+// Enqueue appends a service-origin request to the inbox and announces
+// MessageEnqueued (Python parity: Stream.enqueue defaults to origin="service" —
+// tool updates and background messages must not open a new user interval).
 // When an inbox cap is set and the queue is full, the oldest request is evicted.
 func (m *MemoryStream) Enqueue(parts ...events.Input) error {
-	req := &events.ModelRequest{Parts: parts}
+	return m.EnqueueOrigin(events.OriginService, parts...)
+}
+
+// EnqueueOrigin appends a ModelRequest tagged with its sender's origin; an
+// empty origin normalizes to service. The inbox-cap eviction (audit M-28) is
+// unchanged.
+func (m *MemoryStream) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Input) error {
+	if origin == "" {
+		origin = events.OriginService
+	}
+	req := &events.ModelRequest{Parts: parts, Origin: origin}
 	m.mu.Lock()
 	m.pending = append(m.pending, req)
 	if m.inboxCap > 0 && len(m.pending) > m.inboxCap {
@@ -352,6 +365,14 @@ func (s *SubStream) Enqueue(parts ...events.Input) error {
 	}
 	// The inbox is shared with the parent; a filtered view does not enqueue.
 	return s.parent.Enqueue(parts...)
+}
+
+func (s *SubStream) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Input) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	// The inbox is shared with the parent; a filtered view does not enqueue.
+	return s.parent.EnqueueOrigin(origin, parts...)
 }
 
 func (s *SubStream) Subscribe(fn Subscriber, opts SubscribeOptions) SubID {

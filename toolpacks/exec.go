@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -86,6 +87,21 @@ type execResult struct {
 	ExitCode int
 }
 
+// ErrCommandInterrupted reports a command whose context was canceled while the
+// child was still running: the tree kill stopped it, so no result exists
+// (Python parity: the interrupted exec raises the turn's cancellation instead
+// of returning). Tools surface it as a tool error, never as output.
+var ErrCommandInterrupted = errors.New("toolpacks: command interrupted")
+
+// ErrSandboxClosed reports a call on a tool whose Close already ran (Python
+// parity: RuntimeError "LocalSandbox has been closed.").
+var ErrSandboxClosed = errors.New("toolpacks: local sandbox has been closed")
+
+// ErrSandboxClosedWhileRunning reports a command that Close stopped mid-flight
+// (Python parity: RuntimeError "LocalSandbox was closed while the command was
+// running.").
+var ErrSandboxClosedWhileRunning = errors.New("toolpacks: local sandbox was closed while the command was running")
+
 // limitedBuffer stores subprocess output up to limit bytes and silently counts
 // everything beyond. The exec package serializes Write calls when Stdout and
 // Stderr share one writer, so no extra locking is needed here.
@@ -139,11 +155,14 @@ func buildOutput(b *limitedBuffer, maxOutput int) string {
 // by stderr, whitespace-trimmed, truncated to maxOutput characters with a trailing
 // notice. A missing interpreter reports "Command not found: …" with exit code 127;
 // an expired timeout reports "Command timed out after Ns" with exit code 124.
+// A canceled parent context kills the whole process tree and yields
+// ErrCommandInterrupted: a command stopped mid-flight has no result. A nil ctx
+// means stdcontext.Background().
 // The child environment is always constructed explicitly: the whitelisted parent
 // variables (or all of them when inheritAllEnv is set), with env merged on top.
-func runLocalCommand(argv []string, dir string, env map[string]string, inheritAllEnv bool, timeout time.Duration, maxOutput int) execResult {
+func runLocalCommand(ctx stdcontext.Context, argv []string, dir string, env map[string]string, inheritAllEnv bool, timeout time.Duration, maxOutput int) (execResult, error) {
 	if len(argv) == 0 {
-		return execResult{ExitCode: 2}
+		return execResult{ExitCode: 2}, nil
 	}
 	if timeout <= 0 {
 		timeout = defaultExecTimeout
@@ -151,16 +170,21 @@ func runLocalCommand(argv []string, dir string, env map[string]string, inheritAl
 	if maxOutput <= 0 {
 		maxOutput = defaultMaxOutput
 	}
-	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), timeout)
+	if ctx == nil {
+		ctx = stdcontext.Background()
+	}
+	cctx, cancel := stdcontext.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	// On timeout the default context kill terminates only the direct child,
 	// leaving grandchildren running; setupTreeKill replaces it with a
-	// whole-tree kill (process group on Unix, taskkill /T on Windows).
+	// whole-tree kill (process group on Unix, taskkill /T on Windows). The
+	// same kill serves a parent cancel: every cancellation of cctx — deadline,
+	// turn cancel, Close — stops the whole tree.
 	setupTreeKill(cmd)
 	// Per-call values are appended last and os/exec keeps the last entry per
 	// key, so an explicit value overrides an inherited one.
@@ -181,17 +205,33 @@ func runLocalCommand(argv []string, dir string, env map[string]string, inheritAl
 	// wait once the context cancel has fired.
 	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) || isPathLookupError(err) {
-			return execResult{Output: fmt.Sprintf("Command not found: %v", err), ExitCode: 127}
+		// A context that died before the start is the cancellation (or an
+		// already-passed deadline), not a launch failure.
+		if errors.Is(cctx.Err(), stdcontext.Canceled) {
+			return execResult{}, ErrCommandInterrupted
 		}
-		return execResult{Output: err.Error(), ExitCode: 1}
+		if errors.Is(cctx.Err(), stdcontext.DeadlineExceeded) {
+			return execResult{Output: fmt.Sprintf("Command timed out after %gs", timeout.Seconds()), ExitCode: 124}, nil
+		}
+		if errors.Is(err, exec.ErrNotFound) || isPathLookupError(err) {
+			return execResult{Output: fmt.Sprintf("Command not found: %v", err), ExitCode: 127}, nil
+		}
+		return execResult{Output: err.Error(), ExitCode: 1}, nil
 	}
 	waitErr := cmd.Wait()
-	if ctx.Err() == stdcontext.DeadlineExceeded {
+	if errors.Is(cctx.Err(), stdcontext.DeadlineExceeded) {
 		return execResult{
 			Output:   fmt.Sprintf("Command timed out after %gs", timeout.Seconds()),
 			ExitCode: 124,
-		}
+		}, nil
+	}
+	// A cancel that landed while the child ran killed it through cmd.Cancel, so
+	// the failed wait is the interruption, not a command outcome (Python parity:
+	// the cancelled exec raises). A wait that already succeeded before the
+	// cancel landed keeps its real result — upstream's collect loop returns a
+	// finished command's output without consulting the cancel flag.
+	if waitErr != nil && errors.Is(cctx.Err(), stdcontext.Canceled) {
+		return execResult{}, ErrCommandInterrupted
 	}
 	output := buildOutput(out, maxOutput)
 	res := execResult{Output: output}
@@ -207,7 +247,90 @@ func runLocalCommand(argv []string, dir string, env map[string]string, inheritAl
 			res.ExitCode = 1
 		}
 	}
-	return res
+	return res, nil
+}
+
+// --- in-flight command registry (Python parity: LocalSandbox._running) --------
+
+// runningSlot is one in-flight command: the cancel that stops it and the channel
+// closed once its call has fully returned.
+type runningSlot struct {
+	cancel stdcontext.CancelFunc
+	done   chan struct{}
+}
+
+// localSandbox is the lifecycle plumbing shared by ShellTool and CodeRunner
+// (Python parity: LocalSandbox._running plus the closed guard): every command
+// registers itself so Close can stop the whole set and wait for it to die, and
+// calls on a closed sandbox fail instead of starting work in a disposed one.
+// The zero value is ready for use.
+type localSandbox struct {
+	mu      sync.Mutex
+	closed  bool
+	running map[*runningSlot]struct{}
+}
+
+// isClosed reports whether shutdown has started.
+func (s *localSandbox) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+// call runs one command under parent, registering it so shutdown can stop it.
+// The closed check and the registration share one critical section with
+// shutdown's snapshot, so a call either sees the closed flag or is guaranteed
+// to be canceled by the shutdown that follows. An interruption is reported as
+// ErrCommandInterrupted — or as ErrSandboxClosedWhileRunning when it was Close
+// that stopped the command.
+func (s *localSandbox) call(parent stdcontext.Context, argv []string, dir string, env map[string]string, inheritAllEnv bool, timeout time.Duration, maxOutput int) (execResult, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return execResult{}, ErrSandboxClosed
+	}
+	callCtx, cancel := stdcontext.WithCancel(parent)
+	slot := &runningSlot{cancel: cancel, done: make(chan struct{})}
+	if s.running == nil {
+		s.running = make(map[*runningSlot]struct{})
+	}
+	s.running[slot] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.running, slot)
+		s.mu.Unlock()
+		close(slot.done)
+	}()
+
+	res, err := runLocalCommand(callCtx, argv, dir, env, inheritAllEnv, timeout, maxOutput)
+	if errors.Is(err, ErrCommandInterrupted) && s.isClosed() {
+		// The command did not outlive a close: report the close that stopped it,
+		// not a bare interruption (Python parity: "LocalSandbox was closed while
+		// the command was running.").
+		return execResult{}, ErrSandboxClosedWhileRunning
+	}
+	return res, err
+}
+
+// shutdown marks the sandbox closed, cancels every in-flight command and waits
+// for all of them to return (Python parity: aclose cancels self._running and
+// awaits it). Commands must be dead before their workdir goes away: on Windows
+// the directory cannot be removed while a child still holds it as its CWD.
+func (s *localSandbox) shutdown() {
+	s.mu.Lock()
+	s.closed = true
+	slots := make([]*runningSlot, 0, len(s.running))
+	for slot := range s.running {
+		slots = append(slots, slot)
+	}
+	s.mu.Unlock()
+	for _, slot := range slots {
+		slot.cancel()
+	}
+	for _, slot := range slots {
+		<-slot.done
+	}
 }
 
 // isPathLookupError reports whether err is the exec launcher's look-path failure
