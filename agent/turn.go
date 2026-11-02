@@ -167,6 +167,11 @@ func (r *AgentRun) llmTrigger(ev events.Event) error {
 	if err != nil {
 		return fmt.Errorf("agent: read history: %w", err)
 	}
+	// Every model call sees the projected input, not the raw transcript:
+	// retained status observations become detached service views here, so they
+	// reach the model without ever being conversational turns (Python parity:
+	// _call_client wraps each history read in model_inputs()).
+	evs = events.ModelInputs(evs)
 
 	call := func(evs []events.Event, cx *context.Context) (*events.ModelResponse, error) {
 		opts := config.CallOptions{Tools: r.resolved.Schemas, ResponseSchema: r.schema}

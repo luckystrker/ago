@@ -70,6 +70,16 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 - `UrlInput(Input)` — `url: str`, `kind: BinaryType`.
 - `enum BinaryType(str)`: BINARY, IMAGE, AUDIO, DOCUMENT, VIDEO.
 - Factories `ImageInput/DocumentInput/AudioInput/VideoInput` — from (url | file_id | data+media_type | path), extension→media-type inference.
+- `StatusObservation(BaseEvent)` — `parts: list[Input]`, `source: str` — a dynamic status
+  snapshot published by the `Statusbar` middleware (persist mode): non-transient (persisted, so
+  the last computed status survives into later calls) and non-conversational (compaction never
+  summarizes it, event-count triggers never count it), but sized like its parts because a
+  projected view of it rides every model call. The model never sees the event itself: every
+  model call projects retained observations into detached service-origin `ModelRequest` views
+  (`events.ModelInputs`, `ModelRequest.origin="service"`), which ride that call's input without
+  entering the transcript (upstream parity: `_model_input.model_inputs()` in `_call_client`).
+  AGo-DEVIATION: upstream projects through a transient non-conversational `_StatusRequest`
+  subclass; AGo reuses `ModelRequest.origin` (docs/DECISIONS.md D-081).
 
 ### Model / human events — `ag2\events\types.py`
 - `Usage` (frozen dataclass): `prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens, thinking_tokens` — all `float|None`; field-wise `+` (None+None stays None).
@@ -101,6 +111,13 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 - `Stream` Protocol (`ag2\context.py:33`): `id: UUID`, `history: History`, `pending_messages: list[ModelRequest]`, `send(event, context)`, `enqueue(*content)`, `spawn_background(coro)`, `where(condition) -> Stream`, `join(max_events=None)`, `subscribe(func, *, interrupt=False, sync_to_thread=True, timeout=None, condition=None) -> SubId`, `unsubscribe`, `sub_scope(...)`, `get(condition) -> Future[BaseEvent]`.
 - `MemoryStream` (`ag2\stream.py:129`): in-memory pub/sub; `send()` runs `interrupt` subscribers first (a subscriber returning falsy stops delivery), then normal subscribers in registration order; persistence via `Storage` Protocol (`save_event/get_history/set_history/drop_history`, `ag2\history.py:21`) — non-transient events only unless `persist_all=True`. `SubStream` = filtered view sharing parent's id/history. Redis alternative in `ag2\streams\redis\`.
 - `History` (`ag2\history.py:48`): `stream_id`, `storage`; `get_events()`, `replace(events)`. Helpers: `unanswered_tool_calls(events)`, `close_unanswered_tool_calls(history, result=...)` (repairs mid-flight-killed transcripts with sentinel `HUMAN_INPUT_ABANDONED_TOOL_RESULT`).
+- Dynamic status bars (`ag2\middleware\statusbar.py`, commits 07144b1a8 + 82b15120c, ADR 0028):
+  `Statusbar(callback, WithPersist(bool))` computes input parts on every LLM call, deep-copies
+  them and appends a detached service view to the call input; parts never enter the transcript.
+  With persist, every non-empty snapshot is published as a durable `StatusObservation` BEFORE
+  the model call — a callback or storage failure stops the call, a provider failure leaves the
+  committed observation. Register the factory outside `Retry` (AGo: one snapshot per logical
+  call; D-080).
 
 ### Context — `ag2\context.py:130`
 `ConversationContext` (dataclass, aliased `Context`): `stream: Stream`, `dependency_provider: Provider|None`, `variables: dict[str, Any]` (reserved prefixes `"ag:"`, `"a2a:"` stripped on the wire), `dependencies: dict[Any, Any]` (DI: agent instance, model config, KnowledgeStore, active Task), `prompt: list[str]` (system-prompt fragments), `tool_call_id: str|None`. Methods: `pending_messages` view, `enqueue(*content)` (append + announce `MessageEnqueued`, thread-safe), `spawn_background(coro)`, `async input(message, timeout) -> str` / `async ask(HumanInputRequest) -> str` (HITL; failures normalize to `HumanInputError` subclasses), `async send(event)`.

@@ -653,3 +653,64 @@ func TestRunObservableAPI(t *testing.T) {
 		t.Fatalf("stream observer saw %v", chunks)
 	}
 }
+
+// TestStatusObservationProjectsIntoModelInput pins the model-input projection:
+// a StatusObservation seeded in the transcript reaches the scripted client as a
+// detached service-origin ModelRequest placed after the ToolResultsEvent it
+// followed — never as the observation itself.
+func TestStatusObservationProjectsIntoModelInput(t *testing.T) {
+	call := events.NewToolCallEvent("search")
+	obs := &events.StatusObservation{
+		Parts:  []events.Input{&events.TextInput{Content: "mode: research"}},
+		Source: "statusbar",
+	}
+	seed := []events.Event{
+		&events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: "q1"}}, Origin: events.OriginUser},
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "a1"}},
+		&events.ToolCallsEvent{Calls: []events.ToolCallEvent{call}},
+		&events.ToolResultsEvent{Results: []events.ToolResultEvent{events.FromResultCall(call, events.NewToolResult(false, "r"))}},
+		obs,
+	}
+	ms, err := stream.LoadHistory("status-projection", stream.NewMemoryStorage(), seed)
+	if err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+	cfg := agotest.NewTestConfig(textResp("done"))
+	a := New("worker", "", WithConfig(cfg), WithStreamBase(ms))
+	if _, err := a.Ask(stdcontext.Background(), "go"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+
+	calls := cfg.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("recorded %d calls, want 1", len(calls))
+	}
+	saw := calls[0]
+	if len(saw) != 6 {
+		t.Fatalf("model input has %d events, want 6 (seed + view + new request)", len(saw))
+	}
+	if _, ok := events.AsValue(saw[3]).(events.ToolResultsEvent); !ok {
+		t.Fatalf("event 3 = %T, want ToolResultsEvent (the view follows the tool round)", saw[3])
+	}
+	view, ok := saw[4].(*events.ModelRequest)
+	if !ok {
+		t.Fatalf("event 4 = %T, want the projected *ModelRequest", saw[4])
+	}
+	if view.Origin != events.OriginService {
+		t.Fatalf("view origin = %q, want %q", view.Origin, events.OriginService)
+	}
+	if len(view.Parts) != 1 {
+		t.Fatalf("view has %d parts, want 1", len(view.Parts))
+	}
+	if text, ok := events.AsValue(view.Parts[0]).(events.TextInput); !ok || text.Content != "mode: research" {
+		t.Fatalf("view part = %v, want the observation's text", view.Parts[0])
+	}
+	if _, ok := events.AsValue(saw[5]).(events.ModelRequest); !ok {
+		t.Fatalf("event 5 = %T, want the new user request", saw[5])
+	}
+	for i, ev := range saw {
+		if _, ok := events.AsValue(ev).(events.StatusObservation); ok {
+			t.Fatalf("event %d: the raw StatusObservation reached the model input", i)
+		}
+	}
+}

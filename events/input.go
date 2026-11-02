@@ -136,6 +136,22 @@ func (MessageEnqueued) EventType() string    { return "MessageEnqueued" }
 func (MessageEnqueued) Transient() bool      { return true }
 func (MessageEnqueued) Conversational() bool { return false }
 
+// StatusObservation is a framework-published status snapshot (dynamic status
+// bars): parts the model should keep seeing without the status ever becoming a
+// turn of the conversation. Non-transient — persisted, so the last computed
+// status survives into later calls; non-conversational — compaction never
+// summarizes it and transcript sweeps skip it, while sizing still gives it its
+// parts' weight because a projected service view rides every model call.
+type StatusObservation struct {
+	Base
+	Parts  []Input `json:"parts"`
+	Source string  `json:"source"`
+}
+
+func (StatusObservation) EventType() string    { return "StatusObservation" }
+func (StatusObservation) Transient() bool      { return false }
+func (StatusObservation) Conversational() bool { return false }
+
 // --- marshaling for structs holding Input parts -----------------------------
 
 type wireParts struct {
@@ -243,6 +259,36 @@ func unmarshalParts(raw []json.RawMessage) ([]Input, error) {
 		parts = append(parts, in)
 	}
 	return parts, nil
+}
+
+func (o StatusObservation) MarshalJSON() ([]byte, error) {
+	parts, err := marshalParts(o.Parts)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		Type   string            `json:"@type"`
+		Parts  []json.RawMessage `json:"parts"`
+		Source string            `json:"source"`
+		Base
+	}{"StatusObservation", parts, o.Source, o.Base})
+}
+
+func (o *StatusObservation) UnmarshalJSON(data []byte) error {
+	var w struct {
+		Parts  []json.RawMessage `json:"parts"`
+		Source string            `json:"source"`
+		Base
+	}
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	parts, err := unmarshalParts(w.Parts)
+	if err != nil {
+		return err
+	}
+	o.Base, o.Parts, o.Source = w.Base, parts, w.Source
+	return nil
 }
 
 // --- input helpers ----------------------------------------------------------
@@ -378,4 +424,5 @@ func init() {
 	RegisterEvent(ModelRequest{})
 	RegisterEvent(DrainedModelRequest{})
 	RegisterEvent(MessageEnqueued{})
+	RegisterEvent(StatusObservation{})
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/luckystrker/ago/config"
+	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 )
 
@@ -413,5 +414,180 @@ func TestTestConfigConcurrentCalls(t *testing.T) {
 	}
 	if _, err := cfg.Call(ctx(), nil, nil, config.CallOptions{}); !errors.Is(err, ErrScriptedExhausted) {
 		t.Fatalf("post-concurrency error = %v, want ErrScriptedExhausted", err)
+	}
+}
+
+// stubConfig hands out one fixed client: the minimal ModelConfig a tracking
+// scenario needs (Python parity: tests build a tiny provider stub directly).
+type stubConfig struct {
+	cl       config.LLMClient
+	provider config.Provider
+	model    string
+}
+
+func (s *stubConfig) Provider() config.Provider         { return s.provider }
+func (s *stubConfig) Model() string                     { return s.model }
+func (s *stubConfig) Create() (config.LLMClient, error) { return s.cl, nil }
+
+func (s *stubConfig) Clone(overrides map[string]any) (config.ModelConfig, error) {
+	if len(overrides) > 0 {
+		return nil, fmt.Errorf("stubConfig: no overrides supported, got %v", overrides)
+	}
+	return &stubConfig{cl: s.cl, provider: s.provider, model: s.model}, nil
+}
+
+// scriptedStub fails the first `failures` calls with err, then returns resp
+// (or keeps failing when resp is nil) — the retry-then-success and
+// final-failure shapes of the upstream snapshot tests without pulling in the
+// agent or middleware packages.
+type scriptedStub struct {
+	mu       sync.Mutex
+	failures int
+	err      error
+	resp     *events.ModelResponse
+	calls    int
+}
+
+func (s *scriptedStub) Call(_ context.Context, _ []events.Event, _ *agocontext.Context, _ config.CallOptions) (*events.ModelResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls <= s.failures {
+		return nil, s.err
+	}
+	return s.resp, nil
+}
+
+// TestTrackingConfigRecordsFailedCalls pins the upstream fix the port already
+// implements: TrackingClient records BEFORE delegating, so every attempt —
+// including failed ones — is in Calls(), even when the caller never inspects
+// the recording until after the final call.
+func TestTrackingConfigRecordsFailedCalls(t *testing.T) {
+	boom := errors.New("provider unavailable")
+	scenarios := []struct {
+		name     string
+		failures int
+		resp     *events.ModelResponse
+		wantErr  bool
+	}{
+		{"failed attempt then success", 1, &events.ModelResponse{Message: &events.ModelMessage{Content: "ok"}}, false},
+		{"every attempt fails", 2, nil, true},
+	}
+	for _, tt := range scenarios {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := &stubConfig{
+				cl:       &scriptedStub{failures: tt.failures, err: boom, resp: tt.resp},
+				provider: ProviderTest,
+				model:    "stub",
+			}
+			tc, err := NewTrackingConfig(inner)
+			if err != nil {
+				t.Fatalf("NewTrackingConfig: %v", err)
+			}
+			cl, err := tc.Create()
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			h1 := hist("first")
+			if _, err := cl.Call(ctx(), h1, nil, config.CallOptions{}); !errors.Is(err, boom) {
+				t.Fatalf("call 1 error = %v, want the stub failure", err)
+			}
+			// The failed attempt is already recorded before the second call:
+			// recording happens at delegation time, not on success.
+			calls := tc.Calls()
+			if len(calls) != 1 || !sameEvents(t, calls[0], h1) {
+				t.Fatalf("after the failed call, Calls() = %d entries, want the handed history", len(calls))
+			}
+
+			h2 := hist("second")
+			_, err = cl.Call(ctx(), h2, nil, config.CallOptions{})
+			if tt.wantErr && !errors.Is(err, boom) {
+				t.Fatalf("call 2 error = %v, want the stub failure", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("call 2: %v", err)
+			}
+
+			calls = tc.Calls()
+			if len(calls) != 2 {
+				t.Fatalf("Calls() has %d entries, want both attempts", len(calls))
+			}
+			if !sameEvents(t, calls[0], h1) || !sameEvents(t, calls[1], h2) {
+				t.Fatalf("recorded histories do not match the handed ones")
+			}
+		})
+	}
+}
+
+// TestTrackingConfigSnapshotsAreIsolated mirrors TestTestConfigSnapshotsAreIsolated
+// on the TrackingConfig path: the recording is a deep copy taken at call time,
+// so later mutation of the handed history — and of anything a caller does with
+// the returned snapshot — cannot rewrite it.
+func TestTrackingConfigSnapshotsAreIsolated(t *testing.T) {
+	inner := &stubConfig{
+		cl:       &scriptedStub{resp: &events.ModelResponse{}},
+		provider: ProviderTest,
+		model:    "stub",
+	}
+	tc, err := NewTrackingConfig(inner)
+	if err != nil {
+		t.Fatalf("NewTrackingConfig: %v", err)
+	}
+	cl, err := tc.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	text := &events.TextInput{Content: "hello"}
+	data := &events.DataInput{Data: map[string]any{"nested": "value"}}
+	req := &events.ModelRequest{
+		Parts:    []events.Input{text, data},
+		Metadata: map[string]any{"k": "v"},
+		Origin:   events.OriginUser,
+	}
+	h := []events.Event{req}
+	if _, err := cl.Call(ctx(), h, nil, config.CallOptions{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	// Mutate everything reachable after the call.
+	text.Content = "mutated"
+	data.Data.(map[string]any)["nested"] = "rewritten"
+	req.Metadata["k"] = "changed"
+	req.Metadata = map[string]any{"added": true}
+	h[0] = &events.ModelRequest{Origin: events.OriginService}
+
+	calls := tc.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("Calls() has %d entries, want 1", len(calls))
+	}
+	got, ok := calls[0][0].(*events.ModelRequest)
+	if !ok {
+		t.Fatalf("recorded event = %T, want *events.ModelRequest", calls[0][0])
+	}
+	if got.Origin != events.OriginUser {
+		t.Fatalf("recorded origin = %q, want the call-time %q", got.Origin, events.OriginUser)
+	}
+	if got.Metadata["k"] != "v" || got.Metadata["added"] != nil {
+		t.Fatalf("recorded metadata = %v, want the call-time value", got.Metadata)
+	}
+	if len(got.Parts) != 2 {
+		t.Fatalf("recorded parts = %d, want 2", len(got.Parts))
+	}
+	if text0, ok := got.Parts[0].(*events.TextInput); !ok || text0.Content != "hello" {
+		t.Fatalf("recorded text part mutated: %+v", got.Parts[0])
+	}
+	if nested := got.Parts[1].(*events.DataInput).Data.(map[string]any)["nested"]; nested != "value" {
+		t.Fatalf("recorded nested value mutated: %v", nested)
+	}
+
+	// Mutating a returned snapshot must not corrupt the recording either.
+	got.Parts[0].(*events.TextInput).Content = "caller-mutated"
+	got.Metadata["k"] = "caller-changed"
+	again := tc.Calls()
+	got2 := again[0][0].(*events.ModelRequest)
+	if got2.Parts[0].(*events.TextInput).Content != "hello" || got2.Metadata["k"] != "v" {
+		t.Fatalf("recording changed after caller mutation: %+v", got2)
 	}
 }

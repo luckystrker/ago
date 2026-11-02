@@ -3028,3 +3028,64 @@ an addition (Python has none, AGO-DEVIATION at `internal/sse/sse.go:108`).
 
 Gates `go build ./...`, `go test -count=1 ./internal/sse/... ./config/gemini/... ./mcp/...` green
 2026-11-03.
+
+## D-080 — 2026-11-03 — Statusbar DI: the callback reads the context itself (no fast_depends)
+
+Records the G14 statusbar wave's deviations (rule 5). Upstream `statusbar_middleware(func, ...,
+persist=False)` (`ag2/middleware/statusbar.py`, commits 07144b1a8 + 82b15120c) resolves
+fast_depends annotations — `Context`, `Inject()`, `Variable()`, `Depends()` — when it builds the
+DI callback, and keeps the dependencies open through an `AsyncExitStack` for the duration of the
+model call.
+
+- **`StatusCallback` is a plain function.** AGo's DI is a string-keyed map
+  (`context.Context.Dependencies`/`Variables`, `context/context.go:26-33`), so the middleware
+  takes `StatusCallback func(ctx *agocontext.Context) ([]events.Input, error)`
+  (`middleware/statusbar.go:23`) and the callback reads what it needs itself. No container
+  lifetimes: a dependency lives as long as the values the host put in the map.
+- **Cancellation through `ctx.TurnContext()`.** Middleware hooks carry no stdlib context, so a
+  long-running callback honors `ctx.TurnContext()` (the per-turn cancellable context,
+  `context/context.go:222-229`) — the same channel the approval middleware uses.
+- **Registration order replaces upstream's publication guard.** Upstream blocks
+  `persist=True` inside `RetryMiddleware` with the retry published-output guard (ADR 0028); AGo's
+  `Retry` has no such guard (see `middleware/retry.go`), so `Statusbar` must be registered
+  outside (before) `Retry` in the middleware list — one snapshot per logical call. Inside
+  `Retry` it publishes one observation per attempt (documented in `middleware/statusbar.go:44-48`).
+
+## D-081 — 2026-11-03 — Status projection: `ModelRequest.origin="service"` instead of a transient subclass
+
+Upstream projects a retained `StatusObservation` into a transient non-conversational
+`_StatusRequest` subclass of `ModelRequest` with `origin="service"` (`ag2/_model_input.py`,
+commit 82b15120c): transient/non-conversational flags keep the view out of every persistence and
+transcript sweep, while sizing still weighs it.
+
+- **AGo reuses `ModelRequest` + `OriginService`** (`events/model_input.go:26-35`,
+  `events.StatusRequest` / `events.ObservationRequest` / `events.ModelInputs`). The view only
+  ever lives in the in-memory event list of one model call — it is never sent to a stream, so it
+  can never become durable, and the flags would be dead weight. Provider mappers keep a single
+  `ModelRequest` case (`config/openaicompat.go` BuildMessages); sizing gives a plain request its
+  parts' weight already (`events/sizing.go:34-35`).
+- **`StatusObservation` itself** is non-transient (persisted — the last status must survive into
+  later calls) and non-conversational (compaction never summarizes it,
+  `compact/compact.go:184-193`; `EventCountTrigger` never counts it), but is sized like its
+  parts (`events/sizing.go` gate + case) because each projected copy rides one model call. The
+  compaction `TokenTrigger` sums over every event, not only conversational ones
+  (`compact/trigger.go:50-70`).
+- **Projection failure drops the observation.** `ModelInputs` deletes an observation whose parts
+  cannot round trip through the wire instead of forwarding it: its marshal form is already
+  broken and a provider mapping over it would poison the call
+  (`events/model_input.go:45-58`). Python deepcopy cannot fail for wire types, so upstream has
+  no counterpart for this path.
+- **`ModelRequest.Origin` predates this wave.** The field and the
+  user/service semantics arrived with wave 1 (ADR 0027 parity), so G14 added no field.
+
+## D-082 — 2026-11-03 — `describe()` not ported: middleware has no description surface in AGo
+
+Upstream's statusbar middleware advertises itself through `describe()` (commit 07144b1a8), part
+of the Python `Middleware` self-description surface. AGo's `middleware.Middleware`
+(`middleware/middleware.go:35-40`) has no `describe()` — there is no `MiddlewareDescription`
+anywhere in the port (the Python surface never crossed v0.7.0), so there is nothing to
+implement against; when a description surface is ported, `Statusbar` should report
+`source` (the callback's runtime function name) and the `persist` flag.
+
+Gates `go build ./...`, `go test -count=1 ./events/... ./middleware/... ./agent/... ./compact/...
+./testing/...` green 2026-11-03.

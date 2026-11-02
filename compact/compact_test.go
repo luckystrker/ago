@@ -85,6 +85,7 @@ func TestEventCountTrigger(t *testing.T) {
 		return evs
 	}
 	telemetry := []events.Event{&events.UsageEvent{}, &events.UsageEvent{}}
+	status := &events.StatusObservation{Parts: []events.Input{&events.TextInput{Content: "s"}}}
 
 	tests := []struct {
 		name string
@@ -96,6 +97,7 @@ func TestEventCountTrigger(t *testing.T) {
 		{"at threshold does not fire", 2, conv(2), false},
 		{"above threshold fires", 2, conv(3), true},
 		{"telemetry never counts", 2, append(conv(2), telemetry...), false},
+		{"persisted status never counts", 2, append(conv(2), status), false},
 		{"zero disables", 0, conv(10), false},
 		{"negative disables", -1, conv(10), false},
 	}
@@ -112,6 +114,9 @@ func TestTokenTrigger(t *testing.T) {
 	big := userReq(strings.Repeat("x", 400)) // 400 chars / 4 = 100 est. tokens
 	small := userReq("hi")                   // clamps to 1 est. token
 	telemetry := &events.UsageEvent{}        // not conversational, never estimated
+	status := &events.StatusObservation{Parts: []events.Input{
+		&events.TextInput{Content: strings.Repeat("x", 400)},
+	}} // not conversational, still 100 est. tokens: its view rides every call
 
 	tests := []struct {
 		name   string
@@ -122,6 +127,8 @@ func TestTokenTrigger(t *testing.T) {
 		{"below budget", 50, []events.Event{small}, false},
 		{"over budget fires", 50, []events.Event{big, small}, true},
 		{"telemetry not estimated", 50, []events.Event{small, telemetry}, false},
+		{"status observation counts", 50, []events.Event{small, status}, true},
+		{"status boundary excluded", 101, []events.Event{status}, false},
 		{"budget boundary excluded", 101, []events.Event{big, small}, false},
 		{"zero disables", 0, []events.Event{big}, false},
 		{"negative disables", -5, []events.Event{big}, false},
