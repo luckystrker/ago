@@ -3,9 +3,12 @@ package task
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand"
 	"reflect"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
@@ -327,6 +330,10 @@ func TestCancelEventOnOwnStream(t *testing.T) {
 	if cc.Reason != "user asked" || cc.TaskID != tsk.TaskID() || cc.AgentName != "agent" {
 		t.Fatalf("TaskCancelled = %+v", cc)
 	}
+	// A non-empty reason is also recorded in metadata.Error.
+	if md := tsk.Metadata(); md.Error != "user asked" {
+		t.Fatalf("metadata.Error = %q, want the cancel reason", md.Error)
+	}
 
 	// An empty reason leaves metadata.Error untouched.
 	tsk2, err := Start(c, "agent", Spec{Title: "job2"})
@@ -338,6 +345,45 @@ func TestCancelEventOnOwnStream(t *testing.T) {
 	}
 	if md := tsk2.Metadata(); md.Error != "" {
 		t.Fatalf("error = %q, want empty for empty reason", md.Error)
+	}
+}
+
+func TestCancelSnapshotKeepsNilPayload(t *testing.T) {
+	_, c := newTestContext(t)
+	tsk, err := Start(c, "agent", Spec{Title: "job"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := tsk.Cancel("stop"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	// A spec without a payload must stay a nil map in the snapshot: an empty
+	// non-nil map would render as {} on the wire instead of null.
+	if md := tsk.Metadata(); md.Spec.Payload != nil {
+		t.Fatalf("snapshot Spec.Payload = %#v, want nil", md.Spec.Payload)
+	}
+}
+
+func TestCompleteResultIsJSONEncoded(t *testing.T) {
+	s, c := newTestContext(t)
+	rec := subscribe(s)
+	tsk, err := Start(c, "agent", Spec{Title: "job"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := tsk.Complete(map[string]any{"a": 1}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	done, ok := rec.find("TaskCompleted").(*events.TaskCompleted)
+	if !ok {
+		t.Fatal("TaskCompleted not emitted")
+	}
+	// Non-string results travel JSON-encoded, not with Go's %v rendering.
+	if done.Result != `{"a":1}` {
+		t.Fatalf("TaskCompleted.Result = %q, want JSON encoding", done.Result)
+	}
+	if md := tsk.Metadata(); md.Result == nil {
+		t.Fatal("metadata.Result lost")
 	}
 }
 
@@ -818,5 +864,197 @@ func TestMemoryCheckpointStoreIsolation(t *testing.T) {
 	empty, _ := store.Read("t")
 	if len(empty) != 0 {
 		t.Fatalf("empty = %q", empty)
+	}
+}
+
+// mustStartSibling starts one task on the shared conversation context; helper
+// for the sibling-slot tests below.
+func mustStartSibling(t *testing.T, c *agocontext.Context, name string) *Task {
+	t.Helper()
+	tsk, err := Start(c, "agent", Spec{Title: name})
+	if err != nil {
+		t.Fatalf("start %s: %v", name, err)
+	}
+	return tsk
+}
+
+// assertSlot checks the "ag:task" slot by identity (Python is-checks): it holds
+// exactly want, or nil — which readers must treat as absent.
+func assertSlot(t *testing.T, c *agocontext.Context, want *Task) {
+	t.Helper()
+	dep, ok := c.Dependency(DepKey)
+	switch {
+	case want == nil:
+		if !ok || dep != nil {
+			t.Fatalf("slot = %v (present=%v), want nil", dep, ok)
+		}
+	case !ok || dep != any(want):
+		t.Fatalf("slot = %v (present=%v), want task %q", dep, ok, want.Metadata().Spec.Title)
+	}
+}
+
+// TestConcurrentSiblingTasksKeepSlotConsistent pins the sibling-concurrency
+// fix (upstream ag2 #3287, "keep ag2.task dependency consistent for concurrent
+// sibling tasks"): the "ag:task" slot is a single register shared by tasks
+// started on one context, so an exit may touch it only while its task still
+// owns the slot, and the slot must keep holding the last task that entered and
+// is still running — nil after the last one. Every completion order of 2 and 3
+// overlapping tasks is enumerated (exhaustive, deterministic, no sleeps); the
+// four terminal transitions alternate so each exit path shares the rollback.
+// Expectations are computed independently of the implementation: the highest
+// start index not yet exited, or nil.
+func TestConcurrentSiblingTasksKeepSlotConsistent(t *testing.T) {
+	exits := []struct {
+		name string
+		run  func(*Task) error
+	}{
+		{"complete", func(tsk *Task) error { return tsk.Complete("done") }},
+		{"fail", func(tsk *Task) error { return tsk.Fail(errors.New("boom")) }},
+		{"cancel", func(tsk *Task) error { return tsk.Cancel("nope") }},
+		{"expire", func(tsk *Task) error { return tsk.Expire() }},
+	}
+
+	cases := []struct {
+		count int
+		order []int
+	}{
+		{2, []int{0, 1}},
+		{2, []int{1, 0}},
+		{3, []int{0, 1, 2}},
+		{3, []int{0, 2, 1}},
+		{3, []int{1, 0, 2}},
+		{3, []int{1, 2, 0}},
+		{3, []int{2, 0, 1}},
+		{3, []int{2, 1, 0}},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("count=%d/order=%v", tc.count, tc.order), func(t *testing.T) {
+			_, c := newTestContext(t)
+			tasks := make([]*Task, tc.count)
+			for i := range tasks {
+				tasks[i] = mustStartSibling(t, c, fmt.Sprintf("sibling-%d", i))
+			}
+
+			exited := map[int]bool{}
+			for step, idx := range tc.order {
+				exit := exits[step%len(exits)]
+				if err := exit.run(tasks[idx]); err != nil {
+					t.Fatalf("%s %d: %v", exit.name, idx, err)
+				}
+				exited[idx] = true
+				want := -1
+				for i := tc.count - 1; i >= 0; i-- {
+					if !exited[i] {
+						want = i
+						break
+					}
+				}
+				if want < 0 {
+					assertSlot(t, c, nil)
+					continue
+				}
+				dep, ok := c.Dependency(DepKey)
+				if !ok || dep != any(tasks[want]) {
+					t.Fatalf("after %s of sibling-%d (exited %v): slot = %v (present=%v), want sibling-%d",
+						exit.name, idx, tc.order[:step+1], dep, ok, want)
+				}
+			}
+		})
+	}
+}
+
+// TestTaskSlotChainAcrossSiblingExits pins the previous-task chain: an exit
+// without slot ownership leaves the slot to the later sibling; a new entry
+// resolves its predecessor past already-exited tasks; the rollback of a late
+// task lands on the nearest still-running ancestor. The chain stays walkable
+// because exits never clear it (Python parity: _previous_dep kept on __aexit__).
+func TestTaskSlotChainAcrossSiblingExits(t *testing.T) {
+	_, c := newTestContext(t)
+	a := mustStartSibling(t, c, "A")
+	b := mustStartSibling(t, c, "B")
+	taskC := mustStartSibling(t, c, "C")
+	assertSlot(t, c, taskC)
+
+	// An early sibling exits while a later one owns the slot: untouched.
+	if err := b.Complete("middle done"); err != nil {
+		t.Fatalf("complete B: %v", err)
+	}
+	assertSlot(t, c, taskC)
+
+	// A new entry resolves past exited B onto the still-running C.
+	d := mustStartSibling(t, c, "D")
+	assertSlot(t, c, d)
+
+	// Rollbacks walk the chain: D → C → (B exited) → A → nil.
+	if err := d.Complete("d done"); err != nil {
+		t.Fatalf("complete D: %v", err)
+	}
+	assertSlot(t, c, taskC)
+	if err := taskC.Fail(errors.New("c failed")); err != nil {
+		t.Fatalf("fail C: %v", err)
+	}
+	assertSlot(t, c, a)
+	if err := a.Expire(); err != nil {
+		t.Fatalf("expire A: %v", err)
+	}
+	assertSlot(t, c, nil)
+}
+
+// perm is a completion order of five overlapping tasks, generated by
+// testing/quick for the slot invariant property below.
+type perm []int
+
+func (p perm) Generate(rnd *rand.Rand, _ int) reflect.Value {
+	out := make(perm, 5)
+	copy(out, rnd.Perm(5))
+	return reflect.ValueOf(out)
+}
+
+// TestSlotHoldsLastEnteredRunningTaskForAnyExitOrder is the property form of
+// TestConcurrentSiblingTasksKeepSlotConsistent sampled at a larger fan-in: for
+// any completion order of five overlapping tasks on one context, after every
+// terminal transition the slot equals the last-entered still-running task, nil
+// after the last.
+func TestSlotHoldsLastEnteredRunningTaskForAnyExitOrder(t *testing.T) {
+	prop := func(order perm) bool {
+		s := stream.NewMemoryStream()
+		c := agocontext.New(s)
+		tasks := make([]*Task, len(order))
+		for i := range tasks {
+			var err error
+			tasks[i], err = Start(c, "agent", Spec{Title: fmt.Sprintf("p%d", i)})
+			if err != nil {
+				return false
+			}
+		}
+		exited := map[int]bool{}
+		for _, idx := range order {
+			if err := tasks[idx].Complete(nil); err != nil {
+				return false
+			}
+			exited[idx] = true
+			want := -1
+			for i := len(order) - 1; i >= 0; i-- {
+				if !exited[i] {
+					want = i
+					break
+				}
+			}
+			dep, _ := c.Dependency(DepKey)
+			if want < 0 {
+				if dep != nil {
+					return false
+				}
+				continue
+			}
+			if dep != any(tasks[want]) {
+				return false
+			}
+		}
+		return true
+	}
+	if err := quick.Check(prop, nil); err != nil {
+		t.Fatalf("property failed: %v", err)
 	}
 }

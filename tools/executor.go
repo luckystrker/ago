@@ -197,6 +197,23 @@ func (e *Executor) executeTools(cx *agocontext.Context, tce events.ToolCallsEven
 				if err != nil {
 					return err
 				}
+				// The final turn still owes the transcript a settled batch: a
+				// replay of the conversation would otherwise show assistant
+				// tool calls without answers, which providers reject (Python
+				// parity: retain final tool batches, upstream be11666a5/#3562).
+				// A client hand-off sharing the batch still reaches the client,
+				// but its answer is never awaited — the call is settled with the
+				// skip sentinel. The wrapper is
+				// recorded without publication — publishing ToolResultsEvent
+				// would drive the next model call, which the forced response
+				// below already replaces.
+				settled, err := settleForFinalTurn(tce, outcomes)
+				if err != nil {
+					return err
+				}
+				if err := cx.Stream.History().Append(events.ToolResultsEvent{Results: settled}); err != nil {
+					return fmt.Errorf("tools: record final batch: %w", err)
+				}
 				return cx.Send(events.ModelResponse{
 					Message:       &events.ModelMessage{Content: content, Metadata: res.Result.Metadata},
 					ResponseForce: true,
@@ -227,6 +244,39 @@ func (e *Executor) executeTools(cx *agocontext.Context, tce events.ToolCallsEven
 		})
 	}
 	return cx.Send(events.ToolResultsEvent{Results: results})
+}
+
+// settleForFinalTurn gathers every outcome of the batch into the results
+// recorded for the final turn (Python parity: _settle_for_final_turn). Real and
+// error results travel as themselves; a client hand-off that shared the batch
+// is settled with the skip sentinel, because the forced answer ends the turn
+// before the client could run it.
+func settleForFinalTurn(tce events.ToolCallsEvent, outcomes []*callOutcome) ([]events.ToolResultEvent, error) {
+	settled := make([]events.ToolResultEvent, 0, len(outcomes))
+	for _, o := range outcomes {
+		switch res := events.AsValue(o.ev).(type) {
+		case events.ClientToolCallEvent:
+			settled = append(settled, events.ToolResultEvent{
+				ParentID: res.ID,
+				Name:     res.Name,
+				Result: events.ToolResult{Parts: []events.Input{
+					events.TextInput{Content: events.FinalTurnSkippedToolResult},
+				}},
+			})
+		case events.ToolNotFoundEvent:
+			// AGO-DEVIATION: the batch carries the embedded ToolResultEvent —
+			// Go's []ToolResultEvent cannot hold the subtype's Error field; the
+			// error text travels in the result parts (set by FromErrorCall).
+			settled = append(settled, res.ToolResultEvent)
+		case events.ToolErrorEvent:
+			settled = append(settled, res.ToolResultEvent)
+		case events.ToolResultEvent:
+			settled = append(settled, res)
+		default:
+			return nil, fmt.Errorf("tools: unexpected outcome %T for call %s", o.ev, tce.Calls[o.idx].Name)
+		}
+	}
+	return settled, nil
 }
 
 // finalContent renders the single part of a final=true result as the forced answer

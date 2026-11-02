@@ -9,6 +9,12 @@ package events
 // the sentence the model reads (Python parity: history.py HUMAN_INPUT_ABANDONED_TOOL_RESULT).
 const SentinelToolResult = "This tool call was not completed: the turn ended because a human-input request could not be answered."
 
+// FinalTurnSkippedToolResult is the content recorded for client tool calls that
+// shared a batch with a final=true call: the batch ended the turn before the
+// client ever saw them, so the replayed transcript carries this stub as their
+// answer (Python parity: history.py FINAL_TURN_SKIPPED_TOOL_RESULT).
+const FinalTurnSkippedToolResult = "This tool call was not executed: another tool in the same batch ended the turn."
+
 // UnansweredToolCalls returns calls that have no ToolResultEvent, ToolErrorEvent or
 // ClientToolCallEvent answer in evs.
 func UnansweredToolCalls(evs []Event) []ToolCallEvent {

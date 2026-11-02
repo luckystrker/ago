@@ -561,6 +561,55 @@ func TestResponsesInputMapping(t *testing.T) {
 	}
 }
 
+// TestResponsesInputReplaysFinalToolBatchOnce pins the replay regression for a
+// turn ended by a final=true tool (Python parity: the final_turn_history
+// fixture of upstream be11666a5, #3562). The transcript carries both the loose
+// results the tools published and the batch wrapper the final turn recorded;
+// the Responses mapping replays the wrapper only, so every call gets exactly
+// one function_call_output and the loose duplicates are skipped.
+func TestResponsesInputReplaysFinalToolBatchOnce(t *testing.T) {
+	history := []events.Event{
+		&events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: "go"}}},
+		&events.ModelResponse{ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "call_finish", Name: "finish", Arguments: "{}"},
+			{ID: "call_lookup", Name: "lookup", Arguments: `{"q":"x"}`},
+		}}},
+		// Loose results published by the tools themselves.
+		&events.ToolResultEvent{ParentID: "call_finish", Name: "finish",
+			Result: events.ToolResult{Parts: []events.Input{&events.TextInput{Content: "the end"}}, Final: true}},
+		&events.ToolResultEvent{ParentID: "call_lookup", Name: "lookup",
+			Result: events.ToolResult{Parts: []events.Input{&events.TextInput{Content: "42"}}}},
+		// The batch the final turn recorded into the transcript.
+		&events.ToolResultsEvent{Results: []events.ToolResultEvent{
+			{ParentID: "call_finish", Name: "finish",
+				Result: events.ToolResult{Parts: []events.Input{&events.TextInput{Content: "the end"}}, Final: true}},
+			{ParentID: "call_lookup", Name: "lookup",
+				Result: events.ToolResult{Parts: []events.Input{&events.TextInput{Content: "42"}}}},
+		}},
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "the end"}, ResponseForce: true},
+	}
+	out, err := responsesInput(history)
+	if err != nil {
+		t.Fatalf("responsesInput: %v", err)
+	}
+	outputs := map[string]string{}
+	for _, item := range out {
+		m, ok := item.(map[string]any)
+		if !ok || m["type"] != "function_call_output" {
+			continue
+		}
+		id, _ := m["call_id"].(string)
+		if _, dup := outputs[id]; dup {
+			t.Fatalf("call %s replayed more than once", id)
+		}
+		text, _ := m["output"].(string)
+		outputs[id] = text
+	}
+	if len(outputs) != 2 || outputs["call_finish"] != "the end" || outputs["call_lookup"] != "42" {
+		t.Fatalf("replayed outputs = %v, want exactly one real answer per call", outputs)
+	}
+}
+
 func TestResponsesUnsupportedInputFailsFast(t *testing.T) {
 	srv, got := captureServer(t, "application/json", http.StatusOK, responsesBody())
 	cfg := NewOpenAIResponses("gpt-test")

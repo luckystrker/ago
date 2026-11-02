@@ -172,6 +172,40 @@ func TestExecutorRunsCallsInParallel(t *testing.T) {
 	}
 }
 
+// A batch mixing a registered tool with an unknown name must settle the
+// unknown call through the not-found fallback: the ToolNotFoundEvent matching
+// the call's id is the event that unblocks its await. A bounded default
+// timeout would otherwise turn the call into a timeout error.
+func TestExecutorBatchSettlesUnknownCallAsNotFound(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	ft := mustFunctionTool(t, "real", "", func() string { return "ok" })
+	ex := NewExecutor(WithDefaultToolTimeout(2 * time.Second))
+	if _, err := ex.Register(cx, []Tool{ft}, map[string]bool{"real": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "real", Arguments: "{}"},
+		{ID: "2", Name: "ghost", Arguments: "{}"},
+	}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	results := rec.last(t, "ToolResultsEvent").(events.ToolResultsEvent)
+	if len(results.Results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results.Results))
+	}
+	if results.Results[0].ParentID != "1" {
+		t.Fatalf("first result = %s, want call 1", results.Results[0].ParentID)
+	}
+	second := results.Results[1]
+	if second.ParentID != "2" {
+		t.Fatalf("second result = %s, want call 2", second.ParentID)
+	}
+	if got := partText(second.Result.Parts[0]); !strings.Contains(got, "not found") {
+		t.Fatalf("second result = %q, want the not-found answer", got)
+	}
+}
+
 func TestExecutorToolNotFoundFallback(t *testing.T) {
 	s, cx := newTestContext()
 	rec := newCollector(s)
@@ -245,6 +279,24 @@ func TestExecutorHitlFailureAbandonsBatchAndPropagates(t *testing.T) {
 	}
 }
 
+// recordedWrappers returns the ToolResultsEvents appended to the transcript.
+// The final batch is recorded there without being dispatched, so history is the
+// only place a wrapper can appear.
+func recordedWrappers(t *testing.T, s stream.Stream) []events.ToolResultsEvent {
+	t.Helper()
+	evs, err := s.History().GetEvents()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	var out []events.ToolResultsEvent
+	for _, ev := range evs {
+		if w, ok := events.AsValue(ev).(events.ToolResultsEvent); ok {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 	t.Run("text part", func(t *testing.T) {
 		s, cx := newTestContext()
@@ -272,10 +324,44 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 		if mr.Message.Metadata["why"] != "final" {
 			t.Fatalf("metadata lost: %+v", mr.Message.Metadata)
 		}
+		// The batch is recorded, not published: the transcript carries exactly
+		// one wrapper with the real result, positioned before the forced
+		// response, while the stream dispatch never delivers a ToolResultsEvent
+		// (publishing one would drive the next model call).
 		for _, ev := range rec.snapshot() {
 			if events.AsValue(ev).EventType() == "ToolResultsEvent" {
-				t.Fatalf("final=true must short-circuit the batch")
+				t.Fatalf("ToolResultsEvent was published alongside the forced response")
 			}
+		}
+		evs, err := s.History().GetEvents()
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		wrapperAt, responseAt := -1, -1
+		for i, ev := range evs {
+			switch e := events.AsValue(ev).(type) {
+			case events.ToolResultsEvent:
+				if wrapperAt != -1 {
+					t.Fatal("more than one recorded wrapper")
+				}
+				wrapperAt = i
+				if len(e.Results) != 1 || e.Results[0].ParentID != "1" || e.Results[0].Name != "finisher" {
+					t.Fatalf("recorded batch = %+v, want the single finisher result", e.Results)
+				}
+				if got := partText(e.Results[0].Result.Parts[0]); got != "the end" {
+					t.Fatalf("recorded content = %q, want the end", got)
+				}
+			case events.ModelResponse:
+				if e.ResponseForce && e.Message != nil && e.Message.Content == "the end" {
+					responseAt = i
+				}
+			}
+		}
+		if wrapperAt == -1 || responseAt == -1 {
+			t.Fatalf("final batch or forced response missing from history (wrapper=%d response=%d)", wrapperAt, responseAt)
+		}
+		if wrapperAt > responseAt {
+			t.Fatalf("wrapper recorded after the forced response: %d > %d", wrapperAt, responseAt)
 		}
 	})
 
@@ -301,6 +387,102 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 		if mr.Message == nil || mr.Message.Content != `{"k":1}` {
 			t.Fatalf("content = %v, want JSON of the data part", mr.Message)
 		}
+		wrappers := recordedWrappers(t, s)
+		if len(wrappers) != 1 || len(wrappers[0].Results) != 1 {
+			t.Fatalf("recorded batch = %+v, want the single call", wrappers)
+		}
+		// The recorded result keeps its part as-is; the JSON encoding is only
+		// for the forced response content above.
+		part, ok := events.AsValue(wrappers[0].Results[0].Result.Parts[0]).(events.DataInput)
+		if !ok {
+			t.Fatalf("recorded part = %T, want DataInput", wrappers[0].Results[0].Result.Parts[0])
+		}
+		if m, ok := part.Data.(map[string]any); !ok || m["k"] != 1.0 {
+			t.Fatalf("recorded data = %#v, want the original data part", part.Data)
+		}
+	})
+
+	t.Run("final with a sibling keeps both real results in the recorded batch", func(t *testing.T) {
+		s, cx := newTestContext()
+		rec := newCollector(s)
+		ftFinal := mustFunctionTool(t, "finish", "", func() events.ToolResult {
+			return events.ToolResult{Parts: []events.Input{events.TextInput{Content: "the end"}}, Final: true}
+		})
+		ftAdd := mustFunctionTool(t, "add", "", func(a addArgs) (string, error) {
+			return fmt.Sprintf("%d", a.A+a.B), nil
+		})
+		ex := NewExecutor()
+		if _, err := ex.Register(cx, []Tool{ftAdd, ftFinal}, map[string]bool{"add": true, "finish": true}, nil); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "1", Name: "add", Arguments: `{"a":2,"b":3}`},
+			{ID: "2", Name: "finish", Arguments: "{}"},
+		}}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		rec.last(t, "ModelResponse") // the forced answer closes the batch
+		for _, ev := range rec.snapshot() {
+			if events.AsValue(ev).EventType() == "ToolResultsEvent" {
+				t.Fatalf("ToolResultsEvent was published alongside the forced response")
+			}
+		}
+		wrappers := recordedWrappers(t, s)
+		if len(wrappers) != 1 {
+			t.Fatalf("recorded wrappers = %d, want 1", len(wrappers))
+		}
+		res := wrappers[0].Results
+		if len(res) != 2 || res[0].ParentID != "1" || res[1].ParentID != "2" {
+			t.Fatalf("recorded batch = %+v, want both calls in batch order", res)
+		}
+		if got := partText(res[0].Result.Parts[0]); got != "5" {
+			t.Fatalf("sibling result = %q, want 5", got)
+		}
+		if got := partText(res[1].Result.Parts[0]); got != "the end" {
+			t.Fatalf("final result = %q, want the end", got)
+		}
+	})
+
+	t.Run("final with a client-tool sibling records the skip sentinel", func(t *testing.T) {
+		s, cx := newTestContext()
+		rec := newCollector(s)
+		ct, err := NewClientTool(map[string]any{"name": "client_action"})
+		if err != nil {
+			t.Fatalf("NewClientTool: %v", err)
+		}
+		ftFinal := mustFunctionTool(t, "finish", "", func() events.ToolResult {
+			return events.ToolResult{Parts: []events.Input{events.TextInput{Content: "the end"}}, Final: true}
+		})
+		ex := NewExecutor()
+		if _, err := ex.Register(cx, []Tool{ct, ftFinal}, map[string]bool{"client_action": true, "finish": true}, nil); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "1", Name: "client_action", Arguments: "{}"},
+			{ID: "2", Name: "finish", Arguments: "{}"},
+		}}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		rec.last(t, "ModelResponse") // the forced answer closes the batch
+		for _, ev := range rec.snapshot() {
+			if events.AsValue(ev).EventType() == "ToolResultsEvent" {
+				t.Fatalf("ToolResultsEvent was published alongside the forced response")
+			}
+		}
+		wrappers := recordedWrappers(t, s)
+		if len(wrappers) != 1 || len(wrappers[0].Results) != 2 {
+			t.Fatalf("recorded batch = %+v, want both calls", wrappers)
+		}
+		res := wrappers[0].Results
+		if res[0].ParentID != "1" || res[0].Name != "client_action" {
+			t.Fatalf("client sibling identity = %s/%s, want 1/client_action", res[0].ParentID, res[0].Name)
+		}
+		if got := partText(res[0].Result.Parts[0]); got != events.FinalTurnSkippedToolResult {
+			t.Fatalf("client sibling result = %q, want the skip sentinel", got)
+		}
+		if res[1].ParentID != "2" || partText(res[1].Result.Parts[0]) != "the end" {
+			t.Fatalf("final result = %+v, want the real answer", res[1])
+		}
 	})
 
 	t.Run("multi-part final result is an error", func(t *testing.T) {
@@ -324,6 +506,10 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 		if len(rec.ofType(t, "ModelResponse")) != 0 {
 			t.Fatalf("no forced response expected")
 		}
+		// The error stops the batch before the transcript record: no wrapper.
+		if wrappers := recordedWrappers(t, s); len(wrappers) != 0 {
+			t.Fatalf("recorded wrappers = %d, want 0 on the error path", len(wrappers))
+		}
 	})
 
 	t.Run("unsupported part type is an error", func(t *testing.T) {
@@ -340,6 +526,10 @@ func TestExecutorFinalTrueForcedModelResponse(t *testing.T) {
 		}})
 		if err == nil || !strings.Contains(err.Error(), "unsupported final part") {
 			t.Fatalf("err = %v, want unsupported-part error", err)
+		}
+		// Same as above: the error path records nothing.
+		if wrappers := recordedWrappers(t, s); len(wrappers) != 0 {
+			t.Fatalf("recorded wrappers = %d, want 0 on the error path", len(wrappers))
 		}
 	})
 }

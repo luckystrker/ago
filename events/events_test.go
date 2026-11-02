@@ -176,6 +176,20 @@ func TestRepairUnansweredToolCalls(t *testing.T) {
 	if len(UnansweredToolCalls(append(append([]Event{}, evs...), fixes[0]))) != 0 {
 		t.Error("repair did not answer the call")
 	}
+
+	// Hosted (builtin) calls follow the same rule: an unanswered one is owed a
+	// sentinel, an answered one is not.
+	openBuiltin := &BuiltinToolCallEvent{ToolCallEvent: NewToolCallEvent("web_search")}
+	doneBuiltin := &BuiltinToolCallEvent{ToolCallEvent: NewToolCallEvent("web_search")}
+	builtinEvs := []Event{
+		openBuiltin,
+		doneBuiltin,
+		&BuiltinToolResultEvent{ToolResultEvent: ToolResultEvent{ParentID: doneBuiltin.ID}},
+	}
+	gotBuiltin := UnansweredToolCalls(builtinEvs)
+	if len(gotBuiltin) != 1 || gotBuiltin[0].ID != openBuiltin.ID {
+		t.Fatalf("want exactly the unanswered builtin call, got %v", gotBuiltin)
+	}
 }
 
 func TestEnsureInputAndRequest(t *testing.T) {
