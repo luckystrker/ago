@@ -3089,3 +3089,89 @@ implement against; when a description surface is ported, `Statusbar` should repo
 
 Gates `go build ./...`, `go test -count=1 ./events/... ./middleware/... ./agent/... ./compact/...
 ./testing/...` green 2026-11-03.
+
+## D-083 — 2026-11-02 — agent: `TaskConfig`/`WithTasks` deprecated (upstream 82bdfb480)
+
+Upstream deprecates `Agent(tasks=TaskConfig(...))` for removal in 1.4.0 (commit 82bdfb480, PR #3542),
+steering users to explicit worker agents exposed through `as_tool`. Owner decision: mirror upstream —
+the option keeps working unchanged at the v1.2.2 baseline behavior, and the actual removal becomes a
+separate owner decision when upstream 1.4.0 lands (UPSTREAM_CHANGES #8).
+
+- **The marker is a doc comment, not a runtime warning.** `WithTasks` (`agent/agent.go:80-88`) and
+  `TaskConfig` (`agent/subtask.go:24-33`) carry `Deprecated:` paragraphs that godoc and staticcheck
+  surface automatically. AGO-DEVIATION (mechanism, not behavior): Python's
+  `@deprecated(TASK_CONFIG_DEPRECATION)` decorator and the `DeprecationWarning` in `Agent.__init__`
+  have no idiomatic Go runtime counterpart — no warning is emitted at run time.
+- **Behavior is untouched:** the `run_subtask`/`run_subtasks` tools stay auto-injected every turn
+  (`agent/run.go:150`) and `IncludeTools` keeps filtering the child agent's inherited tools
+  (`agent/subtask.go:106-114`). The recommended replacement is already ported: `Agent.AsTool`
+  (`agent/agent.go:341`).
+
+Gates `go test -count=1 ./agent/...` green 2026-11-03.
+
+## D-084 — 2026-11-02 — agent: upstream `assembly=` deprecation has nothing to port; no `HaltCheckMiddleware`
+
+Upstream deprecates the `Agent(assembly=...)` parameter in favor of explicit middleware and extracts
+the private halt check into a public `HaltCheckMiddleware` (`ag2/middleware/halt.py`, commit
+4d5773e7b, PR #3545).
+
+- **The deprecation half has nothing to port.** AGo never had an `assembly=` parameter — middleware
+  composition is the core design (D-013) — so the port already sits at upstream's post-commit target
+  state; there is nothing to deprecate.
+- **The public `HaltCheckMiddleware` is a conscious difference, not an omission.** The built-in halt
+  covers the same behavior: the run subscribes to `HaltEvent` inside the turn scope
+  (`agent/run.go:205-213`) and the turn answers a halted turn with the synthetic
+  `"HALTED: <reason>"` model response in the LLM trigger (`agent/turn.go:157-163`). No user request
+  for a configurable halt exists; revisit on request or together with the 1.4.0 removal wave.
+
+Gates `go test -count=1 ./agent/...` green 2026-11-03.
+
+## D-085 — 2026-11-02 — events/stream: `RequestOrigin` in structural equality; `HistoryQuery` terminals are synchronous
+
+Records the request-origin/history-query wave's deviations (rule 5).
+
+- **`origin` participates in structural equality.** Python's `ModelRequest.origin` carries
+  `compare=False` — excluded from dataclass equality. Go has no such field metadata, so `==` and
+  `reflect.DeepEqual` include `Origin` (`events/input.go:114`). Rule: tests (and any code) comparing
+  requests structurally must set `Origin` explicitly on both sides (comment at
+  `events/input_test.go:95`). Dispatch and wire behavior are unaffected — the user/service split
+  only marks user-interval boundaries on the history (upstream ADR 0027 parity).
+- **`HistoryQuery` terminals are plain synchronous methods.** `All`/`First`/`Last`/`Count` take no
+  `context.Context` (`stream/query.go:57-101`): AGo's `Storage` is synchronous (D-004), so there is
+  no asynchronous wait to cancel, and Python's `all`/`first`/`last`/`count` are plain methods too.
+  Every terminal call reads a fresh snapshot from storage.
+
+Gates `go test -count=1 ./events/... ./stream/... ./context/...` green 2026-11-03.
+
+## D-086 — 2026-11-02 — toolpacks: an interrupted local command returns `ErrCommandInterrupted`, not a result
+
+Upstream (commit 153ef4cdd) stops the whole child process tree when the turn is cancelled; Python's
+interrupted exec re-raises `CancelledError` and produces no tool result at all.
+
+- **The sentinel stands in for the re-raise.** A Go tool function has no channel to cancel an
+  in-flight result, so a command stopped by turn cancellation returns `ErrCommandInterrupted`
+  (`toolpacks/exec.go:90-94`; `ErrSandboxClosed`/`ErrSandboxClosedWhileRunning` cover the `Close`
+  paths, `toolpacks/exec.go:96-103`). `FunctionTool`'s generic failure path turns it into a
+  `ToolErrorEvent` (`tools/function_tool.go:432`) — no normal `ToolResult` is produced for the
+  interrupted call, which is upstream's no-result outcome expressed at the event level.
+- **Cancellation reaches the whole process tree.** `runLocalCommand` takes the caller's context and
+  distinguishes its own deadline (the existing exit-124 `"Command timed out after %gs"` path) from
+  parent cancellation; `NewShellTool` and `NewLocalCodeRunner` pass `cx.TurnContext()` down
+  (`toolpacks/shell.go:216`, `toolpacks/coderunner.go:260`), and `Close` cancels every in-flight
+  command and waits for them before removing the workdir.
+
+Gates `go test -count=1 ./toolpacks/...` green 2026-11-03.
+
+## D-087 — 2026-11-02 — v0.8.0: upstream diff parts deliberately not ported (MCP dependency bumps, the Variable note, Gemini continuation SDK internals)
+
+- **The `max_sse_event_size` commit's N/A halves** (15c2a9411, PR #3559): the Python packaging bumps
+  (`mcp/mcp-types` 2.2→2.3, `httpx2` 2.9.1→2.10) do not apply to a zero-dependency core (D-003), and
+  the doc note "max_sse_event_size cannot be a Variable" has no counterpart — AGo config values are
+  plain values without the Variable indirection. The functional halves are recorded in D-079.
+- **Gemini `automatic_continuation`'s SDK internals** (d2274ff2d) invisible through the option's
+  surface stay unported: reconnecting a stream broken mid-hop (the google-genai SDK retries it three
+  times), the cross-hop timeout budget, and the SDK rewriting usage/finish_reason inside delivered
+  chunk events (AGo's chunk events carry neither) — recorded at `config/gemini/client.go:297-301`.
+
+Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./...` green 2026-11-03 (fresh full-module
+run: 48 packages ok, 0 failures).

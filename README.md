@@ -58,16 +58,16 @@ models — no API keys needed.
 | | |
 |---|---|
 | 🧠 **One `Agent` type** | blocking `Ask`, observable `Run`, continuations on the same stream, `Resume` from mid-trajectory |
-| 📡 **Event-sourced core** | every observation is an event: pub/sub stream, durable transcript, replays and usage accounting are event logs |
+| 📡 **Event-sourced core** | every observation is an event: pub/sub stream, durable transcript, queryable history (`Where`, scoped to the current user turn), replays and usage accounting are event logs |
 | 🔧 **Tools as subscribers** | function tools with schema generation and dependency injection, toolkits, parallel execution, `final=true` tools, name precedence, hosted builtin tools executed by the provider (`web_search`, `code_execution`, …) |
 | 🧰 **Tool packs** | ready-made tools over the framework: shell, local code runner, filesystem guard, DuckDuckGo/Tavily/Perplexity search, skills loader, dynamic sub-agent factory (`toolpacks`) |
 | 🧩 **Plugins** | tools, middleware and prompt fragments bundled under one name (`plugin.Bundle`), applied to the agent at construction |
 | 🌐 **7 LLM providers + Responses/Decisions** | OpenAI (Chat Completions **and** the Responses API with hosted tools, plus the Decisions API), Anthropic, Gemini, Ollama, Z.AI, Mistral, DashScope — full clients; xAI/Bedrock/TypeSafe as config stubs |
 | 📁 **Files API** | provider-agnostic upload/read/list/delete — OpenAI and Anthropic clients behind one `files.API` wrapper |
-| 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals; OTEL telemetry as the optional `contrib/otelx` module |
+| 🧅 **Middleware everywhere** | four hooks (turn / LLM call / tool execution / human input), conditional composition, limiters, retries, approvals, dynamic status bars for live UIs; OTEL telemetry as the optional `contrib/otelx` module |
 | 🙋 **Human-in-the-loop** | pluggable human hooks, tool approvals, timed-out asks, transcript repair for abandoned tool calls |
 | 📦 **Structured output** | JSON-schema from Go types, validated answers with automatic re-asking |
-| 🗂️ **Tasks & subtasks** | task lifecycle with checkpoints, `run_subtask`/`run_subtasks` fan-out with usage roll-up, `AsTool` delegation |
+| 🗂️ **Tasks & subtasks** | task lifecycle with checkpoints, `run_subtask`/`run_subtasks` fan-out with usage roll-up, `AsTool` delegation — auto-subtasks (`WithTasks`/`TaskConfig`) are deprecated in favor of explicit worker agents via `AsTool` |
 | 🧠 **Knowledge & policies** | virtual filesystem store with a self-describing bootstrap, change polling (`PollingWatcher`) and the model-facing `knowledge` tool (`agent.WithKnowledgeConfig`); optional SQLite/Redis modules; context-assembly policies (sliding window, token budget, alerts) |
 | 🗜️ **Compaction & aggregation** | LLM-driven history summarization behind triggers, keeping the transcript valid for replay |
 | 👀 **Observers & watches** | loop detection, token monitors, alert→halt flow, composable triggers |
@@ -173,7 +173,7 @@ func main() {
 | [docs/MIGRATION.md](docs/MIGRATION.md) | class-by-class map: Python AG2 → AGo |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the binding package contracts |
 | [docs/PORT_STATUS.md](docs/PORT_STATUS.md) | what is ported / partial / stubbed / deferred |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | 70+ decision records behind every deviation from Python |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 80+ decision records behind every deviation from Python |
 
 ## 🔐 Security
 
@@ -241,7 +241,7 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   HITL, tasks, knowledge, policies, compaction, observers, watches, spec,
   multi-agent network (incl. views, arbiter, expectation sweepers, task mirror, client
   LLM tools), eval (attribution, registry, JSONL, diffs, stats, concurrency), TUI, live
-  cascade — `go build`/`vet`/`test` green on every package (47 packages, 0 failures).
+  cascade — `go build`/`vet`/`test` green on every package (48 packages, 0 failures).
 - **Protocol endpoints ported as functional subsets** (each remainder is a recorded
   decision): `github.com/luckystrker/ago/a2a` (push notifications, client-tools
   extension, context/HITL over the wire, REST, security schemes; gRPC closed
