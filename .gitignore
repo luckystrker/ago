@@ -8,6 +8,9 @@ dist/
 .idea/
 .vscode/
 
+# Upstream AG2 tracking notes — local working file, not part of the port.
+/UPSTREAM_CHANGES.md
+
 # Secret and key material — must never land in history or releases.
 .env
 .env.*
