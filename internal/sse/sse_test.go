@@ -240,6 +240,26 @@ func TestWithMaxEventSizeNonPositiveKeepsScanning(t *testing.T) {
 	}
 }
 
+func TestWithUnlimitedEventSizeDeliversOversize(t *testing.T) {
+	// WithUnlimitedEventSize lifts the cap: one event well past
+	// DefaultMaxEventSize is delivered in full, with no error.
+	r := &repeatingLineReader{
+		line:  "data: " + strings.Repeat("a", 1000) + "\n",
+		limit: int64(34 << 20), // ~33 MiB of payload: above DefaultMaxEventSize
+	}
+	sc := NewScanner(r, WithUnlimitedEventSize())
+	if !sc.Next() {
+		t.Fatalf("oversize event rejected with the unlimited option: %v", sc.Err())
+	}
+	_, data := sc.Event()
+	if int64(len(data)) <= DefaultMaxEventSize {
+		t.Fatalf("delivered %d bytes, want an event past DefaultMaxEventSize (%d)", len(data), DefaultMaxEventSize)
+	}
+	if sc.Err() != nil {
+		t.Fatalf("unlimited scan must not error, got %v", sc.Err())
+	}
+}
+
 // repeatingLineReader yields the same complete line on every Read until the
 // byte limit is reached, then EOF. The line is far smaller than the scanner
 // read buffer, so a Read never splits it.
@@ -256,4 +276,19 @@ func (r *repeatingLineReader) Read(p []byte) (int, error) {
 	n := copy(p, r.line)
 	r.sent += int64(n)
 	return n, nil
+}
+
+func TestScannerEventSizeExactlyAtCap(t *testing.T) {
+	// A payload of exactly maxEventSize bytes sits on the boundary: the cap is
+	// "larger than", so the event must be delivered without an error.
+	sc := NewScanner(strings.NewReader("data: aaaaaaaaa\n\n"), WithMaxEventSize(9))
+	if !sc.Next() {
+		t.Fatalf("event of exactly maxEventSize bytes rejected: %v", sc.Err())
+	}
+	if _, data := sc.Event(); string(data) != "aaaaaaaaa" {
+		t.Fatalf("bad data: %q", data)
+	}
+	if sc.Err() != nil {
+		t.Fatalf("err = %v, want nil", sc.Err())
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/luckystrker/ago/config"
@@ -798,5 +799,265 @@ func TestGeminiStreamHTTPError(t *testing.T) {
 	_, err := cl.Call(context.Background(), nil, nil, config.CallOptions{})
 	if err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("want 503 in error, got %v", err)
+	}
+}
+
+// --- automatic continuation -------------------------------------------------------
+
+// multiResponseServer answers request i with bodies[min(i, len-1)] and records
+// every request body; a streaming server frames each body as one SSE chunk.
+func multiResponseServer(t *testing.T, streaming bool, bodies ...string) (*httptest.Server, *[][]byte) {
+	t.Helper()
+	var mu sync.Mutex
+	got := &[][]byte{}
+	i := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading request: %v", err)
+		}
+		mu.Lock()
+		j := i
+		if i < len(bodies)-1 {
+			i++
+		}
+		*got = append(*got, b)
+		mu.Unlock()
+		if streaming {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			for _, line := range strings.Split(bodies[j], "\n") {
+				fmt.Fprintf(w, "data: %s\n", line)
+			}
+			fmt.Fprint(w, "\n")
+			flusher.Flush()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, bodies[j])
+	}))
+	t.Cleanup(srv.Close)
+	return srv, got
+}
+
+const (
+	// hopTruncated is a hop the server cut at its per-request token limit:
+	// finishReason CONTINUATION plus the resumption token (upstream test
+	// numbers: usage 10/4/14, token "cmVzdW1lLWhlcmU=").
+	hopTruncated = `{"candidates":[{"content":{"role":"model","parts":[{"text":"The answer "}]},"finishReason":"CONTINUATION","continuationToken":"cmVzdW1lLWhlcmU="}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,"totalTokenCount":14}}`
+	// hopFinal closes the resumed answer (usage 12/3/15; totals 22/7/29).
+	hopFinal = `{"candidates":[{"content":{"role":"model","parts":[{"text":"is 42."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3,"totalTokenCount":15}}`
+	// hopNoToken claims CONTINUATION without a resumption token: not resumable.
+	hopNoToken = `{"candidates":[{"content":{"role":"model","parts":[{"text":"The answer "}]},"finishReason":"CONTINUATION"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,"totalTokenCount":14}}`
+)
+
+// TestGeminiAutomaticContinuationJoinsHops pins the resumption loop (Python
+// parity: automatic_continuation, the SDK default is enabled): a truncated hop
+// (finishReason CONTINUATION + continuationToken) is resumed with the
+// top-level continuationToken; the texts concatenate, the usage adds up, the
+// finish reason comes from the last hop; streaming and non-streaming behave
+// alike, and the flag itself never travels on the wire.
+func TestGeminiAutomaticContinuationJoinsHops(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		for _, opted := range []string{"unset", "true"} {
+			t.Run(fmt.Sprintf("streaming=%t/%s", streaming, opted), func(t *testing.T) {
+				srv, bodies := multiResponseServer(t, streaming, hopTruncated, hopFinal)
+				opts := []Option{WithBaseURL(srv.URL)}
+				if streaming {
+					opts = append(opts, WithStreaming(true))
+				}
+				if opted == "true" {
+					opts = append(opts, WithAutomaticContinuation(true))
+				}
+				cl := startClient(t, NewGemini("test-key", "gemini-test", opts...))
+				conv, sent := newCaptureConv()
+
+				resp, err := cl.Call(context.Background(), nil, conv, config.CallOptions{})
+				if err != nil {
+					t.Fatalf("call: %v", err)
+				}
+				if len(*bodies) != 2 {
+					t.Fatalf("requests = %d, want 2 hops", len(*bodies))
+				}
+				var second map[string]any
+				if err := json.Unmarshal((*bodies)[1], &second); err != nil {
+					t.Fatalf("second request body: %v", err)
+				}
+				if second["continuationToken"] != "cmVzdW1lLWhlcmU=" {
+					t.Fatalf("second request continuationToken = %v, want the hop's token", second["continuationToken"])
+				}
+				if _, ok := second["automaticContinuation"]; ok {
+					t.Fatal("the option flag must never travel on the wire")
+				}
+				if gen, ok := second["generationConfig"].(map[string]any); ok {
+					if _, ok := gen["automaticContinuation"]; ok {
+						t.Fatal("the option flag must never travel inside generationConfig")
+					}
+				}
+				if got := resp.Content(); got != "The answer is 42." {
+					t.Fatalf("content = %q, want the joined hops", got)
+				}
+				if resp.FinishReason != "stop" {
+					t.Fatalf("finish = %q, want the last hop's stop", resp.FinishReason)
+				}
+				want := events.Usage{PromptTokens: i64(22), CompletionTokens: i64(7), TotalTokens: i64(29)}
+				if !reflect.DeepEqual(resp.Usage, want) {
+					t.Fatalf("usage = %+v, want 22/7/29", resp.Usage)
+				}
+				// One final ModelMessage at the end, carrying the joined text;
+				// the streaming path also delivered the hop texts as chunks.
+				if resp.Message == nil || resp.Message.Content != "The answer is 42." {
+					t.Fatalf("message = %+v, want the joined text", resp.Message)
+				}
+				var kinds []string
+				for _, ev := range *sent {
+					kinds = append(kinds, ev.EventType())
+				}
+				if streaming {
+					wantKinds := []string{"ModelMessageChunk", "ModelMessageChunk", "ModelMessage"}
+					if !reflect.DeepEqual(kinds, wantKinds) {
+						t.Fatalf("progress events = %v, want %v", kinds, wantKinds)
+					}
+				} else if !reflect.DeepEqual(kinds, []string{"ModelMessage"}) {
+					t.Fatalf("progress events = %v, want [ModelMessage]", kinds)
+				}
+			})
+		}
+	}
+}
+
+// TestGeminiDisabledContinuationReportsTruncation pins
+// WithAutomaticContinuation(false) (Python parity: automatic_continuation=False):
+// exactly one request, and the truncated answer returns as-is with the
+// finish reason "continuation" sticking out.
+func TestGeminiDisabledContinuationReportsTruncation(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%t", streaming), func(t *testing.T) {
+			srv, bodies := multiResponseServer(t, streaming, hopTruncated, hopFinal)
+			opts := []Option{WithBaseURL(srv.URL), WithAutomaticContinuation(false)}
+			if streaming {
+				opts = append(opts, WithStreaming(true))
+			}
+			cl := startClient(t, NewGemini("test-key", "gemini-test", opts...))
+			resp, err := cl.Call(context.Background(), nil, nil, config.CallOptions{})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if len(*bodies) != 1 {
+				t.Fatalf("requests = %d, want exactly 1 hop", len(*bodies))
+			}
+			if got := resp.Content(); got != "The answer " {
+				t.Fatalf("content = %q, want the un-resumed hop", got)
+			}
+			if resp.FinishReason != "continuation" {
+				t.Fatalf("finish = %q, want continuation", resp.FinishReason)
+			}
+			want := events.Usage{PromptTokens: i64(10), CompletionTokens: i64(4), TotalTokens: i64(14)}
+			if !reflect.DeepEqual(resp.Usage, want) {
+				t.Fatalf("usage = %+v, want 10/4/14", resp.Usage)
+			}
+		})
+	}
+}
+
+// TestGeminiContinuationWithoutTokenStops pins the token requirement (Python
+// parity: should_continue_generation — no token, no resumption) even when the
+// finish reason alone says CONTINUATION.
+func TestGeminiContinuationWithoutTokenStops(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%t", streaming), func(t *testing.T) {
+			srv, bodies := multiResponseServer(t, streaming, hopNoToken, hopFinal)
+			opts := []Option{WithBaseURL(srv.URL)}
+			if streaming {
+				opts = append(opts, WithStreaming(true))
+			}
+			cl := startClient(t, NewGemini("test-key", "gemini-test", opts...))
+			resp, err := cl.Call(context.Background(), nil, nil, config.CallOptions{})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if len(*bodies) != 1 {
+				t.Fatalf("requests = %d, want 1 hop (no token, no resume)", len(*bodies))
+			}
+			if resp.FinishReason != "continuation" {
+				t.Fatalf("finish = %q, want continuation", resp.FinishReason)
+			}
+		})
+	}
+}
+
+// TestGeminiCloneAutomaticContinuation pins the Clone boundary of the
+// three-state option: false disables, nil (and a nil *bool) restores the
+// enabled default, a type mismatch is an error.
+func TestGeminiCloneAutomaticContinuation(t *testing.T) {
+	base := NewGemini("k", "m")
+	if !base.continuationEnabled() {
+		t.Fatal("the unset option must default to enabled")
+	}
+	cc, err := base.Clone(map[string]any{"automatic_continuation": false})
+	if err != nil {
+		t.Fatalf("clone false: %v", err)
+	}
+	if cc.(*GeminiConfig).continuationEnabled() {
+		t.Fatal("false must disable continuation")
+	}
+	cc2, err := cc.Clone(map[string]any{"automatic_continuation": nil})
+	if err != nil {
+		t.Fatalf("clone nil: %v", err)
+	}
+	if !cc2.(*GeminiConfig).continuationEnabled() {
+		t.Fatal("nil must restore the enabled default")
+	}
+	falsePtr := false
+	cc3, err := base.Clone(map[string]any{"automatic_continuation": &falsePtr})
+	if err != nil {
+		t.Fatalf("clone *bool: %v", err)
+	}
+	if cc3.(*GeminiConfig).continuationEnabled() {
+		t.Fatal("*bool(false) must disable continuation")
+	}
+	var nilPtr *bool
+	cc4, err := cc.Clone(map[string]any{"automatic_continuation": nilPtr})
+	if err != nil {
+		t.Fatalf("clone nil *bool: %v", err)
+	}
+	if !cc4.(*GeminiConfig).continuationEnabled() {
+		t.Fatal("a nil *bool must clear the field back to the default")
+	}
+	// Deep copy: flipping the clone leaves the base untouched.
+	if !base.continuationEnabled() {
+		t.Fatal("the base config was mutated by the clones")
+	}
+	if _, err := base.Clone(map[string]any{"automatic_continuation": "yes"}); err == nil {
+		t.Fatal("type-mismatched override must fail")
+	}
+}
+
+func TestBoolOverrideAcceptsBoolAndBoolPointer(t *testing.T) {
+	// The *bool branch of boolOverride: a non-nil pointer carries the value, a
+	// nil pointer clears to false. The Clone tests route *bool overrides
+	// through boolPtrOverride, so this branch is pinned directly here.
+	tru, fals := true, false
+	for _, tc := range []struct {
+		name string
+		in   any
+		want bool
+	}{
+		{"bool true", true, true},
+		{"bool false", false, false},
+		{"*bool true", &tru, true},
+		{"*bool false", &fals, false},
+		{"nil *bool", (*bool)(nil), false},
+	} {
+		got, err := boolOverride("flag", tc.in)
+		if err != nil {
+			t.Fatalf("%s: err = %v, want nil", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if _, err := boolOverride("flag", "yes"); err == nil {
+		t.Fatal("type-mismatched value must fail")
 	}
 }

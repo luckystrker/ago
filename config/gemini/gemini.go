@@ -42,6 +42,10 @@ type GeminiConfig struct {
 	seed             *int64
 	thinkingLevel    *string
 	thinkingBudget   *int64
+	// automaticContinuation resumes answers the server truncated at its
+	// per-request token limit (Python parity: automatic_continuation
+	// bool|None = None; the SDK default is enabled). nil = enabled.
+	automaticContinuation *bool
 }
 
 // Option sets one field of a GeminiConfig at construction time.
@@ -88,6 +92,20 @@ func WithThinkingLevel(v string) Option { return func(c *GeminiConfig) { c.think
 
 // WithThinkingBudget caps the thinking token budget.
 func WithThinkingBudget(v int64) Option { return func(c *GeminiConfig) { c.thinkingBudget = &v } }
+
+// WithAutomaticContinuation toggles the automatic resumption of answers the
+// server cut off at its per-request token limit. The flag never travels on the
+// wire; it only drives the client-side hop loop (Python parity:
+// automatic_continuation, default enabled).
+func WithAutomaticContinuation(v bool) Option {
+	return func(c *GeminiConfig) { c.automaticContinuation = &v }
+}
+
+// continuationEnabled reports whether truncated answers are resumed
+// (Python parity: should_enable_automatic_continuation — unset means enabled).
+func (c *GeminiConfig) continuationEnabled() bool {
+	return c.automaticContinuation == nil || *c.automaticContinuation
+}
 
 // NewGemini builds a config for one Gemini model.
 func NewGemini(apiKey, model string, opts ...Option) *GeminiConfig {
@@ -147,6 +165,7 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 	cc.seed = cloneInt(c.seed)
 	cc.thinkingLevel = cloneString(c.thinkingLevel)
 	cc.thinkingBudget = cloneInt(c.thinkingBudget)
+	cc.automaticContinuation = cloneBool(c.automaticContinuation)
 	for k, v := range overrides {
 		switch k {
 		case "model":
@@ -243,6 +262,12 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 				return nil, err
 			}
 			cc.thinkingBudget = i
+		case "automatic_continuation":
+			b, err := boolPtrOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.automaticContinuation = b
 		default:
 			return nil, fmt.Errorf("gemini: unknown config override %q", k)
 		}
@@ -318,6 +343,23 @@ func boolOverride(key string, v any) (bool, error) {
 	}
 }
 
+// boolPtrOverride keeps the three-state shape of a bool|None field: nil clears
+// the override (back to the default), a bool or non-nil *bool sets it, and a
+// nil *bool clears it too (boolOverride cannot express that: it maps a nil
+// *bool to false).
+func boolPtrOverride(key string, v any) (*bool, error) {
+	switch b := v.(type) {
+	case nil:
+		return nil, nil
+	case bool:
+		return &b, nil
+	case *bool:
+		return cloneBool(b), nil
+	default:
+		return nil, overrideErr(key, v)
+	}
+}
+
 func cloneFloat(v *float64) *float64 {
 	if v == nil {
 		return nil
@@ -335,6 +377,14 @@ func cloneInt(v *int64) *int64 {
 }
 
 func cloneString(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	return &c
+}
+
+func cloneBool(v *bool) *bool {
 	if v == nil {
 		return nil
 	}

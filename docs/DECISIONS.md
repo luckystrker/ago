@@ -3007,3 +3007,24 @@ installed into that venv as the brief allows) in `a2ui/testdata/golden.json` via
 - [M-27] валидация источника HITL-ответов отложена (in-process доверие);
 - [I-2/I-7/I-8] границы доверия SyncVariables, client-side tools и hosted-инструментов задокументированы в README;
 - [L-5] доверие HTTP(S)_PROXY из окружения — стандартное поведение Go, задокументировано.
+
+## D-079 — 2026-11-03 — mcp: SSE event-size policy (max_sse_event_size) and its error surface
+
+Records the G9 MCP-client wave's deviations (rule 5). Python `MCPServerConfig.max_sse_event_size`
+(default `1_048_576`, `None` = no cap) bounds one SSE event — a tool result travels as a single
+event, so an oversized result fails the call instead of buffering without bound; the cap itself is
+an addition (Python has none, AGO-DEVIATION at `internal/sse/sse.go:108`).
+
+- **Int sentinels instead of `int | None`.** `MCPServerConfig.MaxSSEEventSize int`
+  (`mcp/config.go:35-42`) encodes Python's tri-state: `0` = default `1_048_576`, `> 0` = the
+  threshold in bytes, `< 0` = no cap (Python `None`); wired through `sse.WithMaxEventSize` /
+  `sse.WithUnlimitedEventSize` (`mcp/http.go:89-97`), same sentinel form as
+  `MCPServerConfig.Timeout`.
+- **Own error text inside `ErrProtocol`.** An oversize event surfaces as
+  `ErrProtocol: SSE stream: sse: event too large` — `internal/sse`'s sentinel `ErrEventTooLarge`
+  (`sse.go:25`) double-`%w`-wrapped into `ErrProtocol` (`mcp/http.go:209-213`;
+  `errors.Is(err, sse.ErrEventTooLarge)` is the detection contract) — instead of the upstream
+  SDK's "byte limit" wording.
+
+Gates `go build ./...`, `go test -count=1 ./internal/sse/... ./config/gemini/... ./mcp/...` green
+2026-11-03.

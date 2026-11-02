@@ -118,45 +118,71 @@ func (c *client) endpoint(action string) string {
 	return strings.TrimSuffix(c.baseURL, "/") + "/models/" + c.cfg.model + ":" + action
 }
 
-// generateContent posts one non-streaming request and folds the response into
-// a ModelResponse.
+// generateContent posts generateContent requests until the answer stops carrying
+// a resumption token: a response the server truncated at its per-request token
+// limit (finishReason CONTINUATION plus a continuationToken) is resumed with the
+// top-level "continuationToken" key, and the hops join — text concatenated,
+// usage summed, finish reason and response id from the last hop (Python parity:
+// the google-genai SDK's _generate_content_with_continuation; the port carries
+// the loop because this package speaks raw REST without the SDK).
 func (c *client) generateContent(ctx context.Context, body map[string]any, headers map[string]string, conv *agocontext.Context) (*events.ModelResponse, error) {
-	status, data, err := c.http.PostJSON(ctx, c.endpoint("generateContent"), headers, body)
-	if err != nil {
-		return nil, err
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("gemini: generateContent returned %d: %s", status, snippet(data))
-	}
-	var raw genResponse
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("gemini: decoding generateContent response: %w", err)
-	}
-
-	var acc genAccumulator
-	// Python walks every candidate (multi-candidate answers concatenate) but
-	// reads the finish reason from the first one only.
-	for _, candidate := range raw.Candidates {
-		if candidate.Content == nil {
-			continue
+	var (
+		acc        genAccumulator
+		usage      events.Usage
+		finish     string
+		responseID string
+	)
+	for {
+		status, data, err := c.http.PostJSON(ctx, c.endpoint("generateContent"), headers, body)
+		if err != nil {
+			return nil, err
 		}
-		for _, part := range candidate.Content.Parts {
-			if err := acc.addPart(part, conv, false); err != nil {
-				return nil, err
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("gemini: generateContent returned %d: %s", status, snippet(data))
+		}
+		var raw genResponse
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, fmt.Errorf("gemini: decoding generateContent response: %w", err)
+		}
+
+		// Python walks every candidate (multi-candidate answers concatenate) but
+		// reads the finish reason from the first one only.
+		for _, candidate := range raw.Candidates {
+			if candidate.Content == nil {
+				continue
+			}
+			for _, part := range candidate.Content.Parts {
+				if err := acc.addPart(part, conv, false); err != nil {
+					return nil, err
+				}
 			}
 		}
+		// Every hop is billed separately: usage adds up, while finish reason and
+		// response id come from the last hop unconditionally
+		// (merge_continuation_responses copies them from curr).
+		usage = usage.Add(normalizeUsage(raw.UsageMetadata))
+		finish = finishReasonOf(&raw)
+		if raw.ResponseID != "" {
+			responseID = raw.ResponseID
+		}
+
+		token, ok := continuationOf(&raw)
+		if !c.cfg.continuationEnabled() || !ok {
+			break
+		}
+		body["continuationToken"] = token
 	}
 
 	resp := &events.ModelResponse{
 		ToolCalls:    events.ToolCallsEvent{Calls: acc.calls},
-		Usage:        normalizeUsage(raw.UsageMetadata),
+		Usage:        usage,
 		Model:        c.cfg.model,
 		Provider:     string(config.ProviderGemini),
-		FinishReason: finishReasonOf(&raw),
+		FinishReason: finish,
 		Files:        acc.files,
 		// AGO-DEVIATION: Python leaves response_id unset; the REST response
 		// carries one and the event has the tracing field for it.
-		ResponseID: raw.ResponseID,
+		ResponseID: responseID,
 	}
 	if acc.content.Len() > 0 {
 		msg := &events.ModelMessage{Content: acc.content.String()}
@@ -171,7 +197,10 @@ func (c *client) generateContent(ctx context.Context, body map[string]any, heade
 // streamGenerate posts a streamGenerateContent?alt=sse request: every SSE data
 // chunk is one generateContent-shaped JSON document (Python parity: the
 // streaming loop — chunk events per text part, usage and finish reason from the
-// latest chunk carrying them, one ModelMessage at the end).
+// latest chunk carrying them, one ModelMessage at the end). A stream whose last
+// chunk carries finishReason CONTINUATION plus a continuationToken is resumed
+// with the top-level "continuationToken" key; the hops join like the
+// non-streaming path.
 func (c *client) streamGenerate(ctx context.Context, body map[string]any, headers map[string]string, conv *agocontext.Context) (*events.ModelResponse, error) {
 	var (
 		acc        genAccumulator
@@ -180,34 +209,54 @@ func (c *client) streamGenerate(ctx context.Context, body map[string]any, header
 		responseID string
 	)
 	url := c.endpoint("streamGenerateContent") + "?alt=sse"
-	err := c.http.PostJSONStream(ctx, url, headers, body, func(data []byte) error {
-		var chunk genResponse
-		if err := json.Unmarshal(data, &chunk); err != nil {
-			return fmt.Errorf("gemini: decoding stream chunk: %w", err)
-		}
-		for _, candidate := range chunk.Candidates {
-			if candidate.Content == nil {
-				continue
+	for {
+		// Per-hop state: inside one stream usageMetadata is a running total the
+		// latest chunk carrying it replaces, not a sum.
+		var (
+			hopUsage  events.Usage
+			hopFinish string
+			hopToken  string
+			hopResume bool
+		)
+		err := c.http.PostJSONStream(ctx, url, headers, body, func(data []byte) error {
+			var chunk genResponse
+			if err := json.Unmarshal(data, &chunk); err != nil {
+				return fmt.Errorf("gemini: decoding stream chunk: %w", err)
 			}
-			for _, part := range candidate.Content.Parts {
-				if err := acc.addPart(part, conv, true); err != nil {
-					return err
+			for _, candidate := range chunk.Candidates {
+				if candidate.Content == nil {
+					continue
+				}
+				for _, part := range candidate.Content.Parts {
+					if err := acc.addPart(part, conv, true); err != nil {
+						return err
+					}
 				}
 			}
+			if chunk.UsageMetadata != nil {
+				hopUsage = normalizeUsage(chunk.UsageMetadata)
+			}
+			if fr := finishReasonOf(&chunk); fr != "" {
+				hopFinish = fr
+			}
+			if chunk.ResponseID != "" {
+				responseID = chunk.ResponseID
+			}
+			// Resumption keys off the last chunk of the hop.
+			hopToken, hopResume = continuationOf(&chunk)
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		if chunk.UsageMetadata != nil {
-			usage = normalizeUsage(chunk.UsageMetadata)
+		usage = usage.Add(hopUsage)
+		// The last hop wins even when it carries no finish reason.
+		finish = hopFinish
+
+		if !c.cfg.continuationEnabled() || !hopResume {
+			break
 		}
-		if fr := finishReasonOf(&chunk); fr != "" {
-			finish = fr
-		}
-		if chunk.ResponseID != "" {
-			responseID = chunk.ResponseID
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		body["continuationToken"] = hopToken
 	}
 
 	resp := &events.ModelResponse{
@@ -236,6 +285,30 @@ func finishReasonOf(raw *genResponse) string {
 		return ""
 	}
 	return strings.ToLower(raw.Candidates[0].FinishReason)
+}
+
+// continuationOf reports the resumption token of a response and whether the
+// answer may be resumed: the token is mandatory, and the finish reason must be
+// absent or CONTINUATION (Python parity: should_continue_generation +
+// is_resumable_finish_reason). The token travels back verbatim as the
+// top-level "continuationToken" of the next request; the
+// automatic_continuation flag itself never reaches the wire.
+//
+// SDK internals invisible through the option's surface are deliberately not
+// ported: reconnecting a stream broken mid-hop (the SDK retries it three
+// times), the SDK's cross-hop timeout budget, and the SDK's rewriting of
+// usage/finish_reason inside the delivered chunk events (AGo's chunk events
+// carry neither).
+func continuationOf(raw *genResponse) (token string, ok bool) {
+	if len(raw.Candidates) == 0 {
+		return "", false
+	}
+	token = raw.Candidates[0].ContinuationToken
+	if token == "" {
+		return "", false
+	}
+	fr := raw.Candidates[0].FinishReason
+	return token, fr == "" || strings.EqualFold(fr, "CONTINUATION")
 }
 
 // sendEvent publishes a progress event on the conversation stream; a nil conv

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"math"
 	"strings"
 )
 
@@ -50,6 +51,15 @@ func WithMaxEventSize(n int) Option {
 		if n > 0 {
 			s.maxEventSize = n
 		}
+	}
+}
+
+// WithUnlimitedEventSize removes the per-event cap: every event is delivered no
+// matter how large. Only for a trusted peer — an endpoint that controls the
+// event sizes can otherwise grow the scanner's memory without bound.
+func WithUnlimitedEventSize() Option {
+	return func(s *Scanner) {
+		s.maxEventSize = math.MaxInt
 	}
 }
 

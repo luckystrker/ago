@@ -24,6 +24,10 @@ type httpTransport struct {
 	headers   map[string]string
 	client    *http.Client
 	sessionID string
+	// sseOpts are the resolved scanner options for SSE answers; computed once
+	// at construction so a session rebuild (client.go reuses this transport)
+	// keeps the configured event-size policy.
+	sseOpts []sse.Option
 }
 
 // parseAbsoluteURL validates that raw is an absolute http(s) URL.
@@ -49,6 +53,12 @@ const defaultExchangeTimeout = 30 * time.Second
 // consumed line-capped by the scanner instead.
 const maxJSONResponseBytes int64 = 8 << 20
 
+// defaultSSEEventSize caps one SSE event when the config sets no
+// MaxSSEEventSize (Python parity: max_sse_event_size = 1_048_576 — a tool
+// result travels as a single event, and a hostile server must not be able to
+// force every client to buffer unbounded memory).
+const defaultSSEEventSize = 1 << 20
+
 // newHTTPTransport validates the config and builds the header set: custom headers
 // first, then the derived Bearer token when no Authorization entry exists
 // (Python parity: _resolve_config).
@@ -73,6 +83,18 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	case cfg.Timeout < 0:
 		timeout = 0 // http.Client: no cap
 	}
+	// The SSE event-size policy mirrors Timeout's sentinel form: zero is the
+	// default cap, a positive value is the threshold, a negative value removes
+	// it (Python parity: max_sse_event_size int|None = 1_048_576; None = no cap).
+	var sseOpts []sse.Option
+	switch {
+	case cfg.MaxSSEEventSize > 0:
+		sseOpts = []sse.Option{sse.WithMaxEventSize(cfg.MaxSSEEventSize)}
+	case cfg.MaxSSEEventSize < 0:
+		sseOpts = []sse.Option{sse.WithUnlimitedEventSize()}
+	default:
+		sseOpts = []sse.Option{sse.WithMaxEventSize(defaultSSEEventSize)}
+	}
 	// AGO-DEVIATION: http.Client.Timeout caps the whole exchange (including
 	// reading an SSE response body), while Python's httpx timeout is per-phase
 	// (connect/read/write); a server answering slowly but steadily is cut off
@@ -82,7 +104,7 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	// redirect to another host — the stdlib strips only a small fixed set —
 	// so the redirect policy strips everything non-safelisted at the host
 	// boundary; same-host hops keep the headers.
-	return &httpTransport{url: cfg.URL, headers: headers, client: &http.Client{
+	return &httpTransport{url: cfg.URL, headers: headers, sseOpts: sseOpts, client: &http.Client{
 		Timeout:       timeout,
 		CheckRedirect: httpx.RedirectStripCredentials.CheckRedirect(),
 	}}, nil
@@ -166,7 +188,7 @@ func (t *httpTransport) call(ctx context.Context, id int64, method string, param
 // callOverSSE scans the response stream for the reply with the awaited id,
 // skipping any notification the server interleaves.
 func (t *httpTransport) callOverSSE(r io.Reader, id int64) (json.RawMessage, error) {
-	sc := sse.NewScanner(r)
+	sc := sse.NewScanner(r, t.sseOpts...)
 	for sc.Next() {
 		_, data := sc.Event()
 		var msg wireMessage
@@ -185,7 +207,9 @@ func (t *httpTransport) callOverSSE(r io.Reader, id int64) (json.RawMessage, err
 		return msg.Result, nil
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("%w: SSE stream: %v", ErrProtocol, err)
+		// Double %w: consumers (and the tests) must be able to detect an
+		// oversize event through errors.Is(err, sse.ErrEventTooLarge).
+		return nil, fmt.Errorf("%w: SSE stream: %w", ErrProtocol, err)
 	}
 	return nil, fmt.Errorf("%w: SSE stream ended without the reply to request %d", ErrProtocol, id)
 }

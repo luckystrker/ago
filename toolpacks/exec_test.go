@@ -3,8 +3,10 @@ package toolpacks
 import (
 	stdcontext "context"
 	"errors"
+	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -478,5 +480,65 @@ func TestRunLocalCommandNotFoundIs127(t *testing.T) {
 	}
 	if !strings.HasPrefix(res.Output, "Command not found") {
 		t.Fatalf("output = %q, want the Command not found classification", res.Output)
+	}
+}
+
+// TestUndecodableHelper is not a real test: it is the child-process body of
+// TestRunLocalCommandUndecodableOutputKeepsTextAndExitCode (stdlib idiom: the
+// test binary re-invoked with an env flag, Python parity: sys.executable -c in
+// test_local_sandbox.py). Without the flag it is a no-op.
+func TestUndecodableHelper(t *testing.T) {
+	if os.Getenv("AGO_UNDECODABLE_HELPER") == "" {
+		return
+	}
+	payload := []byte("before\x81after\n")
+	switch os.Getenv("AGO_UNDECODABLE_FD") {
+	case "2":
+		os.Stderr.Write(payload)
+	default:
+		os.Stdout.Write(payload)
+	}
+	code, err := strconv.Atoi(os.Getenv("AGO_UNDECODABLE_EXIT"))
+	if err != nil {
+		code = 0
+	}
+	os.Exit(code)
+}
+
+// TestRunLocalCommandUndecodableOutputKeepsTextAndExitCode is the regression
+// for the undecodable-output tolerance (Python parity: local.py _run_subprocess
+// errors="replace"): output bytes the host text layer cannot decode must lose
+// neither the surrounding text nor the exit code. Go captures raw bytes, so
+// the invalid byte stays raw in the output string here; the model-visible
+// U+FFFD replacement happens at the JSON boundary (pinned in
+// TestCodeRunnerUndecodableOutput).
+func TestRunLocalCommandUndecodableOutputKeepsTextAndExitCode(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	for _, fd := range []string{"1", "2"} {
+		for _, code := range []int{0, 7} {
+			t.Run("fd"+fd+"/exit"+strconv.Itoa(code), func(t *testing.T) {
+				env := map[string]string{
+					"AGO_UNDECODABLE_HELPER": "1",
+					"AGO_UNDECODABLE_FD":     fd,
+					"AGO_UNDECODABLE_EXIT":   strconv.Itoa(code),
+				}
+				res, err := runLocalCommand(stdcontext.Background(),
+					[]string{exe, "-test.run=TestUndecodableHelper$"}, "", env, false, 30*time.Second, defaultMaxOutput)
+				if err != nil {
+					t.Fatalf("runLocalCommand: %v", err)
+				}
+				if res.ExitCode != code {
+					t.Fatalf("exit code = %d, want %d (output %q)", res.ExitCode, code, res.Output)
+				}
+				// The text around the undecodable byte survives, and the byte
+				// itself stays raw at this layer.
+				if !strings.Contains(res.Output, "before\x81after") {
+					t.Fatalf("output = %q, want the raw 0x81 byte preserved between before/after", res.Output)
+				}
+			})
+		}
 	}
 }

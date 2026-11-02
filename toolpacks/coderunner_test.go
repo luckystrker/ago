@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -249,6 +250,73 @@ func TestCodeRunnerOptionsValidation(t *testing.T) {
 		t.Fatalf("valid python binary refused: %v", err)
 	}
 	defer py.Close()
+}
+
+// TestCodeRunnerUndecodableOutput is the adapter-level regression (Python
+// parity: test_code_adapter.py / test_shell_adapter.py, errors="replace"):
+// stderr bytes the host text layer cannot decode must lose neither the text
+// nor the exit code, and at the JSON boundary the invalid byte surfaces as
+// U+FFFD — the form the model actually sees.
+func TestCodeRunnerUndecodableOutput(t *testing.T) {
+	cases := []struct {
+		name     string
+		language string
+		code     string
+		skip     string
+	}{
+		{
+			name:     "bash",
+			language: "bash",
+			code:     "printf 'error: \\201' >&2\nexit 7",
+			skip:     "no working bash/sh on PATH",
+		},
+		{
+			name:     "python",
+			language: "python",
+			code:     "import os\nos.write(2, b'error: \\x81')\nraise SystemExit(7)",
+			skip:     "no python interpreter on PATH",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			switch tc.language {
+			case "bash":
+				if findShell() == "" {
+					t.Skip(tc.skip)
+				}
+			default:
+				if !pythonAvailable() {
+					t.Skip(tc.skip)
+				}
+			}
+			r, err := NewLocalCodeRunner()
+			if err != nil {
+				t.Fatalf("NewLocalCodeRunner: %v", err)
+			}
+			defer r.Close()
+			_, cx := newTestContext()
+			ev := callTool(t, r, cx, r.Name(),
+				`{"code":`+quoteGo(tc.code)+`,"language":"`+tc.language+`"}`)
+			got := resultPartText(t, ev)
+			if !strings.Contains(got, "error: ") {
+				t.Fatalf("output = %q, want the stderr text around the invalid byte", got)
+			}
+			if !strings.Contains(got, "[exit code: 7]") {
+				t.Fatalf("output = %q, want [exit code: 7]", got)
+			}
+			// The invalid 0x81 byte is not valid UTF-8, so marshaling the result
+			// text replaces it with the escaped U+FFFD (the Go twin of
+			// errors="replace"): neither the text nor the exit code was lost to
+			// a decode failure.
+			j, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal result text: %v", err)
+			}
+			if !strings.Contains(string(j), `\ufffd`) {
+				t.Fatalf("JSON result %s does not carry U+FFFD in place of the 0x81 byte", j)
+			}
+		})
+	}
 }
 
 // TestCodeRunnerJavaScript pins the js runner: a javascript snippet runs
