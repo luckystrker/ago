@@ -226,7 +226,7 @@ func TestShellToolTurnCancelKillsCommand(t *testing.T) {
 		t.Skip("no process-listing tool on this platform")
 	}
 	// A stray matching process from outside the test would poison the verdict.
-	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+	if probeAlive(t, listCmd, nameOf(start)) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
 	s, err := NewShellTool()
@@ -243,8 +243,8 @@ func TestShellToolTurnCancelKillsCommand(t *testing.T) {
 		t.Fatalf("startToolCall: %v", err)
 	}
 	defer stop()
-	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
-		t.Fatal("the command never started")
+	if !waitProbeRunning(t, listCmd, nameOf(start), 30*time.Second) {
+		t.Fatalf("the command never started; listing now: %q", strings.TrimSpace(listMatching(t, listCmd)))
 	}
 	cancelTurn()
 	select {
@@ -258,8 +258,8 @@ func TestShellToolTurnCancelKillsCommand(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the tool call did not return after the turn cancel")
 	}
-	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
-		t.Fatalf("a command survived the turn cancel:\n%s", out)
+	if probeAlive(t, listCmd, nameOf(start)) {
+		t.Fatalf("a command survived the turn cancel:\n%s", listMatching(t, listCmd))
 	}
 }
 
@@ -269,7 +269,7 @@ func TestShellToolCloseStopsRunningCommand(t *testing.T) {
 		t.Skip("no process-listing tool on this platform")
 	}
 	// A stray matching process from outside the test would poison the verdict.
-	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+	if probeAlive(t, listCmd, nameOf(start)) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
 	s, err := NewShellTool()
@@ -282,15 +282,15 @@ func TestShellToolCloseStopsRunningCommand(t *testing.T) {
 		t.Fatalf("startToolCall: %v", err)
 	}
 	defer stop()
-	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
-		t.Fatal("the command never started")
+	if !waitProbeRunning(t, listCmd, nameOf(start), 30*time.Second) {
+		t.Fatalf("the command never started; listing now: %q", strings.TrimSpace(listMatching(t, listCmd)))
 	}
 	// Close returns only once the command tree is dead and the workdir is gone.
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
-		t.Fatalf("a command survived Close:\n%s", out)
+	if probeAlive(t, listCmd, nameOf(start)) {
+		t.Fatalf("a command survived Close:\n%s", listMatching(t, listCmd))
 	}
 	if _, err := os.Stat(s.Workdir()); !os.IsNotExist(err) {
 		t.Fatalf("auto workdir survived Close: %v", err)

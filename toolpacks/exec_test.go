@@ -290,9 +290,11 @@ func TestRunLocalCommandOutputBufferCap(t *testing.T) {
 
 // grandchildProbe names a long-running process only this test starts, and how
 // to list matching processes on the platform ("" lines = none running).
+// No `start /b` on windows: it does not spawn reliably on headless CI runners;
+// the foreground pair keeps the same cmd→ping grandchild shape.
 func grandchildProbe() (start []string, listCmd []string, ok bool) {
 	if runtime.GOOS == "windows" {
-		return []string{"cmd", "/c", "start /b ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul"},
+		return []string{"cmd", "/c", "ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul"},
 			[]string{"tasklist", "/FI", "IMAGENAME eq ping.exe", "/FO", "CSV", "/NH"}, true
 	}
 	if _, err := exec.LookPath("pgrep"); err != nil {
@@ -316,6 +318,19 @@ func listMatching(t *testing.T, listCmd []string) string {
 	return string(out)
 }
 
+// probeAlive reports whether the listing shows a live matching process.
+// pgrep -f prints only PIDs — the process name never occurs in its output —
+// so on unix any non-empty listing is a match; tasklist prints image names,
+// so there the name check works.
+func probeAlive(t *testing.T, listCmd []string, name string) bool {
+	t.Helper()
+	out := strings.ToLower(strings.TrimSpace(listMatching(t, listCmd)))
+	if runtime.GOOS == "windows" {
+		return strings.Contains(out, strings.ToLower(name))
+	}
+	return out != ""
+}
+
 // waitProbeRunning polls the probe listing until a matching process appears
 // (the command actually running) or the deadline passes. Only for the test
 // goroutine: listMatching fails the test on a hard listing error.
@@ -323,7 +338,7 @@ func waitProbeRunning(t *testing.T, listCmd []string, name string, timeout time.
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(name)) {
+		if probeAlive(t, listCmd, name) {
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -337,7 +352,7 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 		t.Skip("no process-listing tool on this platform")
 	}
 	// A stray matching process from outside the test would poison the verdict.
-	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+	if probeAlive(t, listCmd, nameOf(start)) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
 	res, err := runLocalCommand(stdcontext.Background(), start, "", nil, false, 2*time.Second, defaultMaxOutput)
@@ -350,8 +365,8 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	// The kill runs inside the context cancel; give the table a moment to
 	// settle before listing.
 	time.Sleep(500 * time.Millisecond)
-	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
-		t.Fatalf("a grandchild survived the timeout kill:\n%s", out)
+	if probeAlive(t, listCmd, nameOf(start)) {
+		t.Fatalf("a grandchild survived the timeout kill:\n%s", listMatching(t, listCmd))
 	}
 }
 
@@ -361,7 +376,7 @@ func TestRunLocalCommandCancelKillsTree(t *testing.T) {
 		t.Skip("no process-listing tool on this platform")
 	}
 	// A stray matching process from outside the test would poison the verdict.
-	if strings.Contains(strings.ToLower(listMatching(t, listCmd)), strings.ToLower(nameOf(start))) {
+	if probeAlive(t, listCmd, nameOf(start)) {
 		t.Skip("a matching process is already running; cannot isolate the check")
 	}
 	ctx, cancel := stdcontext.WithCancel(stdcontext.Background())
@@ -377,8 +392,8 @@ func TestRunLocalCommandCancelKillsTree(t *testing.T) {
 		res, err := runLocalCommand(ctx, start, "", nil, false, time.Minute, defaultMaxOutput)
 		ch <- outcome{res, err}
 	}()
-	if !waitProbeRunning(t, listCmd, nameOf(start), 10*time.Second) {
-		t.Fatal("the probe process never appeared")
+	if !waitProbeRunning(t, listCmd, nameOf(start), 30*time.Second) {
+		t.Fatalf("the probe process never appeared; listing now: %q", strings.TrimSpace(listMatching(t, listCmd)))
 	}
 	cancel()
 	select {
@@ -389,8 +404,8 @@ func TestRunLocalCommandCancelKillsTree(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("runLocalCommand did not return after the parent cancel")
 	}
-	if out := listMatching(t, listCmd); strings.Contains(strings.ToLower(out), strings.ToLower(nameOf(start))) {
-		t.Fatalf("a grandchild survived the cancel kill:\n%s", out)
+	if probeAlive(t, listCmd, nameOf(start)) {
+		t.Fatalf("a grandchild survived the cancel kill:\n%s", listMatching(t, listCmd))
 	}
 }
 

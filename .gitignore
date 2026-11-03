@@ -16,3 +16,6 @@ dist/
 .env.*
 *.pem
 *.key
+
+# Mutation-harness working artifacts (local only).
+.mutlogs/

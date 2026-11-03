@@ -55,12 +55,12 @@ func TestQuickMergeRequestsFoldReference(t *testing.T) {
 			wantOrigin = events.OriginService
 			for _, req := range c.reqs {
 				wantParts = append(wantParts, req.Parts...)
-			for k, v := range req.Metadata {
-				if wantMeta == nil {
-					wantMeta = map[string]any{}
+				for k, v := range req.Metadata {
+					if wantMeta == nil {
+						wantMeta = map[string]any{}
+					}
+					wantMeta[k] = v
 				}
-				wantMeta[k] = v
-			}
 				if req.Origin == events.OriginUser || req.Origin == "" {
 					wantOrigin = events.OriginUser
 				}

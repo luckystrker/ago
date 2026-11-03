@@ -507,7 +507,7 @@ func TestTurnLockRefcountKeepsEntry(t *testing.T) {
 
 	a := New("a", "")
 	l1 := a.acquireTurnLock("s")
-	l1.mu.Lock() // run 1 owns the stream
+	l1.mu.Lock()                 // run 1 owns the stream
 	l2 := a.acquireTurnLock("s") // run 2 joins the same entry, waits on the mutex
 	if l1 != l2 {
 		t.Fatal("concurrent runs on one stream must share the lock entry")

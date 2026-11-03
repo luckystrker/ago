@@ -438,8 +438,8 @@ func TestSubStreamEnqueueOriginDelegates(t *testing.T) {
 // spyStorage records persistence calls, so the WithStorage wiring can be pinned
 // by identity instead of by reading the history back through the default store.
 type spyStorage struct {
-	mu   sync.Mutex
-	saved []events.Event
+	mu       sync.Mutex
+	saved    []events.Event
 	replaced [][]events.Event
 }
 
