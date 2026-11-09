@@ -9,6 +9,7 @@ import (
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
+	"github.com/luckystrker/ago/usage"
 )
 
 // strategyFunc is a closure standing in for an LLM summarizer.
@@ -596,5 +597,102 @@ func TestCutIndex(t *testing.T) {
 				t.Fatalf("cutIndex = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCompactionRetainsForwardedUsageProvenance pins the delegation-aware
+// retention rule: a forwarded source record from before the summarized window
+// survives the rewrite once, keeping its path/task/agent, even when the same
+// record also sits in the retained tail.
+func TestCompactionRetainsForwardedUsageProvenance(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	for _, u := range []string{"u0", "u1", "u2", "u3", "u4", "u5"} {
+		send(t, ctx, userReq(u))
+	}
+	forwarded := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(9)}, events.UsageKindModelCall)
+	forwarded.Path = []string{"worker", "leaf"}
+	forwarded.TaskID, forwarded.AgentName = "leaf-task", "leaf"
+	if err := ctx.Stream.Send(forwarded); err != nil {
+		t.Fatalf("send forwarded usage: %v", err)
+	}
+	for _, u := range []string{"u6", "u7", "u8", "u9", "u10"} {
+		send(t, ctx, userReq(u))
+	}
+	// The same source record replayed inside the window that stays.
+	if err := ctx.Stream.Send(forwarded); err != nil {
+		t.Fatalf("replay forwarded usage: %v", err)
+	}
+
+	mw := New(EventCountTrigger(6), strategyFunc(func(*agocontext.Context, []events.Event) (string, error) {
+		return "s", nil
+	}), WithAgent("tester"))()
+	if _, err := mw.OnTurn(func(ev *events.ModelRequest, ctx *agocontext.Context) (*events.ModelResponse, error) {
+		r := &events.ModelResponse{Message: &events.ModelMessage{Content: "done"}}
+		send(t, ctx, r)
+		return r, nil
+	}, userReq("u11"), ctx); err != nil {
+		t.Fatalf("OnTurn: %v", err)
+	}
+
+	evs, err := ctx.Stream.History().GetEvents()
+	if err != nil {
+		t.Fatalf("GetEvents: %v", err)
+	}
+	report := usage.FromEvents(evs)
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 9 {
+		t.Fatalf("total = %v, want 9 counted once", report.Total.TotalTokens)
+	}
+	var kept []*events.UsageEvent
+	for _, ev := range evs {
+		if ue, ok := events.AsValue(ev).(events.UsageEvent); ok && ue.Kind == events.UsageKindModelCall {
+			kept = append(kept, &ue)
+		}
+	}
+	if len(kept) != 1 {
+		t.Fatalf("retained source records = %d, want 1", len(kept))
+	}
+	if kept[0].EventID != forwarded.EventID || kept[0].TaskID != "leaf-task" || kept[0].AgentName != "leaf" ||
+		len(kept[0].Path) != 2 || kept[0].Path[1] != "leaf" {
+		t.Fatalf("retained provenance = %+v", kept[0])
+	}
+}
+
+// TestCompactionKeepsDistinctIdLessStrategySpend pins legacy (id-less) records:
+// deduplication is by source id only, so two distinct id-less spends are both
+// retained instead of collapsing into one.
+func TestCompactionKeepsDistinctIdLessStrategySpend(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	seedTurnHistory(t, ctx)
+
+	strategy := strategyFunc(func(ctx *agocontext.Context, evs []events.Event) (string, error) {
+		for i := 0; i < 2; i++ {
+			if err := ctx.Send(&events.UsageEvent{
+				Usage: events.Usage{TotalTokens: events.I64(5)},
+				Kind:  events.UsageKindCompaction,
+			}); err != nil {
+				return "", err
+			}
+		}
+		return "s", nil
+	})
+	mw := New(EventCountTrigger(6), strategy, WithAgent("tester"))()
+	if _, err := mw.OnTurn(func(ev *events.ModelRequest, ctx *agocontext.Context) (*events.ModelResponse, error) {
+		r := &events.ModelResponse{Message: &events.ModelMessage{Content: "done"}}
+		send(t, ctx, r)
+		return r, nil
+	}, userReq("u7"), ctx); err != nil {
+		t.Fatalf("OnTurn: %v", err)
+	}
+
+	evs, err := ctx.Stream.History().GetEvents()
+	if err != nil {
+		t.Fatalf("GetEvents: %v", err)
+	}
+	report := usage.FromEvents(evs)
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 10 {
+		t.Fatalf("total = %v, want 10 (both id-less spends)", report.Total.TotalTokens)
+	}
+	if got := report.ByKind[events.UsageKindCompaction]; got.TotalTokens == nil || *got.TotalTokens != 10 {
+		t.Fatalf("compaction kind = %+v, want both records", got)
 	}
 }

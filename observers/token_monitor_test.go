@@ -209,3 +209,24 @@ func TestTokenMonitorCountsSourceEventOnce(t *testing.T) {
 		t.Fatalf("wrapped total = %d, want 30", got)
 	}
 }
+
+// TestTokenMonitorTransientChildEnvelopeCountsOnce pins the archived/transient
+// spelling: a transient observation carrying a source record is accounted by
+// that record's id exactly like the durable envelope.
+func TestTokenMonitorTransientChildEnvelopeCountsOnce(t *testing.T) {
+	s, cx := newConversation()
+	monitor := NewTokenMonitor(1000)
+	if err := monitor.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(40)}, events.UsageKindModelCall)
+	wrapped := &events.TransientChildEvent{ChildEvent: *events.NewChildEvent(source, "t", []string{"t"}, "leaf", source.EventID)}
+	for i := 0; i < 2; i++ {
+		if err := s.Send(wrapped); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	if got := monitor.Total(); got != 40 {
+		t.Fatalf("total = %d, want 40 (source counted once)", got)
+	}
+}

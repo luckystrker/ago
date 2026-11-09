@@ -40,6 +40,39 @@ func sampleEvents() []events.Event {
 		},
 		&events.BinaryInput{Base: events.Base{CreatedAt: now.Add(2 * time.Second)}, Data: []byte{0, 1, 255}, MediaType: "image/png", Kind: events.BinaryImage},
 		&events.MessageEnqueued{Base: events.Base{CreatedAt: now.Add(3 * time.Second)}},
+		// Delegation provenance must survive the wire: path/task_id/agent_name
+		// are new inert fields on UsageEvent and every Task* event.
+		&events.UsageEvent{
+			Base:       events.Base{CreatedAt: now.Add(4 * time.Second)},
+			EventID:    "usage-1",
+			InertEvent: events.InertEvent{Path: []string{"worker", "leaf"}},
+			TaskID:     "leaf-task",
+			AgentName:  "leaf",
+			Usage:      events.Usage{TotalTokens: events.I64(12)},
+			Kind:       events.UsageKindModelCall,
+			Model:      "leaf-model",
+			Provider:   "test",
+		},
+		&events.TaskCompleted{
+			Base:       events.Base{CreatedAt: now.Add(5 * time.Second)},
+			InertEvent: events.InertEvent{Path: []string{"worker"}},
+			TaskID:     "worker-task",
+			AgentName:  "worker",
+			Result:     "done",
+			Usage:      events.Usage{TotalTokens: events.I64(7)},
+		},
+		events.NewChildEvent(
+			&events.UsageEvent{
+				Base:       events.Base{CreatedAt: now.Add(6 * time.Second)},
+				EventID:    "usage-2",
+				InertEvent: events.InertEvent{Path: []string{"leaf"}},
+				TaskID:     "leaf-task",
+				AgentName:  "leaf",
+				Usage:      events.Usage{TotalTokens: events.I64(3)},
+				Kind:       events.UsageKindModelCall,
+			},
+			"leaf-task", []string{"leaf"}, "leaf", "usage-2",
+		),
 	}
 }
 

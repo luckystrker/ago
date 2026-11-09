@@ -285,3 +285,22 @@ func TestFromEventsDeduplicatesSourceRecords(t *testing.T) {
 		t.Fatalf("id-less fixtures collapsed: %v", report.Total.PromptTokens)
 	}
 }
+
+// TestFromEventsNestedArchiveEnvelope pins a replayed delegation tree: nested
+// ChildEvent envelopes resolve to the one source record they wrap, and a sibling
+// copy of that record (the bare forwarded event) still counts once.
+func TestFromEventsNestedArchiveEnvelope(t *testing.T) {
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(12)}, events.UsageKindModelCall)
+	leaf := events.NewChildEvent(source, "leaf", []string{"worker", "leaf"}, "leaf", source.EventID)
+	root := events.NewChildEvent(leaf, "worker", []string{"worker"}, "worker", "worker-event")
+	if got, ok := EventFrom(root); !ok || got.EventID != source.EventID {
+		t.Fatalf("EventFrom(nested) = %+v/%v, want the source record", got, ok)
+	}
+	report := FromEvents([]events.Event{root, source, leaf})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 12 {
+		t.Fatalf("total = %v, want 12 counted once", report.Total.TotalTokens)
+	}
+	if len(report.Records) != 1 {
+		t.Fatalf("records = %d, want 1", len(report.Records))
+	}
+}

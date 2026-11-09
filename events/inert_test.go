@@ -151,3 +151,89 @@ func TestInertIsNotConversational(t *testing.T) {
 		t.Fatal("ModelResponse classified as inert")
 	}
 }
+
+// TestInertValueFormsAndTypedNil pins the value/pointer spellings an archived
+// transcript produces: value-form events keep working through the interfaces,
+// and a typed-nil pointer is an absent event, not an inert one.
+func TestInertValueFormsAndTypedNil(t *testing.T) {
+	value := UsageEvent{
+		InertEvent: InertEvent{Path: []string{"outer"}},
+		Usage:      Usage{TotalTokens: I64(3)},
+		Kind:       UsageKindModelCall,
+	}
+	if !IsInert(value) {
+		t.Fatal("value-form UsageEvent is not inert")
+	}
+	if got := InertPath(value); len(got) != 1 || got[0] != "outer" {
+		t.Fatalf("value-form path = %v", got)
+	}
+	stamped, ok := StampInert(value, []string{"root", "leaf"}, "task", "agent").(*UsageEvent)
+	if !ok {
+		t.Fatalf("stamped value form = %T, want *UsageEvent", stamped)
+	}
+	if len(stamped.Path) != 1 || stamped.Path[0] != "outer" {
+		t.Fatalf("a later hop rewrote the value-form path: %v", stamped.Path)
+	}
+
+	var nilUsage *UsageEvent
+	if IsInert(nilUsage) {
+		t.Fatal("typed-nil UsageEvent classified as inert")
+	}
+	if got := InertPath(nilUsage); got != nil {
+		t.Fatalf("typed-nil path = %v, want nil", got)
+	}
+	if got := StampInert(nilUsage, []string{"x"}, "t", "a"); got != nilUsage {
+		t.Fatalf("StampInert(typed nil) = %#v, want the typed-nil input", got)
+	}
+}
+
+// TestAsLocalDropsPartialIdentity pins that either half of a UsageEvent's
+// delegation identity marks it as inherited: a republished record must not keep
+// the descendant's task id or agent name.
+func TestAsLocalDropsPartialIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		taskID string
+		agent  string
+	}{
+		{name: "task id only", taskID: "leaf-task"},
+		{name: "agent name only", agent: "leaf"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inherited := NewUsageEvent(Usage{TotalTokens: I64(4)}, UsageKindModelCall)
+			inherited.TaskID, inherited.AgentName = tt.taskID, tt.agent
+			local, ok := AsLocal(inherited).(*UsageEvent)
+			if !ok {
+				t.Fatalf("local = %T, want *UsageEvent", local)
+			}
+			if local.EventID == inherited.EventID {
+				t.Fatal("partial identity survived AsLocal: source id unchanged")
+			}
+			if local.TaskID != "" || local.AgentName != "" || len(local.Path) != 0 {
+				t.Fatalf("partial identity survived AsLocal: %+v", local)
+			}
+			if inherited.TaskID != tt.taskID || inherited.AgentName != tt.agent {
+				t.Fatal("AsLocal mutated the forwarded input")
+			}
+		})
+	}
+}
+
+// TestStampInertValueFormTask pins the value-form Task spelling.
+func TestStampInertValueFormTask(t *testing.T) {
+	task := TaskCompleted{TaskID: "t", AgentName: "a", Result: "done"}
+	stamped, ok := StampInert(task, []string{"root", "t"}, "ignored", "ignored").(*TaskCompleted)
+	if !ok {
+		t.Fatalf("stamped = %T, want *TaskCompleted", stamped)
+	}
+	if len(stamped.Path) != 2 || stamped.Path[1] != "t" {
+		t.Fatalf("path = %v", stamped.Path)
+	}
+	if stamped.TaskID != "t" || stamped.AgentName != "a" || stamped.Result != "done" {
+		t.Fatalf("task identity changed: %+v", stamped)
+	}
+	if len(task.Path) != 0 {
+		t.Fatalf("StampInert mutated its value-form input: %v", task.Path)
+	}
+}

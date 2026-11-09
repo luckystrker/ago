@@ -250,3 +250,36 @@ func TestLoopDetectorSeparatesDelegatedHistories(t *testing.T) {
 		t.Fatalf("alerts = %d after sibling b, want still 1", len(got))
 	}
 }
+
+// TestLoopDetectorTransientAndNestedChildOrigin pins that a transient
+// observation and a nested envelope both resolve to the authored response under
+// the outer delegation's identity, so a leaf loop is reported once with the
+// leaf's path.
+func TestLoopDetectorTransientAndNestedChildOrigin(t *testing.T) {
+	s, cx := newConversation()
+	alerts := collectAlerts(s)
+	detector := NewLoopDetector(2)
+	if err := detector.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	inner := events.NewChildEvent(&events.ModelResponse{Message: &events.ModelMessage{Content: "stuck"}},
+		"leaf", []string{"root", "worker", "leaf"}, "leaf", "leaf-event")
+	outer := events.NewChildEvent(inner, "worker", []string{"root", "worker"}, "worker", "worker-event")
+	transient := &events.TransientChildEvent{ChildEvent: *outer}
+
+	for i := 0; i < 2; i++ {
+		if err := s.Send(transient); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	got := alerts()
+	if len(got) != 1 {
+		t.Fatalf("alerts = %d, want 1 for the nested leaf response", len(got))
+	}
+	if got[0].Data["task_id"] != "worker" {
+		t.Fatalf("alert task_id = %v, want the outer envelope's task", got[0].Data["task_id"])
+	}
+	if path, ok := got[0].Data["path"].([]string); !ok || len(path) != 2 || path[1] != "worker" {
+		t.Fatalf("alert path = %v", got[0].Data["path"])
+	}
+}
