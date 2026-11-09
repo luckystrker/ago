@@ -2018,10 +2018,17 @@ truncated at max_output with a trailing notice; a non-zero exit appends
   API key never enters the tool schema (Python parity: constructor-only); where
   Python resolves several request parameters as Variables, the port carries a
   per-conversation variable override for the key (`tavily_api_key` /
-  `perplexity_api_key`) instead, and the optional request parameters beyond
-  max_results/depth/topic/include_answer (Tavily) and max_results (Perplexity)
-  are deferred — Python's Variable-resolvable kwargs per tool do not map onto
-  the argument-struct schema one to one.
+  `perplexity_api_key`) instead. Tavily's `include_raw_content`
+  (`bool | "markdown" | "text"`) and `include_favicon` are constructor options
+  (`WithTavilyIncludeRawContent`/`WithTavilyIncludeFavicon`) written to the
+  request only when set, matching upstream's None filter. The remaining optional
+  parameters (Tavily include_images, time_range, start_date, end_date, days,
+  include_domains, exclude_domains, country, auto_parameters, the literal
+  variants of include_answer; Perplexity max_results beyond the schema) are
+  deferred — Python's Variable-resolvable kwargs per tool do not map onto the
+  argument-struct schema one to one. AGO-DEVIATION: absent optional result
+  fields (`score`, `raw_content`, `favicon`) omit their JSON key via
+  `omitempty`, where Python's `asdict` emits an explicit null.
 - **Skills** (`skills.go`, skills/toolkit.py over runtime/local, abbreviated):
   `NewSkillsToolkit(dir)` discovers `<dir>/<name>/SKILL.md` with a
   `key: value` frontmatter parser (the YAML subset the toolkit reads — no YAML
