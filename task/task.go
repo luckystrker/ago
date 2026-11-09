@@ -537,6 +537,7 @@ func (t *Task) Expire() error {
 	return t.send(&events.TaskExpired{
 		TaskID:    md.TaskID,
 		AgentName: md.OwnerID,
+		Objective: md.Spec.Title,
 	})
 }
 
@@ -555,6 +556,7 @@ func (t *Task) Cancel(reason string) error {
 	return t.send(&events.TaskCancelled{
 		TaskID:    md.TaskID,
 		AgentName: md.OwnerID,
+		Objective: md.Spec.Title,
 		Reason:    reason,
 	})
 }
