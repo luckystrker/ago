@@ -57,10 +57,10 @@ func InertPath(ev Event) []string {
 // The input is never mutated: the child transcript keeps the locally authored
 // record while the ancestor receives the stamped copy (upstream parity).
 func StampInert(ev Event, path []string, taskID, agentName string) Event {
-	ev = unwrapRouted(ev)
 	if !IsInert(ev) {
 		return ev
 	}
+	ev = unwrapRouted(ev)
 	stamped := cloneEvent(ev)
 	if len(InertPath(ev)) > 0 {
 		return stamped
@@ -84,10 +84,10 @@ func StampInert(ev Event, path []string, taskID, agentName string) Event {
 // provenance is actually present, so producers can assign a stable source id
 // before publishing with NewUsageEvent (D-092).
 func AsLocal(ev Event) Event {
-	ev = unwrapRouted(ev)
 	if !IsInert(ev) {
 		return ev
 	}
+	ev = unwrapRouted(ev)
 	if !hasInheritedProvenance(ev) {
 		return ev
 	}

@@ -284,3 +284,17 @@ func TestTaskTerminalObjectiveRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestStampAndAsLocalPreserveRoutedNonInert pins the delivery contract: a
+// routed ordinary event must keep its marker, so Stream.Send still validates
+// the delivery; only inert wrappers are unwrapped for provenance work.
+func TestStampAndAsLocalPreserveRoutedNonInert(t *testing.T) {
+	inner := &ModelResponse{Message: &ModelMessage{Content: "x"}}
+	routed := Routed(inner, Delivery{Validate: func() error { return nil }})
+	if got := StampInert(routed, []string{"t"}, "t", "a"); got != routed {
+		t.Fatalf("StampInert dropped a non-inert delivery marker: %T", got)
+	}
+	if got := AsLocal(routed); got != routed {
+		t.Fatalf("AsLocal dropped a non-inert delivery marker: %T", got)
+	}
+}
