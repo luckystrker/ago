@@ -692,8 +692,16 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 			}
 			for _, tc := range choice.Delta.ToolCalls {
 				ix := 0
-				if tc.Index != nil {
+				switch {
+				case tc.Index != nil:
 					ix = *tc.Index
+				case (tc.ID != nil && *tc.ID != "") || len(calls) == 0:
+					// Some OpenAI-compatible servers (e.g. Gemini) omit the
+					// index: a delta carrying an id starts a new call.
+					ix = len(calls)
+				default:
+					// A delta without an index or id continues the last call.
+					ix = len(calls) - 1
 				}
 				for ix >= len(calls) {
 					calls = append(calls, toolAcc{})
