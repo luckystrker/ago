@@ -156,14 +156,14 @@ func TestUsageAddCacheCreationExtended(t *testing.T) {
 	}
 	b := Usage{
 		CacheCreationInputTokens:         I64(50),
-		CacheCreationExtendedInputTokens: I64(800),
+		CacheCreationExtendedInputTokens: I64(20),
 	}
 	got := a.Add(b)
 	if got.CacheCreationInputTokens == nil || *got.CacheCreationInputTokens != 1050 {
 		t.Errorf("CacheCreationInputTokens: want 1050, got %v", got.CacheCreationInputTokens)
 	}
-	if got.CacheCreationExtendedInputTokens == nil || *got.CacheCreationExtendedInputTokens != 1600 {
-		t.Errorf("CacheCreationExtendedInputTokens: want 1600, got %v", got.CacheCreationExtendedInputTokens)
+	if got.CacheCreationExtendedInputTokens == nil || *got.CacheCreationExtendedInputTokens != 820 {
+		t.Errorf("CacheCreationExtendedInputTokens: want 820, got %v", got.CacheCreationExtendedInputTokens)
 	}
 
 	absent := Usage{}.Add(Usage{CacheCreationInputTokens: I64(7)})

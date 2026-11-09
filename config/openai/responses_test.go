@@ -356,6 +356,43 @@ func TestResponsesStreamToolRoundTrip(t *testing.T) {
 	wantToken(t, resp.Usage.TotalTokens, 120, "total")
 }
 
+func TestResponsesStreamExtendedCacheWrites(t *testing.T) {
+	// The streaming surface also reports the 12-hour cache-write split on
+	// response.completed; the client normalizes it through the same mapper.
+	completed := completedResponse()
+	completed["usage"] = map[string]any{
+		"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      80,
+			"cache_write_tokens": 1000,
+			"cache_write_tokens_details": map[string]any{
+				"ttl_12h_tokens": 800,
+				"ttl_30m_tokens": 200,
+			},
+		},
+	}
+	body := sseBody(
+		map[string]any{"type": "response.created", "response": completed},
+		map[string]any{"type": "response.output_text.delta", "delta": "ok"},
+		map[string]any{"type": "response.completed", "response": completed},
+	)
+	srv, _ := captureServer(t, "text/event-stream", http.StatusOK, body)
+
+	cfg := NewOpenAIResponses("gpt-test")
+	cfg.APIKey = "test-key"
+	cfg.BaseURL = srv.URL + "/v1"
+	cfg.Streaming = true
+
+	req := events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: "cache?"}}}
+	resp, _ := responsesCall(t, cfg, []events.Event{&req}, config.CallOptions{})
+
+	if resp.Message == nil || resp.Message.Content != "ok" {
+		t.Fatalf("response message: %+v", resp.Message)
+	}
+	wantToken(t, resp.Usage.CacheCreationInputTokens, 1000, "cache write")
+	wantToken(t, resp.Usage.CacheCreationExtendedInputTokens, 800, "extended cache write")
+}
+
 // --- hosted web_search: wire schema, events and replay -------------------------------
 
 func TestResponsesHostedWebSearch(t *testing.T) {
