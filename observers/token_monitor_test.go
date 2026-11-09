@@ -199,4 +199,13 @@ func TestTokenMonitorCountsSourceEventOnce(t *testing.T) {
 	if got := monitor.Total(); got != 30 {
 		t.Fatalf("total after reset = %d, want 30 (dedup memory cleared)", got)
 	}
+	// An archived observation envelope carrying the same source record is
+	// still accounted once, through SourceEvent.
+	wrapped := events.NewChildEvent(ev, "t", []string{"t"}, "leaf", ev.EventID)
+	if err := s.Send(wrapped); err != nil {
+		t.Fatalf("Send wrapped: %v", err)
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("wrapped total = %d, want 30", got)
+	}
 }

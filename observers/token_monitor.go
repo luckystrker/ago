@@ -58,8 +58,18 @@ func (m *TokenMonitor) Register(ctx *agocontext.Context) error {
 			return nil
 		}
 		return ctx.Send(alert)
-	}, stream.SubscribeOptions{Condition: events.TypeOf[events.UsageEvent]()})
+	}, stream.SubscribeOptions{Condition: watchedUsageEvent})
 	return nil
+}
+
+// watchedUsageEvent matches a source UsageEvent and an observation envelope
+// that may carry one (archived transcripts); SourceEvent decides which.
+func watchedUsageEvent(ev events.Event) bool {
+	switch events.AsValue(ev).(type) {
+	case events.UsageEvent, events.ChildEvent, events.TransientChildEvent:
+		return true
+	}
+	return false
 }
 
 // observe folds one usage record into the total and returns the alert to emit,
