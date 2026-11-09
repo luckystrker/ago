@@ -298,8 +298,9 @@ func TestTavilySearchOptionalResultFieldEdges(t *testing.T) {
 	}
 }
 
-// TestTavilySearchQueryFallback pins the response query as authoritative and
-// the request query as the fallback when the API omits its echo.
+// TestTavilySearchQueryFallback pins upstream's raw.get("query", query)
+// (d503c8ddc8 tavily.py): an echoed query — even the empty string — is
+// authoritative, and only a missing key falls back to the request query.
 func TestTavilySearchQueryFallback(t *testing.T) {
 	tests := []struct {
 		name string
@@ -307,7 +308,8 @@ func TestTavilySearchQueryFallback(t *testing.T) {
 		want string
 	}{
 		{"api echo wins", `{"query":"api query","results":[]}`, "api query"},
-		{"empty echo falls back", `{"query":"","results":[]}`, "asked query"},
+		{"empty echo wins", `{"query":"","results":[]}`, ""},
+		{"missing echo falls back", `{"results":[]}`, "asked query"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -345,11 +347,84 @@ func TestNewTavilySearchOptionValidation(t *testing.T) {
 		{"unknown search depth", []TavilyOption{WithTavilySearchDepth("deep")}},
 		{"empty base URL", []TavilyOption{WithTavilyBaseURL("")}},
 		{"unknown topic", []TavilyOption{WithTavilyTopic("sports")}},
+		{"unknown include_raw_content string", []TavilyOption{WithTavilyIncludeRawContent("html")}},
+		{"wrong include_raw_content type", []TavilyOption{WithTavilyIncludeRawContent(1)}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := NewTavilySearch("tvly-secret", tc.opts...); err == nil {
 				t.Fatal("expected a constructor error")
+			}
+		})
+	}
+}
+
+// TestTavilySearchIncludeFlags pins the request-side flags that make the API
+// return raw_content/favicon at all (upstream d503c8ddc8, tavily.py:94,104):
+// include_raw_content takes true/false or "markdown"/"text", include_favicon a
+// bool, and an unset option stays off the request like upstream's None filter.
+func TestTavilySearchIncludeFlags(t *testing.T) {
+	tests := []struct {
+		name  string
+		opts  []TavilyOption
+		want  map[string]any
+		unset []string
+	}{
+		{
+			name: "raw content true and favicon",
+			opts: []TavilyOption{WithTavilyIncludeRawContent(true), WithTavilyIncludeFavicon(true)},
+			want: map[string]any{"include_raw_content": true, "include_favicon": true},
+		},
+		{
+			name: "raw content markdown",
+			opts: []TavilyOption{WithTavilyIncludeRawContent("markdown"), WithTavilyIncludeFavicon(true)},
+			want: map[string]any{"include_raw_content": "markdown", "include_favicon": true},
+		},
+		{
+			name: "raw content text",
+			opts: []TavilyOption{WithTavilyIncludeRawContent("text")},
+			want: map[string]any{"include_raw_content": "text"},
+		},
+		{
+			name: "explicit false is sent",
+			opts: []TavilyOption{WithTavilyIncludeRawContent(false), WithTavilyIncludeFavicon(false)},
+			want: map[string]any{"include_raw_content": false, "include_favicon": false},
+		},
+		{
+			name:  "unset options are omitted",
+			unset: []string{"include_raw_content", "include_favicon"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(b, &body)
+				_, _ = io.WriteString(w, `{"query":"q","results":[]}`)
+			}))
+			defer srv.Close()
+
+			opts := append([]TavilyOption{WithTavilyBaseURL(srv.URL)}, tc.opts...)
+			tv, err := NewTavilySearch("tvly-secret", opts...)
+			if err != nil {
+				t.Fatalf("NewTavilySearch: %v", err)
+			}
+			_, cx := newTestContext()
+			ev := callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)
+			if ev == nil {
+				t.Fatal("no event")
+			}
+			for key, want := range tc.want {
+				got, present := body[key]
+				if !present || got != want {
+					t.Fatalf("payload[%s] = %v (present %v), want %v", key, got, present, want)
+				}
+			}
+			for _, key := range tc.unset {
+				if got, present := body[key]; present {
+					t.Fatalf("payload[%s] = %v, want the key omitted", key, got)
+				}
 			}
 		})
 	}
