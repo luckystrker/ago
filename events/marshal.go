@@ -52,15 +52,21 @@ func RegisteredTypes() []string {
 
 // MarshalEvent serializes any event to JSON with a "@type" discriminator.
 func MarshalEvent(ev Event) ([]byte, error) {
+	if ev == nil {
+		return nil, fmt.Errorf("events: marshal nil event")
+	}
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return nil, err
 	}
-	// Events with custom MarshalJSON (ModelRequest, ToolResult, ...) already embed
-	// "@type"; plain structs need it injected here.
+	// Events with custom MarshalJSON (ModelRequest, ToolResult, delegations, ...)
+	// already embed nested "@type" discriminators; the outer one is injected here.
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, fmt.Errorf("events: %T does not marshal to a JSON object: %w", ev, err)
+	}
+	if obj == nil {
+		return nil, fmt.Errorf("events: %T marshals to null", ev)
 	}
 	if _, ok := obj["@type"]; !ok {
 		obj["@type"] = json.RawMessage(`"` + ev.EventType() + `"`)
