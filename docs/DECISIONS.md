@@ -3280,3 +3280,49 @@ Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test -count=1 ./a2ui/...
 toolchain — `TestCodeRunnerUndecodableOutput` expects `\ufffd`, Go 1.27's `encoding/json`
 emits the raw U+FFFD; reproduced at HEAD without this change). `-race` could not run in
 this container (no cgo/gcc); a2ui adds no mutable state.
+
+## D-091 — 2026-11-09 — events: observation envelopes, source authorship and a typed delivery marker
+
+Ported the delegation-observation event layer from `663ddd1574` (`ChildEvent`,
+`TransientChildEvent`, `DeliveryFailed`, `DownEvent`, `TransientDownEvent`,
+`source_event`, `UsageEvent.event_id`) and the typed delivery marker from
+`a591d84f6e` (`Delivery`/`routed()`/`delivery_of()`). AGo keeps the event vocabulary and
+wire names; transport wiring is left to T8 (subagent forwarding) and the reserved
+variable prefixes to T7.
+
+- **`source_event` is a function, not an inherited property.** Go has no base-class
+  properties, and adding `SourceEvent()` to the `Event` interface would force every
+  event type to implement it. `events.SourceEvent(ev)` returns `ev` for ordinary events
+  and follows the unexported `sourceEvent()` hook implemented by `ChildEvent` and
+  `RoutedEvent`; `DownEvent` intentionally has no hook and is its own source (upstream
+  parity: an intervention audit must not count its payload twice). The hook is bounded
+  so a self-referential envelope cannot hang a reader.
+- **A delivery is a wrapper type, not a hidden attribute.** `Delivery{Validate func() error}`
+  and `*RoutedEvent{Inner, Delivery}` replace Python's `setattr`/`_delivery` slot.
+  `Routed`/`DeliveryOf`/`IsRouted` are the public surface; `EventType`, timestamp and
+  storage flags delegate to the inner event, `AsValue`/`TypeOf` unwrap it, and
+  `MarshalEvent` serializes only the inner payload. `Validate` returns an error instead
+  of raising. `Routed` does not clone `Inner` (Go events are pointer values and the
+  wrapper is immutable); callers stamp provenance before wrapping. Persisting a routed
+  copy must unwrap it — that integration belongs to T8's stream changes.
+- **Field defaults need explicit Go entry points.** `UsageEvent.EventID` has no implicit
+  struct default: `NewUsageEvent`/`EnsureEventID` fill a 32-hex id, and `UnmarshalJSON`
+  generates one only when the archived record omits the field (an explicit empty value
+  is preserved for a lossless round-trip). New event producers adopt `NewUsageEvent` in
+  T8 together with descendant provenance. `ChildEvent`/`DownEvent` normalize empty
+  `direction` to `up`/`down` and nil paths to `[]` on the wire; constructors
+  `NewChildEvent`/`NewDownEvent` set them in memory.
+- **Nested events use the existing `@type` convention.** `inner` is marshaled with
+  `MarshalEvent` and decoded with `UnmarshalEvent`, so a nested `UsageEvent` keeps its
+  own discriminator; `RoutedEvent` is not registered because delivery is process-local.
+- **Not ported here:** `InertEvent` provenance (`path`, `_origin`, `origin`, `as_local`),
+  `DeliveryError`/`StreamHandle`, the `Stream.Send` validate hook, usage dedup by
+  `event_id`, and `RESERVED_VARIABLE_PREFIXES` (T7/T8 own those surfaces).
+
+Deviations are marked `// AGO-DEVIATION` in the touched event code. Evidence:
+`events/delegation_test.go` (source through nesting and routing, wire round-trip for all
+five types, delivery marker, id generation/unmarshal, sizing/rendering, type conditions,
+concurrent reads). Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test ./...`,
+`go build ./examples/...`, `go vet ./examples/...` green. `go test -race ./events/`
+cannot run in this container (no cgo/gcc, as in D-089); the new event values are
+immutable after construction and the package test includes an 8-goroutine read stress.

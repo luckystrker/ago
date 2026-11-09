@@ -38,14 +38,58 @@ func (b *Base) StampNow(now time.Time) {
 	}
 }
 
-// AsValue dereferences pointer events so type switches can match one form.
+// sourceEventer is implemented by events that represent another authored event:
+// observation envelopes and routed deliveries. It is unexported so only this
+// package can define the indirection; callers use SourceEvent.
+type sourceEventer interface {
+	sourceEvent() Event
+}
+
+// sourceEventDepth bounds a malformed self-referential envelope chain. Valid
+// delegation trees are shallow; the limit keeps a cycle from hanging a reader.
+const sourceEventDepth = 64
+
+// SourceEvent returns the event that authored ev. For an ordinary event it is ev
+// itself; for a ChildEvent or a routed delivery it is the wrapped authored
+// event, including through nested observations. A DownEvent is its own source:
+// it audits an intervention and its payload must not be counted twice.
+//
+// AGO-DEVIATION: Python exposes this as a BaseEvent property; Go uses a
+// function so ordinary events need no extra method (D-091).
+func SourceEvent(ev Event) Event {
+	for i := 0; i < sourceEventDepth; i++ {
+		if ev == nil {
+			return nil
+		}
+		s, ok := ev.(sourceEventer)
+		if !ok {
+			return ev
+		}
+		ev = s.sourceEvent()
+	}
+	return ev
+}
+
+// AsValue dereferences pointer events so type switches can match one form,
+// unwrapping delivery markers so type-based conditions see the authored type.
 // Value-receiver methods keep the result a valid Event.
 func AsValue(ev Event) Event {
-	rv := reflect.ValueOf(ev)
-	if rv.Kind() == reflect.Pointer && !rv.IsNil() {
-		if v, ok := rv.Elem().Interface().(Event); ok {
-			return v
+	for i := 0; i < sourceEventDepth; i++ {
+		switch e := ev.(type) {
+		case *RoutedEvent:
+			if e == nil {
+				return nil
+			}
+			ev = e.Inner
+			continue
 		}
+		rv := reflect.ValueOf(ev)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+			if v, ok := rv.Elem().Interface().(Event); ok {
+				return v
+			}
+		}
+		return ev
 	}
 	return ev
 }

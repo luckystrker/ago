@@ -107,6 +107,39 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 `events\task_events.py`: `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired`, `TaskCancelled(..., reason)`.
 `events\alert.py`: `enum Severity(str)`; `ObserverAlert(BaseEvent, severity)`; `HaltEvent(BaseEvent, reason)`.
 
+### Delegation observation events — `ag2\events\delegation.py` (+ upstream `a591d84f6e`)
+The event layer for a delegation tree (T8 wires the forwarding itself):
+
+- `ChildEvent(BaseEvent)` (`__conversational__=False`): an uplink observation of a
+  descendant's event — `inner: BaseEvent`, `task_id: str`, `path: tuple[str, ...]`,
+  `agent_name: str`, `origin_event_id: str`, `direction: str = "up"`. It never triggers
+  the ancestor's tools, model loop or HITL; a `TransientChildEvent` keeps the inner
+  event's transient storage policy.
+- `DeliveryFailed(BaseEvent)` (`__conversational__=False`): `task_id: str|None`,
+  `reason: str` — a downlink could not reach an executing delegation.
+- `DownEvent(BaseEvent)` (`__conversational__=False`): audit of an ancestor's
+  intervention — `inner`, `task_id`, `path`, `agent_name`, `direction = "down"`,
+  `origin_task_id: str|None`, `origin_path`, `origin_stream_id`. The inner event is
+  delivered normally; the audit is not counted itself. `TransientDownEvent` is transient.
+- `source_event` property on `BaseEvent`: the authored event. An ordinary event is its
+  own source; a `ChildEvent` resolves recursively through `inner`; a `DownEvent` is its
+  own source (the intervention audit, not the payload).
+- `Delivery` marker (`a591d84f6e`): `Delivery(validate: Callable[[], None] | None)`
+  returned by `delivery_of(event)`, attached by `routed(event, delivery)` instead of the
+  old `_downlink`/`_validate_delivery`/`_bridged` attributes; never serialized. A stream
+  calls `validate` before each handler so a routed copy cannot reach a later turn or be
+  forwarded back. `UsageEvent` carries `event_id` (uuid4 hex) so a forwarded source
+  record keeps its identity for deduplication.
+
+AGo mapping (D-091): `events.ChildEvent`/`TransientChildEvent`/`DeliveryFailed`/
+`DownEvent`/`TransientDownEvent` with `[]string` paths and snake_case wire names;
+`events.SourceEvent(ev)` (function + unexported hook, since Go has no inherited
+property); `events.Delivery{Validate func() error}` plus the `*events.RoutedEvent`
+wrapper, `events.Routed`/`events.DeliveryOf`/`events.IsRouted`; `UsageEvent.EventID`
+filled by `NewUsageEvent`/`EnsureEventID`. `AsValue`/`TypeOf` unwrap routed copies, so a
+delivery keeps the authored type. Inert provenance (`path`/`origin`/`as_local`),
+forwarding and usage dedup belong to T8.
+
 ### Stream & history
 - `Stream` Protocol (`ag2\context.py:33`): `id: UUID`, `history: History`, `pending_messages: list[ModelRequest]`, `send(event, context)`, `enqueue(*content)`, `spawn_background(coro)`, `where(condition) -> Stream`, `join(max_events=None)`, `subscribe(func, *, interrupt=False, sync_to_thread=True, timeout=None, condition=None) -> SubId`, `unsubscribe`, `sub_scope(...)`, `get(condition) -> Future[BaseEvent]`.
 - `MemoryStream` (`ag2\stream.py:129`): in-memory pub/sub; `send()` runs `interrupt` subscribers first (a subscriber returning falsy stops delivery), then normal subscribers in registration order; persistence via `Storage` Protocol (`save_event/get_history/set_history/drop_history`, `ag2\history.py:21`) — non-transient events only unless `persist_all=True`. `SubStream` = filtered view sharing parent's id/history. Redis alternative in `ag2\streams\redis\`.
