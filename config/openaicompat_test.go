@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -145,7 +146,6 @@ func TestBuildMessagesUnsupportedInputs(t *testing.T) {
 		name string
 		part events.Input
 	}{
-		{"binary audio", &events.BinaryInput{Data: []byte{1}, MediaType: "audio/wav", Kind: events.BinaryAudio}},
 		{"url video", &events.UrlInput{URL: "https://x/v.mp4", Kind: events.BinaryVideo}},
 		{"file id", &events.FileIdInput{FileID: "file-1"}},
 		// The Input interface is sealed to the events package, so an unmapped
@@ -1022,5 +1022,245 @@ func TestModelConfigContract(t *testing.T) {
 	}
 	if _, err := client.Call(context.Background(), nil, nil, CallOptions{}); err != nil {
 		t.Fatalf("call failed: %v", err)
+	}
+}
+
+// --- media inputs (W1-B) --------------------------------------------------------
+
+// userPart builds one single-part user turn and returns its wire content part.
+func userPart(t *testing.T, part events.Input) map[string]any {
+	t.Helper()
+	msgs, err := BuildMessages(nil, []events.Event{&events.ModelRequest{Parts: []events.Input{part}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	parts, ok := msgs[1]["content"].([]map[string]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("want a one-element content array, got %#v", msgs[1]["content"])
+	}
+	return parts[0]
+}
+
+func TestBuildMessagesOpenAIAudioInput(t *testing.T) {
+	cases := []struct{ mediaType, format string }{
+		{"audio/wav", "wav"},
+		{"audio/mpeg", "mp3"},
+		{"audio/mp3", "mp3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mediaType, func(t *testing.T) {
+			bin := events.BinaryInput{Data: []byte{1, 2, 3}, MediaType: tc.mediaType, Kind: events.BinaryAudio}
+			got := userPart(t, &bin)
+			want := map[string]any{
+				"type":        "input_audio",
+				"input_audio": map[string]any{"data": "AQID", "format": tc.format},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("wire part = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuildMessagesOpenAIAudioMediaTypeUnsupported(t *testing.T) {
+	bin := events.BinaryInput{Data: []byte{1}, MediaType: "audio/ogg", Kind: events.BinaryAudio}
+	_, err := BuildMessages(nil, []events.Event{&events.ModelRequest{Parts: []events.Input{&bin}}})
+	if !errors.Is(err, ErrUnsupportedInput) {
+		t.Fatalf("want ErrUnsupportedInput for a non-wav/mp3 audio type, got %v", err)
+	}
+}
+
+func TestBuildMessagesOpenAIDocumentInput(t *testing.T) {
+	cases := []struct {
+		name   string
+		vendor map[string]any
+		want   string
+	}{
+		{"derived filename", nil, "file.pdf"},
+		{"vendor filename", map[string]any{"filename": "report.pdf"}, "report.pdf"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := events.BinaryInput{
+				Data: []byte("hi"), MediaType: "application/pdf", Kind: events.BinaryDocument, VendorMetadata: tc.vendor,
+			}
+			got := userPart(t, &bin)
+			want := map[string]any{
+				"type": "file",
+				"file": map[string]any{
+					"file_data": "data:application/pdf;base64,aGk=",
+					"filename":  tc.want,
+				},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("wire part = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuildMessagesOpenAIDocumentFilenameSuffix(t *testing.T) {
+	// Python parity: the suffix is the media type's subtype with any "+..."
+	// suffix dropped, so the API always receives a filename.
+	bin := events.BinaryInput{Data: []byte("x"), MediaType: "text/markdown", Kind: events.BinaryDocument}
+	got := userPart(t, &bin)
+	if name := got["file"].(map[string]any)["filename"]; name != "file.markdown" {
+		t.Fatalf("filename = %v, want file.markdown", name)
+	}
+}
+
+func TestBuildMessagesOpenAIImageDetail(t *testing.T) {
+	for _, detail := range []string{"auto", "low", "high"} {
+		bin := events.BinaryInput{
+			Data: []byte{1, 2, 3}, MediaType: "image/png", Kind: events.BinaryImage,
+			VendorMetadata: map[string]any{"detail": detail},
+		}
+		got := userPart(t, &bin)
+		image := got["image_url"].(map[string]any)
+		if image["detail"] != detail {
+			t.Fatalf("detail = %v, want %q", image["detail"], detail)
+		}
+		if !strings.HasPrefix(image["url"].(string), "data:image/png;base64,") {
+			t.Fatalf("bad data URL: %v", image["url"])
+		}
+	}
+}
+
+func TestBuildMessagesOpenAIImageDetailUnsupported(t *testing.T) {
+	cases := []any{"original", 1, ""}
+	for _, detail := range cases {
+		bin := events.BinaryInput{
+			Data: []byte{1}, MediaType: "image/png", Kind: events.BinaryImage,
+			VendorMetadata: map[string]any{"detail": detail},
+		}
+		_, err := BuildMessages(nil, []events.Event{&events.ModelRequest{Parts: []events.Input{&bin}}})
+		if !errors.Is(err, ErrUnsupportedInput) {
+			t.Fatalf("detail %#v: want ErrUnsupportedInput, got %v", detail, err)
+		}
+	}
+	// No detail key → no detail field (the API default applies).
+	bin := events.BinaryInput{Data: []byte{1}, MediaType: "image/png", Kind: events.BinaryImage}
+	image := userPart(t, &bin)["image_url"].(map[string]any)
+	if _, ok := image["detail"]; ok {
+		t.Fatalf("detail must be omitted when unset: %#v", image)
+	}
+}
+
+// TestBuildMessagesForCompatProvidersKeepImageOnly pins the providers the
+// engine served before this change: Z.AI and DashScope still map images only,
+// per their Python mappers (zai/mappers.py, dashscope/mappers.py).
+func TestBuildMessagesForCompatProvidersKeepImageOnly(t *testing.T) {
+	doc := events.BinaryInput{Data: []byte{1}, MediaType: "application/pdf", Kind: events.BinaryDocument}
+	audio := events.BinaryInput{Data: []byte{1}, MediaType: "audio/wav", Kind: events.BinaryAudio}
+	img := events.BinaryInput{Data: []byte{1}, MediaType: "image/png", Kind: events.BinaryImage}
+	for _, provider := range []Provider{ProviderZAI, ProviderDashScope} {
+		req := events.ModelRequest{Parts: []events.Input{&img}}
+		if _, err := BuildMessagesFor(provider, nil, []events.Event{&req}); err != nil {
+			t.Fatalf("%s must still map images: %v", provider, err)
+		}
+		for _, part := range []events.Input{&doc, &audio} {
+			req := events.ModelRequest{Parts: []events.Input{part}}
+			if _, err := BuildMessagesFor(provider, nil, []events.Event{&req}); !errors.Is(err, ErrUnsupportedInput) {
+				t.Fatalf("%s: want ErrUnsupportedInput for %T, got %v", provider, part, err)
+			}
+		}
+	}
+}
+
+// --- Mistral response content ----------------------------------------------------
+
+func TestRunChatCompatArrayContentReasoning(t *testing.T) {
+	body := `{
+  "id": "cmpl-m1",
+  "model": "mistral-large-actual",
+  "choices": [{
+    "finish_reason": "stop",
+    "message": {
+      "content": [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "let me see"}]},
+        {"type": "text", "text": "the answer"}
+      ]
+    }
+  }]
+}`
+	srv, _ := captureServer(t, 200, body)
+	conv, sent := newCaptureConv()
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Provider: ProviderMistral}
+	resp, err := RunChatCompat(context.Background(), p, nil, conv, CallOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content() != "the answer" {
+		t.Fatalf("text content = %q, want %q", resp.Content(), "the answer")
+	}
+	var reasoning []string
+	for _, ev := range *sent {
+		if r, ok := ev.(*events.ModelReasoning); ok {
+			reasoning = append(reasoning, r.Content)
+		}
+	}
+	if len(reasoning) != 1 || reasoning[0] != "let me see" {
+		t.Fatalf("reasoning events = %v, want [let me see]", reasoning)
+	}
+}
+
+func TestRunChatCompatStringContentUnchanged(t *testing.T) {
+	// The plain-string form must keep working for every dialect.
+	srv, _ := captureServer(t, 200, `{"choices":[{"message":{"content":"plain"}}]}`)
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Provider: ProviderMistral}
+	resp, err := RunChatCompat(context.Background(), p, nil, nil, CallOptions{})
+	if err != nil || resp.Content() != "plain" {
+		t.Fatalf("string content = %q, err %v", resp.Content(), err)
+	}
+}
+
+func TestRunChatCompatArrayContentMixedChunks(t *testing.T) {
+	// Bare strings and unknown citation chunks inside the array are tolerated:
+	// strings are text, unknown chunks carry no answer text (Python parity).
+	body := `{"choices":[{"message":{"content":["a ", {"type":"text","text":"b"}, {"type":"reference","reference_ids":["x"]}]}}]}`
+	srv, _ := captureServer(t, 200, body)
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Provider: ProviderMistral}
+	resp, err := RunChatCompat(context.Background(), p, nil, nil, CallOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content() != "a b" {
+		t.Fatalf("content = %q, want %q", resp.Content(), "a b")
+	}
+}
+
+func TestRunChatStreamArrayContentReasoning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, streamOf(
+			`{"content":[{"type":"thinking","thinking":[{"type":"text","text":"hmm"}]}]}`,
+			`{"content":[{"type":"text","text":"done"}]}`,
+		))
+	}))
+	defer srv.Close()
+
+	conv, sent := newCaptureConv()
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Provider: ProviderMistral, Streaming: true}
+	resp, err := RunChatCompat(context.Background(), p, nil, conv, CallOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content() != "done" {
+		t.Fatalf("content = %q, want done", resp.Content())
+	}
+	var reasoning, chunks []string
+	for _, ev := range *sent {
+		switch e := ev.(type) {
+		case *events.ModelReasoning:
+			reasoning = append(reasoning, e.Content)
+		case *events.ModelMessageChunk:
+			chunks = append(chunks, e.Content)
+		}
+	}
+	if len(reasoning) != 1 || reasoning[0] != "hmm" {
+		t.Fatalf("reasoning events = %v, want [hmm]", reasoning)
+	}
+	if len(chunks) != 1 || chunks[0] != "done" {
+		t.Fatalf("message chunks = %v, want [done]", chunks)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -268,5 +269,169 @@ func TestCallAPIError(t *testing.T) {
 	_, err = client.Call(context.Background(), nil, nil, config.CallOptions{})
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("want an error carrying the status, got %v", err)
+	}
+}
+
+// --- media inputs (W1-B) ---------------------------------------------------------
+
+// TestCallDocumentAndImageInputs pins the exact wire JSON of every Mistral
+// input chunk: documents as document_url (inline data and URL), images as
+// image_url (bare URL or URL + detail from vendor metadata).
+func TestCallDocumentAndImageInputs(t *testing.T) {
+	srv, _, _, _, captured := captureServer(t, http.StatusOK, mistralCompletionBody)
+	cfg := NewMistral("mistral-large-latest")
+	cfg.BaseURL = srv.URL
+	cfg.APIKey = "test-key"
+	client, err := cfg.Create()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	req := events.ModelRequest{Parts: []events.Input{
+		&events.TextInput{Content: "look"},
+		&events.BinaryInput{
+			Data: []byte("hi"), MediaType: "application/pdf", Kind: events.BinaryDocument,
+			VendorMetadata: map[string]any{"filename": "scan.pdf"},
+		},
+		&events.UrlInput{URL: "https://example.com/report.pdf", Kind: events.BinaryDocument},
+		&events.BinaryInput{
+			Data: []byte{1, 2, 3}, MediaType: "image/png", Kind: events.BinaryImage,
+			VendorMetadata: map[string]any{"detail": "high"},
+		},
+		&events.UrlInput{URL: "https://example.com/cat.png", Kind: events.BinaryImage},
+	}}
+	if _, err := client.Call(context.Background(), []events.Event{&req}, nil, config.CallOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	body := requestJSON(t, *captured)
+	content := body["messages"].([]any)[1].(map[string]any)["content"]
+	want := []any{
+		map[string]any{"type": "text", "text": "look"},
+		map[string]any{
+			"type":          "document_url",
+			"document_url":  "data:application/pdf;base64,aGk=",
+			"document_name": "scan.pdf",
+		},
+		map[string]any{"type": "document_url", "document_url": "https://example.com/report.pdf"},
+		map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url":    "data:image/png;base64,AQID",
+				"detail": "high",
+			},
+		},
+		map[string]any{"type": "image_url", "image_url": "https://example.com/cat.png"},
+	}
+	if !reflect.DeepEqual(content, want) {
+		t.Fatalf("wire content = %#v, want %#v", content, want)
+	}
+}
+
+func TestCallDocumentWithoutFilename(t *testing.T) {
+	srv, _, _, _, captured := captureServer(t, http.StatusOK, mistralCompletionBody)
+	cfg := NewMistral("mistral-large-latest")
+	cfg.BaseURL = srv.URL
+	cfg.APIKey = "test-key"
+	client, err := cfg.Create()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// An untyped binary is a document too; no vendor filename means no
+	// document_name key at all.
+	doc := events.BinaryInput{Data: []byte("x"), MediaType: "text/plain", Kind: events.BinaryBinary}
+	req := events.ModelRequest{Parts: []events.Input{&doc}}
+	if _, err := client.Call(context.Background(), []events.Event{&req}, nil, config.CallOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	content := requestJSON(t, *captured)["messages"].([]any)[1].(map[string]any)["content"]
+	want := []any{map[string]any{
+		"type":         "document_url",
+		"document_url": "data:text/plain;base64,eA==",
+	}}
+	if !reflect.DeepEqual(content, want) {
+		t.Fatalf("wire content = %#v, want %#v", content, want)
+	}
+}
+
+func TestCallUnsupportedMediaInputs(t *testing.T) {
+	srv, _, _, _, captured := captureServer(t, http.StatusOK, mistralCompletionBody)
+	cfg := NewMistral("mistral-large-latest")
+	cfg.BaseURL = srv.URL
+	cfg.APIKey = "test-key"
+	client, err := cfg.Create()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := []events.Input{
+		&events.BinaryInput{Data: []byte{1}, MediaType: "audio/wav", Kind: events.BinaryAudio},
+		&events.UrlInput{URL: "https://example.com/a.mp4", Kind: events.BinaryVideo},
+		&events.FileIdInput{FileID: "file-1"},
+		&events.BinaryInput{
+			Data: []byte{1}, MediaType: "image/png", Kind: events.BinaryImage,
+			VendorMetadata: map[string]any{"detail": 1},
+		},
+	}
+	for _, part := range cases {
+		req := events.ModelRequest{Parts: []events.Input{part}}
+		_, err := client.Call(context.Background(), []events.Event{&req}, nil, config.CallOptions{})
+		if !errors.Is(err, config.ErrUnsupportedInput) {
+			t.Fatalf("%T: want ErrUnsupportedInput, got %v", part, err)
+		}
+	}
+	if len(*captured) != 0 {
+		t.Fatal("no request may reach the API on an unmappable part")
+	}
+}
+
+// TestCallThinkChunksBecomeReasoning: a Mistral reasoning answer arrives as a
+// content array; the thinking chunks become ModelReasoning and only the text
+// chunks reach ModelMessage.
+func TestCallThinkChunksBecomeReasoning(t *testing.T) {
+	body := `{
+  "id": "cmpl-m1",
+  "model": "mistral-large-latest",
+  "choices": [{
+    "finish_reason": "stop",
+    "message": {
+      "content": [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "let me see"}]},
+        {"type": "text", "text": "the answer"}
+      ]
+    }
+  }]
+}`
+	srv, _, _, _, _ := captureServer(t, http.StatusOK, body)
+	cfg := NewMistral("mistral-large-latest")
+	cfg.BaseURL = srv.URL
+	cfg.APIKey = "test-key"
+	client, err := cfg.Create()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ms := stream.NewMemoryStream()
+	var sent []events.Event
+	ms.Subscribe(func(ev events.Event) error {
+		sent = append(sent, ev)
+		return nil
+	}, stream.SubscribeOptions{})
+	conv := agocontext.New(ms)
+
+	resp, err := client.Call(context.Background(), nil, conv, config.CallOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content() != "the answer" {
+		t.Fatalf("message content = %q, want %q", resp.Content(), "the answer")
+	}
+	var reasoning []string
+	for _, ev := range sent {
+		if r, ok := ev.(*events.ModelReasoning); ok {
+			reasoning = append(reasoning, r.Content)
+		}
+	}
+	if len(reasoning) != 1 || reasoning[0] != "let me see" {
+		t.Fatalf("reasoning events = %v, want [let me see]", reasoning)
 	}
 }
