@@ -130,6 +130,12 @@ func NewOpenAIResponses(model string) *OpenAIResponsesConfig {
 // Provider reports the vendor (ModelConfig contract).
 func (c *OpenAIResponsesConfig) Provider() config.Provider { return config.ProviderOpenAI }
 
+// InputDialect implements config.InputDialectConfig: the Responses API carries
+// documents and file ids in tool results too, unlike Chat Completions.
+func (c *OpenAIResponsesConfig) InputDialect() config.InputDialect {
+	return config.DialectOpenAIResponses
+}
+
 // Model returns the model identifier sent with every call (ModelConfig
 // contract).
 func (c *OpenAIResponsesConfig) Model() string { return c.model }

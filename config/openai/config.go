@@ -103,6 +103,12 @@ func NewOpenAICompletions(model string) *OpenAICompletionsConfig {
 // Provider reports the vendor (ModelConfig contract).
 func (c *OpenAICompletionsConfig) Provider() config.Provider { return config.ProviderOpenAI }
 
+// InputDialect implements config.InputDialectConfig: Chat Completions and
+// Responses share one provider but not one input vocabulary.
+func (c *OpenAICompletionsConfig) InputDialect() config.InputDialect {
+	return config.DialectOpenAICompletions
+}
+
 // Model returns the model identifier sent with every call (ModelConfig
 // contract).
 func (c *OpenAICompletionsConfig) Model() string { return c.model }
