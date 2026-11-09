@@ -173,7 +173,10 @@ func (f *forwarder) usage(childStream stream.Stream) events.Usage {
 	acc := make([]events.Event, len(f.accounting))
 	copy(acc, f.accounting)
 	f.accountingMu.Unlock()
-	return usage.FromEvents(append(evs, acc...)).Total
+	all := make([]events.Event, 0, len(evs)+len(acc))
+	all = append(all, evs...)
+	all = append(all, acc...)
+	return usage.FromEvents(all).Total
 }
 
 // persistAccounting retains a source UsageEvent in the parent history when the
