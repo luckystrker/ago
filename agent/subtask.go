@@ -273,8 +273,10 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		if scopeOpen {
 			run.awaitTurn()
 		}
-		// A rejected delegation never entered a turn: like upstream reject, it
+		// A pre-turn rejection never entered a turn: like upstream reject, it
 		// publishes directly to the parent without touching the child stream.
+		// A failure after TaskStarted keeps scopeOpen true and uses the child
+		// stream/finally path above instead.
 		emit := func(ev events.Event) error {
 			if scopeOpen {
 				return publish(ev)
@@ -376,6 +378,12 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// delegation cannot be cancelled through the caller's tool call.
 	if err := run.Start(ctx); err != nil {
 		startedPublished = run.delegationStarted
+		// A failure after the delegation scope was entered (config/knowledge/
+		// prompt/tools/subscriber preparation) still owns the child stream and
+		// its relay; publish the terminal there before closing, as upstream's
+		// Forwarder.execution finally does. Only failures before TaskStarted use
+		// the parent-only reject path.
+		scopeOpen = run.delegationStarted
 		return fail(err)
 	}
 	scopeOpen, startedPublished = true, true

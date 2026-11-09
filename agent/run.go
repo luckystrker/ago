@@ -106,7 +106,12 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	// body fails).
 	opened := false
 	defer func() {
-		if !opened {
+		// A failure inside an already-entered delegation scope leaves the scope
+		// open for runTaskOn.fail: the terminal must be published on the child
+		// stream through the live relay, under the lock, before Close (upstream
+		// Forwarder.execution's finally). Every other failed Start releases the
+		// scope here.
+		if !opened && !r.delegationStarted {
 			r.Close()
 		}
 	}()

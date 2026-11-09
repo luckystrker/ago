@@ -150,8 +150,9 @@ func TestStartedNotDuplicatedWhenChildPersistFails(t *testing.T) {
 }
 
 // TestTerminalIsLastEventOnCancellation pins the forwarder-finally ordering:
-// after run.Close has settled the turn goroutine and removed the relay, the
-// terminal is the last event the parent observes.
+// awaitTurn settles the turn goroutine while the relay and lock are still held,
+// the terminal is published through that live relay, and only then is the scope
+// closed; the terminal is the last event the parent observes.
 func TestTerminalIsLastEventOnCancellation(t *testing.T) {
 	var n int64
 	parent := agocontext.New(stream.NewMemoryStream())
