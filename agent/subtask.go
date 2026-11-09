@@ -2,6 +2,7 @@ package agent
 
 import (
 	stdcontext "context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -146,104 +147,43 @@ type taskResult struct {
 	objective   string
 	result      string
 	completed   bool
+	cancelled   bool
 	childStream stream.Stream
 	err         error
 }
 
-// usagePair is one (Provider, Model) attribution candidate behind a spend.
-type usagePair struct{ provider, model string }
-
-// rollupUsage aggregates the child transcript into one subtask UsageEvent on
-// the parent stream (Python parity: run_task._emit_rollup — the child's per-call
-// events stay on the child stream, so the additive report sees the delegation
-// once). Only events appended at index start and later count toward the rollup:
-// Python scopes the rollup with a usage subscription registered per call, so a
-// stream reused across sequential delegations (the persistent_stream behavior
-// of AsTool) reports only this invocation's spend, never an earlier one's.
-// Attribution is stamped only when exactly one (Provider, Model) pair is
-// behind the spend, and only events with reported tokens vote (Python parity:
-// _sole_pair — a nested delegation's unlabelled rollup counts as a pair and
-// correctly leaves the parent unlabelled). A nested rollup is flattened into
-// Parts in place of itself (Python parity: `event.parts or [event]`). The
-// rollup's total_tokens survives only when every counted call reported one
-// (Python parity: _rollup_usage); the returned Usage is the stream's cumulative
-// total (Python parity: reply.usage().total — the running total on a reused
-// stream) and the bool reports whether this invocation spent anything.
-func rollupUsage(parentCX *context.Context, label string, childStream stream.Stream, start int) (events.Usage, bool) {
-	history, err := childStream.History().GetEvents()
+// childStreamUsage reports the cumulative spend recorded on the delegation's
+// own stream. It is a snapshot for inspection (TaskCompleted.Usage), never an
+// additive record: the source UsageEvents have already been forwarded to the
+// parent, so a report that summed this field as well would double count.
+func childStreamUsage(childStream stream.Stream) events.Usage {
+	evs, err := childStream.History().GetEvents()
 	if err != nil {
-		return events.Usage{}, false
+		return events.Usage{}
 	}
-	var (
-		pairs map[usagePair]struct{}
-		parts []events.UsageEvent
-		spent events.Usage
-		total events.Usage
-		// totalsReported stays true while every counted call carried
-		// total_tokens (Python parity: _rollup_usage).
-		totalsReported = true
-	)
-	for i, ev := range history {
-		ue, ok := events.AsValue(ev).(events.UsageEvent)
-		if !ok || !usage.Reported(ue.Usage) {
-			continue
-		}
-		total = total.Add(ue.Usage)
-		if i < start {
-			continue // an earlier delegation's spend: its own rollup already reported it
-		}
-		if pairs == nil {
-			pairs = make(map[usagePair]struct{})
-		}
-		pairs[usagePair{ue.Provider, ue.Model}] = struct{}{}
-		if len(ue.Parts) > 0 {
-			parts = append(parts, ue.Parts...)
-		} else {
-			parts = append(parts, ue)
-		}
-		if ue.Usage.TotalTokens == nil {
-			totalsReported = false
-		}
-		spent = spent.Add(ue.Usage)
-	}
-	if !usage.Reported(spent) {
-		return total, false
-	}
-	out := &events.UsageEvent{Usage: spent, Kind: events.UsageKindSubtask, Label: label, Parts: parts}
-	// total_tokens survives only when every counted call reported one: a partial
-	// sum falls below the counts it is meant to cover (Python parity:
-	// _rollup_usage). The returned Usage keeps the plain sum — TaskCompleted
-	// carries it, like AgentReply.usage in Python.
-	if !totalsReported {
-		out.Usage.TotalTokens = nil
-	}
-	if len(pairs) == 1 {
-		for p := range pairs {
-			out.Provider, out.Model = p.provider, p.model
-		}
-	}
-	_ = parentCX.Send(out)
-	return total, true
+	return usage.FromEvents(evs).Total
 }
 
 // runTaskOn runs child as a sub-task of the conversation parentCX and reports
 // the delegation on the parent stream (Python parity:
-// tools/subagents/run_task.py run_task): TaskStarted before the child turn, one
-// rolled-up subtask UsageEvent and TaskCompleted/TaskFailed after. The child
+// tools/subagents/run_task.py run_task): TaskStarted before the child turn,
+// TaskCompleted/TaskFailed/TaskCancelled after, all authored on the child stream
+// and relayed upward by a Forwarder. Operational child events arrive at the
+// parent as ChildEvent observations; source UsageEvents arrive as themselves
+// with delegation provenance, so there is no rollup to reconcile. The child
 // transcript persists into the parent's storage under the child's own stream id;
 // the child run starts from a copy of the parent's dependencies and a scoped
 // variable branch (COPIED values deep-copied, LOCAL and reserved control-plane
 // keys dropped, SHARED bindings reused), so its mutations stay scoped to the
 // branch except for SHARED rebinding. When the child has no HITL hook of its own
-// and the parent has one, questions asked inside the child are bridged: a copy
-// stamped with the task id goes to the parent stream and the parent's hook
-// answers.
+// and the parent has one, questions asked inside the child are bridged: the
+// child's request is forwarded as a ChildEvent and the parent's hook answers.
 //
 // A hitl failure comes back as the error result — it must end the calling turn
 // (Python parity: run_task re-raises HumanInputError). Any other failure is
 // reported in the returned taskResult with completed=false and becomes the
-// delegating tool's "Error: ..." output; TaskFailed and the rollup are emitted
-// on both paths.
+// delegating tool's "Error: ..." output; the terminal task event is emitted on
+// both paths.
 func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, objective, contextStr string) (taskResult, error) {
 	taskID := strings.ReplaceAll(uuid.New(), "-", "") // Python parity: uuid4().hex
 	prompt := objective
@@ -262,16 +202,16 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	if childStream == nil {
 		childStream = stream.NewMemoryStream(stream.WithStorage(parentCX.Stream.History().Storage()))
 	}
-	// The rollup counts only what this invocation appends: a stream base reused
-	// across sequential delegations already carries the earlier ones' spend, and
-	// Python scopes its per-call usage subscription the same way (run_task
-	// registers it after TaskStarted and removes it in the same finally).
-	invocationStart := 0
-	if evs, err := childStream.History().GetEvents(); err == nil {
-		invocationStart = len(evs)
-	}
 
-	if err := parentCX.Send(&events.TaskStarted{
+	// The relay is installed before TaskStarted so the whole invocation,
+	// including its opening event, is visible on the parent stream. It is an
+	// interrupt subscriber so a child HITL hook cannot swallow the request
+	// before the parent's observers see it.
+	forwarder := newForwarder(parentCX, childStream, taskID, child.Name())
+	forwarder.start()
+	defer forwarder.stop()
+
+	if err := childStream.Send(&events.TaskStarted{
 		TaskID:           taskID,
 		AgentName:        child.Name(),
 		Objective:        objective,
@@ -281,11 +221,25 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	}
 
 	// fail reports a failed delegation the way Python's except branch does:
-	// rollup (nothing spent → skipped) and TaskFailed on every path, hitl
-	// failures re-raised so they end the calling turn.
+	// terminal task event on every path, hitl failures re-raised so they end the
+	// calling turn. A cancelled run reports TaskCancelled and is a normal
+	// (non-hitl) result for the delegating tool.
 	fail := func(err error) (taskResult, error) {
-		rollupUsage(parentCX, child.Name(), childStream, invocationStart)
-		_ = parentCX.Send(&events.TaskFailed{
+		if errors.Is(err, stdcontext.Canceled) {
+			_ = childStream.Send(&events.TaskCancelled{
+				TaskID:    taskID,
+				AgentName: child.Name(),
+				Reason:    err.Error(),
+			})
+			return taskResult{
+				taskID:      taskID,
+				objective:   objective,
+				cancelled:   true,
+				childStream: childStream,
+				err:         err,
+			}, nil
+		}
+		_ = childStream.Send(&events.TaskFailed{
 			TaskID:    taskID,
 			AgentName: child.Name(),
 			Objective: objective,
@@ -313,34 +267,26 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	for k, v := range parentCX.DependenciesSnapshot() {
 		run.cx.Dependencies[k] = v
 	}
+	// Nested delegations extend this forwarder's path when stamping their own
+	// provenance.
+	run.cx.SetDependency(forwarderDependencyKey, forwarder)
 
 	// HITL bridge: a child without its own hook asks through the parent's
 	// (Python parity: run_task installs the bridge when the agent has no
 	// _hitl_hook). The parent hook is the middleware-wrapped one installed on
-	// the parent's run context, so the answer follows the asking context and
-	// lands on the child stream as the reply to the child's request.
+	// the parent's run context. The question and answer already reach the parent
+	// stream as ChildEvent observations through the Forwarder; the bridge only
+	// supplies the answer, so it must not publish a second copy.
 	child.mu.Lock()
 	childHook := child.opts.hitl
 	child.mu.Unlock()
 	if childHook == nil {
 		if parentHook := parentCX.Hook(); parentHook != nil {
-			run.cx.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
-				// Observers on the parent stream see this delegation asking; the
-				// answer is matched on the original request id, so the copy keeps
-				// it and a nested delegation's stamp is replaced.
-				stamped := *req
-				stamped.TaskID = taskID
-				_ = parentCX.Stream.Send(&stamped)
-				return parentHook(hctx, req)
-			})
+			run.cx.SetHitlHook(parentHook)
 		}
-		// AGO-DEVIATION: the forwarded question is transcribed on the parent
-		// stream — Python swallows it with a per-turn interrupter, which AGo
-		// subscribers (event only, no context) cannot replicate; the per-turn
-		// wiring is why the bridge calls the hook directly (docs/DECISIONS.md
-		// D-013, D-040). Without a hook on either side the child's Context.Ask
-		// refuses with hitl.NotProvidedError — the default_hitl_hook refusal,
-		// carried through the tool layer as a turn-ending hitl error.
+		// Without a hook on either side the child's Context.Ask refuses with
+		// hitl.NotProvidedError — the default_hitl_hook refusal, carried through
+		// the tool layer as a turn-ending hitl error.
 	}
 
 	// AGO-DEVIATION: no stdlib context flows through tool execution, so the
@@ -353,8 +299,11 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return fail(err)
 	}
 
-	total, _ := rollupUsage(parentCX, child.Name(), childStream, invocationStart)
-	_ = parentCX.Send(&events.TaskCompleted{
+	// The completed event carries the child stream's cumulative spend for
+	// inspection; the additive accounting already travelled as source
+	// UsageEvents, so a reader must never sum this snapshot.
+	total := childStreamUsage(childStream)
+	_ = childStream.Send(&events.TaskCompleted{
 		TaskID:     taskID,
 		AgentName:  child.Name(),
 		Objective:  objective,
@@ -385,6 +334,9 @@ func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
+		}
+		if res.cancelled {
+			return "Sub-task cancelled: " + res.err.Error(), nil
 		}
 		if !res.completed {
 			return "Error: " + res.err.Error(), nil
@@ -423,6 +375,10 @@ func (r *AgentRun) newRunSubtasksTool(tc *TaskConfig) tools.Tool {
 			res, err := runTaskOn(stdcontext.Background(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
 			if err != nil {
 				return err
+			}
+			if res.cancelled {
+				results[i] = "Sub-task cancelled: " + res.err.Error()
+				return nil
 			}
 			if !res.completed {
 				results[i] = "Error: " + res.err.Error()

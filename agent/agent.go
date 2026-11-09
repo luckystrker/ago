@@ -354,11 +354,13 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 // AsTool exposes this agent as a delegation tool for another agent (Python
 // parity: agent.as_tool / subagent_tool.subagent_tool). Each call runs this
 // agent as a sub-task through the shared delegation machinery (runTaskOn):
-// TaskStarted/TaskCompleted/TaskFailed and one rolled-up subtask UsageEvent on
-// the caller's stream, a copy of the caller's dependencies and variables, and
-// the HITL bridge when this agent has no hook of its own. The agent's own
-// stream base (WithStreamBase) stays the delegation's stream — every
-// delegation opens a fresh stream otherwise.
+// TaskStarted/TaskCompleted/TaskFailed on the caller's stream (relayed from the
+// child stream), source UsageEvents with delegation provenance instead of a
+// rollup, a copy of the caller's dependencies and variables, and the HITL bridge
+// when this agent has no hook of its own. Operational child events reach the
+// caller as ChildEvent observations. The agent's own stream base
+// (WithStreamBase) stays the delegation's stream — every delegation opens a
+// fresh stream otherwise.
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	var o asToolOptions
 	for _, f := range opts {
@@ -385,6 +387,10 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
+		}
+		if res.cancelled {
+			// Python parity: subagent_tool.py checks cancelled before failed.
+			return fmt.Sprintf("Sub-task '%s' cancelled: %s", a.name, res.err.Error()), nil
 		}
 		if !res.completed {
 			// Python parity: subagent_tool.py

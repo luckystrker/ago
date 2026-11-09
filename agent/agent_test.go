@@ -575,19 +575,26 @@ func TestSubtaskRollsUp(t *testing.T) {
 	if reply.Body() != "parent done" {
 		t.Fatalf("body: %q", reply.Body())
 	}
-	// The parent stream carries the rolled-up subtask usage.
+	// The parent stream carries the child's source usage record, stamped with
+	// the delegation that spent it; there is no subtask rollup.
 	evs, _ := reply.History().GetEvents()
-	var sawRollup bool
+	var sawSource bool
 	for _, ev := range evs {
-		if ue, ok := events.AsValue(ev).(events.UsageEvent); ok && ue.Kind == events.UsageKindSubtask {
-			sawRollup = true
+		if ue, ok := events.AsValue(ev).(events.UsageEvent); ok && ue.AgentName == "subtask" {
+			sawSource = true
+			if ue.Kind != events.UsageKindModelCall {
+				t.Fatalf("forwarded kind: %q, want model_call", ue.Kind)
+			}
 			if ue.Usage.TotalTokens == nil || *ue.Usage.TotalTokens != 10 {
-				t.Fatalf("rollup total: %v", ue.Usage.TotalTokens)
+				t.Fatalf("forwarded total: %v", ue.Usage.TotalTokens)
+			}
+			if ue.TaskID == "" || len(ue.Path) != 1 || ue.Path[0] != ue.TaskID {
+				t.Fatalf("forwarded provenance: task=%q path=%v", ue.TaskID, ue.Path)
 			}
 		}
 	}
-	if !sawRollup {
-		t.Fatal("subtask usage rollup missing")
+	if !sawSource {
+		t.Fatal("forwarded subtask usage missing")
 	}
 }
 
