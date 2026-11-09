@@ -212,6 +212,149 @@ func sameOptionalString(got, want *string) bool {
 	return *got == *want
 }
 
+// tavilySearchBody drives one Tavily call against a fake API returning body and
+// returns the model-facing response plus its wire JSON.
+func tavilySearchBody(t *testing.T, body string) (TavilySearchResponse, string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	tv, err := NewTavilySearch("tvly-secret", WithTavilyBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("NewTavilySearch: %v", err)
+	}
+	_, cx := newTestContext()
+	ev := callTool(t, tv, cx, tv.Name(), `{"query":"asked query"}`)
+	data := firstDataJSON(t, ev)
+	var resp TavilySearchResponse
+	if err := json.Unmarshal([]byte(data), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp, data
+}
+
+// TestTavilySearchOptionalResultFieldEdges covers what presence alone leaves
+// open: null decodes to nil and is dropped, empty strings are real values and
+// survive, and one result's optional fields do not leak into another.
+func TestTavilySearchOptionalResultFieldEdges(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []map[string]any // optional keys expected per result; absent means dropped
+	}{
+		{
+			name: "null fields are dropped",
+			body: `{"query":"q","results":[{"title":"T","url":"u","content":"c",
+				"raw_content":null,"favicon":null}]}`,
+			want: []map[string]any{{}},
+		},
+		{
+			name: "empty fields are kept",
+			body: `{"query":"q","results":[{"title":"T","url":"u","content":"c",
+				"raw_content":"","favicon":""}]}`,
+			want: []map[string]any{{"raw_content": "", "favicon": ""}},
+		},
+		{
+			name: "results decode independently",
+			body: `{"query":"q","results":[
+				{"title":"A","url":"a","content":"c","raw_content":"full","favicon":"icon"},
+				{"title":"B","url":"b","content":"c"}]}`,
+			want: []map[string]any{{"raw_content": "full", "favicon": "icon"}, {}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, data := tavilySearchBody(t, tc.body)
+			if len(resp.Results) != len(tc.want) {
+				t.Fatalf("results = %d, want %d", len(resp.Results), len(tc.want))
+			}
+			var wire struct {
+				Results []map[string]any `json:"results"`
+			}
+			if err := json.Unmarshal([]byte(data), &wire); err != nil {
+				t.Fatalf("decode wire: %v", err)
+			}
+			if len(wire.Results) != len(tc.want) {
+				t.Fatalf("wire results = %d, want %d", len(wire.Results), len(tc.want))
+			}
+			for i, want := range tc.want {
+				for key, wantVal := range want {
+					got, present := wire.Results[i][key]
+					if !present || got != wantVal {
+						t.Fatalf("results[%d].%s = %v (present %v), want %q", i, key, got, present, wantVal)
+					}
+				}
+				for _, key := range []string{"raw_content", "favicon"} {
+					if _, expected := want[key]; expected {
+						continue
+					}
+					if got, present := wire.Results[i][key]; present {
+						t.Fatalf("results[%d].%s = %v, want the key omitted", i, key, got)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestTavilySearchQueryFallback pins the response query as authoritative and
+// the request query as the fallback when the API omits its echo.
+func TestTavilySearchQueryFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"api echo wins", `{"query":"api query","results":[]}`, "api query"},
+		{"empty echo falls back", `{"query":"","results":[]}`, "asked query"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, _ := tavilySearchBody(t, tc.body)
+			if resp.Query != tc.want {
+				t.Fatalf("query = %q, want %q", resp.Query, tc.want)
+			}
+		})
+	}
+}
+
+// TestTavilySearchSkipsUndecodableImageObject pins the strict object shape: an
+// image entry whose object form fails to decode is dropped rather than emitted
+// with a partial URL, while well-formed entries around it survive.
+func TestTavilySearchSkipsUndecodableImageObject(t *testing.T) {
+	resp, _ := tavilySearchBody(t, `{"query":"q","results":[],"images":[
+		"https://img.example/1.png",
+		{"url":"https://partial.example/","url":123},
+		{"url":"https://img.example/2.png"}]}`)
+	want := []string{"https://img.example/1.png", "https://img.example/2.png"}
+	if strings.Join(resp.Images, "|") != strings.Join(want, "|") {
+		t.Fatalf("images = %v, want %v", resp.Images, want)
+	}
+}
+
+// TestNewTavilySearchOptionValidation pins the constructor's argument guards.
+func TestNewTavilySearchOptionValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []TavilyOption
+	}{
+		{"nil http client", []TavilyOption{WithTavilyHTTPClient(nil)}},
+		{"zero max results", []TavilyOption{WithTavilyMaxResults(0)}},
+		{"negative max results", []TavilyOption{WithTavilyMaxResults(-1)}},
+		{"unknown search depth", []TavilyOption{WithTavilySearchDepth("deep")}},
+		{"empty base URL", []TavilyOption{WithTavilyBaseURL("")}},
+		{"unknown topic", []TavilyOption{WithTavilyTopic("sports")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewTavilySearch("tvly-secret", tc.opts...); err == nil {
+				t.Fatal("expected a constructor error")
+			}
+		})
+	}
+}
+
 func TestTavilySearchKeyVariable(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
