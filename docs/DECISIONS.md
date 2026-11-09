@@ -3454,20 +3454,22 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   relay and lock; a late event from a client that ignores cancellation therefore
   cannot land in the next delegation's relay. `Close` is deliberately blocking:
   a client that never returns keeps `Close` (and a deferred `Close` inside
-  `Ask`) waiting. On a caller-cancellation failure, `runTaskOn` closes/waits the
-  child turn and removes its relay before publishing `TaskCancelled`, so the
-  terminal is the last event the parent observes.
+  `Ask`) waiting. On a failure, `runTaskOn` first cancels and awaits the child
+  turn goroutine, then publishes the terminal through the still-installed relay
+  while the per-stream lock is held, and only then closes the scope (stops the
+  relay and releases the lock). The terminal is therefore the last event the
+  parent observes, and a queued sibling cannot relay it under its own
+  provenance — matching upstream `Forwarder.execution`'s finally block.
 - **Same-stream nested delegation is rejected, not deadlocked (D-092b).**
   Upstream's per-stream `asyncio.Lock` is not reentrant either; a child whose
   stream is the caller's (or any ancestor's) would queue forever. AGo carries
   the chain of held stream ids through the delegated context
   (`ago:held-streams`) and `runTaskOn` returns `ErrNestedSameStream` before
-  entering the child turn. This is a deliberate behavior choice (no hang), not
-  a wire change; nested delegations normally use a fresh child stream. It relays through `Stream.Send`, not `Context.Send`,
-  because the latter would call `AsLocal` and strip the stamped provenance. An
-  already-enveloped `ChildEvent` is relayed unchanged (leaf identity preserved),
-  and a delegation reusing its caller's stream disables the relay to avoid an
-  echo loop.
+  entering the child turn. The rejection still publishes `TaskStarted` and
+  `TaskFailed` directly to the parent stream (upstream `reject` does not touch a
+  busy child stream), so observers and AG-UI see the attempt. This is a
+  deliberate behavior choice (no hang), not a wire change; nested delegations
+  normally use a fresh child stream.
 - **No downlink port (follow-up task).** Upstream's `StreamHandle`/`_Endpoint`,
   non-serialized `origin` on `InertEvent`/`ChildEvent`, `DownEvent` delivery,
   `DeliveryFailed`/`DeliveryError`, targeted `HaltEvent` addressing,

@@ -160,6 +160,11 @@ subscriber on the child stream:
 - forwarding and the child lifecycle are installed inside the child's turn scope,
   after the per-stream turn lock is taken and stopped before it is released, so a
   queued delegation on a shared stream cannot capture the active invocation;
+- on success the terminal is published while the scope is open; on failure the
+  turn goroutine is awaited first, the terminal is published through the still
+  installed relay under the lock, and only then is the relay stopped; a
+  pre-turn rejection (`ErrNestedSameStream`, variable/config failure) publishes
+  `TaskStarted`+terminal directly to the parent without touching the child stream;
 - `Context.Dependencies`/`Variables` scoping (D-090) is unchanged; the child stream
   persists into the parent's storage under its own id.
 
