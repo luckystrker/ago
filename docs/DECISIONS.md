@@ -3411,3 +3411,79 @@ concurrent reads). Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test 
 `go build ./examples/...`, `go vet ./examples/...` green. `go test -race ./events/`
 cannot run in this container (no cgo/gcc, as in D-089); the new event values are
 immutable after construction and the package test includes an 8-goroutine read stress.
+
+## D-092 — 2026-11-09 — agent: subagent event tree, inert provenance and source-based usage (upstream `1c27f221a5`)
+
+Ported the forwarding layer of upstream `tools/subagents/_forwarding.py` plus the
+consumer migrations from `run_task.py`, `usage.py`, `observers/*`,
+`compact.py` and the telemetry usage recorder. Operational child events now
+reach ancestors as `ChildEvent`/`TransientChildEvent` observations; `UsageEvent`
+and `Task*` travel as themselves with `path`/`task_id`/`agent_name` provenance.
+There is no subtask usage rollup: accounting reads source records and dedups by
+`event_id`.
+
+- **Inert is embedding, not inheritance (D-092a).** Go has no base classes, so
+  `events.InertEvent{Path}` is embedded by UsageEvent and every Task event. The
+  exported marker/accessors (`IsInertEvent`, `InertPath`, `SetInertPath`,
+  `SetInertIdentity`) let custom events embed the same base and still be stamped.
+  `StampInert` copies through reflection (pointer or value spelling) before
+  mutating provenance, so the child transcript keeps the locally authored record;
+  it never clones maps/slices other than the replacement path.
+- **`AsLocal` only rewrites records that carry inherited provenance (D-092a).**
+  Upstream `UsageEvent.as_local` always assigns a fresh `event_id`, even to a
+  just-constructed local record. AGo returns the record unchanged when path,
+  task_id and agent_name are all empty: producers assign the source id with
+  `NewUsageEvent`/`EnsureEventID` before publication, and rewriting it on
+  `Context.Send` would make those constructors pointless. A forwarded record is
+  copied, stripped of provenance and given a fresh id, so republishing cannot
+  impersonate the original spend.
+- **Empty provenance is omitted on the wire (D-092a).** `path`, `UsageEvent.task_id`
+  and `UsageEvent.agent_name` are `omitempty`, whereas Python emits `()`/`null`.
+  This follows AGo's optional-string convention (D-091) and keeps existing local
+  records byte-compatible; non-empty provenance round-trips losslessly.
+- **Forwarding is upward-only (D-092a).** `agent/forwarding.go` subscribes as an
+  interrupt handler before the child HITL hook, so a swallowed question is still
+  observed by the parent. It relays through `Stream.Send`, not `Context.Send`,
+  because the latter would call `AsLocal` and strip the stamped provenance. An
+  already-enveloped `ChildEvent` is relayed unchanged (leaf identity preserved),
+  and a delegation reusing its caller's stream disables the relay to avoid an
+  echo loop.
+- **No downlink port.** Upstream's `StreamHandle`/`_Endpoint`, `DownEvent`
+  delivery, `DeliveryFailed`, `DeliveryError`, targeted `HaltEvent` cancellation
+  and the `DelegationRegistry`/`settle_descendants` machinery depend on
+  asyncio task cancellation. AGo has no equivalent task stack in this layer and
+  no public `origin` handle on observations; Halt addressing remains a separate
+  task. `DownEvent` stays a vocabulary type (T6) and `Delivery` is now validated
+  by `Stream.Send` before every handler (interrupt, persistence, normal), with
+  routed copies persisted as their inner event.
+- **Task lifecycle is inert and authored on the child stream (D-092a).** Task
+  events embed `InertEvent` and are no longer conversational (upstream
+  `TaskEvent(InertEvent)`); this aligns compaction/rendering. `runTaskOn` emits
+  `TaskStarted`/`TaskCompleted`/`TaskFailed` (and `TaskCancelled` on
+  `context.Canceled`) on the child stream, and the forwarder relays them. The
+  HITL bridge no longer publishes a stamped `HumanInputRequest` locally: the
+  request and answer reach the parent only as `ChildEvent` observations, and the
+  bridge just calls the parent hook.
+- **Source accounting replaces rollups (D-092a).** `agent/turn.go`,
+  `compact/strategy.go` and `aggregate/aggregate.go` publish via `NewUsageEvent`;
+  `usage.FromEvents` resolves `SourceEvent` and deduplicates by non-empty
+  `event_id` (id-less legacy fixtures remain distinct). Compaction now retains
+  every source usage record from before the rewrite, matching upstream
+  `_with_usage_events`; the old AGo deviation that dropped spend outside the
+  retained window is gone. `TokenMonitor` deduplicates by `event_id`;
+  `LoopDetector` observes local and `ChildEvent` responses with per-origin state
+  and puts `task_id`/`path` in the alert data so sibling histories cannot merge.
+- **Telemetry/otelx unchanged.** The contrib module has no `UsageEvent`
+  subscription (usage spans are deferred by D-064), so forwarding introduces no
+  code path to migrate; it sees child LLM calls through its existing hooks.
+- **T6 review items closed here.** Direct assertions were replaced with
+  `events.AsValue` in `agent/run.go` (DrainedModelRequest/HaltEvent),
+  `context/context.go` (HumanMessage/HumanInputRequest), `network/taskmirror.go`
+  (Task*) and `network/hub.go` (Input); producers use `NewUsageEvent`; the
+  `Delivery.Validate` hook is wired into `Stream.Send`.
+
+Verified by `events/inert_test.go`, `stream/delivery_test.go`,
+`agent/forwarding_test.go`, the rewritten subtask accounting tests, and the new
+usage/observer dedup tests. Gates (2026-11-09): `go build ./...`, `go vet ./...`,
+`go test ./...`, `go build ./examples/...`, `go vet ./examples/...`; race runs
+for the stateful packages are recorded in the T8 dev report.
