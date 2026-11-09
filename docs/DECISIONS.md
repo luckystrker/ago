@@ -3175,3 +3175,31 @@ Gates `go test -count=1 ./toolpacks/...` green 2026-11-03.
 
 Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./...` green 2026-11-03 (fresh full-module
 run: 48 packages ok, 0 failures).
+
+## D-088 — 2026-11-09 — gemini: the skip thought-signature placeholder is silent; real-signature replay is deferred
+
+Upstream `3539d07500` (AG2 1.3.0) makes the Gemini mapper give the first `functionCall`
+of every unsigned step in the current turn Google's documented
+`skip_thought_signature_validator` placeholder, and logs a warning per insertion.
+
+- **The insertion is silent.** `config/gemini` has no logger and the core is stdlib-only
+  (D-003); warning through a package-global `slog` logger would add process-wide state
+  that no other provider package has. The placeholder still lands on the wire
+  (`config/gemini/mappers.go`, `signCurrentTurnCalls`), which is what fixes the Gemini 3
+  400. Code comment: `AGO-DEVIATION` at `signCurrentTurnCalls`.
+- **The wire value is the literal sentinel.** The Python SDK types the field as `bytes`
+  and its serializer base64-encodes those bytes; AGo speaks raw REST, and the API accepts
+  the literal string (Google's own `gemini-cli` sends exactly this). `SkipThoughtSignature`
+  is exported so callers/tests share one value.
+- **Replaying the real signature from a response is deferred.** `genPart` does not read
+  `thoughtSignature`, and `ToolCallEvent` has no field for it, so every call rebuilt from
+  history is unsigned and takes the placeholder. The "signed first call is left alone"
+  branch mirrors upstream and is covered by a direct mapper test, but it becomes reachable
+  from real history only when a follow-up records the signature on the tool call and
+  replays it inside its original part.
+
+Current-turn/step detection follows upstream exactly: a turn starts after the last `user`
+content carrying any part that is not a `functionResponse`; only the first `functionCall`
+part of each `model` step is signed.
+
+Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./config/gemini/...` green 2026-11-09.

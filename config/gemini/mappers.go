@@ -23,6 +23,12 @@ type wireContent struct {
 	Parts []map[string]any `json:"parts"`
 }
 
+// SkipThoughtSignature is Google's documented placeholder for a function call
+// that has no real thought signature (Gemini 3 rejects unsigned current-turn
+// calls with 400). The raw REST API takes the literal sentinel; SDKs that type
+// the field as bytes base64-encode the same value before sending it.
+const SkipThoughtSignature = "skip_thought_signature_validator"
+
 // mimeByExtension infers a MIME type from a URL path extension (Python parity:
 // the gemini mapper's _URL_EXTENSION_TO_MIME; entries Gemini accepts as file data).
 var mimeByExtension = map[string]string{
@@ -139,7 +145,62 @@ func buildContents(evs []events.Event) ([]wireContent, error) {
 			}})
 		}
 	}
+	signCurrentTurnCalls(contents)
 	return contents, nil
+}
+
+// signCurrentTurnCalls gives the first function call of every unsigned model
+// step in the current turn the documented skip placeholder (Python parity:
+// _sign_current_turn_calls). A current turn begins after the last user content
+// that carries any part other than a functionResponse; function-response
+// batches keep the turn open. Only the first call of a step is signed, signed
+// calls are kept as they are, and earlier turns are left untouched.
+//
+// AGO-DEVIATION: upstream logs a warning for each placeholder it inserts; this
+// package has no logger and the core is stdlib-only, so insertion is silent
+// (docs/DECISIONS.md D-088).
+func signCurrentTurnCalls(contents []wireContent) {
+	turnStart := 0
+	for i, content := range contents {
+		if content.Role == "user" && hasNonFunctionResponsePart(content.Parts) {
+			turnStart = i + 1
+		}
+	}
+
+	for _, content := range contents[turnStart:] {
+		if content.Role != "model" {
+			continue
+		}
+		first := firstFunctionCallPart(content.Parts)
+		if first == nil {
+			continue
+		}
+		if sig, ok := first["thoughtSignature"]; ok && sig != nil {
+			continue
+		}
+		first["thoughtSignature"] = SkipThoughtSignature
+	}
+}
+
+// hasNonFunctionResponsePart reports whether a user content opens a new turn:
+// a function-response batch alone continues the current turn.
+func hasNonFunctionResponsePart(parts []map[string]any) bool {
+	for _, part := range parts {
+		if response, ok := part["functionResponse"]; !ok || response == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// firstFunctionCallPart returns the first functionCall part of one model step.
+func firstFunctionCallPart(parts []map[string]any) map[string]any {
+	for _, part := range parts {
+		if call, ok := part["functionCall"]; ok && call != nil {
+			return part
+		}
+	}
+	return nil
 }
 
 // requestParts maps one ModelRequest's parts to Gemini parts.
