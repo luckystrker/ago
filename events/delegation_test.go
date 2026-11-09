@@ -370,6 +370,43 @@ func TestDelegationDegenerateValues(t *testing.T) {
 	}
 }
 
+func TestDelegationConstructorsNormalizePaths(t *testing.T) {
+	inner := testUsageEvent("inner")
+	child := NewChildEvent(inner, "t", nil, "w", "inner")
+	if child.Path == nil || len(child.Path) != 0 {
+		t.Fatalf("NewChildEvent path = %#v, want an empty non-nil slice", child.Path)
+	}
+	if child.Direction != DirectionUp {
+		t.Fatalf("NewChildEvent direction = %q", child.Direction)
+	}
+	down := NewDownEvent(inner, "t", nil, "w")
+	if down.Path == nil || len(down.Path) != 0 {
+		t.Fatalf("NewDownEvent path = %#v, want an empty non-nil slice", down.Path)
+	}
+	if down.OriginPath == nil || len(down.OriginPath) != 0 {
+		t.Fatalf("NewDownEvent origin path = %#v, want an empty non-nil slice", down.OriginPath)
+	}
+	if down.Direction != DirectionDown {
+		t.Fatalf("NewDownEvent direction = %q", down.Direction)
+	}
+}
+
+func TestSourceEventTypedNil(t *testing.T) {
+	cases := []Event{
+		(*ChildEvent)(nil),
+		(*TransientChildEvent)(nil),
+		(*DownEvent)(nil),
+		(*TransientDownEvent)(nil),
+		(*RoutedEvent)(nil),
+		(*UsageEvent)(nil),
+	}
+	for _, ev := range cases {
+		if got := SourceEvent(ev); got != nil {
+			t.Errorf("SourceEvent(%T(nil)) = %v, want nil", ev, got)
+		}
+	}
+}
+
 func TestDelegationConcurrentRead(t *testing.T) {
 	source := testUsageEvent("race")
 	observation := &ChildEvent{Inner: source, TaskID: "t", Path: []string{"t"}, AgentName: "w", OriginEventID: "race"}

@@ -87,7 +87,7 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 - `ModelMessage(ModelEvent)` (transient): `content: str`, `metadata: dict`.
 - `ModelMessageChunk(ModelEvent)` (transient): `content: str`. `ModelReasoning(ModelEvent)` (transient): `content: str`.
 - `ModelResponse(ModelEvent)` — the turn's final answer: `message: ModelMessage|None`, `tool_calls: ToolCallsEvent`, `usage: Usage`, `response_force: bool` (True = a `final=True` tool forced this response, ends the loop), `files: list[BinaryResult]`, tracing `model/provider/finish_reason/response_id: str|None`; properties `content`, `metadata`; `to_api()`.
-- `UsageEvent(BaseEvent)` (`__conversational__=False`): `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`), `model/provider/finish_reason/label: str|None`, `parts: list[UsageEvent]`.
+- `UsageEvent(BaseEvent)` (`__conversational__=False`): `event_id: str (uuid4 hex; source-record identity)`, `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`), `model/provider/finish_reason/label: str|None`, `parts: list[UsageEvent]`.
 - `HumanInputRequest(BaseEvent)`: `id: str (uuid)`, `content: str`, `timeout: float|None`, `task_id: str|None`.
 - `ToolApprovalRequest(HumanInputRequest)`: `+ tool_call_id: str`.
 - `HumanMessage(BaseEvent)`: `parent_id: str`, `content: str`.

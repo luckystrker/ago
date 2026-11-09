@@ -81,13 +81,17 @@ Concrete events (fields per specs; JSON tags = Python field names):
 `ModelRequest{Parts []Input, Metadata map[string]any}`, `DrainedModelRequest`, `MessageEnqueued`,
 `ModelMessage{Content string, Metadata map[string]any}`, `ModelMessageChunk{Content string}`, `ModelReasoning{Content string}`,
 `ModelResponse{Message *ModelMessage, ToolCalls ToolCallsEvent, Usage Usage, ResponseForce bool, Files []BinaryResult, Model, Provider, FinishReason, ResponseID string}`,
-`UsageEvent{Usage Usage, Kind string, Model, Provider, FinishReason, Label string, Parts []UsageEvent}`,
+`UsageEvent{EventID string, Usage Usage, Kind string, Model, Provider, FinishReason, Label string, Parts []UsageEvent}`,
 `HumanInputRequest{ID, Content string, Timeout float64, TaskID string}`, `ToolApprovalRequest{ToolCallID string}` (embeds HumanInputRequest), `HumanMessage{ParentID, Content string}`,
 `ToolCallsEvent{Calls []ToolCallEvent}`, `ToolResultsEvent{Results []ToolResultEvent}`,
 `ToolCallEvent{ID, Name, Arguments string, VendorMetadata map[string]any, Source string}`,
 `ToolResultEvent{ParentID, Name string, Result ToolResult}`, `ToolErrorEvent{Error string}`, `ToolNotFoundEvent`,
 `TaskStarted/TaskProgress/TaskCompleted/TaskFailed/TaskExpired/TaskCancelled`,
 `CompactionSummary{Content string}`, `ObserverAlert{Source string, Severity Severity, Message string, Data map[string]any}`, `HaltEvent{Reason string}`,
+delegation observation events `ChildEvent{Inner Event, TaskID string, Path []string, AgentName, OriginEventID, Direction string}`,
+`TransientChildEvent`, `DeliveryFailed{TaskID, Reason string}`,
+`DownEvent{Inner Event, TaskID string, Path []string, AgentName, Direction string, OriginTaskID string, OriginPath []string, OriginStreamID string}`,
+`TransientDownEvent`, with `SourceEvent(ev Event) Event` and the `Delivery`/`*RoutedEvent` transport marker,
 lifecycle events (`ObserverStarted/Completed`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `UnknownEvent`).
 
 ```go

@@ -3311,7 +3311,12 @@ variable prefixes to T7.
   is preserved for a lossless round-trip). New event producers adopt `NewUsageEvent` in
   T8 together with descendant provenance. `ChildEvent`/`DownEvent` normalize empty
   `direction` to `up`/`down` and nil paths to `[]` on the wire; constructors
-  `NewChildEvent`/`NewDownEvent` set them in memory.
+  `NewChildEvent`/`NewDownEvent` also normalize nil paths and `origin_path` in memory.
+  `SourceEvent` treats a typed-nil event pointer as absent instead of panicking.
+- **Optional wire fields omit instead of encoding `null`.** `DeliveryFailed.TaskID` and
+  `DownEvent.OriginTaskID` are `omitempty` strings, whereas Python serializes an absent
+  value as `null`. This follows AGo's existing optional-string convention for events
+  (for example `HumanInputRequest.TaskID`).
 - **Nested events use the existing `@type` convention.** `inner` is marshaled with
   `MarshalEvent` and decoded with `UnmarshalEvent`, so a nested `UsageEvent` keeps its
   own discriminator; `RoutedEvent` is not registered because delivery is process-local.

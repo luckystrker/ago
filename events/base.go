@@ -61,6 +61,11 @@ func SourceEvent(ev Event) Event {
 		if ev == nil {
 			return nil
 		}
+		// A typed-nil pointer satisfies the interface but has no value receiver to
+		// call; treat it as an absent event instead of panicking.
+		if rv := reflect.ValueOf(ev); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return nil
+		}
 		s, ok := ev.(sourceEventer)
 		if !ok {
 			return ev

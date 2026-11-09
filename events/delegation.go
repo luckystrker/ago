@@ -36,11 +36,20 @@ func NewChildEvent(inner Event, taskID string, path []string, agentName, originE
 	return &ChildEvent{
 		Inner:         inner,
 		TaskID:        taskID,
-		Path:          path,
+		Path:          normalizePath(path),
 		AgentName:     agentName,
 		OriginEventID: originEventID,
 		Direction:     DirectionUp,
 	}
+}
+
+// normalizePath keeps an empty path representable as an empty JSON array rather
+// than null; callers may pass nil.
+func normalizePath(path []string) []string {
+	if path == nil {
+		return []string{}
+	}
+	return path
 }
 
 func (ChildEvent) EventType() string    { return "ChildEvent" }
@@ -125,6 +134,8 @@ func (TransientChildEvent) Transient() bool   { return true }
 // delegation. It is an audit record, not a trigger.
 type DeliveryFailed struct {
 	Base
+	// AGO-DEVIATION: upstream serializes task_id as null when absent; AGo's
+	// optional string fields omit empty values across the event vocabulary (D-091).
 	TaskID string `json:"task_id,omitempty"`
 	Reason string `json:"reason"`
 }
@@ -138,11 +149,13 @@ func (DeliveryFailed) Conversational() bool { return false }
 // its own source (the payload must not be counted again).
 type DownEvent struct {
 	Base
-	Inner          Event    `json:"inner"`
-	TaskID         string   `json:"task_id"`
-	Path           []string `json:"path"`
-	AgentName      string   `json:"agent_name"`
-	Direction      string   `json:"direction"`
+	Inner     Event    `json:"inner"`
+	TaskID    string   `json:"task_id"`
+	Path      []string `json:"path"`
+	AgentName string   `json:"agent_name"`
+	Direction string   `json:"direction"`
+	// AGO-DEVIATION: upstream serializes origin_task_id as null when absent;
+	// AGo omits empty optional strings (D-091).
 	OriginTaskID   string   `json:"origin_task_id,omitempty"`
 	OriginPath     []string `json:"origin_path"`
 	OriginStreamID string   `json:"origin_stream_id"`
@@ -151,11 +164,12 @@ type DownEvent struct {
 // NewDownEvent builds an intervention audit with the default direction.
 func NewDownEvent(inner Event, taskID string, path []string, agentName string) *DownEvent {
 	return &DownEvent{
-		Inner:     inner,
-		TaskID:    taskID,
-		Path:      path,
-		AgentName: agentName,
-		Direction: DirectionDown,
+		Inner:      inner,
+		TaskID:     taskID,
+		Path:       normalizePath(path),
+		AgentName:  agentName,
+		Direction:  DirectionDown,
+		OriginPath: []string{},
 	}
 }
 
@@ -240,9 +254,11 @@ func (TransientDownEvent) EventType() string { return "TransientDownEvent" }
 func (TransientDownEvent) Transient() bool   { return true }
 
 // Delivery describes how a copy entered a stream it was not published on.
-// A routed copy is never forwarded back to the stream it came from, and the
-// stream calls Validate before each handler. Validate must be safe for
-// concurrent use; an error means the addressed invocation has ended.
+// A routed copy is never forwarded back to the stream it came from. Once the
+// forwarding integration wires the send path (T8, D-091), the stream will call
+// Validate before each handler, so a delivery cannot reach a later turn; until
+// then no caller invokes it. Validate must be safe for concurrent use, and an
+// error means the addressed invocation has ended.
 //
 // AGO-DEVIATION: Python raises from validate and carries the marker in a hidden
 // attribute; Go returns an error and uses a wrapper type (D-091).
