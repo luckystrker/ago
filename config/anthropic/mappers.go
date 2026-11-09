@@ -796,15 +796,25 @@ type wireUsage struct {
 	OutputTokens             *int64 `json:"output_tokens"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
-	OutputTokensDetails      *struct {
+	// CacheCreation carries the per-lifetime split of the cache writes; only
+	// the 1-hour part maps onto Usage (the 5-minute rest is the total minus it).
+	CacheCreation       *wireCacheCreation `json:"cache_creation"`
+	OutputTokensDetails *struct {
 		ThinkingTokens *int64 `json:"thinking_tokens"`
 	} `json:"output_tokens_details"`
 }
 
+// wireCacheCreation is Anthropic's per-retention cache-write breakdown.
+type wireCacheCreation struct {
+	Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
+}
+
 // NormalizeUsage maps the native usage keys onto events.Usage:
 // input_tokens → PromptTokens, output_tokens → CompletionTokens, the cache
-// counters as-is, and output_tokens_details.thinking_tokens → ThinkingTokens
-// (a decomposition of output_tokens, not an addition — Python mapper parity).
+// counters as-is, cache_creation.ephemeral_1h_input_tokens →
+// CacheCreationExtendedInputTokens (the extended-retention subset of the cache
+// writes), and output_tokens_details.thinking_tokens → ThinkingTokens (a
+// decomposition of output_tokens, not an addition — Python mapper parity).
 // TotalTokens is the input+output sum when either was reported.
 func NormalizeUsage(w wireUsage) events.Usage {
 	var u events.Usage
@@ -822,6 +832,9 @@ func NormalizeUsage(w wireUsage) events.Usage {
 	}
 	u.CacheReadInputTokens = w.CacheReadInputTokens
 	u.CacheCreationInputTokens = w.CacheCreationInputTokens
+	if w.CacheCreation != nil {
+		u.CacheCreationExtendedInputTokens = w.CacheCreation.Ephemeral1hInputTokens
+	}
 	if w.OutputTokensDetails != nil {
 		u.ThinkingTokens = w.OutputTokensDetails.ThinkingTokens
 	}

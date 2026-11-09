@@ -82,7 +82,7 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
   subclass; AGo reuses `ModelRequest.origin` (docs/DECISIONS.md D-081).
 
 ### Model / human events — `ag2\events\types.py`
-- `Usage` (frozen dataclass): `prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens, thinking_tokens` — all `float|None`; field-wise `+` (None+None stays None).
+- `Usage` (frozen dataclass): `prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_creation_extended_input_tokens, thinking_tokens` — all `float|None`; field-wise `+` (None+None stays None). The extended field is the part of `cache_creation_input_tokens` written with the provider's extended cache retention.
 - `BinaryResult` (frozen dataclass): `data: bytes`, `metadata: dict` (`.name` from `metadata["filename"]`).
 - `ModelMessage(ModelEvent)` (transient): `content: str`, `metadata: dict`.
 - `ModelMessageChunk(ModelEvent)` (transient): `content: str`. `ModelReasoning(ModelEvent)` (transient): `content: str`.

@@ -144,12 +144,13 @@ func TestMiddlewareLLMCallAttributes(t *testing.T) {
 		Provider:     "openai",
 		FinishReason: "stop",
 		Usage: events.Usage{
-			PromptTokens:             events.I64(10),
-			CompletionTokens:         events.I64(5),
-			TotalTokens:              events.I64(15),
-			CacheReadInputTokens:     events.I64(2),
-			CacheCreationInputTokens: events.I64(3),
-			ThinkingTokens:           events.I64(4),
+			PromptTokens:                     events.I64(10),
+			CompletionTokens:                 events.I64(5),
+			TotalTokens:                      events.I64(15),
+			CacheReadInputTokens:             events.I64(2),
+			CacheCreationInputTokens:         events.I64(3),
+			CacheCreationExtendedInputTokens: events.I64(1),
+			ThinkingTokens:                   events.I64(4),
 		},
 	}
 	if _, err := tel.OnLLMCall(func(evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
@@ -168,10 +169,28 @@ func TestMiddlewareLLMCallAttributes(t *testing.T) {
 	wantInt64(t, m, "gen_ai.usage.total_tokens", 15)
 	wantInt64(t, m, "gen_ai.usage.cache_read_input_tokens", 2)
 	wantInt64(t, m, "gen_ai.usage.cache_creation_input_tokens", 3)
+	wantInt64(t, m, "gen_ai.usage.cache_creation_extended_input_tokens", 1)
 	wantInt64(t, m, "gen_ai.usage.thinking_tokens", 4)
 	if got, ok := m["gen_ai.response.finish_reasons"]; !ok || got.AsStringSlice()[0] != "stop" {
 		t.Errorf("finish_reasons = %v, want [stop]", m["gen_ai.response.finish_reasons"])
 	}
+}
+
+func TestMiddlewareLLMCallKeepsMeasuredZeroExtendedCacheWrites(t *testing.T) {
+	tp, sr := newRecorder(t)
+	tel := Middleware(tp)()
+
+	resp := &events.ModelResponse{
+		Usage: events.Usage{CacheCreationExtendedInputTokens: events.I64(0)},
+	}
+	if _, err := tel.OnLLMCall(func(evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
+		return resp, nil
+	}, nil, nil); err != nil {
+		t.Fatalf("OnLLMCall: %v", err)
+	}
+
+	m := attrMap(findSpan(t, ended(sr), spanLLM))
+	wantInt64(t, m, "gen_ai.usage.cache_creation_extended_input_tokens", 0)
 }
 
 func TestMiddlewareLLMCallEmptyResponseOmitsAttributes(t *testing.T) {

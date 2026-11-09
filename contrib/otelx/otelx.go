@@ -140,6 +140,11 @@ func setLLMAttributes(span trace.Span, resp *events.ModelResponse) {
 	if u.CacheCreationInputTokens != nil {
 		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_creation_input_tokens", *u.CacheCreationInputTokens))
 	}
+	// A measured zero is still a measurement: unlike the truthiness-guarded
+	// counts above, an explicit 0 must reach the span (Python parity).
+	if u.CacheCreationExtendedInputTokens != nil {
+		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_creation_extended_input_tokens", *u.CacheCreationExtendedInputTokens))
+	}
 	if u.CacheReadInputTokens != nil {
 		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_read_input_tokens", *u.CacheReadInputTokens))
 	}

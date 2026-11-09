@@ -75,7 +75,8 @@ func FromEvents(evs []events.Event) *Report {
 func usageReported(u events.Usage) bool {
 	for _, p := range []*int64{
 		u.PromptTokens, u.CompletionTokens, u.TotalTokens,
-		u.CacheReadInputTokens, u.CacheCreationInputTokens, u.ThinkingTokens,
+		u.CacheReadInputTokens, u.CacheCreationInputTokens,
+		u.CacheCreationExtendedInputTokens, u.ThinkingTokens,
 	} {
 		if p != nil && *p != 0 {
 			return true

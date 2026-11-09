@@ -104,6 +104,7 @@ type ToolResult struct {
 type Usage struct {
     PromptTokens, CompletionTokens, TotalTokens            *int64
     CacheReadInputTokens, CacheCreationInputTokens         *int64
+    CacheCreationExtendedInputTokens                       *int64 // extended-retention subset of CacheCreation
     ThinkingTokens                                         *int64
 }
 func (u Usage) Add(o Usage) Usage   // field-wise; nil+nil=nil

@@ -47,6 +47,32 @@ func TestGroupsByModelAndProvider(t *testing.T) {
 	}
 }
 
+// TestExtendedCacheWritesCountAsReported covers Usage.__bool__ parity: an
+// extended cache-write count alone makes the usage non-empty and reaches the
+// totals, while an all-zero record stays unset.
+func TestExtendedCacheWritesCountAsReported(t *testing.T) {
+	if !Reported(events.Usage{CacheCreationExtendedInputTokens: events.I64(1)}) {
+		t.Error("a non-zero extended cache-write count must count as reported")
+	}
+	if Reported(events.Usage{CacheCreationExtendedInputTokens: events.I64(0)}) {
+		t.Error("a measured zero alone must stay unreported")
+	}
+
+	report := FromEvents([]events.Event{
+		&events.UsageEvent{
+			Usage: events.Usage{
+				CacheCreationInputTokens:         events.I64(1000),
+				CacheCreationExtendedInputTokens: events.I64(800),
+			},
+			Kind: events.UsageKindModelCall,
+		},
+	})
+	want := events.Usage{CacheCreationInputTokens: events.I64(1000), CacheCreationExtendedInputTokens: events.I64(800)}
+	if !usageEqual(report.Total, want) {
+		t.Fatalf("total = %+v, want %+v", report.Total, want)
+	}
+}
+
 // TestSubtaskRollupHasNoDoubleCount mirrors ag2/test/test_usage.py: the parent
 // made one model call, a subtask rolled its own spend into a single subtask
 // UsageEvent, and the report sums both without double counting.
@@ -225,5 +251,6 @@ func usageEqual(a, b events.Usage) bool {
 		same(a.TotalTokens, b.TotalTokens) &&
 		same(a.CacheReadInputTokens, b.CacheReadInputTokens) &&
 		same(a.CacheCreationInputTokens, b.CacheCreationInputTokens) &&
+		same(a.CacheCreationExtendedInputTokens, b.CacheCreationExtendedInputTokens) &&
 		same(a.ThinkingTokens, b.ThinkingTokens)
 }

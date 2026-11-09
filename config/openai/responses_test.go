@@ -802,6 +802,59 @@ func TestNormalizeResponsesUsage(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesUsageExtendedCacheWrites(t *testing.T) {
+	cases := []struct {
+		name    string
+		details map[string]any
+		want    *int64
+	}{
+		{
+			name: "ttl_12h breakdown",
+			details: map[string]any{
+				"cache_write_tokens": 1000,
+				"cache_write_tokens_details": map[string]any{
+					"ttl_12h_tokens": 800,
+					"ttl_30m_tokens": 200,
+				},
+			},
+			want: events.I64(800),
+		},
+		{
+			name: "measured zero",
+			details: map[string]any{
+				"cache_write_tokens": 1000,
+				"cache_write_tokens_details": map[string]any{
+					"ttl_12h_tokens": 0,
+					"ttl_30m_tokens": 1000,
+				},
+			},
+			want: events.I64(0),
+		},
+		{
+			name:    "no breakdown",
+			details: map[string]any{"cache_write_tokens": 1000},
+			want:    nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := normalizeResponsesUsage(map[string]any{
+				"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
+				"input_tokens_details": tc.details,
+			})
+			got := u.CacheCreationExtendedInputTokens
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("extended cache writes = %d, want absent", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("extended cache writes absent, want %d", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Fatalf("extended cache writes = %d, want %d", *got, *tc.want)
+			}
+		})
+	}
+}
+
 // --- reasoning and hosted stream events ----------------------------------------------
 
 func TestResponsesStreamReasoningAndHostedEvents(t *testing.T) {

@@ -1616,6 +1616,8 @@ func responsesTextConfig(schema response.Proto) map[string]any {
 // normalizeResponsesUsage maps the Responses usage object onto events.Usage:
 // input/output/total tokens, input_tokens_details.cached_tokens →
 // CacheReadInputTokens, cache_write_tokens → CacheCreationInputTokens,
+// cache_write_tokens_details.ttl_12h_tokens →
+// CacheCreationExtendedInputTokens (writes made with the 12-hour retention),
 // output_tokens_details.reasoning_tokens → ThinkingTokens (Python parity:
 // normalize_responses_usage).
 func normalizeResponsesUsage(usage map[string]any) events.Usage {
@@ -1626,6 +1628,9 @@ func normalizeResponsesUsage(usage map[string]any) events.Usage {
 	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
 		u.CacheReadInputTokens = tokenField(details, "cached_tokens")
 		u.CacheCreationInputTokens = tokenField(details, "cache_write_tokens")
+		if writes, ok := details["cache_write_tokens_details"].(map[string]any); ok {
+			u.CacheCreationExtendedInputTokens = tokenField(writes, "ttl_12h_tokens")
+		}
 	}
 	if details, ok := usage["output_tokens_details"].(map[string]any); ok {
 		u.ThinkingTokens = tokenField(details, "reasoning_tokens")
