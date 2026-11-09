@@ -153,11 +153,6 @@ type taskResult struct {
 	err         error
 }
 
-// childStreamUsage reports the cumulative spend recorded on the delegation's
-// own stream plus source records the forwarder retained while publishing
-// upward. It is a snapshot for inspection (TaskCompleted.Usage), never an
-// additive record: the source UsageEvents have already been forwarded to the
-// parent, so a report that summed this field as well would double count.
 // heldStreamsDependencyKey carries the chain of stream ids owned by enclosing
 // turns into a delegated run, so a grandchild reusing any ancestor's stream is
 // rejected before it can block on a non-reentrant per-stream lock.
@@ -175,6 +170,11 @@ func heldStreamsOf(cx *context.Context) []string {
 	return nil
 }
 
+// childStreamUsage reports the cumulative spend recorded on the delegation's
+// own stream plus source records the forwarder retained while publishing
+// upward. It is a snapshot for inspection (TaskCompleted.Usage), never an
+// additive record: the source UsageEvents have already been forwarded to the
+// parent, so a report that summed this field as well would double count.
 func childStreamUsage(childStream stream.Stream, f *forwarder) events.Usage {
 	if f != nil {
 		return f.usage(childStream)
@@ -230,14 +230,11 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// asyncio lock would queue forever). Reject the delegation instead of
 	// deadlocking; nested delegations normally use a fresh child stream.
 	heldStreams := append(heldStreamsOf(parentCX), parentCX.Stream.ID())
+	var nestedErr error
 	for _, id := range heldStreams {
 		if id != "" && id == childStream.ID() {
-			return taskResult{
-				taskID:      taskID,
-				objective:   objective,
-				childStream: childStream,
-				err:         fmt.Errorf("%w: stream %s is held by an enclosing turn", ErrNestedSameStream, id),
-			}, nil
+			nestedErr = fmt.Errorf("%w: stream %s is held by an enclosing turn", ErrNestedSameStream, id)
+			break
 		}
 	}
 
@@ -256,25 +253,9 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	var run *AgentRun
 
 	// publish authors an event on the child stream. While the turn scope is
-	// open the ordinary stream path persists and the relay forwards it; before
-	// the scope opened (or after a failed Start) there is no subscription, so the
-	// event is relayed directly to the parent.
+	// open the ordinary stream path persists and the relay forwards it.
 	publish := func(ev events.Event) error {
 		return forwarder.publish(childStream, scopeOpen, ev)
-	}
-
-	// publishAfterTurn persists an event on the child stream (best effort) and
-	// then relays it to the parent. It is used only after the child turn scope
-	// has been closed, so the terminal is the last event the parent observes for
-	// this delegation.
-	publishAfterTurn := func(ev events.Event) error {
-		if childStream.ID() == parentCX.Stream.ID() {
-			return childStream.Send(ev)
-		}
-		if serr := childStream.Send(ev); serr != nil {
-			slog.Error("agent: delegation terminal persist failed", "agent", child.Name(), "err", serr)
-		}
-		return forwarder.forward(ev)
 	}
 
 	// fail reports a failed delegation the way Python's except branch does:
@@ -282,16 +263,26 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// calling turn. A cancelled run reports TaskCancelled and is a normal
 	// (non-hitl) result for the delegating tool. Terminal publication is
 	// best-effort but no longer silent: a broken parent stream is logged.
+	//
+	// Ordering mirrors upstream Forwarder.execution's finally: cancel and await
+	// the turn goroutine first, publish the terminal while the relay still holds
+	// the per-stream lock, and only then close the scope. Publishing before the
+	// close keeps a queued sibling on the same stream from relaying this
+	// invocation's terminal under its own provenance.
 	fail := func(err error) (taskResult, error) {
-		// A turn goroutine that outlived Result must finish and its relay must be
-		// gone before the terminal: the terminal is the last event the parent
-		// observes (upstream publishes it in Forwarder.execution finally).
-		if run != nil {
-			run.Close()
+		if scopeOpen {
+			run.awaitTurn()
 		}
-		scopeOpen = false
+		// A rejected delegation never entered a turn: like upstream reject, it
+		// publishes directly to the parent without touching the child stream.
+		emit := func(ev events.Event) error {
+			if scopeOpen {
+				return publish(ev)
+			}
+			return forwarder.reject(ev)
+		}
 		if !startedPublished {
-			if serr := publishAfterTurn(startedEvent); serr != nil {
+			if serr := emit(startedEvent); serr != nil {
 				slog.Error("agent: delegation TaskStarted send failed", "agent", child.Name(), "err", serr)
 			}
 			startedPublished = true
@@ -303,8 +294,11 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 				Objective: objective,
 				Reason:    err.Error(),
 			}
-			if serr := publishAfterTurn(terminal); serr != nil {
+			if serr := emit(terminal); serr != nil {
 				slog.Error("agent: delegation TaskCancelled send failed", "agent", child.Name(), "err", serr)
+			}
+			if run != nil {
+				run.Close()
 			}
 			return taskResult{
 				taskID:      taskID,
@@ -320,13 +314,20 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 			Objective: objective,
 			Error:     err.Error(),
 		}
-		if serr := publishAfterTurn(terminal); serr != nil {
+		if serr := emit(terminal); serr != nil {
 			slog.Error("agent: delegation TaskFailed send failed", "agent", child.Name(), "err", serr)
+		}
+		if run != nil {
+			run.Close()
 		}
 		if hitl.IsError(err) {
 			return taskResult{}, err
 		}
 		return taskResult{taskID: taskID, objective: objective, childStream: childStream, err: err}, nil
+	}
+
+	if nestedErr != nil {
+		return fail(nestedErr)
 	}
 
 	var err error

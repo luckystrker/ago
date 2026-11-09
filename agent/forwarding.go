@@ -122,6 +122,23 @@ func (f *forwarder) forward(ev events.Event) error {
 	if f.stream != nil && f.stream.ID() == f.parent.Stream.ID() {
 		return nil
 	}
+	return f.forwardToParent(ev)
+}
+
+// reject publishes a pre-turn lifecycle event straight to the parent without
+// touching the child stream (upstream Forwarder.reject). Unlike forward it has
+// no same-stream echo guard: a rejected delegation did not subscribe anywhere,
+// so its start/failure must still be observable on the parent — including the
+// degenerate case where the child was configured with the parent's stream.
+func (f *forwarder) reject(ev events.Event) error {
+	if f == nil || f.parent == nil || f.parent.Stream == nil || ev == nil {
+		return nil
+	}
+	return f.forwardToParent(ev)
+}
+
+// forwardToParent stamps and publishes one event upward.
+func (f *forwarder) forwardToParent(ev events.Event) error {
 	switch e := events.AsValue(ev).(type) {
 	case events.ChildEvent:
 		// An observation from a deeper delegation keeps the leaf's task id,

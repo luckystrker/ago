@@ -308,6 +308,23 @@ func (r *AgentRun) Enqueue(parts ...events.Input) error {
 // Stream exposes the conversation stream.
 func (r *AgentRun) Stream() stream.Stream { return r.stream }
 
+// awaitTurn cancels the turn and waits until its goroutine has finished, but
+// leaves the relay and the per-stream lock in place. The failure path uses it
+// to publish the terminal inside the turn scope, as upstream
+// Forwarder.execution does in its finally block.
+func (r *AgentRun) awaitTurn() {
+	if r == nil {
+		return
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.running.Load() {
+		<-r.done
+		r.running.Store(false)
+	}
+}
+
 // Close ends the turn scope: cancels an in-flight turn, waits for its goroutine
 // to finish, unsubscribes and releases the per-stream lock. It is blocking by
 // design: a model client that ignores cancellation can make Close wait until
@@ -321,16 +338,7 @@ func (r *AgentRun) Close() {
 		if r.cancel != nil {
 			r.cancel()
 		}
-		// Wait for the turn goroutine to finish before tearing down its relay
-		// and releasing the stream lock: a client that ignores cancellation can
-		// otherwise publish a late event after the next invocation subscribed
-		// to the same stream. startOnce has returned by the time a started run is
-		// closed; a scope that failed before launching the goroutine leaves
-		// running false.
-		if r.running.Load() {
-			<-r.done
-			r.running.Store(false)
-		}
+		r.awaitTurn()
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
 		}
