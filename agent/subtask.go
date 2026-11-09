@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -203,34 +204,49 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		childStream = stream.NewMemoryStream(stream.WithStorage(parentCX.Stream.History().Storage()))
 	}
 
-	// The relay is installed before TaskStarted so the whole invocation,
-	// including its opening event, is visible on the parent stream. It is an
-	// interrupt subscriber so a child HITL hook cannot swallow the request
-	// before the parent's observers see it.
+	// The relay is installed by the child turn scope, after the per-stream lock
+	// is held: a delegation queued behind another one on a shared stream must not
+	// capture that invocation's events (upstream Forwarder.execution inside
+	// _turn_scope). TaskStarted is the first event the scope publishes.
 	forwarder := newForwarder(parentCX, childStream, taskID, child.Name())
-	forwarder.start()
-	defer forwarder.stop()
-
-	if err := childStream.Send(&events.TaskStarted{
+	startedEvent := &events.TaskStarted{
 		TaskID:           taskID,
 		AgentName:        child.Name(),
 		Objective:        objective,
 		ParentToolCallID: parentCX.ToolCallID,
-	}); err != nil {
-		return taskResult{}, err
+	}
+	scopeOpen, startedPublished := false, false
+
+	// publish authors an event on the child stream. While the turn scope is
+	// open the ordinary stream path persists and the relay forwards it; before
+	// the scope opened (or after a failed Start) there is no subscription, so the
+	// event is relayed directly to the parent.
+	publish := func(ev events.Event) error {
+		return forwarder.publish(childStream, scopeOpen, ev)
 	}
 
 	// fail reports a failed delegation the way Python's except branch does:
 	// terminal task event on every path, hitl failures re-raised so they end the
 	// calling turn. A cancelled run reports TaskCancelled and is a normal
-	// (non-hitl) result for the delegating tool.
+	// (non-hitl) result for the delegating tool. Terminal publication is
+	// best-effort but no longer silent: a broken parent stream is logged.
 	fail := func(err error) (taskResult, error) {
+		if !startedPublished {
+			if serr := publish(startedEvent); serr != nil {
+				slog.Error("agent: delegation TaskStarted send failed", "agent", child.Name(), "err", serr)
+			}
+			startedPublished = true
+		}
 		if errors.Is(err, stdcontext.Canceled) {
-			_ = childStream.Send(&events.TaskCancelled{
+			terminal := &events.TaskCancelled{
 				TaskID:    taskID,
 				AgentName: child.Name(),
+				Objective: objective,
 				Reason:    err.Error(),
-			})
+			}
+			if serr := publish(terminal); serr != nil {
+				slog.Error("agent: delegation TaskCancelled send failed", "agent", child.Name(), "err", serr)
+			}
 			return taskResult{
 				taskID:      taskID,
 				objective:   objective,
@@ -239,12 +255,15 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 				err:         err,
 			}, nil
 		}
-		_ = childStream.Send(&events.TaskFailed{
+		terminal := &events.TaskFailed{
 			TaskID:    taskID,
 			AgentName: child.Name(),
 			Objective: objective,
 			Error:     err.Error(),
-		})
+		}
+		if serr := publish(terminal); serr != nil {
+			slog.Error("agent: delegation TaskFailed send failed", "agent", child.Name(), "err", serr)
+		}
 		if hitl.IsError(err) {
 			return taskResult{}, err
 		}
@@ -256,6 +275,8 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return fail(err)
 	}
 	defer run.Close()
+	run.delegation = forwarder
+	run.delegationStart = startedEvent
 
 	// The child run starts from the parent's dependencies merged over the child
 	// agent's own option maps (newRun already seeded those): Python passes
@@ -275,7 +296,7 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// (Python parity: run_task installs the bridge when the agent has no
 	// _hitl_hook). The parent hook is the middleware-wrapped one installed on
 	// the parent's run context. The question and answer already reach the parent
-	// stream as ChildEvent observations through the Forwarder; the bridge only
+	// stream as ChildEvent observations through the forwarder; the bridge only
 	// supplies the answer, so it must not publish a second copy.
 	child.mu.Lock()
 	childHook := child.opts.hitl
@@ -292,8 +313,10 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// AGO-DEVIATION: no stdlib context flows through tool execution, so the
 	// delegation cannot be cancelled through the caller's tool call.
 	if err := run.Start(ctx); err != nil {
+		startedPublished = run.delegationStarted
 		return fail(err)
 	}
+	scopeOpen, startedPublished = true, true
 	reply, err := run.Result(ctx)
 	if err != nil {
 		return fail(err)
@@ -303,14 +326,17 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// inspection; the additive accounting already travelled as source
 	// UsageEvents, so a reader must never sum this snapshot.
 	total := childStreamUsage(childStream)
-	_ = childStream.Send(&events.TaskCompleted{
+	terminal := &events.TaskCompleted{
 		TaskID:     taskID,
 		AgentName:  child.Name(),
 		Objective:  objective,
 		Result:     reply.Body(),
 		TaskStream: childStream.ID(),
 		Usage:      total,
-	})
+	}
+	if serr := publish(terminal); serr != nil {
+		slog.Error("agent: delegation TaskCompleted send failed", "agent", child.Name(), "err", serr)
+	}
 	return taskResult{
 		taskID:      taskID,
 		objective:   objective,

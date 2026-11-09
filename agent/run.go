@@ -54,10 +54,17 @@ type AgentRun struct {
 	maxToolRounds int
 	// scanStart is the transcript length recorded before the resume trigger was
 	// sent, so the turn loop starts scanning at the right position.
-	scanStart  int
-	haltMu     sync.Mutex
-	halted     bool
-	haltReason string
+	scanStart int
+	// delegation is the relay of a sub-agent turn. It starts after the
+	// per-stream turn lock is held and stops before the lock is released, so a
+	// queued delegation on a shared stream cannot capture another invocation's
+	// events (upstream Forwarder.execution inside _turn_scope).
+	delegation        *forwarder
+	delegationStart   events.Event
+	delegationStarted bool
+	haltMu            sync.Mutex
+	halted            bool
+	haltReason        string
 }
 
 // Start opens the turn scope and launches the turn goroutine. Idempotent.
@@ -97,6 +104,22 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 			r.Close()
 		}
 	}()
+
+	// Delegation relay: installed only now, under the per-stream turn lock, so
+	// a queued invocation on a shared stream cannot observe another turn's
+	// events. TaskStarted is the first event of the child transcript; the relay
+	// forwards it (and every later event) to the parent similarly to upstream
+	// Forwarder.execution inside _turn_scope.
+	if r.delegation != nil {
+		r.delegation.start()
+		if r.delegationStart != nil {
+			if err := r.stream.Send(r.delegationStart); err != nil {
+				return fmt.Errorf("agent: send task started: %w", err)
+			}
+			r.delegationStarted = true
+			r.delegationStart = nil
+		}
+	}
 
 	// The turn's input enters the inbox only now, under the lock: a sibling
 	// delegation blocked on this stream must not have its objective drained by
@@ -288,6 +311,13 @@ func (r *AgentRun) Close() {
 		}
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
+		}
+		// Stop the delegation relay before the turn lock is released: the next
+		// invocation on a shared child stream must not inherit this turn's
+		// subscription (upstream _turn_scope bracket).
+		if r.delegation != nil {
+			r.delegation.stop()
+			r.delegation = nil
 		}
 		if r.lock != nil {
 			// Releases the mutex and the run's map slot; the entry survives

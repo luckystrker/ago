@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/stream"
@@ -221,7 +222,7 @@ func TestNewForwarderExtendsAncestorPathAndIgnoresForeignDependency(t *testing.T
 		t.Fatalf("local path = %v, want just the task id", f.path)
 	}
 
-	ancestor := &Forwarder{path: []string{"root", "a"}}
+	ancestor := &forwarder{path: []string{"root", "a"}}
 	parent.SetDependency(forwarderDependencyKey, ancestor)
 	nested := newForwarder(parent, stream.NewMemoryStream(), "task-b", "b")
 	if len(nested.path) != 3 || nested.path[0] != "root" || nested.path[1] != "a" || nested.path[2] != "task-b" {
@@ -234,30 +235,30 @@ func TestNewForwarderExtendsAncestorPathAndIgnoresForeignDependency(t *testing.T
 }
 
 func TestForwarderNilAndEmptyStateIsSafe(t *testing.T) {
-	var nilF *Forwarder
+	var nilF *forwarder
 	nilF.start()
 	nilF.stop()
 	if err := nilF.forward(nil); err != nil {
 		t.Fatalf("nil forward: %v", err)
 	}
 
-	(&Forwarder{}).start()
-	(&Forwarder{}).stop()
-	if err := (&Forwarder{}).forward(&events.ModelResponse{}); err != nil {
+	(&forwarder{}).start()
+	(&forwarder{}).stop()
+	if err := (&forwarder{}).forward(&events.ModelResponse{}); err != nil {
 		t.Fatalf("nil parent forward: %v", err)
 	}
 
 	parent := agocontext.New(stream.NewMemoryStream())
-	if err := (&Forwarder{parent: &agocontext.Context{}}).forward(&events.ModelResponse{}); err != nil {
+	if err := (&forwarder{parent: &agocontext.Context{}}).forward(&events.ModelResponse{}); err != nil {
 		t.Fatalf("nil parent stream forward: %v", err)
 	}
-	if err := (&Forwarder{parent: parent}).forward(nil); err != nil {
+	if err := (&forwarder{parent: parent}).forward(nil); err != nil {
 		t.Fatalf("nil event forward: %v", err)
 	}
 
 	// A nil child stream is not the parent stream, so the event is relayed; the
 	// relay must not panic on the missing child handle.
-	f := &Forwarder{parent: parent, taskID: "t", agentName: "a", path: []string{"t"}}
+	f := &forwarder{parent: parent, taskID: "t", agentName: "a", path: []string{"t"}}
 	if err := f.forward(&events.ModelResponse{Message: &events.ModelMessage{Content: "x"}}); err != nil {
 		t.Fatalf("nil child stream forward: %v", err)
 	}
@@ -272,9 +273,9 @@ func TestForwarderNilAndEmptyStateIsSafe(t *testing.T) {
 		t.Fatalf("forwarded event = %T, want ChildEvent", evs[0])
 	}
 
-	(&Forwarder{parent: parent}).start()
-	(&Forwarder{parent: parent}).stop()
-	(&Forwarder{stream: stream.NewMemoryStream()}).start()
+	(&forwarder{parent: parent}).start()
+	(&forwarder{parent: parent}).stop()
+	(&forwarder{stream: stream.NewMemoryStream()}).start()
 }
 
 func TestForwarderDoesNotEchoOnTheSameStream(t *testing.T) {
@@ -623,10 +624,12 @@ func TestCancelledDelegationReportsTaskCancelled(t *testing.T) {
 		t.Fatalf("history: %v", err)
 	}
 	var cancelled, failed, completed int
+	var cancelEvent events.TaskCancelled
 	for _, ev := range evs {
-		switch events.AsValue(ev).(type) {
+		switch e := events.AsValue(ev).(type) {
 		case events.TaskCancelled:
 			cancelled++
+			cancelEvent = e
 		case events.TaskFailed:
 			failed++
 		case events.TaskCompleted:
@@ -636,6 +639,9 @@ func TestCancelledDelegationReportsTaskCancelled(t *testing.T) {
 	if cancelled != 1 || failed != 0 || completed != 0 {
 		t.Fatalf("terminal events: cancelled=%d failed=%d completed=%d", cancelled, failed, completed)
 	}
+	if cancelEvent.Objective != "work" {
+		t.Fatalf("TaskCancelled objective = %q, want work", cancelEvent.Objective)
+	}
 }
 
 func derefTokens(p *int64) int64 {
@@ -643,4 +649,151 @@ func derefTokens(p *int64) int64 {
 		return -1
 	}
 	return *p
+}
+
+type sharedSlowConfig struct{ name string }
+
+func (c sharedSlowConfig) Provider() config.Provider { return "test" }
+func (c sharedSlowConfig) Model() string             { return c.name }
+func (c sharedSlowConfig) Create() (config.LLMClient, error) {
+	return sharedSlowClient{name: c.name}, nil
+}
+func (c sharedSlowConfig) Clone(map[string]any) (config.ModelConfig, error) { return c, nil }
+
+type sharedSlowClient struct{ name string }
+
+func (c sharedSlowClient) Call(ctx stdcontext.Context, _ []events.Event, _ *agocontext.Context, _ config.CallOptions) (*events.ModelResponse, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(40 * time.Millisecond):
+	}
+	return &events.ModelResponse{
+		Message: &events.ModelMessage{Content: c.name + " done"},
+		Usage:   events.Usage{TotalTokens: events.I64(10)},
+		Model:   c.name,
+	}, nil
+}
+
+// TestConcurrentDelegationsOnOneSharedStreamDoNotCrossForward pins the turn-scope
+// bracket: two AsTool calls of one child agent that reuse one WithStreamBase
+// serialize on the child's per-stream lock, and each relay only sees its own
+// invocation. A queued delegation must not capture the active turn's events,
+// duplicate its TaskStarted/TaskCompleted or restamp its source usage.
+func TestConcurrentDelegationsOnOneSharedStreamDoNotCrossForward(t *testing.T) {
+	child := New("child", "", WithConfig(sharedSlowConfig{name: "child"}),
+		WithStreamBase(stream.NewMemoryStream()))
+	base := stream.NewMemoryStream()
+	parent := New("root", "", WithConfig(agotest.NewTestConfig(
+		&events.ModelResponse{ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "a", Name: "task_child", Arguments: `{"objective":"one"}`},
+			{ID: "b", Name: "task_child", Arguments: `{"objective":"two"}`},
+		}}},
+		&events.ModelResponse{
+			Message: &events.ModelMessage{Content: "root done"},
+			Usage:   events.Usage{TotalTokens: events.I64(1)},
+		},
+	)), WithStreamBase(base), WithTools(child.AsTool(WithToolName("task_child"))))
+
+	if _, err := parent.Ask(stdcontext.Background(), "go"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	history, err := base.History().GetEvents()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	var started, completed []events.TaskCompleted
+	var startEvents []events.TaskStarted
+	for _, ev := range history {
+		switch e := events.AsValue(ev).(type) {
+		case events.TaskStarted:
+			startEvents = append(startEvents, e)
+			started = append(started, events.TaskCompleted{})
+		case events.TaskCompleted:
+			completed = append(completed, e)
+		}
+	}
+	if len(startEvents) != 2 || len(completed) != 2 {
+		t.Fatalf("lifecycle = started %d completed %d, want 2/2", len(startEvents), len(completed))
+	}
+	ids := map[string]bool{}
+	for _, s := range startEvents {
+		ids[s.TaskID] = true
+		if len(s.Path) != 1 || s.Path[0] != s.TaskID {
+			t.Fatalf("TaskStarted %s path = %v", s.TaskID, s.Path)
+		}
+	}
+	for _, c := range completed {
+		if !ids[c.TaskID] || len(c.Path) != 1 || c.Path[0] != c.TaskID {
+			t.Fatalf("TaskCompleted %s path = %v (started ids %v)", c.TaskID, c.Path, ids)
+		}
+	}
+	seenUsage := map[string]bool{}
+	childSpend := int64(0)
+	for _, ev := range history {
+		u, ok := events.AsValue(ev).(events.UsageEvent)
+		if !ok || u.AgentName != "child" {
+			continue
+		}
+		if seenUsage[u.EventID] {
+			t.Fatalf("source usage %s forwarded twice", u.EventID)
+		}
+		seenUsage[u.EventID] = true
+		if len(u.Path) != 1 || u.Path[0] != u.TaskID {
+			t.Fatalf("usage path = %v, task = %s", u.Path, u.TaskID)
+		}
+		if u.Usage.TotalTokens != nil {
+			childSpend += *u.Usage.TotalTokens
+		}
+	}
+	if len(seenUsage) != 2 || childSpend != 20 {
+		t.Fatalf("child usage = %d records / %d tokens, want 2 / 20", len(seenUsage), childSpend)
+	}
+	if got := usage.FromEvents(history).Total.TotalTokens; got == nil || *got != 21 {
+		t.Fatalf("report total = %v, want 21", got)
+	}
+}
+
+// TestForwarderRetainsAccountingWhenUpwardDeliveryFails pins the
+// _persist_accounting fallback: a failed parent publication must leave the
+// source UsageEvent in the parent transcript exactly once, whether the failure
+// happened before or after persistence.
+func TestForwarderRetainsAccountingWhenUpwardDeliveryFails(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		interrupt bool
+	}{
+		{name: "failure before persistence", interrupt: true},
+		{name: "subscriber failure after persistence"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := agocontext.New(stream.NewMemoryStream())
+			parent.Stream.Subscribe(func(ev events.Event) error {
+				if events.IsInert(ev) {
+					return errors.New("parent unavailable")
+				}
+				return nil
+			}, stream.SubscribeOptions{Interrupt: tc.interrupt})
+			child := stream.NewMemoryStream()
+			f := newForwarder(parent, child, "t", "child")
+			f.start()
+			defer f.stop()
+
+			src := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(10)}, events.UsageKindModelCall)
+			if err := child.Send(src); err == nil {
+				t.Fatal("child send succeeded despite the parent failure")
+			}
+			evs, err := parent.Stream.History().GetEvents()
+			if err != nil {
+				t.Fatalf("history: %v", err)
+			}
+			if len(evs) != 1 {
+				t.Fatalf("parent accounting records = %d, want 1", len(evs))
+			}
+			u, ok := events.AsValue(evs[0]).(events.UsageEvent)
+			if !ok || u.EventID != src.EventID || len(u.Path) != 1 || u.Path[0] != "t" {
+				t.Fatalf("retained record = %#v", evs[0])
+			}
+		})
+	}
 }
