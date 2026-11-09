@@ -891,6 +891,34 @@ func TestRunChatCompatStreamToolCallAssembly(t *testing.T) {
 			},
 			want: []call{{"", "tool_a", "12"}},
 		},
+		{
+			// The empty-accumulator guard: a first delta without index or id
+			// opens calls[0]; the continue-the-last path would index -1.
+			name: "first delta without index or id opens the first call",
+			deltas: []string{
+				`{"tool_calls":[{"function":{"name":"tool_a","arguments":"1"}}]}`,
+			},
+			want: []call{{"", "tool_a", "1"}},
+		},
+		{
+			// JSON null decodes to a nil index, i.e. absent for assembly, so
+			// each id-carrying delta still opens its own call.
+			name: "null index behaves like an absent one",
+			deltas: []string{
+				`{"tool_calls":[{"index":null,"id":"call_a","function":{"name":"tool_a","arguments":"1"}}]}`,
+				`{"tool_calls":[{"index":null,"id":"call_b","function":{"name":"tool_b","arguments":"2"}}]}`,
+			},
+			want: []call{{"call_a", "tool_a", "1"}, {"call_b", "tool_b", "2"}},
+		},
+		{
+			// Within one delta the second entry has no id, so it continues the
+			// call the first entry opened rather than starting another one.
+			name: "id-less entry in the same delta joins its predecessor",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","function":{"name":"tool_a","arguments":"1"}},{"function":{"arguments":"2"}}]}`,
+			},
+			want: []call{{"call_a", "tool_a", "12"}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
