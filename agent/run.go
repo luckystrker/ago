@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/context"
@@ -62,6 +63,7 @@ type AgentRun struct {
 	delegation        *forwarder
 	delegationStart   events.Event
 	delegationStarted bool
+	running           atomic.Bool
 	haltMu            sync.Mutex
 	halted            bool
 	haltReason        string
@@ -92,7 +94,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
 	// the per-stream turn lock in _turn_scope).
-	r.lock = a.acquireTurnLock(r.stream.ID())
+	r.lock = acquireTurnLock(r.stream.ID())
 	r.lock.mu.Lock()
 	// A failed scope entry releases everything the scope took, so a forgotten
 	// Close after a Start error cannot strand the stream for later asks
@@ -264,6 +266,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	}
 
 	opened = true
+	r.running.Store(true)
 	go r.executeTurn()
 	return nil
 }
@@ -309,6 +312,16 @@ func (r *AgentRun) Close() {
 		if r.cancel != nil {
 			r.cancel()
 		}
+		// Wait for the turn goroutine to finish before tearing down its relay
+		// and releasing the stream lock: a client that ignores cancellation can
+		// otherwise publish a late event after the next invocation subscribed
+		// to the same stream. startOnce has returned by the time a started run is
+		// closed; a scope that failed before launching the goroutine leaves
+		// running false.
+		if r.running.Load() {
+			<-r.done
+			r.running.Store(false)
+		}
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
 		}
@@ -322,7 +335,7 @@ func (r *AgentRun) Close() {
 		if r.lock != nil {
 			// Releases the mutex and the run's map slot; the entry survives
 			// while other runs still serialize on this stream (audit L-19).
-			r.agent.releaseTurnLock(r.stream.ID(), r.lock)
+			releaseTurnLock(r.stream.ID(), r.lock)
 			r.lock = nil
 		}
 	})

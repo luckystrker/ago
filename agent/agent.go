@@ -136,30 +136,15 @@ type Agent struct {
 	name string
 	mu   sync.Mutex
 	opts options
-	// turns serializes concurrent asks per stream. Entries carry a refcount so
-	// the map shrinks when the last turn on a stream finishes: agents asked over
-	// many fresh streams (delegations, resume) must not accumulate one mutex
-	// per stream id for the process lifetime (audit L-19).
-	turnsMu sync.Mutex
-	turns   map[string]*turnLock
-
 	// knowledge bootstraps once per agent (Python parity: _KnowledgeContext's
 	// bootstrapped flag + lock).
 	knowledgeMu           sync.Mutex
 	knowledgeBootstrapped bool
 }
 
-// turnLock is the per-stream mutex serializing concurrent asks. refs counts
-// runs that acquired it (including ones still waiting to Lock), so the entry
-// is deleted only when nobody can still be holding or waiting on it.
-type turnLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
 func New(name string, prompt string, opts ...Option) *Agent {
-	a := &Agent{name: name, turns: map[string]*turnLock{}}
+	a := &Agent{name: name}
 	a.opts.fragments = append(a.opts.fragments, prompt)
 	for _, o := range opts {
 		o(&a.opts)
@@ -190,41 +175,6 @@ func (a *Agent) PromptFragments() []string {
 	out := make([]string, len(a.opts.fragments))
 	copy(out, a.opts.fragments)
 	return out
-}
-
-// acquireTurnLock takes the per-stream lock slot for a run: an existing entry
-// is shared (the run joins everyone else serializing on this stream), a missing
-// one is created. The refcount is taken under turnsMu before the caller can
-// block on the mutex, so a release that shrinks the count to zero can safely
-// delete the entry — no waiter can be left blocking on a mutex the map no
-// longer knows.
-func (a *Agent) acquireTurnLock(streamID string) *turnLock {
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	if a.turns == nil {
-		a.turns = map[string]*turnLock{}
-	}
-	l, ok := a.turns[streamID]
-	if !ok {
-		l = &turnLock{}
-		a.turns[streamID] = l
-	}
-	l.refs++
-	return l
-}
-
-// releaseTurnLock unlocks the stream mutex and drops the run's slot. The entry
-// is deleted only when this was the last reference: the mutex is released
-// first, so a run arriving between the unlock and the map cleanup finds the
-// same entry and keeps serializing instead of racing on a fresh one.
-func (a *Agent) releaseTurnLock(streamID string, l *turnLock) {
-	l.mu.Unlock()
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	l.refs--
-	if l.refs == 0 && a.turns[streamID] == l {
-		delete(a.turns, streamID)
-	}
 }
 
 // Ask runs one blocking turn and returns the reply (Python parity: agent.ask).

@@ -402,6 +402,7 @@ func TestRunInputWaitsForStreamLock(t *testing.T) {
 	if _, err := second.Result(stdcontext.Background()); err != nil {
 		t.Fatalf("turn B: %v", err)
 	}
+	second.Close()
 
 	hist := g.histories()
 	if len(hist) != 2 {
@@ -425,10 +426,7 @@ func TestTurnLockMapShrinksAfterRuns(t *testing.T) {
 			t.Fatalf("ask %d: %v", i, err)
 		}
 	}
-	a.turnsMu.Lock()
-	n := len(a.turns)
-	a.turnsMu.Unlock()
-	if n != 0 {
+	if n := turnLockCount(); n != 0 {
 		t.Fatalf("per-stream lock map kept %d entries after all runs finished", n)
 	}
 }
@@ -499,45 +497,44 @@ func TestMaxToolRoundsStopsLoop(t *testing.T) {
 // creates its map. The mutex dance mirrors open(): every acquired reference
 // holds the mutex between its acquire and its release.
 func TestTurnLockRefcountKeepsEntry(t *testing.T) {
-	// Zero-value Agent: the lazy map initialization must hold.
-	var zero Agent
-	lz := zero.acquireTurnLock("s-zero")
+	lz := acquireTurnLock("s-zero")
 	lz.mu.Lock()
-	zero.releaseTurnLock("s-zero", lz)
+	releaseTurnLock("s-zero", lz)
 
-	a := New("a", "")
-	l1 := a.acquireTurnLock("s")
-	l1.mu.Lock()                 // run 1 owns the stream
-	l2 := a.acquireTurnLock("s") // run 2 joins the same entry, waits on the mutex
+	// The registry is process-wide: two agents sharing a stream id must join
+	// the same entry.
+	a, b := New("a", ""), New("b", "")
+	l1 := acquireTurnLock("s")
+	l1.mu.Lock()               // run 1 owns the stream
+	l2 := acquireTurnLock("s") // run 2 joins the same entry, waits on the mutex
 	if l1 != l2 {
 		t.Fatal("concurrent runs on one stream must share the lock entry")
 	}
 	// Run 1 finishes while run 2 still serializes on the entry: it must survive,
 	// or a third run would start on a fresh lock and stop serializing with the
 	// run still in flight.
-	a.releaseTurnLock("s", l1)
-	l3 := a.acquireTurnLock("s")
+	releaseTurnLock("s", l1)
+	l3 := acquireTurnLock("s")
 	if l3 != l2 {
 		t.Fatal("lock entry deleted while another run still serializes on it")
 	}
 	l3.mu.Lock()
-	a.releaseTurnLock("s", l2) // run 2 done
-	l3.mu.Lock()               // run 3's serialized section
-	a.releaseTurnLock("s", l3) // the last reference: the entry goes away
-	a.turnsMu.Lock()
-	n := len(a.turns)
-	a.turnsMu.Unlock()
-	if n != 0 {
+	releaseTurnLock("s", l2) // run 2 done
+	l3.mu.Lock()             // run 3's serialized section
+	releaseTurnLock("s", l3) // the last reference: the entry goes away
+	if n := turnLockCount(); n != 0 {
 		t.Fatalf("lock map kept %d entries after the last reference released", n)
 	}
 	// The next run gets a fresh entry (the old lock is still referenced here, so
 	// its address cannot be reused).
-	l4 := a.acquireTurnLock("s")
+	l4 := acquireTurnLock("s")
 	l4.mu.Lock()
 	if l4 == l2 {
 		t.Fatal("expected a fresh lock entry after the last reference dropped")
 	}
-	a.releaseTurnLock("s", l4)
+	releaseTurnLock("s", l4)
+	_ = a // a/b prove the registry is not keyed by Agent instance
+	_ = b
 }
 
 // TestReplyContentWithSchema pins AgentReply.Content: with a response schema

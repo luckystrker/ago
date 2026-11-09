@@ -154,10 +154,14 @@ type taskResult struct {
 }
 
 // childStreamUsage reports the cumulative spend recorded on the delegation's
-// own stream. It is a snapshot for inspection (TaskCompleted.Usage), never an
+// own stream plus source records the forwarder retained while publishing
+// upward. It is a snapshot for inspection (TaskCompleted.Usage), never an
 // additive record: the source UsageEvents have already been forwarded to the
 // parent, so a report that summed this field as well would double count.
-func childStreamUsage(childStream stream.Stream) events.Usage {
+func childStreamUsage(childStream stream.Stream, f *forwarder) events.Usage {
+	if f != nil {
+		return f.usage(childStream)
+	}
 	evs, err := childStream.History().GetEvents()
 	if err != nil {
 		return events.Usage{}
@@ -325,7 +329,7 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// The completed event carries the child stream's cumulative spend for
 	// inspection; the additive accounting already travelled as source
 	// UsageEvents, so a reader must never sum this snapshot.
-	total := childStreamUsage(childStream)
+	total := childStreamUsage(childStream, forwarder)
 	terminal := &events.TaskCompleted{
 		TaskID:     taskID,
 		AgentName:  child.Name(),

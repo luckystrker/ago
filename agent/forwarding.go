@@ -2,6 +2,7 @@ package agent
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
@@ -36,6 +37,13 @@ type forwarder struct {
 	agentName string
 	path      []string
 	sub       stream.SubID
+
+	accountingMu sync.Mutex
+	// accounting retains source UsageEvents relayed (or best-effort persisted)
+	// by this invocation. TaskCompleted.Usage combines it with the child
+	// history, so spend retained only on the parent side after a delivery
+	// failure is still visible in the snapshot (upstream history + accounting).
+	accounting []events.Event
 }
 
 // newForwarder builds the relay for one delegation. The path extends the
@@ -129,6 +137,11 @@ func (f *forwarder) forward(ev events.Event) error {
 		// stream, not Context.Send: AsLocal would strip the provenance and
 		// replace a UsageEvent's source id.
 		stamped := events.StampInert(ev, clonePath(f.path), f.taskID, f.agentName)
+		if _, isUsage := usage.EventFrom(stamped); isUsage {
+			f.accountingMu.Lock()
+			f.accounting = append(f.accounting, stamped)
+			f.accountingMu.Unlock()
+		}
 		if err := f.parent.Stream.Send(stamped); err != nil {
 			if u, isUsage := usage.EventFrom(stamped); isUsage {
 				f.persistAccounting(stamped, u.EventID)
@@ -145,6 +158,22 @@ func (f *forwarder) forward(ev events.Event) error {
 		return f.parent.Stream.Send(&events.TransientChildEvent{ChildEvent: *ce})
 	}
 	return f.parent.Stream.Send(ce)
+}
+
+// usage reports this delegation's cumulative spend: the child transcript plus
+// source records this relay retained while publishing upward. Both sources
+// carry the same event ids, so usage.FromEvents deduplicates a record that
+// exists on both sides.
+func (f *forwarder) usage(childStream stream.Stream) events.Usage {
+	evs, err := childStream.History().GetEvents()
+	if err != nil {
+		evs = nil
+	}
+	f.accountingMu.Lock()
+	acc := make([]events.Event, len(f.accounting))
+	copy(acc, f.accounting)
+	f.accountingMu.Unlock()
+	return usage.FromEvents(append(evs, acc...)).Total
 }
 
 // persistAccounting retains a source UsageEvent in the parent history when the
