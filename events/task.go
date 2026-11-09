@@ -85,6 +85,7 @@ type TaskExpired struct {
 	InertEvent
 	TaskID    string `json:"task_id"`
 	AgentName string `json:"agent_name"`
+	Objective string `json:"objective,omitempty"`
 }
 
 func (TaskExpired) EventType() string    { return "TaskExpired" }
@@ -97,6 +98,7 @@ type TaskCancelled struct {
 	InertEvent
 	TaskID    string `json:"task_id"`
 	AgentName string `json:"agent_name"`
+	Objective string `json:"objective,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 }
 

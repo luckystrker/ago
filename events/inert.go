@@ -57,6 +57,7 @@ func InertPath(ev Event) []string {
 // The input is never mutated: the child transcript keeps the locally authored
 // record while the ancestor receives the stamped copy (upstream parity).
 func StampInert(ev Event, path []string, taskID, agentName string) Event {
+	ev = unwrapRouted(ev)
 	if !IsInert(ev) {
 		return ev
 	}
@@ -83,6 +84,7 @@ func StampInert(ev Event, path []string, taskID, agentName string) Event {
 // provenance is actually present, so producers can assign a stable source id
 // before publishing with NewUsageEvent (D-092).
 func AsLocal(ev Event) Event {
+	ev = unwrapRouted(ev)
 	if !IsInert(ev) {
 		return ev
 	}
@@ -113,6 +115,17 @@ func hasInheritedProvenance(ev Event) bool {
 		return u.TaskID != "" || u.AgentName != ""
 	}
 	return false
+}
+
+// unwrapRouted drops a transport-only delivery wrapper before provenance is
+// copied: the wrapper has no writable path/identity fields, so stamping it
+// would silently lose the provenance (and AsLocal could not refresh a
+// UsageEvent id through it).
+func unwrapRouted(ev Event) Event {
+	if r, ok := ev.(*RoutedEvent); ok && r != nil && r.Inner != nil {
+		return r.Inner
+	}
+	return ev
 }
 
 // isNilEvent reports a nil interface or a typed-nil pointer, which satisfies

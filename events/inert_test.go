@@ -237,3 +237,50 @@ func TestStampInertValueFormTask(t *testing.T) {
 		t.Fatalf("StampInert mutated its value-form input: %v", task.Path)
 	}
 }
+
+// TestStampInertUnwrapsRoutedDelivery pins that provenance is applied to the
+// authored event, not to a transport wrapper that has nowhere to store it.
+func TestStampInertUnwrapsRoutedDelivery(t *testing.T) {
+	src := NewUsageEvent(Usage{TotalTokens: I64(7)}, UsageKindModelCall)
+	routed := Routed(src, Delivery{Validate: func() error { return nil }})
+	stamped, ok := StampInert(routed, []string{"t"}, "t", "child").(*UsageEvent)
+	if !ok {
+		t.Fatalf("stamped = %T, want *UsageEvent (wrapper dropped)", stamped)
+	}
+	if len(stamped.Path) != 1 || stamped.TaskID != "t" || stamped.AgentName != "child" {
+		t.Fatalf("provenance = %+v", stamped)
+	}
+	if local, ok := AsLocal(routed).(*UsageEvent); !ok {
+		t.Fatalf("local = %T, want *UsageEvent", local)
+	} else if local.EventID == "" || local.TaskID != "" || len(local.Path) != 0 {
+		t.Fatalf("local = %+v", local)
+	}
+}
+
+func TestTaskTerminalObjectiveRoundTrip(t *testing.T) {
+	for _, ev := range []Event{
+		&TaskCancelled{TaskID: "t", AgentName: "a", Objective: "work", Reason: "stop"},
+		&TaskExpired{TaskID: "t", AgentName: "a", Objective: "work"},
+	} {
+		raw, err := MarshalEvent(ev)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", ev.EventType(), err)
+		}
+		back, err := UnmarshalEvent(raw)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", ev.EventType(), err)
+		}
+		switch got := back.(type) {
+		case *TaskCancelled:
+			if got.Objective != "work" || got.Reason != "stop" {
+				t.Fatalf("cancelled round trip = %+v", got)
+			}
+		case *TaskExpired:
+			if got.Objective != "work" {
+				t.Fatalf("expired round trip = %+v", got)
+			}
+		default:
+			t.Fatalf("back = %T", back)
+		}
+	}
+}
