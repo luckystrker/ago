@@ -16,6 +16,71 @@ Reading conventions:
   `context`. Cancellable operations take a `context.Context` as first parameter where Python
   was `async`.
 
+## Breaking changes — v1.3.0 sync
+
+The scoped-variables port (upstream `fad570ca19`, D-090) changes the context
+variable API. Migrate external code as follows.
+
+**`Context.Variables` is a store, not a map.** A Go map cannot intercept
+`m[k] = v`, so a map field cannot declare a scope or rebind a SHARED value.
+Before/after:
+
+```go
+// before
+cx.Variables["tone"] = "terse"
+tone := cx.Variables["tone"]
+delete(cx.Variables, "tone")
+
+// after
+err := cx.SetVariable("tone", "terse")       // returns *agocontext.ScopeError on conflict
+tone, ok := cx.Variable("tone")
+cx.VariableStore().Delete("tone")
+```
+
+Declare scopes with `agocontext.ScopedValue`:
+
+```go
+agent.New("root", "", agent.WithVariables(map[string]any{
+	"findings": agocontext.ScopedValue{Value: []string{}, Scope: agocontext.ScopeShared},
+	"secret":   agocontext.ScopedValue{Value: "root only", Scope: agocontext.ScopeLocal},
+	"depth":    0, // COPIED (default): each delegated child gets a deep copy
+}))
+```
+
+**`NewWithDeps` returns `(*Context, error)`.** A malformed declaration is now
+an error instead of being silently ignored. `NewWithVariables(s, deps, store)`
+takes an already-built `*agocontext.Variables` (the delegation path).
+
+```go
+// before
+cx := agocontext.NewWithDeps(s, deps, vars)
+
+// after
+cx, err := agocontext.NewWithDeps(s, deps, vars)
+if err != nil { return err }
+// or, with a prebuilt store:
+cx = agocontext.NewWithVariables(s, deps, store)
+```
+
+**`Context.SetVariable` returns `error`.** Existing call statements still
+compile; code that wants to surface a scope conflict must now check it.
+`Context.Variable`/`VariablesSnapshot` stay the read path.
+
+**`AgentReply.Context()` is new** — additive, Python `reply.context` parity.
+
+**`a2a.ReservedVariablePrefixes` is deprecated.** The control-plane prefixes
+have a single source in `context`: use `agocontext.ReservedVariablePrefixes()`
+(returns a copy) or `agocontext.IsReservedVariable(key)`. The old
+`a2a.ReservedVariablePrefixes` variable remains as a snapshot alias for source
+compatibility (mutating it does not affect the context contract);
+`a2a.StripReservedVariables` and agui's state export already delegate to the
+context helper.
+
+`Context.Clone()` keeps the existing cross-turn isolation for branch values and
+keeps one SHARED binding table for the continuation; a delegated child instead
+gets a derived branch (COPIED deep-copied, LOCAL/reserved dropped, SHARED
+reused). Full contract: `docs/specs/core.md` §2 and D-090.
+
 ## 1. Core API
 
 ### Agent and turn lifecycle (`ag2/agent.py` → `github.com/luckystrker/ago/agent`)
@@ -31,7 +96,7 @@ Reading conventions:
 | `reply.files`, `reply.history`, `await reply.usage()` | `reply.Files()`, `reply.History() *stream.History`, `reply.Usage() *usage.Report` | `Usage()` is a synchronous aggregation of the stream's `UsageEvent`s — no await |
 | `reply.ask(...)` / `reply.run(...)` | `reply.Ask(ctx, ...)` / `reply.Run(ctx, ...)` | Continuation on the same stream/context |
 | `resume(*events, ...)` | `a.Resume(ctx, evs ...events.Event) (*AgentReply, error)` | All but last event seed history; last is the re-entry trigger |
-| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed` plus one rolled-up subtask `UsageEvent` on the caller's stream, child state = copy of the caller's dependencies/variables (approval bypass key dropped), HITL bridge to the parent's hook (the forwarded question is transcribed on the parent stream — D-041). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
+| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` and the child's source `UsageEvent` records (with `path`/`task_id`/`agent_name`) on the caller's stream — **no subtask rollup**; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (request and answer reach the parent only as `ChildEvent` observations — D-041/D-092). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too). `TaskCompleted.Usage` is a cumulative child-stream snapshot — never sum it with source usage records |
 | `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards; the task always opens its own private stream (D-030) |
 | `PromptHook` (async prompt hook), `update_system_message` | `agent.WithPromptHook(fn agent.PromptHook)`, `agent.WithPromptFragments(...)` | `PromptHook func(*agocontext.Context) ([]string, error)` |
 | `Plugin` / `PluginTarget._apply_plugin` (`ag2/plugin.py`), `Agent(plugins=[...])` | `plugin.NewBundle(name)` builder (`.WithTool`, `.WithMiddleware`, `.WithPrompt`, `.WithPromptHook`) handed to `agent.WithPlugin(p plugin.Plugin)` | Applied once at agent construction — Python's turn-scoped `additional_plugins` attach/detach is not ported (D-044). Carried legs: tools append after the agent's own, middleware appends after the agent's own (innermost), fragments extend the collectors, hooks run like `WithPromptHook`. Not carried (no agent slot): plugin HITL hook, dependencies, variables, observers, assembly policies. A nil plugin contributes nothing |
@@ -42,7 +107,7 @@ Reading conventions:
 
 | Python | Go | Differences |
 |---|---|---|
-| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `github.com/luckystrker/ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, copies maps |
+| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `github.com/luckystrker/ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables *agocontext.Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, branches the variable store (SHARED bindings persist across the continuation) and copies dependencies/prompt. Variables support delegation scopes (`ScopedValue`, D-090) |
 | `context.enqueue/input/ask/send/spawn_background` | `Enqueue/Pending/Drain`, `Input(ctx, msg, timeout)`, `Ask(ctx, req)`, `Send`, `SpawnBackground` | `Drain()` returns and clears pending input (Python drains implicitly in the turn loop) |
 | `dependency_provider` / DI annotations `Inject`, `Variable`, `Context` | `Dependency(id)`, `MustDependency(id)`, `SetDependency`; tool-side: `tools.NewInject`, `tools.NewVariable`, a `*agocontext.Context` parameter (§2) | DI values keyed by string id (Python keys are arbitrary objects) |
 | `hitl_hook: HumanHook`, `default_hitl_hook` | `hitl.HumanHook`, `hitl.DefaultHook` (`→ hitl.ErrNotProvided`), `ctx.SetHitlHook(h)` | `HumanHook func(ctx context.Context, req *events.HumanInputRequest) (*events.HumanMessage, error)`; typed errors `NotProvidedError`/`FailedError`/`TimeoutError` match the Python `HumanInputError` family |
@@ -215,7 +280,7 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 | `acp/` — `ACPAgent` (`agent.py:118`) + executor, `ACPBridge` (`bridge.py:259`) + `make_bridge`, `ACPClient` (`client.py:77`), `permissions.py`, `elicitation.py`, `auth.py`, `tool_gateway.py` | Ported through wave 2 (D-052 + D-066; closure ledger D-070): `github.com/luckystrker/ago/acp` — both roles over newline-delimited JSON-RPC 2.0 stdio. Serve: `Serve(ServeConfig)` / `ServeAgent(a, cfg)` (`initialize` with truthful capabilities + `authMethods` + `loadSession: true`, `authenticate` + `Auth`/`acp.NewStaticTokenAuth(token)` gating session methods, `session/new` (uuid4 id, cwd/mcpServers recorded), `session/load` history replay (`ServeConfig.History`; `ServeAgent` replays its per-session conversations), `session/prompt` running `Handle(ctx, sessionID, userText, emit *Emitter)` — the full update vocabulary (`Message` chunks, `Thought` under `StreamThoughts`, `Plan`, `ToolCall`/`ToolCallUpdate`, `Usage` under `ContextWindow`), `session/cancel` stops the turn context and answers `{"stopReason":"cancelled"}`, never an error; `Session.RequestPermission`/`Session.Elicit` gated by the config policies (deny = synthesized locally); `Session.Gateway()` proxies client-declared MCP servers through `ago/mcp`. Client: `NewBridge(cmd, args, env)` + `SessionNew`/`SessionNewWithServers`/`Prompt`/`PromptTurn` (stop reason)/`Cancel`/`Load`/`Close`, `Bridge.FS` mediating `fs/read_text_file`/`fs/write_text_file` and `terminal/*` under the root guard (nil = disabled, `-32601`). Not ported: the multi-session store, cross-process `session/load` storage, the tool_gateway HOST direction (exposing local tools over HTTP), serving the agent's own tools through the gateway, `guard.py`, OAuth/terminal auth kinds, model pickers, remote transports |
 | `ag_ui/` — `AGUIStream` (`stream.py:118`), `build_asgi` (`asgi.py:22`), `run_input.py` (`read_run_input`), `capabilities.py` (`served_capabilities`), `events.py` (`AGUIEvent`), `interrupts.py` | Ported through wave 2 (D-053 + D-065; closure ledger D-070): `github.com/luckystrker/ago/agui` — AG-UI 1.0 serving over `net/http`: `ServeAgent(a) http.Handler` and `Handler(HandlerConfig)` (GET capabilities, POST → SSE, 400 before any stream, protocol-major refusal, cancelled outcome), the event projection `NewStream(emit)` + `Handle`, `ReadRunInput` (dual-case keys, unknown-role strip, base64 refusal), `CapabilitiesFor`, typed events + `UnmarshalEvent` + `Raw`. Held turns (D-065): `agui.NewServer(opts...)` — `WithRetention` (default 900s/128), `WithResumeProof`, `WithStateSnapshots` — with `ServeAgent(name, prompt, opts...)`/`Handler(a)`: a `HumanInputRequest` pauses the run as RUN_FINISHED with an `interrupt` outcome (`InterruptOutcome{Interrupts}`); the next POST's `ResumeEntry{InterruptID, Status, Payload}` answers it (resolved → rebind to the new exchange, cancelled → abandon), refusals are single coded RUN_ERRORs before RUN_STARTED. Not ported: REASONING_ENCRYPTED_VALUE, the subagent suspension ledger, seeding the turn's variables from the client's state, prompt-level inputs as per-run fragments |
 | `eval/` — `runtime/runner.py` (`run_agent`), `runtime/evaluate.py` (`evaluate_traces`), `trace.py` (`Trace`), `scorer.py` (`Scorer`, the `@scorer` decorator), `scorers/` (correctness, cost, threshold, tools, judge, pairwise_judge, attribution), `pairwise.py` (`PairwiseComparator`, `WinRate`), `results/` (`RunResult`, `store.dump`) | Ported produce-then-grade (D-051 + D-061; closure ledger D-070): `github.com/luckystrker/ago/eval` — `Run(ctx, agent, Suite, opts ...RunOption)` over `Case{Name, Input, Expected, Scorers}` (`WithConcurrency(n)`, default 4; 1 = strict order), `BuildTrace(evs)` reconstructing `Trace` **from the stream's event log — no OTEL** (the core deviation; `Trace.Err` = Python `Trace.exception`), scorers `Correctness`, `TokenBudget`, `ToolsCalled`, `Threshold`, `LLMJudge`, `Pairwise`, `FailureAttribution` + `DetectMechanical` (attribution.py), the scorer registry (`NewScorerRegistry`, name + params factories for `correctness`/`token_budget`/`tools_called`/`threshold`/`llm_judge`/`failure`, `SetClient`, `Register`), `SuiteFromJSONL(path, registry)` (input required, auto-names, scorer specs), `RunResult.SaveJSON`/`LoadJSON` + `Compare`, `Diff`/`DiffStrict`/`Summary`, `WilsonCI`/`(*RunResult).PassRateCI`/`CohenKappa`. Deferred: OTEL/Tempo/OTLP trace sources and `evaluate_traces`, repeats/per-task configs/`BudgetThresholds`/lifecycle events, suite name/source metadata + tags, pairwise single-order mode |
-| `a2ui/` — `A2UIServer` (`server.py:25`), `A2UIAction`/`A2UIEventAction` (`actions.py`), `SchemaManager` (`schema_manager.py`), `parser.py`, `incoming.py`, `serialize.py`, `request.py` | Ported v1.0-only subset (D-076, supersedes the D-010 deferral for this slice): `github.com/luckystrker/ago/a2ui` — the `Message` union + flat `Component` (verbatim camelCase, golden-tested against the running Python) and the canonical `ToJSONL` serializer; `NewParser(mgr).Parse(response)` (the `<a2ui-json>` tags, fence stripping, JSONL, the exactly-one-payload envelope + root-component rules) with `Validate`/`FormatValidationError` over the vendored v1.0 basic catalog (hand-rolled JSON-Schema subset — unsupported keywords pass); `SanitizeForPrompt` plus the exact unregistered-click/error/function-response rewrites; `Action{Name, Description, ExampleContext, Fn ActionFunc}` + `NewActionRegistry()`; `NewServer(opts...)` — an `http.Handler` (SSE or NDJSON, the rest.py request contract and error strings) that answers registered clicks and every `callAgentFunction` itself and hands the rest to `WithPromptHandler` (`Turn{Text, Messages}`). Not ported: v0_9/v0_9_1, the A2A transport, Starlette transports/ASGI app, events/middleware stream integration, capabilities negotiation, custom catalogs, `dispatch.py`'s agent-turn execution |
+| `a2ui/` — `A2UIServer` (`server.py:25`), `A2UIAction`/`A2UIEventAction` (`actions.py`), `SchemaManager` (`schema_manager.py`), `parser.py`, `incoming.py`, `serialize.py`, `request.py` | Ported v1.0-only subset (D-076, supersedes the D-010 deferral for this slice; stable wire in D-089): `github.com/luckystrker/ago/a2ui` — the `Message` union + flat `Component` (verbatim camelCase, golden-tested against the running Python; the stable wire version is `"1.0"` while the protocol selector stays `v1.0`) and the canonical `ToJSONL` serializer; `NewParser(mgr).Parse(response)` (the `<a2ui-json>` tags, fence stripping, JSONL, the exactly-one-payload envelope + root-component rules) with `Validate`/`FormatValidationError` over the vendored v1.0 basic catalog (hand-rolled JSON-Schema subset — unsupported keywords pass; `TextField.value` required, restricted catalog `$ref`s enforced at load); `SanitizeForPrompt` plus the exact unregistered-click/error/function-response rewrites; `Action{Name, Description, ExampleContext, Fn ActionFunc}` + `NewActionRegistry()`; `NewServer(opts...)` — an `http.Handler` (SSE or NDJSON, the rest.py request contract and error strings) that answers registered clicks and every `callAgentFunction` itself and hands the rest to `WithPromptHandler` (`Turn{Text, Messages}`). Not ported: v0_9/v0_9_1 spec and capacity keys, the A2A transport (and its MIME-tagged parts), Starlette transports/ASGI app, events/middleware stream integration, capabilities negotiation, custom catalogs, `dispatch.py`'s agent-turn execution |
 | `mcp_ui/` (`resources.py`, `actions.py`) | Ported (D-045, supersedes the D-010 deferral for this slice): `github.com/luckystrker/ago/mcpui` — UI resources `RawHTML`/`ExternalURL`/`RemoteDOM` (text/blob encoding, `ui://` guard, `_meta` merge), UI actions `ToolCall`/`Prompt`/`Link`/`Intent`/`Notify`, `PostMessage` (json.dumps + html.escape byte parity), `mcpui.Marshal` for exact wire bytes, `WithUIResource` attaching blocks to `events.ToolResult.Parts` |
 | `CronWatch` / `CadenceWatch` (`ag2/watch.py`) | Deferred (D-024); `EventWatch`/`IntervalWatch`/`DelayWatch`/`AllOf`/`AnyOf`/`Sequence` are ported |
 | `MetricsMiddleware` | — | Deferred (D-013). `TelemetryMiddleware` is ported as `contrib/otelx` (row in §2, D-064) |
@@ -224,6 +289,18 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
 | `mypy.py`, `_import_utils.py`, `_telemetry_consts.py`, `types.py`, `utils.py` | Python infrastructure without a Go counterpart (typing helpers, telemetry constants, the extras-import block); `utils.build_model` → `response.SchemaOf`. `plugin.py` has a counterpart since D-044 (`github.com/luckystrker/ago/plugin`) |
 
 ## 6. Semantics cheat-sheet (things that look different but are parity)
+
+**A2UI wire version (D-089, upstream `1b0c399012`).** v1.0 stabilized: a
+message's `version` and a version-keyed capabilities object carry the bare
+`"1.0"`, not the protocol selector `"v1.0"`. AGo exposes `a2ui.WireVersionV1`
+(`"1.0"`) and keeps `a2ui.VersionV1` (`"v1.0"`) for the protocol/spec names;
+`Message.Version` defaults to the wire version, `SchemaManager.VersionString()`
+and `Parser.VersionString()` report it, and `ProtocolVersion()` reports the
+selector. Serialized messages and the golden fixtures now carry `"1.0"`; an
+operation declaring `"v1.0"` is rejected by the re-vendored schema.
+`TextField.value` is required in the basic catalog, and the restricted catalog
+`$ref` rule is enforced when the vendored catalog loads (custom catalogs are
+still not ported).
 
 - **Async → goroutines + `context.Context`:** every cancellable op takes `ctx` first; stream
   pub/sub dispatches synchronously in the caller's goroutine (D-004).
@@ -234,8 +311,11 @@ Everything below is a deliberate decision (recorded in `docs/DECISIONS.md`), not
   fatal alert produces `"HALTED: <reason>"`. `max_turns` exists only in network transitions.
 - **HITL failure path:** a `HumanInputError` escaping the turn triggers
   `events.CloseUnansweredToolCalls` history repair before propagating — same as Python.
-- **Usage roll-up:** child-agent calls stay on the child stream; only the rolled-up
-  `UsageEvent(kind="subtask")` reaches the parent — no double counting.
+- **Delegation usage:** operational child events reach the parent as `ChildEvent`
+  observations; source `UsageEvent`/`Task*` records travel as themselves with
+  `path`/`task_id`/`agent_name`. There is no subtask rollup: reports deduplicate
+  source records by `event_id`, and `TaskCompleted.Usage` is a cumulative snapshot
+  that must not be added to them (D-092).
 
 ## 7. Verification status
 

@@ -327,7 +327,7 @@ func TestCancelEventOnOwnStream(t *testing.T) {
 	if !ok {
 		t.Fatal("TaskCancelled not emitted")
 	}
-	if cc.Reason != "user asked" || cc.TaskID != tsk.TaskID() || cc.AgentName != "agent" {
+	if cc.Reason != "user asked" || cc.TaskID != tsk.TaskID() || cc.AgentName != "agent" || cc.Objective != "job" {
 		t.Fatalf("TaskCancelled = %+v", cc)
 	}
 	// A non-empty reason is also recorded in metadata.Error.
@@ -400,8 +400,12 @@ func TestExpire(t *testing.T) {
 	if tsk.State() != StateExpired {
 		t.Fatalf("state = %q", tsk.State())
 	}
-	if _, ok := rec.find("TaskExpired").(*events.TaskExpired); !ok {
+	expired, ok := rec.find("TaskExpired").(*events.TaskExpired)
+	if !ok {
 		t.Fatal("TaskExpired not emitted")
+	}
+	if expired.Objective != "job" {
+		t.Fatalf("TaskExpired.Objective = %q, want job", expired.Objective)
 	}
 	select {
 	case <-tsk.Done():

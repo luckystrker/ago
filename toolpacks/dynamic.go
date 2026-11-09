@@ -34,10 +34,10 @@ const dynamicBaseDescription = "Create an ephemeral dynamic agent from a spec (n
 // runtime — name, system prompt, a tool subset picked from the pool by name, an
 // optional response schema — and the tool spawns an ephemeral agent for it and
 // runs one objective. The delegation machinery is Agent.AsTool: the child turn
-// reports TaskStarted/TaskCompleted/TaskFailed and one rolled-up subtask
-// UsageEvent on the caller's stream, starts from a copy of the caller's
-// dependencies and variables, and bridges HITL to the caller's hook (see
-// docs/DECISIONS.md for the wording deviations this composition carries).
+// relays TaskStarted/TaskCompleted/TaskFailed and its source UsageEvents (with
+// delegation provenance) to the caller's stream, starts from a copy of the
+// caller's dependencies and variables, and bridges HITL to the caller's hook
+// (see docs/DECISIONS.md for the wording deviations this composition carries).
 //
 // The middleware the registering parent carries is inherited by every spawned
 // child (see Register and the AGO-DEVIATION note in run): the parent's
@@ -215,8 +215,8 @@ func (f *DynamicAgentFactory) run(spec spec.AgentSpec, objective string, cx *ago
 	}
 
 	// The delegation goes through Agent.AsTool so the child turn runs exactly
-	// the shared sub-task machinery (lifecycle events, usage rollup, HITL
-	// bridge, dependency copy). The delegation tool's stream name is made
+	// the shared sub-task machinery (relayed lifecycle events, source usage,
+	// HITL bridge, dependency copy). The delegation tool's stream name is made
 	// unique per call: the framework routes calls to tools by name, so two
 	// concurrent create_and_run_agent calls spawning same-named children must
 	// not answer each other's calls.

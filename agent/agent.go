@@ -25,6 +25,14 @@ import (
 // ErrConfigNotProvided matches Python ConfigNotProvidedError: Ask/Run without a model config.
 var ErrConfigNotProvided = errors.New("agent: no model config provided (pass WithConfig)")
 
+// ErrNestedSameStream reports a delegation whose child stream is already owned
+// by an enclosing turn in the same call chain. Taking the per-stream turn lock
+// again would deadlock, so runTaskOn rejects the delegation instead.
+//
+// AGO-DEVIATION: upstream's non-reentrant asyncio.Lock would queue such a child
+// forever; AGo fails fast with this sentinel instead (D-092b).
+var ErrNestedSameStream = errors.New("agent: nested delegation on the same stream is not supported")
+
 // ErrMaxToolRounds is returned by a turn whose model kept requesting tools
 // after the WithMaxToolRounds budget of executed tool rounds ran out. The
 // transcript is repaired (unanswered calls closed) exactly as on a HITL
@@ -64,9 +72,16 @@ func WithMiddleware(fs ...middleware.Factory) Option {
 	return func(o *options) { o.middleware = append(o.middleware, fs...) }
 }
 func WithDependencies(deps map[string]any) Option { return func(o *options) { o.dependencies = deps } }
-func WithVariables(vars map[string]any) Option    { return func(o *options) { o.variables = vars } }
-func WithResponseSchema(p response.Proto) Option  { return func(o *options) { o.schema = p } }
-func WithStreamBase(s stream.Stream) Option       { return func(o *options) { o.streamBase = s } }
+
+// WithVariables seeds the conversation variables. Values may be plain values
+// (ScopeCopied by default: a delegated child gets a deep copy) or
+// context.ScopedValue declarations: context.ScopeLocal keeps a value out of
+// child branches, context.ScopeShared makes one binding for the whole
+// invocation tree. Invalid declarations surface as *context.ScopeError from
+// Run/Ask.
+func WithVariables(vars map[string]any) Option   { return func(o *options) { o.variables = vars } }
+func WithResponseSchema(p response.Proto) Option { return func(o *options) { o.schema = p } }
+func WithStreamBase(s stream.Stream) Option      { return func(o *options) { o.streamBase = s } }
 func WithPromptHook(h PromptHook) Option {
 	return func(o *options) { o.promptHooks = append(o.promptHooks, h) }
 }
@@ -129,30 +144,15 @@ type Agent struct {
 	name string
 	mu   sync.Mutex
 	opts options
-	// turns serializes concurrent asks per stream. Entries carry a refcount so
-	// the map shrinks when the last turn on a stream finishes: agents asked over
-	// many fresh streams (delegations, resume) must not accumulate one mutex
-	// per stream id for the process lifetime (audit L-19).
-	turnsMu sync.Mutex
-	turns   map[string]*turnLock
-
 	// knowledge bootstraps once per agent (Python parity: _KnowledgeContext's
 	// bootstrapped flag + lock).
 	knowledgeMu           sync.Mutex
 	knowledgeBootstrapped bool
 }
 
-// turnLock is the per-stream mutex serializing concurrent asks. refs counts
-// runs that acquired it (including ones still waiting to Lock), so the entry
-// is deleted only when nobody can still be holding or waiting on it.
-type turnLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
 func New(name string, prompt string, opts ...Option) *Agent {
-	a := &Agent{name: name, turns: map[string]*turnLock{}}
+	a := &Agent{name: name}
 	a.opts.fragments = append(a.opts.fragments, prompt)
 	for _, o := range opts {
 		o(&a.opts)
@@ -185,44 +185,16 @@ func (a *Agent) PromptFragments() []string {
 	return out
 }
 
-// acquireTurnLock takes the per-stream lock slot for a run: an existing entry
-// is shared (the run joins everyone else serializing on this stream), a missing
-// one is created. The refcount is taken under turnsMu before the caller can
-// block on the mutex, so a release that shrinks the count to zero can safely
-// delete the entry — no waiter can be left blocking on a mutex the map no
-// longer knows.
-func (a *Agent) acquireTurnLock(streamID string) *turnLock {
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	if a.turns == nil {
-		a.turns = map[string]*turnLock{}
-	}
-	l, ok := a.turns[streamID]
-	if !ok {
-		l = &turnLock{}
-		a.turns[streamID] = l
-	}
-	l.refs++
-	return l
-}
-
-// releaseTurnLock unlocks the stream mutex and drops the run's slot. The entry
-// is deleted only when this was the last reference: the mutex is released
-// first, so a run arriving between the unlock and the map cleanup finds the
-// same entry and keeps serializing instead of racing on a fresh one.
-func (a *Agent) releaseTurnLock(streamID string, l *turnLock) {
-	l.mu.Unlock()
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	l.refs--
-	if l.refs == 0 && a.turns[streamID] == l {
-		delete(a.turns, streamID)
-	}
-}
-
 // Ask runs one blocking turn and returns the reply (Python parity: agent.ask).
 func (a *Agent) Ask(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, error) {
-	run, err := a.Run(ctx, msgs...)
+	return a.AskWith(ctx, RunOptions{}, msgs...)
+}
+
+// AskWith runs one blocking turn with per-invocation task-lifecycle options
+// (Python parity: agent.ask(capability=..., ttl_seconds=...)). Either option
+// enables TaskStarted/TaskCompleted/TaskFailed/TaskCancelled for this turn.
+func (a *Agent) AskWith(ctx stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error) {
+	run, err := a.RunWith(ctx, opts, msgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -234,13 +206,25 @@ func (a *Agent) Ask(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, erro
 }
 
 // Run prepares an observable turn (Python parity: agent.run): Start launches the
-// turn, Result awaits the reply, Close ends the turn scope.
-func (a *Agent) Run(_ stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
+// turn, Result awaits the reply, Close ends the turn scope and publishes the
+// task terminal.
+func (a *Agent) Run(ctx stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
+	return a.RunWith(ctx, RunOptions{}, msgs...)
+}
+
+// RunWith is Run with per-invocation task-lifecycle options (Python parity:
+// agent.run(capability=..., ttl_seconds=...)).
+func (a *Agent) RunWith(_ stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error) {
 	s := a.opts.streamBase
 	if s == nil {
 		s = stream.NewMemoryStream()
 	}
-	return a.newRun(s, msgs...)
+	run, err := a.newRun(s, msgs...)
+	if err != nil {
+		return nil, err
+	}
+	run.runOpts = opts
+	return run, nil
 }
 
 // newRun builds a turn over an explicit stream. Continuations (AgentReply.ask)
@@ -251,21 +235,35 @@ func (a *Agent) Run(_ stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
 // would otherwise race — whichever sibling owns the lock drains the others'
 // objectives into its own prompt (audit M-25).
 func (a *Agent) newRun(s stream.Stream, msgs ...Sendable) (*AgentRun, error) {
+	return a.newRunWith(s, nil, msgs...)
+}
+
+// newRunWith is newRun with an inherited variable view (a delegation child
+// branch). Agent defaults are merged over the inherited view, so the parent's
+// values win on shared names while the child keeps its own options on the rest.
+func (a *Agent) newRunWith(s stream.Stream, inherited *context.Variables, msgs ...Sendable) (*AgentRun, error) {
+	a.mu.Lock()
+	defaults := make(map[string]any, len(a.opts.variables))
+	for k, v := range a.opts.variables {
+		defaults[k] = v
+	}
+	deps := make(map[string]any, len(a.opts.dependencies))
+	for k, v := range a.opts.dependencies {
+		deps[k] = v
+	}
+	a.mu.Unlock()
+
+	vars, err := context.MergeVariables(defaults, inherited)
+	if err != nil {
+		return nil, err
+	}
 	run := &AgentRun{
 		agent:  a,
 		stream: s,
-		cx:     context.NewWithDeps(s, map[string]any{}, map[string]any{}),
+		cx:     context.NewWithVariables(s, deps, vars),
 		done:   make(chan struct{}),
 		wake:   make(chan struct{}, 1),
 	}
-	a.mu.Lock()
-	for k, v := range a.opts.dependencies {
-		run.cx.Dependencies[k] = v
-	}
-	for k, v := range a.opts.variables {
-		run.cx.Variables[k] = v
-	}
-	a.mu.Unlock()
 	// Per-turn input goes through the inbox so mid-turn enqueues merge uniformly.
 	if len(msgs) > 0 {
 		run.pendingInput = events.EnsureRequest(msgs...).Parts
@@ -296,6 +294,12 @@ func (a *Agent) newRunOn(prev *context.Context, msgs ...Sendable) (*AgentRun, er
 // trigger re-enters through the inbox; any other event (e.g. ToolResultsEvent) is
 // sent directly and the turn continues from the model's next response.
 func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply, error) {
+	return a.ResumeWith(ctx, RunOptions{}, evs...)
+}
+
+// ResumeWith is Resume with per-invocation task-lifecycle options. Each resume
+// is a fresh task identity (upstream ADR 0035).
+func (a *Agent) ResumeWith(ctx stdcontext.Context, opts RunOptions, evs ...events.Event) (*AgentReply, error) {
 	if len(evs) == 0 {
 		return nil, errors.New("agent: resume needs at least one event")
 	}
@@ -307,6 +311,7 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 	if err != nil {
 		return nil, err
 	}
+	run.runOpts = opts
 	defer run.Close()
 	switch last := events.AsValue(evs[len(evs)-1]).(type) {
 	case events.ModelRequest:
@@ -333,11 +338,13 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 // AsTool exposes this agent as a delegation tool for another agent (Python
 // parity: agent.as_tool / subagent_tool.subagent_tool). Each call runs this
 // agent as a sub-task through the shared delegation machinery (runTaskOn):
-// TaskStarted/TaskCompleted/TaskFailed and one rolled-up subtask UsageEvent on
-// the caller's stream, a copy of the caller's dependencies and variables, and
-// the HITL bridge when this agent has no hook of its own. The agent's own
-// stream base (WithStreamBase) stays the delegation's stream — every
-// delegation opens a fresh stream otherwise.
+// TaskStarted/TaskCompleted/TaskFailed on the caller's stream (relayed from the
+// child stream), source UsageEvents with delegation provenance instead of a
+// rollup, a copy of the caller's dependencies and variables, and the HITL bridge
+// when this agent has no hook of its own. Operational child events reach the
+// caller as ChildEvent observations. The agent's own stream base
+// (WithStreamBase) stays the delegation's stream — every delegation opens a
+// fresh stream otherwise.
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	var o asToolOptions
 	for _, f := range opts {
@@ -357,13 +364,19 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 		Context   string `json:"context" agschema:"description=Optional additional context for the subtask agent"`
 	}
 	fn := func(args subArgs, cx *context.Context) (string, error) {
-		// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-		// delegation cannot be cancelled through the caller's tool call.
-		res, err := runTaskOn(stdcontext.Background(), cx, a, args.Objective, args.Context)
+		// The parent turn's cancellable context is installed on its conversation
+		// context (Context.TurnContext), so a parent cancellation reaches the
+		// delegated run and reports PARENT_CANCELLED (upstream run_task's
+		// origin-cancelled path).
+		res, err := runTaskOn(cx.TurnContext(), cx, a, args.Objective, args.Context)
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
+		}
+		if res.cancelled {
+			// Python parity: subagent_tool.py checks cancelled before failed.
+			return fmt.Sprintf("Sub-task '%s' cancelled: %s", a.name, res.err.Error()), nil
 		}
 		if !res.completed {
 			// Python parity: subagent_tool.py

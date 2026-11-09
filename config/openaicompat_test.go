@@ -771,6 +771,171 @@ func TestRunChatCompatStreamToolCallIndices(t *testing.T) {
 	}
 }
 
+// streamOf renders an SSE chat-completions body from raw delta objects (the
+// value of choices[0].delta).
+func streamOf(deltas ...string) string {
+	var b strings.Builder
+	for _, d := range deltas {
+		fmt.Fprintf(&b, "data: {\"id\":\"chatcmpl-1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":%s}]}\n\n", d)
+	}
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// runCompatStream replays body as one streaming completions response.
+func runCompatStream(t *testing.T, body string) *events.ModelResponse {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Streaming: true}
+	resp, err := RunChatCompat(context.Background(), p, nil, nil, CallOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return resp
+}
+
+func TestRunChatCompatStreamToolCallAssembly(t *testing.T) {
+	type call struct{ id, name, arguments string }
+	tests := []struct {
+		name   string
+		deltas []string
+		want   []call
+	}{
+		{
+			// OpenAI's shape: id and name on the first delta only, arguments in pieces.
+			name: "indexed fragments assemble per call",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"arguments":"{\"ci"}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"arguments":"ty\": \"Paris\"}"}}]}`,
+				`{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"get_time","arguments":"{\"tz\": "}}]}`,
+				`{"tool_calls":[{"index":1,"function":{"arguments":"\"UTC\"}"}}]}`,
+			},
+			want: []call{
+				{"call_a", "get_weather", `{"city": "Paris"}`},
+				{"call_b", "get_time", `{"tz": "UTC"}`},
+			},
+		},
+		{
+			name: "interleaved indexed fragments go to their own call",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":""}}]}`,
+				`{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"get_time","arguments":""}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\": "}}]}`,
+				`{"tool_calls":[{"index":1,"function":{"arguments":"{\"tz\": "}}]}`,
+				`{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]}`,
+				`{"tool_calls":[{"index":1,"function":{"arguments":"\"UTC\"}"}}]}`,
+			},
+			want: []call{
+				{"call_a", "get_weather", `{"city": "Paris"}`},
+				{"call_b", "get_time", `{"tz": "UTC"}`},
+			},
+		},
+		{
+			// Gemini's OpenAI-compatible endpoint: no index, each call whole.
+			name: "parallel calls without index stay separate",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]}`,
+				`{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\"}"}}]}`,
+			},
+			want: []call{
+				{"call_a", "get_weather", `{"city": "Paris"}`},
+				{"call_b", "get_time", `{"tz": "UTC"}`},
+			},
+		},
+		{
+			name: "parallel calls without index in one delta stay separate",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}},{"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\"}"}}]}`,
+			},
+			want: []call{
+				{"call_a", "get_weather", `{"city": "Paris"}`},
+				{"call_b", "get_time", `{"tz": "UTC"}`},
+			},
+		},
+		{
+			name: "argument fragments without index join the last call",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","function":{"name":"get_weather","arguments":"{\"city\": "}}]}`,
+				`{"tool_calls":[{"function":{"arguments":"\"Paris\"}"}}]}`,
+			},
+			want: []call{{"call_a", "get_weather", `{"city": "Paris"}`}},
+		},
+		{
+			// A mix of dialect features: the indexed accumulator stays put when
+			// an unindexed, id-carrying delta opens the next call.
+			name: "unindexed call after an indexed one",
+			deltas: []string{
+				`{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"tool_a","arguments":"1"}}]}`,
+				`{"tool_calls":[{"id":"call_b","function":{"name":"tool_b","arguments":"2"}}]}`,
+				`{"tool_calls":[{"function":{"arguments":"3"}}]}`,
+			},
+			want: []call{
+				{"call_a", "tool_a", "1"},
+				{"call_b", "tool_b", "23"},
+			},
+		},
+		{
+			// An empty id is falsy for the index decision, so it continues the
+			// last call; the id field itself is still overwritten (is-not-None
+			// semantics), which is upstream's behavior for this wire shape.
+			name: "empty id continues the last call",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","function":{"name":"tool_a","arguments":"1"}}]}`,
+				`{"tool_calls":[{"id":"","function":{"arguments":"2"}}]}`,
+			},
+			want: []call{{"", "tool_a", "12"}},
+		},
+		{
+			// The empty-accumulator guard: a first delta without index or id
+			// opens calls[0]; the continue-the-last path would index -1.
+			name: "first delta without index or id opens the first call",
+			deltas: []string{
+				`{"tool_calls":[{"function":{"name":"tool_a","arguments":"1"}}]}`,
+			},
+			want: []call{{"", "tool_a", "1"}},
+		},
+		{
+			// JSON null decodes to a nil index, i.e. absent for assembly, so
+			// each id-carrying delta still opens its own call.
+			name: "null index behaves like an absent one",
+			deltas: []string{
+				`{"tool_calls":[{"index":null,"id":"call_a","function":{"name":"tool_a","arguments":"1"}}]}`,
+				`{"tool_calls":[{"index":null,"id":"call_b","function":{"name":"tool_b","arguments":"2"}}]}`,
+			},
+			want: []call{{"call_a", "tool_a", "1"}, {"call_b", "tool_b", "2"}},
+		},
+		{
+			// Within one delta the second entry has no id, so it continues the
+			// call the first entry opened rather than starting another one.
+			name: "id-less entry in the same delta joins its predecessor",
+			deltas: []string{
+				`{"tool_calls":[{"id":"call_a","function":{"name":"tool_a","arguments":"1"}},{"function":{"arguments":"2"}}]}`,
+			},
+			want: []call{{"call_a", "tool_a", "12"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := runCompatStream(t, streamOf(tt.deltas...))
+			got := resp.ToolCalls.Calls
+			if len(got) != len(tt.want) {
+				t.Fatalf("want %d calls, got %d: %+v", len(tt.want), len(got), got)
+			}
+			for i, w := range tt.want {
+				if got[i].ID != w.id || got[i].Name != w.name || got[i].Arguments != w.arguments {
+					t.Errorf("call %d: want %+v, got {%q, %q, %q}", i, w, got[i].ID, got[i].Name, got[i].Arguments)
+				}
+			}
+		})
+	}
+}
+
 func TestRunChatCompatStreamAPIError(t *testing.T) {
 	srv, _ := captureServer(t, 500, `{"error":"down"}`)
 	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Streaming: true, MaxRetries: 0}

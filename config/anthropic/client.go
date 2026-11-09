@@ -396,6 +396,9 @@ func mergeStreamUsage(start, delta *wireUsage) events.Usage {
 	if u.CacheCreationInputTokens == nil {
 		u.CacheCreationInputTokens = d.CacheCreationInputTokens
 	}
+	if u.CacheCreationExtendedInputTokens == nil {
+		u.CacheCreationExtendedInputTokens = d.CacheCreationExtendedInputTokens
+	}
 	u.TotalTokens = nil
 	if u.PromptTokens != nil || u.CompletionTokens != nil {
 		total := int64(0)

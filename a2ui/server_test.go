@@ -42,7 +42,7 @@ func TestActionRegistry(t *testing.T) {
 }
 
 func TestMessagesOf(t *testing.T) {
-	version := VersionV1
+	version := WireVersionV1
 	msg := Message{DeleteSurface: &DeleteSurface{SurfaceID: "s1"}}
 
 	// Typed message → stamped.
@@ -76,7 +76,7 @@ func TestMessagesOf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(raw, []byte(`{"version":"v1.0","deleteSurface":{"surfaceId":"s1"}}`)) {
+	if !bytes.Equal(raw, []byte(`{"version":"1.0","deleteSurface":{"surfaceId":"s1"}}`)) {
 		t.Errorf("stamped wire form: %s", raw)
 	}
 
@@ -118,14 +118,14 @@ func TestServerRegisteredActionClick(t *testing.T) {
 	})
 	srv := NewServer(WithActions(registry), WithEncoding(EncodingJSONL))
 
-	body := `{"messages": [], "a2ui": [{"version": "v1.0", "action": {"name": "addNote",
+	body := `{"messages": [], "a2ui": [{"version": "1.0", "action": {"name": "addNote",
 		"surfaceId": "s1", "sourceComponentId": "btn1", "timestamp": "2026-10-30T00:00:00Z",
 		"context": {"text": "hi"}}}]}`
 	resp := serve(t, srv, body)
 	if resp.code != http.StatusOK {
 		t.Fatalf("status: %d (%s)", resp.code, resp.body)
 	}
-	want := `{"version":"v1.0","updateDataModel":{"surfaceId":"s1","path":"/notes","value":1}}` + "\n"
+	want := `{"version":"1.0","updateDataModel":{"surfaceId":"s1","path":"/notes","value":1}}` + "\n"
 	if resp.body != want {
 		t.Errorf("click result:\n  want %q\n  got  %q", want, resp.body)
 	}
@@ -140,11 +140,11 @@ func TestServerUnregisteredClickBecomesPrompt(t *testing.T) {
 		func(_ context.Context, prompt string) (Turn, error) {
 			gotPrompt = prompt
 			return Turn{Text: "Adding it.", Messages: []Message{
-				{Version: VersionV1, UpdateDataModel: &UpdateDataModel{SurfaceID: "s1", Value: 1}}},
+				{Version: WireVersionV1, UpdateDataModel: &UpdateDataModel{SurfaceID: "s1", Value: 1}}},
 			}, nil
 		}))
 
-	body := `{"a2ui": [{"version": "v1.0", "action": {"name": "refresh",
+	body := `{"a2ui": [{"version": "1.0", "action": {"name": "refresh",
 		"surfaceId": "s1", "sourceComponentId": "btn1", "timestamp": "",
 		"context": {"good_id": "g-1"}}}]}`
 	resp := serve(t, srv, body)
@@ -163,7 +163,7 @@ func TestServerUnregisteredClickBecomesPrompt(t *testing.T) {
 	if lines[0] != `{"text": "Adding it."}` {
 		t.Errorf("prose frame: %q", lines[0])
 	}
-	if lines[1] != `{"version":"v1.0","updateDataModel":{"surfaceId":"s1","value":1}}` {
+	if lines[1] != `{"version":"1.0","updateDataModel":{"surfaceId":"s1","value":1}}` {
 		t.Errorf("message frame: %q", lines[1])
 	}
 }
@@ -188,21 +188,21 @@ func TestServerCallAgentFunction(t *testing.T) {
 			parts += `, "catalogId": ` + catalogJSON
 		}
 		parts += `, "args": {}}`
-		return `{"a2ui": [{"version": "v1.0", "callAgentFunction": {"surfaceId": "s1",
+		return `{"a2ui": [{"version": "1.0", "callAgentFunction": {"surfaceId": "s1",
 			"functionCallId": "fc-7", "callFunction": ` + parts + `}}]}`
 	}
 
 	// Registered + default catalog → agentFunctionResponse echoing the id.
 	srv := NewServer(WithActions(registry), WithEncoding(EncodingJSONL))
 	resp := serve(t, srv, call("getItemCount", "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"))
-	want := `{"version":"v1.0","agentFunctionResponse":{"functionCallId":"fc-7","value":5}}` + "\n"
+	want := `{"version":"1.0","agentFunctionResponse":{"functionCallId":"fc-7","value":5}}` + "\n"
 	if resp.body != want {
 		t.Errorf("success response:\n  want %q\n  got  %q", want, resp.body)
 	}
 
 	// Unknown function (catalog omitted) → UNKNOWN_FUNCTION.
 	resp = serve(t, srv, call("nope", ""))
-	want = `{"version":"v1.0","agentFunctionResponse":{"functionCallId":"fc-7","error":{"code":"UNKNOWN_FUNCTION","message":"Unknown function 'nope'."}}}` + "\n"
+	want = `{"version":"1.0","agentFunctionResponse":{"functionCallId":"fc-7","error":{"code":"UNKNOWN_FUNCTION","message":"Unknown function 'nope'."}}}` + "\n"
 	if resp.body != want {
 		t.Errorf("unknown function:\n  want %q\n  got  %q", want, resp.body)
 	}
@@ -229,7 +229,7 @@ func TestServerCallAgentFunction(t *testing.T) {
 	}
 
 	// Non-object args are INVALID_FUNCTION_CALL without running the handler.
-	nonObject := `{"a2ui": [{"version": "v1.0", "callAgentFunction": {"surfaceId": "s1",
+	nonObject := `{"a2ui": [{"version": "1.0", "callAgentFunction": {"surfaceId": "s1",
 		"functionCallId": "fc-8", "callFunction": {"@call": "getItemCount", "args": [1]}}}]}`
 	resp = serve(t, srv, nonObject)
 	if !strings.Contains(resp.body, "INVALID_FUNCTION_CALL") ||
@@ -249,17 +249,17 @@ func TestServerCallAgentFunctionReturnsMessages(t *testing.T) {
 			}, nil
 		}})
 	srv := NewServer(WithActions(registry), WithEncoding(EncodingJSONL))
-	body := `{"a2ui": [{"version": "v1.0", "callAgentFunction": {"surfaceId": "cart",
+	body := `{"a2ui": [{"version": "1.0", "callAgentFunction": {"surfaceId": "cart",
 		"functionCallId": "fc-9", "callFunction": {"@call": "add", "args": {}}}}]}`
 	resp := serve(t, srv, body)
 	lines := strings.Split(strings.TrimRight(resp.body, "\n"), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("frames: %q", resp.body)
 	}
-	if lines[0] != `{"version":"v1.0","updateDataModel":{"surfaceId":"cart","path":"/n","value":2}}` {
+	if lines[0] != `{"version":"1.0","updateDataModel":{"surfaceId":"cart","path":"/n","value":2}}` {
 		t.Errorf("update frame: %q", lines[0])
 	}
-	if lines[1] != `{"version":"v1.0","agentFunctionResponse":{"functionCallId":"fc-9","value":null}}` {
+	if lines[1] != `{"version":"1.0","agentFunctionResponse":{"functionCallId":"fc-9","value":null}}` {
 		t.Errorf("response frame: %q", lines[1])
 	}
 }
@@ -274,9 +274,9 @@ func TestServerErrorAndFunctionResponseBecomePrompts(t *testing.T) {
 		}))
 
 	body := `{"a2ui": [
-		{"version": "v1.0", "error": {"code": "VALIDATION_FAILED", "surfaceId": "s1",
+		{"version": "1.0", "error": {"code": "VALIDATION_FAILED", "surfaceId": "s1",
 			"path": "/components/0/text", "message": "text is required"}},
-		{"version": "v1.0", "rendererFunctionResponse": {"functionCallId": "fc-1", "value": "done"}}
+		{"version": "1.0", "rendererFunctionResponse": {"functionCallId": "fc-1", "value": "done"}}
 	]}`
 	resp := serve(t, srv, body)
 	if resp.code != http.StatusOK || resp.body != "" {
@@ -308,7 +308,7 @@ func TestServerOnlyHandledInteractionsSkipThePrompt(t *testing.T) {
 			called = true
 			return Turn{}, nil
 		}))
-	resp := serve(t, srv, `{"a2ui": [{"version": "v1.0", "action": {"name": "ping",
+	resp := serve(t, srv, `{"a2ui": [{"version": "1.0", "action": {"name": "ping",
 		"surfaceId": "s", "sourceComponentId": "c", "timestamp": "", "context": {}}}]}`)
 	if resp.code != http.StatusOK {
 		t.Fatalf("status: %d", resp.code)
@@ -377,12 +377,12 @@ func TestServerRequestErrors(t *testing.T) {
 func TestServerSSEEncoding(t *testing.T) {
 	srv := NewServer(WithPromptHandler(func(context.Context, string) (Turn, error) {
 		return Turn{Text: "你好", Messages: []Message{
-			{Version: VersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}},
+			{Version: WireVersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}},
 		}}, nil
 	}))
 	resp := serve(t, srv, `{"messages": [{"role": "user", "content": "x"}]}`)
 	want := "event: text\ndata: {\"text\": \"\\u4f60\\u597d\"}\n\n" +
-		"data: {\"version\":\"v1.0\",\"deleteSurface\":{\"surfaceId\":\"s1\"}}\n\n" +
+		"data: {\"version\":\"1.0\",\"deleteSurface\":{\"surfaceId\":\"s1\"}}\n\n" +
 		"event: done\ndata: {}\n\n"
 	if resp.body != want {
 		t.Errorf("SSE:\n  want %q\n  got  %q", want, resp.body)
@@ -408,9 +408,9 @@ func TestServerLogging(t *testing.T) {
 	var buf bytes.Buffer
 	srv := NewServer(WithEncoding(EncodingJSONL), WithLogger(log.New(&buf, "", 0)))
 	// A nameless action is dropped with a warning.
-	serve(t, srv, `{"a2ui": [{"version": "v1.0", "action": {"name": "", "surfaceId": "s",
+	serve(t, srv, `{"a2ui": [{"version": "1.0", "action": {"name": "", "surfaceId": "s",
 		"sourceComponentId": "c", "timestamp": "", "context": {}}}]} ,`)
-	serve(t, srv, `{"a2ui": [{"version": "v1.0", "action": {"name": "", "surfaceId": "s",
+	serve(t, srv, `{"a2ui": [{"version": "1.0", "action": {"name": "", "surfaceId": "s",
 		"sourceComponentId": "c", "timestamp": "", "context": {}}}]}`)
 	if !strings.Contains(buf.String(), "Dropping A2UI action with no name.") {
 		t.Errorf("log: %q", buf.String())
@@ -464,9 +464,9 @@ func TestServerAuthorizedOnlyAction(t *testing.T) {
 			ran = true
 			return nil, nil
 		}})
-	click := `{"a2ui": [{"version": "v1.0", "action": {"name": "wipe",
+	click := `{"a2ui": [{"version": "1.0", "action": {"name": "wipe",
 		"surfaceId": "s", "sourceComponentId": "c", "timestamp": "", "context": {}}}]}`
-	call := `{"a2ui": [{"version": "v1.0", "callAgentFunction": {"surfaceId": "s",
+	call := `{"a2ui": [{"version": "1.0", "callAgentFunction": {"surfaceId": "s",
 		"functionCallId": "fc-1", "callFunction": {"@call": "wipe", "args": {}}}}]}`
 
 	// Without WithAuthToken no request can be authorized, so the privileged

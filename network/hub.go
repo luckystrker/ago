@@ -234,7 +234,7 @@ func (w *KnowledgeWAL) ReadAll() ([]WALRecord, error) {
 	}
 	out := make([]WALRecord, 0, len(evs))
 	for _, ev := range evs {
-		input, ok := ev.(events.Input)
+		input, ok := events.AsValue(ev).(events.Input)
 		if !ok {
 			continue
 		}

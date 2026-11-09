@@ -480,8 +480,10 @@ func strictifySchema(schema map[string]any) map[string]any {
 // NormalizeUsage maps the Chat-Completions usage object onto events.Usage:
 // prompt/completion/total tokens, prompt_tokens_details.cached_tokens →
 // CacheReadInputTokens, cache_write_tokens → CacheCreationInputTokens,
-// completion_tokens_details.reasoning_tokens → ThinkingTokens. Fractional
-// values are rounded (D-006: token counts are integers).
+// completion_tokens_details.reasoning_tokens → ThinkingTokens. Chat
+// Completions reports no per-retention cache-write breakdown, so
+// CacheCreationExtendedInputTokens stays nil. Fractional values are rounded
+// (D-006: token counts are integers).
 func NormalizeUsage(usage map[string]any) events.Usage {
 	var u events.Usage
 	u.PromptTokens = tokenField(usage, "prompt_tokens")
@@ -692,8 +694,16 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 			}
 			for _, tc := range choice.Delta.ToolCalls {
 				ix := 0
-				if tc.Index != nil {
+				switch {
+				case tc.Index != nil:
 					ix = *tc.Index
+				case (tc.ID != nil && *tc.ID != "") || len(calls) == 0:
+					// Some OpenAI-compatible servers (e.g. Gemini) omit the
+					// index: a delta carrying an id starts a new call.
+					ix = len(calls)
+				default:
+					// A delta without an index or id continues the last call.
+					ix = len(calls) - 1
 				}
 				for ix >= len(calls) {
 					calls = append(calls, toolAcc{})

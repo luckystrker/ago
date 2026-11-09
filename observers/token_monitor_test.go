@@ -173,3 +173,60 @@ func TestTokenMonitorRegisterErrors(t *testing.T) {
 		t.Fatalf("Register(no stream) = %v, want ErrNoStream", err)
 	}
 }
+
+// TestTokenMonitorCountsSourceEventOnce pins the delegation-safe accounting:
+// the same source UsageEvent seen twice (local publication plus a forwarded hop,
+// or a replayed transcript) charges the budget once.
+func TestTokenMonitorCountsSourceEventOnce(t *testing.T) {
+	s, cx := newConversation()
+	monitor := NewTokenMonitor(1000)
+	if err := monitor.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ev := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(30)}, events.UsageKindModelCall)
+	for i := 0; i < 2; i++ {
+		if err := s.Send(ev); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("total = %d, want 30 (source event counted once)", got)
+	}
+	monitor.Reset()
+	if err := s.Send(ev); err != nil {
+		t.Fatalf("Send after reset: %v", err)
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("total after reset = %d, want 30 (dedup memory cleared)", got)
+	}
+	// An archived observation envelope carrying the same source record is
+	// still accounted once, through SourceEvent.
+	wrapped := events.NewChildEvent(ev, "t", []string{"t"}, "leaf", ev.EventID)
+	if err := s.Send(wrapped); err != nil {
+		t.Fatalf("Send wrapped: %v", err)
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("wrapped total = %d, want 30", got)
+	}
+}
+
+// TestTokenMonitorTransientChildEnvelopeCountsOnce pins the archived/transient
+// spelling: a transient observation carrying a source record is accounted by
+// that record's id exactly like the durable envelope.
+func TestTokenMonitorTransientChildEnvelopeCountsOnce(t *testing.T) {
+	s, cx := newConversation()
+	monitor := NewTokenMonitor(1000)
+	if err := monitor.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(40)}, events.UsageKindModelCall)
+	wrapped := &events.TransientChildEvent{ChildEvent: *events.NewChildEvent(source, "t", []string{"t"}, "leaf", source.EventID)}
+	for i := 0; i < 2; i++ {
+		if err := s.Send(wrapped); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	if got := monitor.Total(); got != 40 {
+		t.Fatalf("total = %d, want 40 (source counted once)", got)
+	}
+}

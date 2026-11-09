@@ -254,7 +254,10 @@ func (p *bindPlan) bind(call events.ToolCallEvent, cx *agocontext.Context, toolN
 				}
 			}
 			for _, d := range p.diFields {
-				v, ok := resolveDILookup(cx, d.slot)
+				v, ok, err := resolveDILookup(cx, d.slot)
+				if err != nil {
+					return nil, fmt.Errorf("tools: tool %q: %w", toolName, err)
+				}
 				if !ok {
 					return nil, fmt.Errorf("%w: tool %q: %s %q is not provided",
 						ErrNotFound, toolName, d.slot.kind, d.slot.key)

@@ -56,6 +56,14 @@ func (s *Stream) Handle(ev events.Event) {
 	defer s.mu.Unlock()
 	e := events.AsValue(ev)
 
+	// A forwarded descendant event is an observation, not part of this agent's
+	// stream of thought: it must not close the root's open reasoning span
+	// (Python parity: map_events_to_ag_ui returns early for ChildEvent).
+	switch e.(type) {
+	case events.ChildEvent, events.TransientChildEvent:
+		return
+	}
+
 	// A reasoning span ends where the reasoning stops, whatever follows it
 	// (Python parity: the close at the top of the subscriber).
 	if _, isReasoning := e.(events.ModelReasoning); !isReasoning {
@@ -439,9 +447,10 @@ func (s *Stream) TakeUsage() []TokenUsage {
 }
 
 // tokenUsageFromEvents groups attributed spend per (provider, model) in the
-// protocol's accounting (Python parity: usage.py). A delegation's rollup is
-// replaced by the calls it sums; absent counts stay unset unless some call
-// reported them; totalTokens is recomputed, never copied.
+// protocol's accounting (Python parity: usage.py). Live delegations forward
+// source records, so Parts only appear on archived legacy subtask rollups,
+// where the rollup is replaced by the calls it sums; absent counts stay unset
+// unless some call reported them; totalTokens is recomputed, never copied.
 func tokenUsageFromEvents(evs []events.UsageEvent) []TokenUsage {
 	type key struct{ provider, model string }
 	groups := map[key]*TokenUsage{}

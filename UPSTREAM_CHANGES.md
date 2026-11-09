@@ -434,6 +434,34 @@ writes, включая спан-атрибут в `contrib/otelx`); затем w
 должны идти с обновлением `docs/specs/core.md`, `docs/DECISIONS.md` и
 `docs/PORT_STATUS.md`.
 
+### Статус портирования (ветка `sync/ag2-v1.3.0`, 2026-11-09)
+
+Все 10 коммитов «утянуть» перенесены — 9 задач, каждая прошла цикл
+разработка (DeepSeek V4.1 Flash) → критик с мутационным тестированием → ревью
+→ исправления → слияние. T8 и T9 дополнительно приняты независимым
+верификатором на другой модели (Muse Spark 1.3).
+
+| Upstream | Задача | Наш коммит | Что сделано |
+|---|---|---|---|
+| `9e7575ae6d` | T1 | `d0cba08` | tool-call дельты без `index`: `id` открывает новый вызов, иначе продолжается последний |
+| `3539d07500` | T2 | `f32ef68` | плейсхолдер `skip_thought_signature_validator` (base64) для неподписанных function-call текущего турна; D-088 |
+| `d503c8ddc8` | T3 | `f9e728f` | Tavily `raw_content`/`favicon` + флаги `include_raw_content`/`include_favicon`; регрессия glob `5125cb5dfc` закреплена тестом; починен `TestCodeRunnerUndecodableOutput` под Go 1.27 |
+| `c751dabac4` + `b4814ca6e6` | T4 | `f0c6818` | `Usage.CacheCreationExtendedInputTokens` (OpenAI 12h, Anthropic 1h) + атрибут спана в `contrib/otelx`; D-064 |
+| `1b0c399012` | T5 | `c29f211` | A2UI: протокол `v1.0` отделён от wire-версии `"1.0"`, спека ре-вендорена, restricted `$ref`; D-089 (wire-break, MIGRATION.md) |
+| `663ddd1574` + `a591d84f6e` | T6 | `d23f0f0` | `ChildEvent`/`DownEvent`/`DeliveryFailed`, `SourceEvent`, типизированный маркер доставки, `UsageEvent.EventID`; D-091 |
+| `fad570ca19` | T7 | `00db235` | `Scope` COPIED/LOCAL/SHARED, `ScopedValue`, глубокое копирование; **breaking:** `Context.Variables` → `*context.Variables`, `NewWithDeps`/`SetVariable` возвращают ошибку; D-090/090a |
+| `1c27f221a5` | T8 | `3540536` | пересылка дерева событий субагентов с провенансом, учёт usage по source-событиям с дедупом по `event_id`, per-stream turn lock с отменой, терминал внутри lock; D-092/092a/092b |
+| `d716fcbefe` | T9 | `43b848e` | единый жизненный цикл Task для run и делегации, терминал при любом исходе, тайтл = имя агента, `PARENT_CANCELLED`; D-093/093a/093b |
+
+Сознательно не перенесено (follow-up): downlink из `1c27f221a5` — `StreamHandle`/origin,
+адресные `DownEvent`/`HaltEvent`, `DeliveryFailed`-публикация, registry/каскад отмены,
+`CANCELLED_TOOL_RESULT` (D-092). Известные мелочи с риском < 5: подписка `Task`, не
+доведённого до терминала, остаётся пассивной записью до `Close` (риск 2×2); ветка
+`"index": -1` в `config/openaicompat.go` даёт панику (паника была до синка).
+Ограничение проверки: `go test -race` в окружении недоступен (нет gcc) — конкурентные
+инварианты T7–T9 проверены стресс-прогонами (`-count` до 2000) и чтением кода; нужен
+прогон `-race` в CI.
+
 ---
 
 ## Синк v0.8.0 (2026-11-02/03, PR #11 — влит в main)
@@ -503,4 +531,6 @@ v0.8.0»; коммиты релиза: `ddc845f` (волна 1), `b09565e` (во
   Разобраны 17 новых коммитов релиза + 12 коммитов main после него (до
   `5125cb5dfc`); бейслайн переведён на v1.3.0. Итог: 10 «утянуть», 6 отложено,
   2 не тянем, 11 неприменимо — см. раздел «Синк v1.3.0».
+- 2026-11-09 (вечер): все 10 коммитов «утянуть» перенесены в ветку `sync/ag2-v1.3.0`
+  (9 задач, T1–T9) — см. «Статус портирования». Ветка влита в main, релиз **v0.9.0**.
 

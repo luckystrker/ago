@@ -85,10 +85,10 @@ func goldenMessages(t *testing.T) []Message {
 	t.Helper()
 	// The typed wire forms, mirroring the capture script's literals.
 	return []Message{
-		{Version: VersionV1, CreateSurface: &CreateSurface{SurfaceID: "s1", CatalogID: DefaultCatalogID}},
-		{Version: VersionV1, UpdateDataModel: &UpdateDataModel{SurfaceID: "s1", Path: "/count", Value: 2}},
-		{Version: VersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}},
-		{Version: VersionV1, CallRendererFunction: &CallRendererFunction{
+		{Version: WireVersionV1, CreateSurface: &CreateSurface{SurfaceID: "s1", CatalogID: DefaultCatalogID}},
+		{Version: WireVersionV1, UpdateDataModel: &UpdateDataModel{SurfaceID: "s1", Path: "/count", Value: 2}},
+		{Version: WireVersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}},
+		{Version: WireVersionV1, CallRendererFunction: &CallRendererFunction{
 			SurfaceID:      "s1",
 			FunctionCallID: "fc-1",
 			CallFunction: FunctionCall{
@@ -97,7 +97,7 @@ func goldenMessages(t *testing.T) []Message {
 				Args:      map[string]any{"url": "https://a2ui.org"},
 			},
 		}},
-		{Version: VersionV1, AgentFunctionResponse: &FunctionResponse{
+		{Version: WireVersionV1, AgentFunctionResponse: &FunctionResponse{
 			FunctionCallID: "fc-1",
 			Value:          map[string]any{"ok": true},
 		}},
@@ -106,7 +106,7 @@ func goldenMessages(t *testing.T) []Message {
 
 func updateComponentsMessage(t *testing.T) Message {
 	t.Helper()
-	return Message{Version: VersionV1, UpdateComponents: &UpdateComponents{
+	return Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 		SurfaceID: "s1",
 		Components: []Component{
 			{ID: "root", Kind: "Card", Child: "layout1"},
@@ -120,6 +120,12 @@ func updateComponentsMessage(t *testing.T) Message {
 }
 
 func TestGoldenConstants(t *testing.T) {
+	if got := VersionV1; got != goldenStr(t, "protocol_version") {
+		t.Errorf("protocol version: want %q, got %q", goldenStr(t, "protocol_version"), got)
+	}
+	if got := WireVersionV1; got != goldenStr(t, "wire_version") {
+		t.Errorf("wire version: want %q, got %q", goldenStr(t, "wire_version"), got)
+	}
 	if got := DefaultCatalogID; got != goldenStr(t, "catalog_id_v1") {
 		t.Errorf("catalog id: want %q, got %q", goldenStr(t, "catalog_id_v1"), got)
 	}
@@ -261,7 +267,7 @@ func TestGoldenParser(t *testing.T) {
 	requireJSONEqual(t, "fenced_block operations", c["operations"], opsToAny(r.Operations))
 	requireJSONEqual(t, "fenced_block raw_json", c["raw_json"], r.RawJSON)
 
-	r = parser.Parse("<a2ui-json>```json {\"version\": \"v1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}```</a2ui-json>")
+	r = parser.Parse("<a2ui-json>```json {\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}```</a2ui-json>")
 	c = asMap(cases["single_line_fence"])
 	requireJSONEqual(t, "single_line_fence raw_json", c["raw_json"], r.RawJSON)
 	requireJSONEqual(t, "single_line_fence operations", c["operations"], opsToAny(r.Operations))
@@ -269,8 +275,8 @@ func TestGoldenParser(t *testing.T) {
 		t.Errorf("single_line_fence text: want %q, got %q", c["text"], r.Text)
 	}
 
-	jsonlBlock := "<a2ui-json>\n{\"version\": \"v1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}\n" +
-		"{\"version\": \"v1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": 1}}\n</a2ui-json>"
+	jsonlBlock := "<a2ui-json>\n{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}\n" +
+		"{\"version\": \"1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": 1}}\n</a2ui-json>"
 	r = parser.Parse(jsonlBlock)
 	c = asMap(cases["jsonl_block"])
 	requireJSONEqual(t, "jsonl_block raw_json", c["raw_json"], r.RawJSON)
@@ -289,7 +295,7 @@ func TestGoldenParser(t *testing.T) {
 		t.Errorf("invalid_json parse error prefix: want %q…, got %q", prefix, r.ParseError)
 	}
 
-	r = parser.Parse("<a2ui-json>{\"version\": \"v1.0\"}</a2ui-json>")
+	r = parser.Parse("<a2ui-json>{\"version\": \"1.0\"}</a2ui-json>")
 	c = asMap(cases["not_a_message"])
 	if r.ParseError != c["parse_error"].(string) {
 		t.Errorf("not_a_message parse error:\n  want %q\n  got  %q", c["parse_error"], r.ParseError)
@@ -348,7 +354,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 	}
 
 	c := asMap(matrix["no_root"])
-	check("no_root", messageToMap(t, Message{Version: VersionV1, UpdateComponents: &UpdateComponents{
+	check("no_root", messageToMap(t, Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 		SurfaceID:  "s1",
 		Components: []Component{NewText("txt", "hi")},
 	}}), c["is_valid"].(bool), func(t *testing.T, vr ValidationResult) {
@@ -366,7 +372,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 		})
 
 	c = asMap(matrix["text_missing_text"])
-	check("text_missing_text", messageToMap(t, Message{Version: VersionV1, UpdateComponents: &UpdateComponents{
+	check("text_missing_text", messageToMap(t, Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 		SurfaceID:  "s1",
 		Components: []Component{{ID: "root", Kind: "Card", Child: "t"}, {ID: "t", Kind: "Text"}},
 	}}), c["is_valid"].(bool), func(t *testing.T, vr ValidationResult) {
@@ -376,7 +382,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 	})
 
 	c = asMap(matrix["unknown_component"])
-	check("unknown_component", messageToMap(t, Message{Version: VersionV1, UpdateComponents: &UpdateComponents{
+	check("unknown_component", messageToMap(t, Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 		SurfaceID:  "s1",
 		Components: []Component{{ID: "root", Kind: "Widget", Child: "t"}, NewText("t", "hi")},
 	}}), c["is_valid"].(bool), func(t *testing.T, vr ValidationResult) {
@@ -395,7 +401,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 
 	c = asMap(matrix["extra_payload_prop"])
 	check("extra_payload_prop", map[string]any{
-		"version": "v1.0", "deleteSurface": map[string]any{"surfaceId": "s1", "bogus": true}},
+		"version": "1.0", "deleteSurface": map[string]any{"surfaceId": "s1", "bogus": true}},
 		c["is_valid"].(bool), func(t *testing.T, vr ValidationResult) {
 			if len(vr.Errors) != int(c["error_count"].(float64)) {
 				t.Errorf("extra_payload_prop: want %d errors, got %v", int(c["error_count"].(float64)), vr.Errors)
@@ -413,7 +419,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 	// Data bindings: {"@path": ...} validates where a DynamicString is
 	// expected; so does a plain literal string (Python confirms both).
 	textField := func(value any) map[string]any {
-		return messageToMap(t, Message{Version: VersionV1, UpdateComponents: &UpdateComponents{
+		return messageToMap(t, Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 			SurfaceID: "s1",
 			Components: []Component{
 				{ID: "root", Kind: "Card", Child: "f"},
@@ -434,11 +440,29 @@ func TestGoldenValidationMatrix(t *testing.T) {
 	c = asMap(matrix["string_where_binding_expected"])
 	check("string_where_binding_expected", textField("/qty"), c["is_valid"].(bool), nil)
 
+	// Stable v1.0 made TextField.value required (a2ui-project/a2ui#3868).
+	c = asMap(matrix["text_field_missing_value"])
+	missingValue := messageToMap(t, Message{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
+		SurfaceID: "s1",
+		Components: []Component{
+			{ID: "root", Kind: "Card", Child: "f"},
+			{ID: "f", Kind: "TextField", Props: map[string]any{"label": "Qty"}},
+		},
+	}})
+	check("text_field_missing_value", missingValue, c["is_valid"].(bool), func(t *testing.T, vr ValidationResult) {
+		if len(vr.Errors) != int(c["error_count"].(float64)) {
+			t.Errorf("text_field_missing_value: want %d errors, got %v", int(c["error_count"].(float64)), vr.Errors)
+		}
+		if !contains(vr.Errors, "'value' is a required property") {
+			t.Errorf("text_field_missing_value: missing the required-value error in %v", vr.Errors)
+		}
+	})
+
 	c = asMap(matrix["child_wrong_type"])
 	// The golden uses a numeric child (42); the typed Component.Child is a
 	// string, so this case builds the raw operation map.
 	wrongChildOp := map[string]any{
-		"version": "v1.0",
+		"version": "1.0",
 		"updateComponents": map[string]any{
 			"surfaceId": "s1",
 			"components": []any{
@@ -466,7 +490,7 @@ func TestGoldenValidationMatrix(t *testing.T) {
 	}
 
 	// Unknown function name: the rendered error is byte-exact against Python.
-	unknownFn := Message{Version: VersionV1, CallRendererFunction: &CallRendererFunction{
+	unknownFn := Message{Version: WireVersionV1, CallRendererFunction: &CallRendererFunction{
 		FunctionCallID: "fc-2",
 		CallFunction: FunctionCall{
 			Call:      "myFunc",
@@ -656,7 +680,7 @@ func TestGoldenIncomingClassification(t *testing.T) {
 	incoming, _ := golden["incoming"].(map[string]any)
 
 	actionEnv := map[string]any{
-		"version": "v1.0",
+		"version": "1.0",
 		"action": map[string]any{
 			"name":              "addToCart",
 			"surfaceId":         "cart",
@@ -683,7 +707,7 @@ func TestGoldenIncomingClassification(t *testing.T) {
 	}
 
 	callEnv := map[string]any{
-		"version": "v1.0",
+		"version": "1.0",
 		"callAgentFunction": map[string]any{
 			"surfaceId":      "s1",
 			"functionCallId": "fc-9",
@@ -703,13 +727,13 @@ func TestGoldenIncomingClassification(t *testing.T) {
 		t.Errorf("call args: %v %v", args, err)
 	}
 
-	r = ParseIncomingMessage(map[string]any{"version": "v1.0", "rendererFunctionResponse": map[string]any{"functionCallId": "fc-1", "value": []any{1.0, 2.0}}})
+	r = ParseIncomingMessage(map[string]any{"version": "1.0", "rendererFunctionResponse": map[string]any{"functionCallId": "fc-1", "value": []any{1.0, 2.0}}})
 	if r.Kind != IncomingFunctionResponseKind || r.FunctionResponse == nil || r.FunctionResponse.Error != nil {
 		t.Fatalf("renderer fn response: got %+v", r)
 	}
 	requireJSONEqual(t, "fn response value", asMap(incoming["renderer_fn_response"])["value"], r.FunctionResponse.Value)
 
-	r = ParseIncomingMessage(map[string]any{"version": "v1.0", "error": map[string]any{
+	r = ParseIncomingMessage(map[string]any{"version": "1.0", "error": map[string]any{
 		"code": "VALIDATION_FAILED", "surfaceId": "s1", "path": "/components/0/text", "message": "text is required"}})
 	if r.Kind != IncomingErrorKind || r.Error == nil || r.Error.Surface == nil || r.Error.Function != nil {
 		t.Fatalf("surface error: got %+v", r)
@@ -718,13 +742,13 @@ func TestGoldenIncomingClassification(t *testing.T) {
 		t.Errorf("surface error path: %q", r.Error.Surface.Path)
 	}
 
-	r = ParseIncomingMessage(map[string]any{"version": "v1.0", "error": map[string]any{
+	r = ParseIncomingMessage(map[string]any{"version": "1.0", "error": map[string]any{
 		"code": "RENDER_FAILED", "functionCallId": "fc-1", "message": "boom"}})
 	if r.Kind != IncomingErrorKind || r.Error == nil || r.Error.Function == nil || r.Error.Surface != nil {
 		t.Fatalf("function error: got %+v", r)
 	}
 
-	r = ParseIncomingMessage(map[string]any{"version": "v1.0", "wat": map[string]any{}})
+	r = ParseIncomingMessage(map[string]any{"version": "1.0", "wat": map[string]any{}})
 	c = asMap(incoming["unknown"])
 	if r.Kind != IncomingUnknownKind || r.ParseError != c["parse_error"] {
 		t.Errorf("unknown: want %q, got %q", c["parse_error"], r.ParseError)

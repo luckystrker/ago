@@ -114,8 +114,12 @@ func (t *telemetry) OnLLMCall(next middleware.LLMCallFunc, evs []events.Event, c
 }
 
 // setLLMAttributes stamps the reply's model/provider/usage onto the span. Only
-// reported fields are set: a nil token count stays absent (Python parity — the
-// original guards each `if usage.x:`).
+// reported fields are set: a nil token count stays absent, while a measured
+// zero is exported.
+//
+// AGO-DEVIATION: Python guards each token count with truthiness (`if usage.x:`)
+// and drops a measured zero; AGo guards nil and writes it (D-064). The extended
+// cache-write attribute uses `is not None` upstream, so AGo matches it there.
 func setLLMAttributes(span trace.Span, resp *events.ModelResponse) {
 	span.SetAttributes(attribute.String("gen_ai.operation.name", "chat"))
 	if resp.Provider != "" {
@@ -139,6 +143,12 @@ func setLLMAttributes(span trace.Span, resp *events.ModelResponse) {
 	}
 	if u.CacheCreationInputTokens != nil {
 		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_creation_input_tokens", *u.CacheCreationInputTokens))
+	}
+	// Nil-guarded like the neighboring counts, so a measured zero reaches the
+	// span; upstream guards this attribute with `is not None` for the same
+	// result.
+	if u.CacheCreationExtendedInputTokens != nil {
+		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_creation_extended_input_tokens", *u.CacheCreationExtendedInputTokens))
 	}
 	if u.CacheReadInputTokens != nil {
 		span.SetAttributes(attribute.Int64("gen_ai.usage.cache_read_input_tokens", *u.CacheReadInputTokens))

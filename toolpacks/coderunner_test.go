@@ -304,15 +304,17 @@ func TestCodeRunnerUndecodableOutput(t *testing.T) {
 			if !strings.Contains(got, "[exit code: 7]") {
 				t.Fatalf("output = %q, want [exit code: 7]", got)
 			}
-			// The invalid 0x81 byte is not valid UTF-8, so marshaling the result
-			// text replaces it with the escaped U+FFFD (the Go twin of
-			// errors="replace"): neither the text nor the exit code was lost to
-			// a decode failure.
+			// The invalid 0x81 byte is not valid UTF-8: rendering the result
+			// and json.Marshal both substitute U+FFFD (the Go twin of
+			// errors="replace"), so neither the text nor the exit code was lost
+			// to a decode failure. encoding/json up to Go 1.24 (the CI toolchain)
+			// writes the substitute as the escape `\ufffd`; newer toolchains
+			// write the raw rune, so accept either encoding.
 			j, err := json.Marshal(got)
 			if err != nil {
 				t.Fatalf("marshal result text: %v", err)
 			}
-			if !strings.Contains(string(j), `\ufffd`) {
+			if !strings.Contains(string(j), `\ufffd`) && !strings.Contains(string(j), "\ufffd") {
 				t.Fatalf("JSON result %s does not carry U+FFFD in place of the 0x81 byte", j)
 			}
 		})

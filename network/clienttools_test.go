@@ -66,7 +66,7 @@ func callToolIn(t *testing.T, set []tools.Tool, name string, args string, cx *ag
 	// A fresh stream per call keeps the result scan unambiguous when the
 	// caller-supplied context already carries earlier tool results.
 	s := stream.NewMemoryStream()
-	cx = agocontext.NewWithDeps(s, cx.Dependencies, cx.Variables)
+	cx = agocontext.NewWithVariables(s, cx.Dependencies, cx.Variables.Branch())
 	if _, err := target.Register(cx, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -140,6 +140,11 @@ func newStreamID() string { return "s-" + uuid.New() }
 // the persistence subscriber is a normal subscriber, so a swallowed event never
 // reaches it); another error stops delivery and is returned. Errors from normal
 // subscribers are logged and do not stop delivery.
+//
+// A routed copy carries a process-local delivery marker; its Validate hook runs
+// before every handler (interrupt, persistence, normal), and an error means the
+// addressed invocation has ended. A routed copy is persisted as its inner event:
+// the marker is transport, never transcript.
 func (m *MemoryStream) Send(ev events.Event) error {
 	if s, ok := ev.(interface{ StampNow(time.Time) }); ok {
 		s.StampNow(time.Now())
@@ -154,6 +159,9 @@ func (m *MemoryStream) Send(ev events.Event) error {
 		if !se.opt.Interrupt || !matches(se.opt.Condition, ev) {
 			continue
 		}
+		if err := validateDelivery(ev); err != nil {
+			return err
+		}
 		if err := se.fn(ev); err != nil {
 			if errors.Is(err, ErrHandled) {
 				return nil
@@ -164,7 +172,10 @@ func (m *MemoryStream) Send(ev events.Event) error {
 	// A swallowed event never reaches the transcript; everything else persists
 	// before the normal subscribers see it (Python parity: persistence is the
 	// first-registered normal subscriber, after the interrupters).
-	if err := m.persist(ev); err != nil {
+	if err := validateDelivery(ev); err != nil {
+		return err
+	}
+	if err := m.persist(persistedEvent(ev)); err != nil {
 		return err
 	}
 	var firstErr error
@@ -172,12 +183,34 @@ func (m *MemoryStream) Send(ev events.Event) error {
 		if se.opt.Interrupt || !matches(se.opt.Condition, ev) {
 			continue
 		}
+		if err := validateDelivery(ev); err != nil {
+			return err
+		}
 		if err := se.fn(ev); err != nil && firstErr == nil {
 			m.logger.Error("stream: subscriber failed", "event", ev.EventType(), "err", err)
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// validateDelivery runs the delivery marker's guard, if the event carries one.
+// The function must be safe for concurrent use (it is called from Send paths
+// that may overlap); an error means the addressed execution is gone.
+func validateDelivery(ev events.Event) error {
+	if d, ok := events.DeliveryOf(ev); ok && d.Validate != nil {
+		return d.Validate()
+	}
+	return nil
+}
+
+// persistedEvent strips a transport-only delivery wrapper: the transcript stores
+// the authored event, never the marker.
+func persistedEvent(ev events.Event) events.Event {
+	if r, ok := ev.(*events.RoutedEvent); ok && r != nil && r.Inner != nil {
+		return r.Inner
+	}
+	return ev
 }
 
 func matches(c events.Condition, ev events.Event) bool {

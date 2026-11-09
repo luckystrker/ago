@@ -30,21 +30,23 @@ out["close_tag"] = "</a2ui-json>"
 
 # --- prompt section pieces --------------------------------------------------
 mgr = A2UISchemaManager(protocol_version="v1.0")
+out["wire_version"] = mgr.version_string
+out["protocol_version"] = mgr.protocol_version
 out["prompt_example_rendered"] = mgr._build_prompt_example()
 out["message_types_md"] = mgr._prompt_message_types.replace(
     "{catalog_id}", mgr.catalog_id
-).replace("{version_string}", "v1.0")
+).replace("{version_string}", mgr.version_string)
 out["catalog_instructions"] = mgr._catalog_rules
 
 # --- canonical wire forms (typed-key messages) -------------------------------
 # Key order mirrors the AGo struct field order so the JSONL bytes compare
 # byte-exact; the FORM (names, nesting) is the v1.0 spec's.
 create_surface = {
-    "version": "v1.0",
+    "version": "1.0",
     "createSurface": {"surfaceId": "s1", "catalogId": out["catalog_id_v1"]},
 }
 update_components = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [
@@ -62,12 +64,12 @@ update_components = {
     },
 }
 update_data_model = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateDataModel": {"surfaceId": "s1", "path": "/count", "value": 2},
 }
-delete_surface = {"version": "v1.0", "deleteSurface": {"surfaceId": "s1"}}
+delete_surface = {"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}
 call_renderer_function = {
-    "version": "v1.0",
+    "version": "1.0",
     "callRendererFunction": {
         "surfaceId": "s1",
         "functionCallId": "fc-1",
@@ -79,7 +81,7 @@ call_renderer_function = {
     },
 }
 agent_function_response = {
-    "version": "v1.0",
+    "version": "1.0",
     "agentFunctionResponse": {"functionCallId": "fc-1", "value": {"ok": True}},
 }
 typed_messages = [
@@ -97,7 +99,7 @@ out["to_jsonl_component_list"] = to_jsonl([update_components])
 # (The basic v1.0 catalog marks every function rendererOnly, so Python's
 # validator rejects any agent-initiated callRendererFunction naming one —
 # recorded separately below; agentFunctionResponse is server-only.)
-parser = A2UIResponseParser("v1.0", mgr.server_to_client_schema, mgr.build_schema_registry())
+parser = A2UIResponseParser(mgr.version_string, mgr.server_to_client_schema, mgr.build_schema_registry())
 
 def op(d):
     return json.loads(json.dumps(d))
@@ -112,7 +114,7 @@ out["call_renderer_openurl_is_valid"] = vr.is_valid
 out["call_renderer_openurl_error_count"] = len(vr.errors)
 
 unknown_fn = {
-    "version": "v1.0",
+    "version": "1.0",
     "callRendererFunction": {
         "functionCallId": "fc-2",
         "callFunction": {"@call": "myFunc", "catalogId": out["catalog_id_v1"], "args": {}},
@@ -156,7 +158,7 @@ cases["fenced_block"] = {
     "operations": json.loads(json.dumps(r.operations)),
 }
 
-single_line = '```json {"version": "v1.0", "deleteSurface": {"surfaceId": "s1"}}```'
+single_line = '```json {"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}```'
 r = parser.parse(f"<a2ui-json>{single_line}</a2ui-json>")
 cases["single_line_fence"] = {
     "text": r.text,
@@ -166,8 +168,8 @@ cases["single_line_fence"] = {
 }
 
 jsonl_block = (
-    '<a2ui-json>\n{"version": "v1.0", "deleteSurface": {"surfaceId": "s1"}}\n'
-    '{"version": "v1.0", "updateDataModel": {"surfaceId": "s1", "value": 1}}\n</a2ui-json>'
+    '<a2ui-json>\n{"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}\n'
+    '{"version": "1.0", "updateDataModel": {"surfaceId": "s1", "value": 1}}\n</a2ui-json>'
 )
 r = parser.parse(jsonl_block)
 cases["jsonl_block"] = {
@@ -187,7 +189,7 @@ cases["invalid_json"] = {
     "parse_error_nil": r.parse_error is None,
 }
 
-r = parser.parse('<a2ui-json>{"version": "v1.0"}</a2ui-json>')
+r = parser.parse('<a2ui-json>{"version": "1.0"}</a2ui-json>')
 cases["not_a_message"] = {
     "text": r.text,
     "has_a2ui": r.has_a2ui,
@@ -206,7 +208,7 @@ vr = parser.validate([])
 matrix["empty_ops"] = {"is_valid": vr.is_valid, "errors": vr.errors}
 
 no_root = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [{"id": "txt", "component": "Text", "text": "hi"}],
@@ -226,7 +228,7 @@ matrix["agent_fn_response"] = {
 }
 
 missing_text = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [
@@ -242,7 +244,7 @@ matrix["text_missing_text"] = {
 }
 
 unknown_component = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [
@@ -262,7 +264,7 @@ vr = parser.validate([op(bad_version)])
 matrix["bad_version"] = {"is_valid": vr.is_valid, "error_count": len(vr.errors)}
 
 extra_prop = {
-    "version": "v1.0",
+    "version": "1.0",
     "deleteSurface": {"surfaceId": "s1", "bogus": True},
 }
 vr = parser.validate([op(extra_prop)])
@@ -273,7 +275,7 @@ vr = parser.validate([op(missing_version)])
 matrix["missing_version"] = {"is_valid": vr.is_valid, "error_count": len(vr.errors)}
 
 data_binding = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [
@@ -285,6 +287,19 @@ data_binding = {
 vr = parser.validate([op(data_binding)])
 matrix["data_binding_value"] = {"is_valid": vr.is_valid, "errors": vr.errors}
 
+missing_value = {
+    "version": "1.0",
+    "updateComponents": {
+        "surfaceId": "s1",
+        "components": [
+            {"id": "root", "component": "Card", "child": "f"},
+            {"id": "f", "component": "TextField", "label": "Qty"},
+        ],
+    },
+}
+vr = parser.validate([op(missing_value)])
+matrix["text_field_missing_value"] = {"is_valid": vr.is_valid, "error_count": len(vr.errors)}
+
 binding_on_string = dict(data_binding)
 binding_on_string["updateComponents"] = dict(data_binding["updateComponents"])
 binding_on_string["updateComponents"]["components"] = [
@@ -295,7 +310,7 @@ vr = parser.validate([op(binding_on_string)])
 matrix["string_where_binding_expected"] = {"is_valid": vr.is_valid, "error_count": len(vr.errors)}
 
 wrong_type_child = {
-    "version": "v1.0",
+    "version": "1.0",
     "updateComponents": {
         "surfaceId": "s1",
         "components": [
@@ -333,7 +348,7 @@ def classify(env):
 out["incoming"] = {
     "action": classify(
         {
-            "version": "v1.0",
+            "version": "1.0",
             "action": {
                 "name": "addToCart",
                 "surfaceId": "cart",
@@ -346,7 +361,7 @@ out["incoming"] = {
     ),
     "call_agent_function": classify(
         {
-            "version": "v1.0",
+            "version": "1.0",
             "callAgentFunction": {
                 "surfaceId": "s1",
                 "functionCallId": "fc-9",
@@ -356,13 +371,13 @@ out["incoming"] = {
     ),
     "renderer_fn_response": classify(
         {
-            "version": "v1.0",
+            "version": "1.0",
             "rendererFunctionResponse": {"functionCallId": "fc-1", "value": [1, 2]},
         }
     ),
     "surface_error": classify(
         {
-            "version": "v1.0",
+            "version": "1.0",
             "error": {
                 "code": "VALIDATION_FAILED",
                 "surfaceId": "s1",
@@ -373,7 +388,7 @@ out["incoming"] = {
     ),
     "function_error": classify(
         {
-            "version": "v1.0",
+            "version": "1.0",
             "error": {
                 "code": "RENDER_FAILED",
                 "functionCallId": "fc-1",
@@ -381,7 +396,7 @@ out["incoming"] = {
             },
         }
     ),
-    "unknown": classify({"version": "v1.0", "wat": {}}),
+    "unknown": classify({"version": "1.0", "wat": {}}),
     "not_object": classify([1]),
 }
 

@@ -2018,10 +2018,17 @@ truncated at max_output with a trailing notice; a non-zero exit appends
   API key never enters the tool schema (Python parity: constructor-only); where
   Python resolves several request parameters as Variables, the port carries a
   per-conversation variable override for the key (`tavily_api_key` /
-  `perplexity_api_key`) instead, and the optional request parameters beyond
-  max_results/depth/topic/include_answer (Tavily) and max_results (Perplexity)
-  are deferred — Python's Variable-resolvable kwargs per tool do not map onto
-  the argument-struct schema one to one.
+  `perplexity_api_key`) instead. Tavily's `include_raw_content`
+  (`bool | "markdown" | "text"`) and `include_favicon` are constructor options
+  (`WithTavilyIncludeRawContent`/`WithTavilyIncludeFavicon`) written to the
+  request only when set, matching upstream's None filter. The remaining optional
+  parameters (Tavily include_images, time_range, start_date, end_date, days,
+  include_domains, exclude_domains, country, auto_parameters, the literal
+  variants of include_answer; Perplexity max_results beyond the schema) are
+  deferred — Python's Variable-resolvable kwargs per tool do not map onto the
+  argument-struct schema one to one. AGO-DEVIATION: absent optional result
+  fields (`score`, `raw_content`, `favicon`) omit their JSON key via
+  `omitempty`, where Python's `asdict` emits an explicit null.
 - **Skills** (`skills.go`, skills/toolkit.py over runtime/local, abbreviated):
   `NewSkillsToolkit(dir)` discovers `<dir>/<name>/SKILL.md` with a
   `key: value` frontmatter parser (the YAML subset the toolkit reads — no YAML
@@ -2172,8 +2179,9 @@ OnToolExecution wrap next with spans `ago.turn` (internal), `ago.llm_call` (clie
 builds one instance per turn; Go has no ambient context, so the parenting is explicit
 under a mutex instead of `start_as_current_span`). `ago.llm_call` stamps model/provider
 (`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.provider.name`), the usage
-tokens (`gen_ai.usage.input/output/total_tokens` + cache_read/cache_creation/thinking)
-and finish_reasons off the ModelResponse, only for reported fields; `ago.tool_execution`
+tokens (`gen_ai.usage.input/output/total_tokens` + cache_read/cache_creation/
+cache_creation_extended/thinking) and finish_reasons off the ModelResponse, only for
+reported fields; `ago.tool_execution`
 stamps the tool name/call id/type. Pipeline errors record an exception event and set the
 span status to Error; a `ToolErrorEvent` answer (value or pointer) does the same when
 next() itself succeeded (Python parity). OnHumanInput passes through.
@@ -2184,7 +2192,11 @@ localhost:4318), registering the process-global provider.
 
 AGO-DEVIATION: span names `ago.*` instead of Python's "invoke_agent <agent>"/"chat"/
 "execute_tool <name>"; tracer scope `github.com/luckystrker/ago/contrib/otelx` instead
-of `opentelemetry.instrumentation.ag2` (same schema URL 1.11.0); InstallDefault speaks
+of `opentelemetry.instrumentation.ag2` (same schema URL 1.11.0). Usage attributes are
+nil-guarded, so a provider-reported zero is written to the span, whereas Python's
+`if usage.x:` drops it; the extended cache-write attribute (`gen_ai.usage.
+cache_creation_extended_input_tokens`) is guarded by presence in both ports.
+InstallDefault speaks
 only OTLP/HTTP — a gRPC user builds their own provider and hands it to Middleware.
 Deferred: content capture (message bodies, tool arguments/results, the 8192-char
 truncation), the constructor knobs (agent/provider/model names, span_attributes), the
@@ -3175,3 +3187,461 @@ Gates `go test -count=1 ./toolpacks/...` green 2026-11-03.
 
 Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./...` green 2026-11-03 (fresh full-module
 run: 48 packages ok, 0 failures).
+
+## D-088 — 2026-11-09 — gemini: the skip thought-signature placeholder is silent; real-signature replay is deferred
+
+Upstream `3539d07500` (AG2 1.3.0) makes the Gemini mapper give the first `functionCall`
+of every unsigned step in the current turn Google's documented
+`skip_thought_signature_validator` placeholder, and logs a warning per insertion.
+
+- **The insertion is silent.** `config/gemini` has no logger and the core is stdlib-only
+  (D-003); warning through a package-global `slog` logger would add process-wide state
+  that no other provider package has. The placeholder still lands on the wire
+  (`config/gemini/mappers.go`, `signCurrentTurnCalls`), which is what fixes the Gemini 3
+  400. Code comment: `AGO-DEVIATION` at `signCurrentTurnCalls`.
+- **The wire value is base64-encoded.** The REST `thoughtSignature` field is bytes, so the
+  placeholder travels standard-base64 encoded (`c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=`),
+  exactly as the Python SDK's serializer emits the same bytes; Vertex-like endpoints accept
+  this form. `SkipThoughtSignature` stays the documented sentinel, and
+  `skipThoughtSignatureWire` is the encoded value the mapper writes.
+- **Replaying the real signature from a response is deferred.** `genPart` does not read
+  `thoughtSignature`, and `ToolCallEvent` has no field for it, so every call rebuilt from
+  history is unsigned and takes the placeholder. The "signed first call is left alone"
+  branch mirrors upstream and is covered by a direct mapper test, but it becomes reachable
+  from real history only when a follow-up records the signature on the tool call and
+  replays it inside its original part.
+
+Current-turn/step detection follows upstream exactly: a turn starts after the last `user`
+content carrying any part that is not a `functionResponse`; only the first `functionCall`
+part of each `model` step is signed.
+
+Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./config/gemini/...` green 2026-11-09.
+
+## D-089 — 2026-11-09 — a2ui: stable v1.0 wire version split from the protocol selector; spec re-vendored
+
+Upstream `1b0c399012` (`fix(a2ui): speak the stable A2UI v1.0 wire and re-vendor the spec`)
+stabilized A2UI v1.0 (A2UI `078b3d5c`: a2ui-project/a2ui#3726 wire version, #3868
+`TextField.value`, #3999 version status, #3575 restricted `$ref`s). AGo emitted `"v1.0"` in
+every message: `VersionV1` served both as the protocol selector and as the wire version, so
+after stabilization the port wrote a version no renderer accepts. This entry supersedes the
+version half of D-076; the deferral list in D-076 otherwise stands.
+
+- **Two constants, two meanings.** `a2ui.VersionV1 = "v1.0"` is the protocol selector
+  (`v1_0` spec directory, `schemaBaseURI`, prompt headings). New
+  `a2ui.WireVersionV1 = "1.0"` is what a stable v1.0 message and a version-keyed
+  capability object carry (a2ui-project/a2ui#3726; v0.9.x keeps the `v`). `Message.Version`
+  defaults to the wire version when empty (an explicit caller value is respected, as
+  upstream `_stamp` does); `SchemaManager.VersionString()` and `Parser.VersionString()` now
+  report `"1.0"` and the new `ProtocolVersion()` accessors report `"v1.0"`. The HTTP
+  `Server` stamps `"1.0"`; the prompt example and message-type body substitute
+  `{version_string}` with `"1.0"` while the response-format heading keeps `(v1.0)`.
+- **Spec re-vendored** under `a2ui/spec/v1_0/` from upstream `1b0c399012` (A2UI
+  `078b3d5c`): `agent_to_renderer.json`/`renderer_to_agent.json` message `const` is
+  `"1.0"`; `basic_catalog.json` adds the shared `$defs/Weight` (components now `$ref` it),
+  requires `TextField.value`, tightens the regex description and renders its `instructions`
+  examples with `"1.0"`; `prompt_example.json`/`prompt_message_types.md` carry the
+  `{version_string}` template; a `README.md` records the new pin and the protocol-vs-wire
+  split. `common_types.json` is unchanged upstream. The wire break is reflected in
+  `a2ui/testdata/capture_golden.py` (parser version, message literals, a new
+  `text_field_missing_value` matrix case) and `a2ui/testdata/golden.json`
+  (`"version": "1.0"` everywhere, new `wire_version`/`protocol_version` keys).
+- **Restricted catalog `$ref`s** (`a2ui/catalog_refs.go`): the port has no custom-catalog
+  load path (deferred with D-076), so the upstream `_check_catalog_references` rule is
+  ported and applied to the vendored basic catalog at `NewSchemaManager` load time instead:
+  a local `$ref` must name a `#/components/`, `#/functions/` or leaf `#/$defs/` entry the
+  catalog declares (never `anyComponent`/`anyFunction`), and an external one must be one of
+  the listed `common_types.json#/$defs/<Type>` names. Annotations (`metadata`, `examples`,
+  `const`, `default`, `enum`, `description`) are data, not subschemas (upstream
+  `run_tests.py` parity).
+- **Not ported here** (unchanged deferrals, no code surface to change): the A2A transport
+  and therefore upstream `a2a/parts.py`'s `metadata["mimeType"]` partner for `media_type`
+  (AGo's `a2a.DataPart` could carry it — it has `MimeType` and `Metadata` — but there is no A2UI-over-A2A part helper to stamp it); capabilities negotiation
+  and therefore the `_CAPABILITIES_LOCATION` map (`v1.0 → a2uiRendererCapabilities["1.0"]`,
+  `v0.9`/`v0.9.1 → a2uiClientCapabilities["v0.9"]`); the v0.9.1 spec re-vendor (only
+  `a2ui/spec/v1_0` is vendored — v0.9.x was never vendored); custom catalogs. The v1.0
+  halves the port does have (`ParseClientDataModel` reading `a2uiRendererDataModel`) already
+  match upstream's `v1.0` branch.
+
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **The restricted-`$ref` check runs on the vendored basic catalog**, where Python runs it
+  only on custom catalogs. It has no effect on a valid catalog; it is the port's substitute
+  for the deferred custom-catalog load path and keeps a bad re-vendor from reaching the
+  registry.
+- **The checker walks definitions/properties in sorted-name order**, so with several
+  invalid `$ref`s the reported first offender may differ from Python's declaration order;
+  the rule and the message shape are identical.
+
+Evidence: `a2ui/wire_version_test.go` (protocol/wire split, prompt substitution, schema
+rejection of `"v1.0"`, `TextField.value`, `#/$defs/Weight` resolution) and
+`a2ui/catalog_refs_test.go` (allowed/rejected/annotation cases, vendored catalog passes).
+Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test -count=1 ./a2ui/...` green
+(full-module `go test ./...` has one pre-existing `toolpacks` failure under the Go 1.27
+toolchain — `TestCodeRunnerUndecodableOutput` expects `\ufffd`, Go 1.27's `encoding/json`
+emits the raw U+FFFD; reproduced at HEAD without this change). `-race` could not run in
+this container (no cgo/gcc); a2ui adds no mutable state.
+
+## D-090 — 2026-11-09 — context: scoped invocation variables (`Scope` COPIED/LOCAL/SHARED)
+
+Ports upstream `fad570ca19` (`ag2/scopes.py`) to `context/scopes.go` and replaces
+the flat variable copy in `agent/subtask.go` with `DeriveChildVariables` +
+`MergeVariables`. `COPIED` (default) deep-copies per child branch, `LOCAL` is not
+inherited, `SHARED` is one tree-wide binding whose rebinding is visible in the
+root and siblings. Reserved `ag:`/`a2a:` keys (including the approval bypass) are
+never inherited; a new SHARED name below the root, a reserved SHARED key, an
+unknown scope and a different redeclaration are `*ScopeError` values wrapping
+`ErrScope`.
+
+- **Variables are a store type, not a map (API shape change).** Go maps cannot
+  intercept `m[key] = value`, so keeping `Context.Variables map[string]any`
+  would silently bypass SHARED rebinding and scope declarations. It is now
+  `*context.Variables` with `Get`/`Set`/`SetScoped`/`Declare`/`Snapshot`/
+  `Declared`/`Branch`. `NewWithDeps` and `Context.SetVariable` return errors
+  because a declaration can fail; statement-only call sites are unaffected.
+  Behavior matches Python's scoped `MutableMapping`. `AgentReply.Context()` is
+  added so turn state (Python `reply.context`) is readable after a reply. Code:
+  `context/scopes.go`, `context/context.go`, `agent/run.go`.
+- **Deep copy: explicit `Clone` + reflection fallback (D-090a).** Python uses
+  `copy.deepcopy`; the stdlib-only port checks a `context.Clone` interface
+  first, then reflects over pointers/maps/slices/arrays/structs/interfaces,
+  preserving cycles and aliases through one memo per store (Python deepcopy
+  parity). Slice memo keys include the view length: Go `buf[:3]` and `buf[:2]`
+  share a data pointer but are distinct values, unlike Python list objects.
+  Limits are documented on `DeepCopy`: unexported struct fields stay shallow
+  (reflection cannot set them), funcs/chans/unsafe pointers are shared, and
+  concurrent mutation during a copy is the caller's race.
+- **own/shared consistency (D-090a).** Declaring SHARED (or `Declare` without a
+  value) removes the stale branch value, and `Snapshot`/`Keys`/`Branch` skip a
+  SHARED key even if a legacy store still holds one. `Delete(SHARED)` removes
+  the binding and any stale own value. AGO-DEVIATION: upstream leaves the own
+  value in place and its `copy()` then raises `KeyError`; AGo keeps `Get`,
+  `Snapshot`, `Keys` and the agui/a2a state export consistent. `MergeVariables`
+  restores an inherited value dropped by the declaration so inherited values
+  still win. Comment: `context/scopes.go`, `declareLocked`/`Delete`/`Snapshot`.
+- **Three small Go-shape deviations (D-090a).** A zero `Scope` normalizes to
+  COPIED (upstream `Scope("")` raises); `Keys()` sorts names for deterministic
+  output (upstream keeps insertion order); `Delete` returns `bool` instead of
+  raising `KeyError`. Comments on `normalizeScope`, `Keys`, `Delete`.
+- **SHARED is visible, not synchronized (D-090a).** `Variables` protects its
+  maps and the shared-binding table with RWMutexes (lock order branch → shared);
+  sibling rebinding is `-race` safe. Compound mutation of a shared value
+  (`append`, read-modify-write) still needs a caller-supplied lock, matching the
+  upstream contract; the test passes one through `dependencies` like upstream's
+  `findings_lock`. Go also cannot make an `append` to an injected SHARED slice
+  visible through the store, because a slice is a header; rebind it with `Set`
+  or share a map/pointer. Code comment: `context/scopes.go`, type `Variables`.
+- **Child derivation ignores the shared table (D-090a).** Only branch values are
+  copied, so a SHARED name declared after a branch was derived can never leak
+  into a grandchild as a deep copy. Upstream iterates `own ∪ shared` and can do
+  that on this rare interleaving; AGo treats shared bindings strictly as a
+  reused tree-wide reference. The same live branch also keeps `Get`/`Snapshot`/
+  `Keys`/`Len` consistent: a shared name its copied declaration map does not
+  know is omitted from all of them. Comment: `DeriveChildVariables` and the
+  `Keys`/`Snapshot` docs.
+- **No wire representation (D-090a).** `ScopedValue`/`Scope` never enter an
+  event or transport payload; `Snapshot` and a2a context updates carry resolved
+  values only, so no `@type`/snake_case wire change. `ReservedVariablePrefixes`
+  is an accessor over an unexported array (callers cannot mutate the package
+  list); `a2a.StripReservedVariables` and `agui`'s state filter reuse
+  `context.IsReservedVariable` instead of local copies. The old mutable
+  `a2a.ReservedVariablePrefixes` slice stays as a deprecated snapshot alias
+  (`// Deprecated:`), so existing code still compiles; mutating it does not
+  change the context contract.
+- **`OverlayVariables` is exposed but unused by the agent (D-090a).** AGo has no
+  per-`ask` `variables=` override or turn-scoped plugin defaults, so the helper
+  exists for parity and is covered by tests rather than wired into a call site.
+- **Zero-value Context uses `VariableStore()` (D-090a).** The accessor
+  initializes the store under the context mutex, so lazy initialization cannot
+  race with an internal reader. Contexts built by `New`/`NewWithDeps`/
+  `NewWithVariables` install the pointer before use, so direct field reads stay
+  safe there. `tools.resolveDILookup` now propagates a `SetVariable` error
+  (wrapped with `%w`) instead of dropping it.
+
+Gates run green: `go build ./...`, `go vet ./...`, `go test ./...`. The intended
+`go test -race ./context/ ./agent/` could not run on this runner (no cgo
+compiler), see the T7 dev report; the concurrency tests are written for it.
+
+## D-091 — 2026-11-09 — events: observation envelopes, source authorship and a typed delivery marker
+
+Ported the delegation-observation event layer from `663ddd1574` (`ChildEvent`,
+`TransientChildEvent`, `DeliveryFailed`, `DownEvent`, `TransientDownEvent`,
+`source_event`, `UsageEvent.event_id`) and the typed delivery marker from
+`a591d84f6e` (`Delivery`/`routed()`/`delivery_of()`). AGo keeps the event vocabulary and
+wire names; transport wiring is left to T8 (subagent forwarding) and the reserved
+variable prefixes to T7.
+
+- **`source_event` is a function, not an inherited property.** Go has no base-class
+  properties, and adding `SourceEvent()` to the `Event` interface would force every
+  event type to implement it. `events.SourceEvent(ev)` returns `ev` for ordinary events
+  and follows the unexported `sourceEvent()` hook implemented by `ChildEvent` and
+  `RoutedEvent`; `DownEvent` intentionally has no hook and is its own source (upstream
+  parity: an intervention audit must not count its payload twice). The hook is bounded
+  so a self-referential envelope cannot hang a reader.
+- **A delivery is a wrapper type, not a hidden attribute.** `Delivery{Validate func() error}`
+  and `*RoutedEvent{Inner, Delivery}` replace Python's `setattr`/`_delivery` slot.
+  `Routed`/`DeliveryOf`/`IsRouted` are the public surface; `EventType`, timestamp and
+  storage flags delegate to the inner event, `AsValue`/`TypeOf` unwrap it, and
+  `MarshalEvent` serializes only the inner payload. `Validate` returns an error instead
+  of raising. `Routed` does not clone `Inner` (Go events are pointer values and the
+  wrapper is immutable); callers stamp provenance before wrapping. Persisting a routed
+  copy must unwrap it — that integration belongs to T8's stream changes.
+- **Field defaults need explicit Go entry points.** `UsageEvent.EventID` has no implicit
+  struct default: `NewUsageEvent`/`EnsureEventID` fill a 32-hex id, and `UnmarshalJSON`
+  generates one only when the archived record omits the field (an explicit empty value
+  is preserved for a lossless round-trip). New event producers adopt `NewUsageEvent` in
+  T8 together with descendant provenance. `ChildEvent`/`DownEvent` normalize empty
+  `direction` to `up`/`down` and nil paths to `[]` on the wire; constructors
+  `NewChildEvent`/`NewDownEvent` also normalize nil paths and `origin_path` in memory.
+  `SourceEvent` treats a typed-nil event pointer as absent instead of panicking.
+- **Optional wire fields omit instead of encoding `null`.** `DeliveryFailed.TaskID` and
+  `DownEvent.OriginTaskID` are `omitempty` strings, whereas Python serializes an absent
+  value as `null`. This follows AGo's existing optional-string convention for events
+  (for example `HumanInputRequest.TaskID`).
+- **Nested events use the existing `@type` convention.** `inner` is marshaled with
+  `MarshalEvent` and decoded with `UnmarshalEvent`, so a nested `UsageEvent` keeps its
+  own discriminator; `RoutedEvent` is not registered because delivery is process-local.
+- **Not ported here:** `InertEvent` provenance (`path`, `_origin`, `origin`, `as_local`),
+  `DeliveryError`/`StreamHandle`, the `Stream.Send` validate hook, usage dedup by
+  `event_id`, and `RESERVED_VARIABLE_PREFIXES` (T7/T8 own those surfaces).
+
+Deviations are marked `// AGO-DEVIATION` in the touched event code. Evidence:
+`events/delegation_test.go` (source through nesting and routing, wire round-trip for all
+five types, delivery marker, id generation/unmarshal, sizing/rendering, type conditions,
+concurrent reads). Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test ./...`,
+`go build ./examples/...`, `go vet ./examples/...` green. `go test -race ./events/`
+cannot run in this container (no cgo/gcc, as in D-089); the new event values are
+immutable after construction and the package test includes an 8-goroutine read stress.
+
+## D-092 — 2026-11-09 — agent: subagent event tree, inert provenance and source-based usage (upstream `1c27f221a5`)
+
+Ported the forwarding layer of upstream `tools/subagents/_forwarding.py` plus the
+consumer migrations from `run_task.py`, `usage.py`, `observers/*`,
+`compact.py` and the telemetry usage recorder. Operational child events now
+reach ancestors as `ChildEvent`/`TransientChildEvent` observations; `UsageEvent`
+and `Task*` travel as themselves with `path`/`task_id`/`agent_name` provenance.
+There is no subtask usage rollup: accounting reads source records and dedups by
+`event_id`.
+
+- **Inert is embedding, not inheritance (D-092a).** Go has no base classes, so
+  `events.InertEvent{Path}` is embedded by UsageEvent and every Task event. The
+  exported marker/accessors (`IsInertEvent`, `InertPath`, `SetInertPath`,
+  `SetInertIdentity`) let custom events embed the same base and still be stamped.
+  `StampInert` copies through reflection (pointer or value spelling) before
+  mutating provenance, so the child transcript keeps the locally authored record;
+  it never clones maps/slices other than the replacement path.
+- **`AsLocal` only rewrites records that carry inherited provenance (D-092a).**
+  Upstream `UsageEvent.as_local` always assigns a fresh `event_id`, even to a
+  just-constructed local record. AGo returns the record unchanged when path,
+  task_id and agent_name are all empty: producers assign the source id with
+  `NewUsageEvent`/`EnsureEventID` before publication, and rewriting it on
+  `Context.Send` would make those constructors pointless. A forwarded record is
+  copied, stripped of provenance and given a fresh id, so republishing cannot
+  impersonate the original spend.
+- **Empty provenance is omitted on the wire (D-092a).** `path`, `UsageEvent.task_id`
+  and `UsageEvent.agent_name` are `omitempty`, whereas Python emits `()`/`null`.
+  This follows AGo's optional-string convention (D-091) and keeps existing local
+  records byte-compatible; non-empty provenance round-trips losslessly.
+- **Forwarding is upward-only (D-092a).** `agent/forwarding.go` subscribes as an
+  interrupt handler before the child HITL hook, so a swallowed question is still
+  observed by the parent. It is installed by the child's turn scope after the
+  per-stream lock is held and stopped before the lock is released. The turn lock
+  is process-wide by stream/conversation id (`agent/turnlock.go`), not per
+  `Agent`: two agents handed the same `WithStreamBase` serialize on the same
+  event bus, so their relays cannot cross-forward. Acquiring the lock honors the
+  caller's `context.Context` (channel semaphore + `select`), and a canceled wait
+  drops its reference so the registry entry cannot leak.
+  `Close` cancels and waits for the turn goroutine (`<-done`) before dropping the
+  relay and lock; a late event from a client that ignores cancellation therefore
+  cannot land in the next delegation's relay. `Close` is deliberately blocking:
+  a client that never returns keeps `Close` (and a deferred `Close` inside
+  `Ask`) waiting. `awaitTurn` has the same blocking contract on the failure
+  path: it cancels and waits while still holding the per-stream lock, so a
+  sibling delegation on that stream waits until its own ctx deadline (an
+  `AsTool` delegation supplies `context.Background()`, so it waits for the turn
+  to finish). On a failure, `runTaskOn` first awaits the child turn goroutine,
+  then publishes the terminal through the still-installed relay while the lock
+  is held, and only then closes the scope (stops the relay and releases the
+  lock). The terminal is therefore the last event the parent observes, and a
+  queued sibling cannot relay it under its own provenance — matching upstream
+  `Forwarder.execution`'s finally block. A preparation failure inside
+  `AgentRun.open` after `TaskStarted` follows the same finally path: because the
+  scope was entered, `runTaskOn` keeps it open, publishes the terminal on the
+  child stream through the relay, and then closes; only failures before
+  `TaskStarted` use the parent-only reject path.
+- **Same-stream nested delegation is rejected, not deadlocked (D-092b).**
+  Upstream's per-stream `asyncio.Lock` is not reentrant either; a child whose
+  stream is the caller's (or any ancestor's) would queue forever. AGo carries
+  the chain of held stream ids through the delegated context
+  (`ago:held-streams`) and `runTaskOn` returns `ErrNestedSameStream` before
+  entering the child turn (before any child `TaskStarted`). The rejection still
+  publishes `TaskStarted` and `TaskFailed` directly to the parent stream
+  (upstream `reject` does not touch a busy child stream), so observers and
+  AG-UI see the attempt. This is a deliberate behavior choice (no hang), not a
+  wire change; nested delegations normally use a fresh child stream. Failures
+  that happen after `TaskStarted` inside `AgentRun.open` are not reject-path
+  cases: the child scope is kept open and the terminal is published on the
+  child stream through the relay before closing.
+- **No downlink port (follow-up task).** Upstream's `StreamHandle`/`_Endpoint`,
+  non-serialized `origin` on `InertEvent`/`ChildEvent`, `DownEvent` delivery,
+  `DeliveryFailed`/`DeliveryError`, targeted `HaltEvent` addressing,
+  `DelegationRegistry.cancel_descendants`/`settle_descendants`, and the
+  `CANCELLED_TOOL_RESULT` repair of unfinished tool calls all belong to the
+  same upstream commit but are deliberately deferred. AGo already has a
+  cancellation channel — `context.Context.TurnContext()`/`AgentRun.cancel` —
+  but observations carry no live invocation address, and there is no
+  per-delegation `cancel func` registry or downlink transport. Consequently an
+  observer cannot address a delegation with `HaltEvent`, and cancelling a root
+  turn does not necessarily stop an already-running child: tool execution has
+  no stdlib context (`runTaskOn` was called with `context.Background()` in
+  `AsTool`/`run_subtask(s)`), which was already true before T8, so that was a
+  pre-existing gap rather than a T8 regression. D-093 closed the cancellation
+  half: delegations now start on the parent turn's `Context.TurnContext()`, so
+  a parent cancellation reaches the child and is reported as
+  `TaskCancelled{reason: "parent cancelled"}`. The downlink (addressing,
+  registry, `DeliveryFailed`) remains deferred. Follow-up scope: origin handle
+  + registry keyed by task id, downlink delivery/validation, cancel cascade and
+  settlement, cancelled-tool-call repair, then user-facing observability.
+  `DownEvent` stays a vocabulary type (T6); `Delivery` is now validated by
+  `Stream.Send` before every handler (interrupt, persistence, normal), with
+  routed copies persisted as their inner event.
+- **Task lifecycle is inert and authored on the child stream (D-092a).** Task
+  events embed `InertEvent` and are no longer conversational (upstream
+  `TaskEvent(InertEvent)`); this aligns compaction/rendering. `runTaskOn` emits
+  `TaskStarted`/`TaskCompleted`/`TaskFailed` (and `TaskCancelled` on
+  `context.Canceled`) on the child stream, and the forwarder relays them. All
+  task terminals carry `objective`: `runTaskOn` sets it on cancellation and the
+  `task.Task` primitive sets `spec.title` on `Cancel`/`Expire`. The
+  HITL bridge no longer publishes a stamped `HumanInputRequest` locally: the
+  request and answer reach the parent only as `ChildEvent` observations, and the
+  bridge just calls the parent hook.
+- **Source accounting replaces rollups (D-092a).** `agent/turn.go`,
+  `compact/strategy.go` and `aggregate/aggregate.go` publish via `NewUsageEvent`;
+  `usage.FromEvents` resolves `SourceEvent` and deduplicates by non-empty
+  `event_id` (id-less legacy fixtures remain distinct). Compaction now retains
+  every source usage record from before the rewrite, matching upstream
+  `_with_usage_events`; the old AGo deviation that dropped spend outside the
+  retained window is gone. A forwarder also retains source records it relayed
+  and, if upward publication failed, best-effort accounting written to the
+  parent; `TaskCompleted.Usage` combines the child history with that accounting
+  (deduplicated by `event_id`), matching upstream `history + accounting`.
+  `TokenMonitor` deduplicates by `event_id`;
+  `LoopDetector` observes local and `ChildEvent` responses with per-origin state
+  and puts `task_id`/`path` in the alert data so sibling histories cannot merge.
+- **Telemetry/otelx unchanged.** The contrib module has no `UsageEvent`
+  subscription (usage spans are deferred by D-064), so forwarding introduces no
+  code path to migrate; it sees child LLM calls through its existing hooks.
+- **T6 review items closed here.** Direct assertions were replaced with
+  `events.AsValue` in `agent/run.go` (DrainedModelRequest/HaltEvent),
+  `context/context.go` (HumanMessage/HumanInputRequest), `network/taskmirror.go`
+  (Task*) and `network/hub.go` (Input); producers use `NewUsageEvent`; the
+  `Delivery.Validate` hook is wired into `Stream.Send`.
+
+Verified by `events/inert_test.go`, `stream/delivery_test.go`,
+`agent/forwarding_test.go`, the rewritten subtask accounting tests, and the new
+usage/observer dedup tests. Gates (2026-11-09): `go build ./...`, `go vet ./...`,
+`go test ./...`, `go build ./examples/...`, `go vet ./examples/...`.
+`go test -race` could not run in this container (no cgo/gcc:
+`C compiler "gcc" not found`), as recorded in the T8 dev report; the
+stateful-package race tests are written but were not executed here.
+
+## D-093 — 2026-11-09 — agent: one task lifecycle for model runs and delegations (upstream `d716fcbefe`)
+
+Ported upstream `ag2/_run_lifecycle.py` and ADR 0034/0035. A model run and a
+delegation now use the same `task.Task` transitions, the same terminal
+selection, and the same usage snapshot. `agent/lifecycle.go`'s unexported
+`runLifecycle` is the only place that opens a task and publishes its terminal;
+`AgentRun` owns it, and `runTaskOn` no longer constructs
+`TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` by hand.
+
+- **Ordinary runs opt in (D-093a).** `RunOptions{Capability, TTL}` plus
+  `AskWith`/`RunWith`/`ResumeWith` and the reply continuations mirror
+  upstream's `capability=`/`ttl_seconds=` keyword arguments; `Ask`/`Run`/
+  `Resume` are the zero-options spelling and stay byte-identical to the
+  pre-lifecycle behavior (ADR 0035: "ordinary calls without either remain
+  unchanged"). AGO-DEVIATION: Go has no keyword arguments, so the options
+  travel as a value through a `...With` family instead of extra parameters on
+  the existing methods. Delegations always open a lifecycle, with the existing
+  task id, parent tool-call id and objective title. `emit_events=False` is not
+  ported: AGo never exposed an opt-out surface for it, so no behavior is lost.
+- **The title is the agent name (D-093a).** An opted-in run publishes
+  `TaskSpec{Title: agentName, Capability: ...}` and `Objective` equal to the
+  agent name; the caller's prompt never enters a Task event. `TaskStarted` is
+  inert and reaches the network mirror, so this is the privacy boundary.
+  Delegations keep their objective as the title and now also carry a
+  `TaskSpec` (upstream: "Delegated TaskStarted now carries a TaskSpec").
+- **Terminal on every outcome (D-093a).** `AgentRun.open` starts the lifecycle
+  after acquiring the per-stream turn lock (unchanged T8 ordering) and before
+  the remaining setup. `Close` cancels and awaits the turn, unsubscribes the
+  run's own subscribers, publishes the terminal while the relay and the lock
+  are still held, then stops the relay and releases the lock. The terminal is
+  therefore the last event and covers: success, turn error, `context.Canceled`
+  (`TaskCancelled`, reason `"cancelled"` for a run and `"parent cancelled"` for
+  a delegation), a panic recovered by `executeTurn`, a session that returned no
+  reply after its caller gave up, and a usage read failure. `Run.Result`
+  leaves the scope open as upstream does; the terminal follows on `Close`, and
+  `Ask` publishes it before returning. A `Start` failure after the lifecycle
+  started releases the scope and publishes the terminal even when the caller
+  forgets `Close`; a delegation keeps the scope open so the terminal travels
+  through its relay under the lock.
+- **Delegation reject goes through the same lifecycle (D-093a).**
+  `ErrNestedSameStream` and `newRunWith`/`MergeVariables` failures happen
+  before the turn scope exists; `runTaskOn` builds a lifecycle whose publisher
+  is `forwarder.reject`, so started+terminal go straight to the parent and the
+  (possibly busy) child stream is never touched. Failures after the scope
+  opened publish on the child stream and are relayed as before.
+- **PARENT_CANCELLED closes the D-092 cancellation gap (D-093a).** `AsTool`
+  and `run_subtask(s)` now start the delegated run on `cx.TurnContext()`
+  instead of `context.Background()`. The parent turn's cancellable context is
+  installed on its conversation context, so a parent cancellation reaches the
+  child turn; the child reports `TaskCancelled{reason: "parent cancelled"}`
+  and the delegating tool renders the cancelled result. A call cancelled while
+  waiting for the per-stream lock still opens no lifecycle for an ordinary run
+  (ADR 0035); a delegation reports that attempt through `reject`.
+- **Usage snapshot and retention (D-093a).** `TaskCompleted.Usage` is
+  `usage.FromEvents(streamHistory + forwarderRetainedAccounting)`, deduplicated
+  by `event_id`, so it stays a snapshot (D-092/D-093 contract: never additive).
+  Before the terminal, source records the relay captured but the stream never
+  persisted are appended (upstream `persist_accounting`); a retention write
+  failure decides the terminal when nothing failed before and is logged and
+  suppressed behind an earlier failure. A usage read failure falls back to the
+  retained accounting and does not replace the task outcome (upstream
+  `snapshot_usage`).
+- **`task.New` + `Task.Start` (D-093b).** Upstream splits Task construction
+  from `_start`, and the lifecycle needs a handle that survives a failed
+  `TaskStarted` send so it can still publish a terminal. AGo adds `task.New`
+  (builds an unstarted handle) and `(*Task).Start`; the package-level
+  `task.Start` remains `New`+`Start` and still returns a nil handle on failure,
+  preserving its public contract. `WithoutInjection` keeps the lifecycle out of
+  the `ag:task` dependency slot, as upstream `inject=False` does, so a tagged
+  run inside an owner's `TaskInject` block does not steal the binding.
+  `WithTaskID`/`WithParentToolCallID` carry the delegation identity, and
+  `WithPublisher` routes events away from the bound stream for the reject path.
+  The task subscribes to its stream's `Task*` terminals and adopts a matching
+  external terminal (same task id) without emitting a second one; the
+  subscription, `Done` and dependency rollback are released by the terminal
+  itself, so `task.Start` users need no scope object. `CompleteWithUsage`
+  carries the snapshot. `Agent.Task` keeps its doc-only deprecation (D-083);
+  the compatible replacement is now `task.New`/`task.Start` with a `task.Spec`.
+- **Panics.** Upstream fails a task on any `BaseException` from a tool. AGo's
+  tool layer already recovers every tool panic into a `ToolErrorEvent`
+  (`tools.FunctionTool.callFn`), so a panicking tool is a tool error and the
+  run still reaches `TaskCompleted`; the panic never escapes. A panic in
+  middleware or elsewhere in the turn goroutine is recovered by
+  `executeTurn`, surfaces as the run error, and reaches `TaskFailed`. Both
+  paths are covered by tests.
+- **Not ported (D-093b).** TTL remains an external observation deadline (no
+  timer); `TaskExpired` adoption from an observer is supported. Upstream's
+  `DelegationRegistry`/`settle_descendants`/`cancel_descendants` and the
+  downlink remain out of scope (D-092). `Agent.task()` still emits no runtime
+  `DeprecationWarning` (D-083).
+
+Verified by `agent/lifecycle_test.go` (untagged calls, tagged ask/run,
+terminal-on-close, undriven scope, TTL, setup failure, cancellation, middleware
+and tool panics, continuations, delegation spec/parent-call, parent
+cancellation to the child, usage read failure, delegated turn panic, retention)
+and `task/start_test.go` (New/Start split, publisher bypass, external identity,
+non-injection, adoption, failed start keeps a terminal-capable handle).
+Regression: the T8 suite, including the order-sensitive delegation tests
+(`-count=200`) and `go test ./agent/ -count=20`. Gates (2026-11-09):
+`go build ./...`, `go vet ./...`, `go test ./...` (three consecutive green
+runs). `go test -race` still cannot run in this container (no cgo/gcc).

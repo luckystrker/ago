@@ -67,7 +67,9 @@ func BuildTrace(evs []events.Event) *Trace {
 			}
 			t.FinishedAt = at
 		}
-		switch e := events.AsValue(ev).(type) {
+		observed := isChildObservation(ev)
+		source := events.SourceEvent(ev)
+		switch e := events.AsValue(source).(type) {
 		case events.ModelRequest:
 			pendingInput = renderParts(e.Parts)
 		case events.DrainedModelRequest:
@@ -91,7 +93,11 @@ func BuildTrace(evs []events.Event) *Trace {
 				Provider:   e.Provider,
 			})
 			pendingInput, lastUsage = "", events.Usage{}
-			final = e.Content()
+			if !observed {
+				// The graded answer is the root agent's; a descendant's response
+				// is an LLMCall in the trajectory, never the final answer.
+				final = e.Content()
+			}
 		case events.ToolCallEvent:
 			addToolCall(t, indexByCallID, e.ID, e.Name, e.Arguments)
 		case events.BuiltinToolCallEvent:
@@ -118,6 +124,16 @@ func BuildTrace(evs []events.Event) *Trace {
 	}
 	t.FinalResponse = final
 	return t
+}
+
+// isChildObservation reports a forwarded descendant event. Its source event
+// contributes calls/tools to the trace; only local events may set FinalResponse.
+func isChildObservation(ev events.Event) bool {
+	switch events.AsValue(ev).(type) {
+	case events.ChildEvent, events.TransientChildEvent:
+		return true
+	}
+	return false
 }
 
 func addToolCall(t *Trace, indexByCallID map[string]int, id, name, arguments string) {

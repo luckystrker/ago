@@ -107,6 +107,19 @@ func serveTurn(ctx context.Context, a *agent.Agent, input RunAgentInput, emit fu
 	emit(NewRunStartedEvent(input.ThreadID, input.RunID))
 
 	if err := run.Start(ctx); err != nil {
+		// A turn canceled while queued for its stream lock ends as a cancelled
+		// run, not a protocol error (the same outcome as cancellation during
+		// Result below).
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			emit(RunFinishedEvent{
+				baseEvent: baseEvent{Type: EventRunFinished, Timestamp: TimestampMs()},
+				ThreadID:  input.ThreadID,
+				RunID:     input.RunID,
+				Outcome:   CancelledOutcome{},
+				Usage:     proj.TakeUsage(),
+			})
+			return nil
+		}
 		emit(runErrorEvent(err))
 		return nil
 	}

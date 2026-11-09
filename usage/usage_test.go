@@ -47,6 +47,32 @@ func TestGroupsByModelAndProvider(t *testing.T) {
 	}
 }
 
+// TestExtendedCacheWritesCountAsReported covers Usage.__bool__ parity: an
+// extended cache-write count alone makes the usage non-empty and reaches the
+// totals, while an all-zero record stays unset.
+func TestExtendedCacheWritesCountAsReported(t *testing.T) {
+	if !Reported(events.Usage{CacheCreationExtendedInputTokens: events.I64(1)}) {
+		t.Error("a non-zero extended cache-write count must count as reported")
+	}
+	if Reported(events.Usage{CacheCreationExtendedInputTokens: events.I64(0)}) {
+		t.Error("a measured zero alone must stay unreported")
+	}
+
+	report := FromEvents([]events.Event{
+		&events.UsageEvent{
+			Usage: events.Usage{
+				CacheCreationInputTokens:         events.I64(1000),
+				CacheCreationExtendedInputTokens: events.I64(800),
+			},
+			Kind: events.UsageKindModelCall,
+		},
+	})
+	want := events.Usage{CacheCreationInputTokens: events.I64(1000), CacheCreationExtendedInputTokens: events.I64(800)}
+	if !usageEqual(report.Total, want) {
+		t.Fatalf("total = %+v, want %+v", report.Total, want)
+	}
+}
+
 // TestSubtaskRollupHasNoDoubleCount mirrors ag2/test/test_usage.py: the parent
 // made one model call, a subtask rolled its own spend into a single subtask
 // UsageEvent, and the report sums both without double counting.
@@ -225,5 +251,56 @@ func usageEqual(a, b events.Usage) bool {
 		same(a.TotalTokens, b.TotalTokens) &&
 		same(a.CacheReadInputTokens, b.CacheReadInputTokens) &&
 		same(a.CacheCreationInputTokens, b.CacheCreationInputTokens) &&
+		same(a.CacheCreationExtendedInputTokens, b.CacheCreationExtendedInputTokens) &&
 		same(a.ThinkingTokens, b.ThinkingTokens)
+}
+
+// TestFromEventsDeduplicatesSourceRecords pins the delegation accounting rule:
+// the same source event_id counts once even when a forwarded copy and an
+// archived observation envelope both carry it; records without an id stay
+// distinct, preserving compatibility with hand-built fixtures.
+func TestFromEventsDeduplicatesSourceRecords(t *testing.T) {
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(30)}, events.UsageKindModelCall)
+	source.Model = "leaf"
+	report := FromEvents([]events.Event{source, source})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 30 {
+		t.Fatalf("total = %v, want 30", report.Total.TotalTokens)
+	}
+	if len(report.Records) != 1 {
+		t.Fatalf("records = %d, want 1", len(report.Records))
+	}
+
+	wrapped := events.NewChildEvent(source, "t", []string{"t"}, "leaf", source.EventID)
+	report = FromEvents([]events.Event{source, wrapped})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 30 {
+		t.Fatalf("wrapped total = %v, want 30", report.Total.TotalTokens)
+	}
+	if _, ok := EventFrom(wrapped); !ok {
+		t.Fatal("EventFrom did not resolve an archived ChildEvent envelope")
+	}
+
+	legacyA, legacyB := modelCall(1, 0, "m", "p"), modelCall(1, 0, "m", "p")
+	report = FromEvents([]events.Event{legacyA, legacyB})
+	if report.Total.PromptTokens == nil || *report.Total.PromptTokens != 2 {
+		t.Fatalf("id-less fixtures collapsed: %v", report.Total.PromptTokens)
+	}
+}
+
+// TestFromEventsNestedArchiveEnvelope pins a replayed delegation tree: nested
+// ChildEvent envelopes resolve to the one source record they wrap, and a sibling
+// copy of that record (the bare forwarded event) still counts once.
+func TestFromEventsNestedArchiveEnvelope(t *testing.T) {
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(12)}, events.UsageKindModelCall)
+	leaf := events.NewChildEvent(source, "leaf", []string{"worker", "leaf"}, "leaf", source.EventID)
+	root := events.NewChildEvent(leaf, "worker", []string{"worker"}, "worker", "worker-event")
+	if got, ok := EventFrom(root); !ok || got.EventID != source.EventID {
+		t.Fatalf("EventFrom(nested) = %+v/%v, want the source record", got, ok)
+	}
+	report := FromEvents([]events.Event{root, source, leaf})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 12 {
+		t.Fatalf("total = %v, want 12 counted once", report.Total.TotalTokens)
+	}
+	if len(report.Records) != 1 {
+		t.Fatalf("records = %d, want 1", len(report.Records))
+	}
 }

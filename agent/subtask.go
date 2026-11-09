@@ -2,18 +2,19 @@ package agent
 
 import (
 	stdcontext "context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/context"
-	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/hitl"
 	"github.com/luckystrker/ago/internal/uuid"
 	"github.com/luckystrker/ago/stream"
+	"github.com/luckystrker/ago/task"
 	"github.com/luckystrker/ago/tools"
-	"github.com/luckystrker/ago/usage"
 )
 
 // TaskConfig configures the auto-injected subtask tools (Python parity:
@@ -49,10 +50,10 @@ type TaskConfig struct {
 }
 
 // bypassKey is the variables key Python's approval middleware stores "always"
-// grants under (middleware/builtin/tools/approval.py BYPASS_KEY). Tool approvals
-// are not inherited by a sub-task: exactly this key is dropped from the copied
-// variables so the child asks again (Python parity: run_task.py
-// `if k != BYPASS_KEY` — filter by key, not by prefix).
+// grants under (middleware/builtin/tools/approval.py BYPASS_KEY). It lives under
+// the reserved "ag:" prefix, so derive_child_variables never hands it to a
+// sub-task: the child asks again. The constant remains the contract used by the
+// delegation tests and documents the key the reserved-prefix rule covers.
 const bypassKey = "ag:approval_required:always"
 
 // Delegation tool descriptions (Python parity: _RUN_SUBTASK_DESCRIPTION /
@@ -146,103 +147,48 @@ type taskResult struct {
 	objective   string
 	result      string
 	completed   bool
+	cancelled   bool
 	childStream stream.Stream
 	err         error
 }
 
-// usagePair is one (Provider, Model) attribution candidate behind a spend.
-type usagePair struct{ provider, model string }
+// heldStreamsDependencyKey carries the chain of stream ids owned by enclosing
+// turns into a delegated run, so a grandchild reusing any ancestor's stream is
+// rejected before it can block on a non-reentrant per-stream lock.
+const heldStreamsDependencyKey = "ago:held-streams"
 
-// rollupUsage aggregates the child transcript into one subtask UsageEvent on
-// the parent stream (Python parity: run_task._emit_rollup — the child's per-call
-// events stay on the child stream, so the additive report sees the delegation
-// once). Only events appended at index start and later count toward the rollup:
-// Python scopes the rollup with a usage subscription registered per call, so a
-// stream reused across sequential delegations (the persistent_stream behavior
-// of AsTool) reports only this invocation's spend, never an earlier one's.
-// Attribution is stamped only when exactly one (Provider, Model) pair is
-// behind the spend, and only events with reported tokens vote (Python parity:
-// _sole_pair — a nested delegation's unlabelled rollup counts as a pair and
-// correctly leaves the parent unlabelled). A nested rollup is flattened into
-// Parts in place of itself (Python parity: `event.parts or [event]`). The
-// rollup's total_tokens survives only when every counted call reported one
-// (Python parity: _rollup_usage); the returned Usage is the stream's cumulative
-// total (Python parity: reply.usage().total — the running total on a reused
-// stream) and the bool reports whether this invocation spent anything.
-func rollupUsage(parentCX *context.Context, label string, childStream stream.Stream, start int) (events.Usage, bool) {
-	history, err := childStream.History().GetEvents()
-	if err != nil {
-		return events.Usage{}, false
+func heldStreamsOf(cx *context.Context) []string {
+	if cx == nil {
+		return nil
 	}
-	var (
-		pairs map[usagePair]struct{}
-		parts []events.UsageEvent
-		spent events.Usage
-		total events.Usage
-		// totalsReported stays true while every counted call carried
-		// total_tokens (Python parity: _rollup_usage).
-		totalsReported = true
-	)
-	for i, ev := range history {
-		ue, ok := events.AsValue(ev).(events.UsageEvent)
-		if !ok || !usage.Reported(ue.Usage) {
-			continue
-		}
-		total = total.Add(ue.Usage)
-		if i < start {
-			continue // an earlier delegation's spend: its own rollup already reported it
-		}
-		if pairs == nil {
-			pairs = make(map[usagePair]struct{})
-		}
-		pairs[usagePair{ue.Provider, ue.Model}] = struct{}{}
-		if len(ue.Parts) > 0 {
-			parts = append(parts, ue.Parts...)
-		} else {
-			parts = append(parts, ue)
-		}
-		if ue.Usage.TotalTokens == nil {
-			totalsReported = false
-		}
-		spent = spent.Add(ue.Usage)
-	}
-	if !usage.Reported(spent) {
-		return total, false
-	}
-	out := &events.UsageEvent{Usage: spent, Kind: events.UsageKindSubtask, Label: label, Parts: parts}
-	// total_tokens survives only when every counted call reported one: a partial
-	// sum falls below the counts it is meant to cover (Python parity:
-	// _rollup_usage). The returned Usage keeps the plain sum — TaskCompleted
-	// carries it, like AgentReply.usage in Python.
-	if !totalsReported {
-		out.Usage.TotalTokens = nil
-	}
-	if len(pairs) == 1 {
-		for p := range pairs {
-			out.Provider, out.Model = p.provider, p.model
+	if v, ok := cx.Dependency(heldStreamsDependencyKey); ok {
+		if ids, ok := v.([]string); ok {
+			return append([]string(nil), ids...)
 		}
 	}
-	_ = parentCX.Send(out)
-	return total, true
+	return nil
 }
 
 // runTaskOn runs child as a sub-task of the conversation parentCX and reports
 // the delegation on the parent stream (Python parity:
-// tools/subagents/run_task.py run_task): TaskStarted before the child turn, one
-// rolled-up subtask UsageEvent and TaskCompleted/TaskFailed after. The child
+// tools/subagents/run_task.py run_task): TaskStarted before the child turn,
+// TaskCompleted/TaskFailed/TaskCancelled after, all authored on the child stream
+// and relayed upward by a Forwarder. Operational child events arrive at the
+// parent as ChildEvent observations; source UsageEvents arrive as themselves
+// with delegation provenance, so there is no rollup to reconcile. The child
 // transcript persists into the parent's storage under the child's own stream id;
-// the child run starts from a copy of the parent's dependencies and variables
-// (minus the approval bypass key — tool approvals are not inherited) and its
-// variable mutations stay scoped to the child run. When the child has no HITL
-// hook of its own and the parent has one, questions asked inside the child are
-// bridged: a copy stamped with the task id goes to the parent stream and the
-// parent's hook answers.
+// the child run starts from a copy of the parent's dependencies and a scoped
+// variable branch (COPIED values deep-copied, LOCAL and reserved control-plane
+// keys dropped, SHARED bindings reused), so its mutations stay scoped to the
+// branch except for SHARED rebinding. When the child has no HITL hook of its own
+// and the parent has one, questions asked inside the child are bridged: the
+// child's request is forwarded as a ChildEvent and the parent's hook answers.
 //
 // A hitl failure comes back as the error result — it must end the calling turn
 // (Python parity: run_task re-raises HumanInputError). Any other failure is
 // reported in the returned taskResult with completed=false and becomes the
-// delegating tool's "Error: ..." output; TaskFailed and the rollup are emitted
-// on both paths.
+// delegating tool's "Error: ..." output; the terminal task event is emitted on
+// both paths.
 func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, objective, contextStr string) (taskResult, error) {
 	taskID := strings.ReplaceAll(uuid.New(), "-", "") // Python parity: uuid4().hex
 	prompt := objective
@@ -261,97 +207,136 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	if childStream == nil {
 		childStream = stream.NewMemoryStream(stream.WithStorage(parentCX.Stream.History().Storage()))
 	}
-	// The rollup counts only what this invocation appends: a stream base reused
-	// across sequential delegations already carries the earlier ones' spend, and
-	// Python scopes its per-call usage subscription the same way (run_task
-	// registers it after TaskStarted and removes it in the same finally).
-	invocationStart := 0
-	if evs, err := childStream.History().GetEvents(); err == nil {
-		invocationStart = len(evs)
+
+	// A stream already owned by an enclosing turn in this call chain cannot be
+	// entered again: the process-wide turn lock is not reentrant (upstream's
+	// asyncio lock would queue forever). Reject the delegation instead of
+	// deadlocking; nested delegations normally use a fresh child stream.
+	heldStreams := append(heldStreamsOf(parentCX), parentCX.Stream.ID())
+	var nestedErr error
+	for _, id := range heldStreams {
+		if id != "" && id == childStream.ID() {
+			nestedErr = fmt.Errorf("%w: stream %s is held by an enclosing turn", ErrNestedSameStream, id)
+			break
+		}
 	}
 
-	if err := parentCX.Send(&events.TaskStarted{
-		TaskID:           taskID,
-		AgentName:        child.Name(),
-		Objective:        objective,
-		ParentToolCallID: parentCX.ToolCallID,
-	}); err != nil {
-		return taskResult{}, err
-	}
+	// The relay is installed by the child turn scope, after the per-stream lock
+	// is held: a delegation queued behind another one on a shared stream must not
+	// capture that invocation's events (upstream Forwarder.execution inside
+	// _turn_scope). The lifecycle publishes TaskStarted as the first event.
+	forwarder := newForwarder(parentCX, childStream, taskID, child.Name())
+	var run *AgentRun
 
 	// fail reports a failed delegation the way Python's except branch does:
-	// rollup (nothing spent → skipped) and TaskFailed on every path, hitl
-	// failures re-raised so they end the calling turn.
+	// exactly one terminal task event on every path, hitl failures re-raised so
+	// they end the calling turn. A cancelled run reports TaskCancelled and is a
+	// normal (non-hitl) result for the delegating tool.
+	//
+	// A failure inside an entered scope closes the run, which awaits the turn,
+	// publishes the terminal through the still-installed relay under the
+	// per-stream lock, and only then stops the relay and releases the lock
+	// (upstream Forwarder.execution's finally). A failure before the scope was
+	// entered uses lifecycle.reject: started+terminal go straight to the parent,
+	// without touching the child stream.
 	fail := func(err error) (taskResult, error) {
-		rollupUsage(parentCX, child.Name(), childStream, invocationStart)
-		_ = parentCX.Send(&events.TaskFailed{
-			TaskID:    taskID,
-			AgentName: child.Name(),
-			Objective: objective,
-			Error:     err.Error(),
-		})
+		lc := (*runLifecycle)(nil)
+		if run != nil {
+			lc = run.lifecycle
+		}
+		if lc == nil {
+			lc = rejectLifecycle(child, childStream, forwarder, taskID, objective, parentCX.ToolCallID)
+		}
+		if lc.failure == nil {
+			lc.failure = err
+		}
+		lc.cancelReason = ParentCancelledReason
+		if lc.started() {
+			if run != nil {
+				run.Close()
+			} else if ferr := lc.finish(); ferr != nil {
+				slog.Error("agent: delegation terminal publication failed", "agent", child.Name(), "err", ferr)
+			}
+		} else {
+			lc.publisher = forwarder.reject
+			if ferr := lc.reject(err); ferr != nil {
+				slog.Error("agent: rejected delegation lifecycle failed", "agent", child.Name(), "err", ferr)
+			}
+			if run != nil {
+				run.Close()
+			}
+		}
+		if errors.Is(err, stdcontext.Canceled) {
+			return taskResult{
+				taskID:      taskID,
+				objective:   objective,
+				cancelled:   true,
+				childStream: childStream,
+				err:         err,
+			}, nil
+		}
 		if hitl.IsError(err) {
 			return taskResult{}, err
 		}
 		return taskResult{taskID: taskID, objective: objective, childStream: childStream, err: err}, nil
 	}
 
-	run, err := child.newRun(childStream, prompt)
+	if nestedErr != nil {
+		return fail(nestedErr)
+	}
+
+	var err error
+	run, err = child.newRunWith(childStream, context.DeriveChildVariables(parentCX.VariableStore()), prompt)
 	if err != nil {
 		return fail(err)
 	}
 	defer run.Close()
 
-	// The child run starts from the parent's state merged over the child agent's
-	// own option maps (newRun already seeded those): Python passes
-	// dependencies=parent_context.dependencies.copy() / variables minus the
-	// bypass key into agent.ask, and __build_context unions them as
-	// self._agent_dependencies | overrides — the delegated agent's own
-	// WithDependencies/WithVariables survive, the parent's snapshot wins only on
-	// shared keys. Replacing the maps instead would strip the child of its own
-	// injected state, which its tools read at call time. The bypass key is
-	// dropped from the parent's copy, so approvals are not inherited and
-	// concurrent sibling tasks cannot clobber each other.
+	// The delegation uses the same lifecycle as an ordinary run: same Task
+	// transitions, objective title, the caller's task id and tool-call id. The
+	// forwarder keeps addressing/forwarding; it constructs no terminal events of
+	// its own (upstream Forwarder.lifecycle).
+	lc := newRunLifecycle(child.Name(), task.Spec{Title: objective}, run.cx)
+	lc.taskID = taskID
+	lc.parentToolCallID = parentCX.ToolCallID
+	lc.accounting = forwarder.accountingEvents
+	lc.cancelReason = ParentCancelledReason
+	run.lifecycle = lc
+	run.delegation = forwarder
+
+	// The child run starts from the parent's dependencies merged over the child
+	// agent's own option maps (newRun already seeded those): Python passes
+	// dependencies=parent_context.dependencies.copy() into agent.ask, and
+	// __build_context unions them as self._agent_dependencies | overrides — the
+	// delegated agent's own WithDependencies survive, the parent's snapshot wins
+	// only on shared keys. Replacing the map instead would strip the child of its
+	// own injected state, which its tools read at call time.
 	for k, v := range parentCX.DependenciesSnapshot() {
 		run.cx.Dependencies[k] = v
 	}
-	vars := parentCX.VariablesSnapshot()
-	delete(vars, bypassKey)
-	for k, v := range vars {
-		run.cx.Variables[k] = v
-	}
+	// Nested delegations extend this forwarder's path when stamping their own
+	// provenance.
+	run.cx.SetDependency(forwarderDependencyKey, forwarder)
+	run.cx.SetDependency(heldStreamsDependencyKey, heldStreams)
 
 	// HITL bridge: a child without its own hook asks through the parent's
 	// (Python parity: run_task installs the bridge when the agent has no
 	// _hitl_hook). The parent hook is the middleware-wrapped one installed on
-	// the parent's run context, so the answer follows the asking context and
-	// lands on the child stream as the reply to the child's request.
+	// the parent's run context. The question and answer already reach the parent
+	// stream as ChildEvent observations through the forwarder; the bridge only
+	// supplies the answer, so it must not publish a second copy.
 	child.mu.Lock()
 	childHook := child.opts.hitl
 	child.mu.Unlock()
 	if childHook == nil {
 		if parentHook := parentCX.Hook(); parentHook != nil {
-			run.cx.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
-				// Observers on the parent stream see this delegation asking; the
-				// answer is matched on the original request id, so the copy keeps
-				// it and a nested delegation's stamp is replaced.
-				stamped := *req
-				stamped.TaskID = taskID
-				_ = parentCX.Stream.Send(&stamped)
-				return parentHook(hctx, req)
-			})
+			run.cx.SetHitlHook(parentHook)
 		}
-		// AGO-DEVIATION: the forwarded question is transcribed on the parent
-		// stream — Python swallows it with a per-turn interrupter, which AGo
-		// subscribers (event only, no context) cannot replicate; the per-turn
-		// wiring is why the bridge calls the hook directly (docs/DECISIONS.md
-		// D-013, D-040). Without a hook on either side the child's Context.Ask
-		// refuses with hitl.NotProvidedError — the default_hitl_hook refusal,
-		// carried through the tool layer as a turn-ending hitl error.
+		// Without a hook on either side the child's Context.Ask refuses with
+		// hitl.NotProvidedError — the default_hitl_hook refusal, carried through
+		// the tool layer as a turn-ending hitl error.
 	}
 
-	// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-	// delegation cannot be cancelled through the caller's tool call.
 	if err := run.Start(ctx); err != nil {
 		return fail(err)
 	}
@@ -360,15 +345,11 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return fail(err)
 	}
 
-	total, _ := rollupUsage(parentCX, child.Name(), childStream, invocationStart)
-	_ = parentCX.Send(&events.TaskCompleted{
-		TaskID:     taskID,
-		AgentName:  child.Name(),
-		Objective:  objective,
-		Result:     reply.Body(),
-		TaskStream: childStream.ID(),
-		Usage:      total,
-	})
+	// The completed event carries the child stream's cumulative spend for
+	// inspection; the additive accounting already travelled as source
+	// UsageEvents, so a reader must never sum this snapshot. The deferred Close
+	// publishes it (with the forwarder's retained accounting merged in).
+	lc.result = reply.Body()
 	return taskResult{
 		taskID:      taskID,
 		objective:   objective,
@@ -378,6 +359,19 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	}, nil
 }
 
+// rejectLifecycle builds the lifecycle of a delegation that never entered its
+// turn. Its publisher is the forwarder's reject path, so the started and
+// terminal events reach the parent without touching the child stream (which may
+// be owned by a busy enclosing turn).
+func rejectLifecycle(child *Agent, childStream stream.Stream, f *forwarder, taskID, objective, parentToolCallID string) *runLifecycle {
+	lc := newRunLifecycle(child.Name(), task.Spec{Title: objective}, context.New(childStream))
+	lc.taskID = taskID
+	lc.parentToolCallID = parentToolCallID
+	lc.publisher = f.reject
+	lc.cancelReason = ParentCancelledReason
+	return lc
+}
+
 // run_subtask tool -----------------------------------------------------------
 
 func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
@@ -385,13 +379,14 @@ func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
 		Task string `json:"task" agschema:"description=The objective for the subtask agent,required"`
 	}
 	fn := func(args subtaskArgs, cx *context.Context) (string, error) {
-		// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-		// delegation cannot be cancelled through the caller's tool call.
-		res, err := runTaskOn(stdcontext.Background(), cx, r.childAgent(tc, "subtask"), args.Task, "")
+		res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, "subtask"), args.Task, "")
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
+		}
+		if res.cancelled {
+			return "Sub-task cancelled: " + res.err.Error(), nil
 		}
 		if !res.completed {
 			return "Error: " + res.err.Error(), nil
@@ -426,10 +421,13 @@ func (r *AgentRun) newRunSubtasksTool(tc *TaskConfig) tools.Tool {
 		// the combined output (Python parity: `_spawn_subtask` returns
 		// f"Error: {result.error}"), hitl failures end the whole call.
 		runOne := func(i int, task string) error {
-			// AGO-DEVIATION: no stdlib context flows through tool execution.
-			res, err := runTaskOn(stdcontext.Background(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
+			res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
 			if err != nil {
 				return err
+			}
+			if res.cancelled {
+				results[i] = "Sub-task cancelled: " + res.err.Error()
+				return nil
 			}
 			if !res.completed {
 				results[i] = "Error: " + res.err.Error()

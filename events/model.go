@@ -1,6 +1,11 @@
 package events
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+
+	"github.com/luckystrker/ago/internal/uuid"
+)
 
 // Usage is the normalized token record (Python parity: field-wise add, nil = not reported).
 // AGO-DEVIATION: Python uses float|None; token counts are integers, so AGo uses *int64 (D-006).
@@ -10,7 +15,13 @@ type Usage struct {
 	TotalTokens              *int64 `json:"total_tokens,omitempty"`
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
-	ThinkingTokens           *int64 `json:"thinking_tokens,omitempty"`
+	// CacheCreationExtendedInputTokens is the part of CacheCreationInputTokens
+	// written with the provider's extended cache retention: OpenAI's 12-hour
+	// TTL, Anthropic's 1-hour TTL. Extended writes are priced differently, so
+	// cost accounting needs the split; the duration itself is provider-specific.
+	// Nil means the provider reported no per-retention breakdown.
+	CacheCreationExtendedInputTokens *int64 `json:"cache_creation_extended_input_tokens,omitempty"`
+	ThinkingTokens                   *int64 `json:"thinking_tokens,omitempty"`
 }
 
 func addPtr(a, b *int64) *int64 {
@@ -29,12 +40,13 @@ func addPtr(a, b *int64) *int64 {
 // Add returns the field-wise sum; nil+nil stays nil.
 func (u Usage) Add(o Usage) Usage {
 	return Usage{
-		PromptTokens:             addPtr(u.PromptTokens, o.PromptTokens),
-		CompletionTokens:         addPtr(u.CompletionTokens, o.CompletionTokens),
-		TotalTokens:              addPtr(u.TotalTokens, o.TotalTokens),
-		CacheReadInputTokens:     addPtr(u.CacheReadInputTokens, o.CacheReadInputTokens),
-		CacheCreationInputTokens: addPtr(u.CacheCreationInputTokens, o.CacheCreationInputTokens),
-		ThinkingTokens:           addPtr(u.ThinkingTokens, o.ThinkingTokens),
+		PromptTokens:                     addPtr(u.PromptTokens, o.PromptTokens),
+		CompletionTokens:                 addPtr(u.CompletionTokens, o.CompletionTokens),
+		TotalTokens:                      addPtr(u.TotalTokens, o.TotalTokens),
+		CacheReadInputTokens:             addPtr(u.CacheReadInputTokens, o.CacheReadInputTokens),
+		CacheCreationInputTokens:         addPtr(u.CacheCreationInputTokens, o.CacheCreationInputTokens),
+		CacheCreationExtendedInputTokens: addPtr(u.CacheCreationExtendedInputTokens, o.CacheCreationExtendedInputTokens),
+		ThinkingTokens:                   addPtr(u.ThinkingTokens, o.ThinkingTokens),
 	}
 }
 
@@ -126,15 +138,53 @@ const (
 )
 
 // UsageEvent is persisted token telemetry; not part of the conversational transcript.
+// It is an inert event: a delegation forwards the source record itself, stamped
+// with the delegation path, so an ancestor can account for it once by EventID.
 type UsageEvent struct {
 	Base
-	Usage        Usage        `json:"usage"`
-	Kind         string       `json:"kind"`
-	Model        string       `json:"model,omitempty"`
+	InertEvent
+	// EventID identifies the source accounting record. Delegation forwards this
+	// record unchanged, so ancestors deduplicate the same expenditure by it.
+	// NewUsageEvent and EnsureEventID fill it; archived records decode with one
+	// generated when the field is absent.
+	//
+	// AGO-DEVIATION: Python's default_factory fills this on construction; Go has
+	// no struct-field defaults, so producers call the constructor (D-091).
+	EventID string `json:"event_id"`
+	Usage   Usage  `json:"usage"`
+	Kind    string `json:"kind"`
+	Model   string `json:"model,omitempty"`
+	// TaskID and AgentName name the delegation that spent these tokens; empty
+	// for the local agent's own spend.
+	TaskID       string       `json:"task_id,omitempty"`
+	AgentName    string       `json:"agent_name,omitempty"`
 	Provider     string       `json:"provider,omitempty"`
 	FinishReason string       `json:"finish_reason,omitempty"`
 	Label        string       `json:"label,omitempty"`
 	Parts        []UsageEvent `json:"parts,omitempty"`
+}
+
+// NewUsageEvent builds a source accounting record with a fresh event id.
+func NewUsageEvent(usage Usage, kind string) *UsageEvent {
+	return &UsageEvent{EventID: newUsageEventID(), Usage: usage, Kind: kind}
+}
+
+// SetInertIdentity stamps the delegation that spent these tokens.
+func (u *UsageEvent) SetInertIdentity(taskID, agentName string) {
+	u.TaskID, u.AgentName = taskID, agentName
+}
+
+// EnsureEventID returns the record's source id, generating it on first use.
+// It mutates the field, so call it before publishing the event, not concurrently.
+func (u *UsageEvent) EnsureEventID() string {
+	if u.EventID == "" {
+		u.EventID = newUsageEventID()
+	}
+	return u.EventID
+}
+
+func newUsageEventID() string {
+	return strings.ReplaceAll(uuid.New(), "-", "")
 }
 
 func (UsageEvent) EventType() string    { return "UsageEvent" }
@@ -142,12 +192,43 @@ func (UsageEvent) Transient() bool      { return false }
 func (UsageEvent) Conversational() bool { return false }
 
 func (u *UsageEvent) UnmarshalJSON(data []byte) error {
-	type alias UsageEvent
-	var a alias
-	if err := json.Unmarshal(data, &a); err != nil {
+	var wire struct {
+		Base
+		Path         []string     `json:"path,omitempty"`
+		EventID      *string      `json:"event_id"`
+		Usage        Usage        `json:"usage"`
+		Kind         string       `json:"kind"`
+		Model        string       `json:"model,omitempty"`
+		TaskID       string       `json:"task_id,omitempty"`
+		AgentName    string       `json:"agent_name,omitempty"`
+		Provider     string       `json:"provider,omitempty"`
+		FinishReason string       `json:"finish_reason,omitempty"`
+		Label        string       `json:"label,omitempty"`
+		Parts        []UsageEvent `json:"parts,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
-	*u = UsageEvent(a)
+	*u = UsageEvent{
+		Base:         wire.Base,
+		InertEvent:   InertEvent{Path: wire.Path},
+		Usage:        wire.Usage,
+		Kind:         wire.Kind,
+		Model:        wire.Model,
+		TaskID:       wire.TaskID,
+		AgentName:    wire.AgentName,
+		Provider:     wire.Provider,
+		FinishReason: wire.FinishReason,
+		Label:        wire.Label,
+		Parts:        wire.Parts,
+	}
+	// An absent field is an id-less archived record; an explicit empty value is
+	// preserved so the wire round-trip stays lossless.
+	if wire.EventID != nil {
+		u.EventID = *wire.EventID
+	} else {
+		u.EventID = newUsageEventID()
+	}
 	return nil
 }
 

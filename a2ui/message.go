@@ -21,13 +21,13 @@ var (
 
 // Message is one server→client A2UI message — the ServerToClientMessage union
 // of _types.py. Exactly one payload field must be set; MarshalJSON emits the
-// single-key envelope {"version": "v1.0", "<payload>": {...}} and
+// single-key envelope {"version": "1.0", "<payload>": {...}} and
 // UnmarshalJSON enforces the same shape on input.
 //
 // A Message is safe for concurrent use as long as its payload values are:
 // the struct is a plain value type.
 type Message struct {
-	Version string // always VersionV1 in this port
+	Version string // wire version; "" means WireVersionV1
 
 	CreateSurface         *CreateSurface
 	UpdateComponents      *UpdateComponents
@@ -102,7 +102,7 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	}
 	version := m.Version
 	if version == "" {
-		version = VersionV1
+		version = WireVersionV1
 	}
 	var b bytes.Buffer
 	b.WriteString(`{"version":`)

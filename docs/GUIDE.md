@@ -97,14 +97,20 @@ middleware and observers receive: the stream, the system-prompt fragments, depen
 (DI) and variable maps, and the HITL hook.
 
 ```go
-cx := agocontext.New(s)          // or NewWithDeps(s, deps, vars)
+cx := agocontext.New(s)          // or NewWithDeps(s, deps, vars) / NewWithVariables(s, deps, store)
 cx.AddPrompt("Extra fragment.")  // system-prompt lines
 cx.SetDependency("db", pool)     // DI: tools.Inject reads this
-cx.SetVariable("tone", "terse")  // variables: tools.Variable reads this
+if err := cx.SetVariable("tone", "terse"); err != nil {
+	return err // *agocontext.ScopeError: conflicting scope declaration
+}
+tone, _ := cx.Variable("tone")   // tools.Variable reads this too
 ```
 
-It is safe for concurrent use; `Clone()` shares the stream but copies the maps (the
-agent clones the context between turns, so per-turn mutations do not leak backwards).
+It is safe for concurrent use. `Clone()` shares the stream and branches the variable
+store: branch values are copied between turns, while a `ScopeShared` binding stays one
+tree-wide value across a continuation. Declare delegation scopes with
+`agocontext.ScopedValue` (`ScopeCopied` default, `ScopeLocal`, `ScopeShared`); a delegated
+child receives a derived branch (deep copy / drop / reuse) rather than a flat copy.
 
 ## Agents
 
@@ -242,27 +248,33 @@ a := agent.New("lead", "Delegate research to subtasks.", agent.WithConfig(cfg),
 ```
 
 Every delegation is reported on the caller's stream: `TaskStarted` before the child
-turn, `TaskCompleted`/`TaskFailed` after, and the child's spend as one rolled-up
-`UsageEvent{Kind: "subtask"}` — `reply.Usage().ByKind["subtask"]` reports it. The
-child starts from a copy of the caller's dependencies and variables (the approval
-bypass key `ag:approval_required:always` is dropped, so tool approvals are not
-inherited) and its variable mutations stay scoped to the child run. A failed sub-task
-comes back as `Error: …` text in the tool result, so the model can react;
-`run_subtasks` joins the answers as `## <task>` sections.
+turn, `TaskCompleted`/`TaskFailed`/`TaskCancelled` after, all relayed from the child
+stream. Operational child events (model/tool/HITL traffic) reach the caller as
+`ChildEvent`/`TransientChildEvent` observations — observers see them, but the
+caller's model, tools and HITL do not react to them. The child's spend arrives as its
+own source `UsageEvent` records, stamped with `path`, `task_id` and `agent_name`;
+there is no subtask rollup, and `reply.Usage()` deduplicates source records by
+`event_id`. `TaskCompleted.Usage` is a cumulative snapshot of the child stream for
+inspection — never add it to the source records. The child starts from a copy of the
+caller's dependencies and variables (the approval bypass key
+`ag:approval_required:always` is dropped, so tool approvals are not inherited) and
+its variable mutations stay scoped to the child run. A failed sub-task comes back as
+`Error: …` text in the tool result, so the model can react; `run_subtasks` joins the
+answers as `## <task>` sections.
 
 If the child has no HITL hook of its own, its questions are bridged to the parent's
-hook: a copy of the request stamped with the task id is sent to the parent stream (the
-one delegation event that *is* transcribed there), and only the answer lands in the
-child's transcript. With no hook on either side, the calling turn ends with a
+hook. The question and answer reach the parent stream only as `ChildEvent`
+observations; the bridge supplies the answer and the question is not re-published as
+a local trigger. With no hook on either side, the calling turn ends with a
 `*hitl.NotProvidedError`.
 
 ### Agents as tools
 
 `AsTool` exposes an agent as a callable tool for another agent. It delegates through
 the same machinery as `WithTasks`: the tool takes an `objective` (plus optional
-`context`), the caller's stream gets `TaskStarted`/`TaskCompleted`/`TaskFailed` and
-the rolled-up subtask usage, and the child runs on its own stream persisted into the
-caller's storage. The child's final text is the tool result; a failed sub-task is the
+`context`), the caller's stream gets `TaskStarted`/`TaskCompleted`/`TaskFailed`
+(relayed with delegation provenance) and the child's source usage records, and the
+child runs on its own stream persisted into the caller's storage. The child's final text is the tool result; a failed sub-task is the
 text `Sub-task '<name>' failed: …`. The default tool name is `task_<name>`
 (`WithToolName` overrides it; Python parity — it was `ask_<name>` in earlier AGo
 builds):
@@ -1179,6 +1191,8 @@ answers with clicks and function calls. The package pieces:
   `UpdateComponents`, `UpdateDataModel`, `DeleteSurface`, `CallRendererFunction`,
   `AgentFunctionResponse`; exactly one payload per envelope), the flat `a2ui.Component`
   with `NewText`/`NewImage`, and `a2ui.ToJSONL(messages)` as the canonical wire form.
+  The stable v1.0 wire version is `"1.0"` (`a2ui.WireVersionV1`); `a2ui.VersionV1`
+  (`"v1.0"`) names the protocol and never appears in a message (D-089).
 - **Parser + schema** — `a2ui.NewSchemaManager()` vendors the v1.0 basic catalog;
   `a2ui.NewParser(mgr).Parse(response)` splits a model reply into prose and A2UI
   operations, `Validate` checks them against the catalog (a hand-rolled JSON-Schema

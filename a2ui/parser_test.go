@@ -62,7 +62,7 @@ func TestServerHTTPRoundTrip(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body := `{"messages": [], "a2ui": [{"version": "v1.0", "action": {"name": "echo",
+	body := `{"messages": [], "a2ui": [{"version": "1.0", "action": {"name": "echo",
 		"surfaceId": "s1", "sourceComponentId": "btn1", "timestamp": "",
 		"context": {"v": "round-trip"}}}]}`
 	resp, err := http.Post(ts.URL, "application/json", strings.NewReader(body))
@@ -80,7 +80,7 @@ func TestServerHTTPRoundTrip(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/x-ndjson" {
 		t.Errorf("content type: %s", ct)
 	}
-	want := `{"version":"v1.0","updateDataModel":{"surfaceId":"s1","path":"/last","value":"round-trip"}}` + "\n"
+	want := `{"version":"1.0","updateDataModel":{"surfaceId":"s1","path":"/last","value":"round-trip"}}` + "\n"
 	if buf.String() != want {
 		t.Errorf("round-trip body:\n  want %q\n  got  %q", want, buf.String())
 	}
@@ -92,7 +92,7 @@ func TestMessageEnvelopeErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "both present") {
 		t.Errorf("ambiguous payload: %v", err)
 	}
-	err = json.Unmarshal([]byte(`{"version": "v1.0"}`), &m)
+	err = json.Unmarshal([]byte(`{"version": "1.0"}`), &m)
 	if err == nil || !strings.Contains(err.Error(), "exactly one of") {
 		t.Errorf("no payload: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestParseJSONLAndArrayForms(t *testing.T) {
 	parser := NewParser(mgr)
 
 	// A bare object (not wrapped in an array) parses as one operation.
-	r := parser.Parse(`<a2ui-json>{"version": "v1.0", "deleteSurface": {"surfaceId": "s"}}</a2ui-json>`)
+	r := parser.Parse(`<a2ui-json>{"version": "1.0", "deleteSurface": {"surfaceId": "s"}}</a2ui-json>`)
 	if len(r.Operations) != 1 {
 		t.Fatalf("bare object: %+v", r)
 	}

@@ -82,12 +82,12 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
   subclass; AGo reuses `ModelRequest.origin` (docs/DECISIONS.md D-081).
 
 ### Model / human events — `ag2\events\types.py`
-- `Usage` (frozen dataclass): `prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens, thinking_tokens` — all `float|None`; field-wise `+` (None+None stays None).
+- `Usage` (frozen dataclass): `prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_creation_extended_input_tokens, thinking_tokens` — all `float|None`; field-wise `+` (None+None stays None). The extended field is the part of `cache_creation_input_tokens` written with the provider's extended cache retention.
 - `BinaryResult` (frozen dataclass): `data: bytes`, `metadata: dict` (`.name` from `metadata["filename"]`).
 - `ModelMessage(ModelEvent)` (transient): `content: str`, `metadata: dict`.
 - `ModelMessageChunk(ModelEvent)` (transient): `content: str`. `ModelReasoning(ModelEvent)` (transient): `content: str`.
 - `ModelResponse(ModelEvent)` — the turn's final answer: `message: ModelMessage|None`, `tool_calls: ToolCallsEvent`, `usage: Usage`, `response_force: bool` (True = a `final=True` tool forced this response, ends the loop), `files: list[BinaryResult]`, tracing `model/provider/finish_reason/response_id: str|None`; properties `content`, `metadata`; `to_api()`.
-- `UsageEvent(BaseEvent)` (`__conversational__=False`): `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`), `model/provider/finish_reason/label: str|None`, `parts: list[UsageEvent]`.
+- `UsageEvent(InertEvent)` (`__conversational__=False`): `event_id: str (uuid4 hex; source-record identity)`, `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`; `"subtask"` is only an archived legacy kind), `model/provider/finish_reason/label: str|None`, `task_id/agent_name: str|None` (the delegation that spent the tokens), `path: tuple[str, ...]` (delegation hops), `parts: list[UsageEvent]` (legacy rollup details).
 - `HumanInputRequest(BaseEvent)`: `id: str (uuid)`, `content: str`, `timeout: float|None`, `task_id: str|None`.
 - `ToolApprovalRequest(HumanInputRequest)`: `+ tool_call_id: str`.
 - `HumanMessage(BaseEvent)`: `parent_id: str`, `content: str`.
@@ -104,8 +104,81 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 
 ### Lifecycle / task / alert events
 `events\lifecycle.py` (all transient): `ObserverStarted/Completed(name)`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent`.
-`events\task_events.py`: `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired`, `TaskCancelled(..., reason)`.
+`events\task_events.py`: `TaskEvent(InertEvent)` (`__conversational__=False`) with `path`, then `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired(task_id, agent_name, objective)`, `TaskCancelled(..., objective, reason)`.
 `events\alert.py`: `enum Severity(str)`; `ObserverAlert(BaseEvent, severity)`; `HaltEvent(BaseEvent, reason)`.
+
+### Delegation observation events — `ag2\events\delegation.py` (+ upstream `a591d84f6e`)
+The event layer for a delegation tree:
+
+- `ChildEvent(BaseEvent)` (`__conversational__=False`): an uplink observation of a
+  descendant's event — `inner: BaseEvent`, `task_id: str`, `path: tuple[str, ...]`,
+  `agent_name: str`, `origin_event_id: str`, `direction: str = "up"`. It never triggers
+  the ancestor's tools, model loop or HITL; a `TransientChildEvent` keeps the inner
+  event's transient storage policy.
+- `DeliveryFailed(BaseEvent)` (`__conversational__=False`): `task_id: str|None`,
+  `reason: str` — a downlink could not reach an executing delegation.
+- `DownEvent(BaseEvent)` (`__conversational__=False`): audit of an ancestor's
+  intervention — `inner`, `task_id`, `path`, `agent_name`, `direction = "down"`,
+  `origin_task_id: str|None`, `origin_path`, `origin_stream_id`. The inner event is
+  delivered normally; the audit is not counted itself. `TransientDownEvent` is transient.
+- `source_event` property on `BaseEvent`: the authored event. An ordinary event is its
+  own source; a `ChildEvent` resolves recursively through `inner`; a `DownEvent` is its
+  own source (the intervention audit, not the payload).
+- `Delivery` marker (`a591d84f6e`): `Delivery(validate: Callable[[], None] | None)`
+  returned by `delivery_of(event)`, attached by `routed(event, delivery)` instead of the
+  old `_downlink`/`_validate_delivery`/`_bridged` attributes; never serialized. A stream
+  calls `validate` before each handler so a routed copy cannot reach a later turn or be
+  forwarded back. `UsageEvent` carries `event_id` (uuid4 hex) so a forwarded source
+  record keeps its identity for deduplication.
+
+AGo mapping (D-091, D-092): `events.ChildEvent`/`TransientChildEvent`/
+`DeliveryFailed`/`DownEvent`/`TransientDownEvent` with `[]string` paths and snake_case
+wire names; `events.SourceEvent(ev)` (function + unexported hook, since Go has no
+inherited property); `events.Delivery{Validate func() error}` plus the
+`*events.RoutedEvent` wrapper, `events.Routed`/`events.DeliveryOf`/`events.IsRouted`.
+`Stream.Send` runs `Validate` before every handler and persists a routed copy as its
+inner event. `events.InertEvent` (embedded `path`) marks UsageEvent/Task* as inert;
+`events.IsInert`/`InertPath`/`StampInert`/`AsLocal` are the provenance surface.
+`UsageEvent.EventID` is filled by `NewUsageEvent`/`EnsureEventID`. `AsValue`/`TypeOf`
+unwrap routed copies, so a delivery keeps the authored type; they do **not** unwrap
+`ChildEvent`, so an ancestor's tools, model loop and HITL never fire on a descendant's
+event.
+
+### Subagent event tree — `ag2\tools\subagents\_forwarding.py` (+ `run_task.py`, `1c27f221a5`)
+
+A delegated turn installs a `Forwarder` (`agent/forwarding.go`) as an interrupt
+subscriber on the child stream:
+
+- operational events (model/tool/HITL/lifecycle traffic) travel upward as
+  `ChildEvent`/`TransientChildEvent` (inner transient → transient envelope), with
+  `task_id`, `agent_name`, the delegation `path` and an `origin_event_id`;
+- an already-forwarded `ChildEvent` keeps the leaf's identity across further hops;
+- inert events (`UsageEvent`, `Task*`) travel as themselves: the first hop stamps
+  `path` (and a UsageEvent's `task_id`/`agent_name`), later hops preserve it;
+- the forwarder's own path is `parentForwarder.path + taskID`, published through the
+  child context's `ago:forwarder` dependency, so paths grow with nesting;
+- forwarding and the child lifecycle are installed inside the child's turn scope,
+  after the per-stream turn lock is taken and stopped before it is released, so a
+  queued delegation on a shared stream cannot capture the active invocation;
+- on success the terminal is published while the scope is open; on failure the
+  turn goroutine is awaited first, the terminal is published through the still
+  installed relay under the lock, and only then is the relay stopped; a
+  preparation failure inside `AgentRun.open` after `TaskStarted` follows the
+  same child-stream finally path; a pre-turn rejection (`ErrNestedSameStream`,
+  `MergeVariables`/`newRunWith` failure) publishes `TaskStarted`+terminal
+  directly to the parent without touching the child stream;
+- `Context.Dependencies`/`Variables` scoping (D-090) is unchanged; the child stream
+  persists into the parent's storage under its own id.
+
+`runTaskOn` authors `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` on the
+child stream (relayed upward) and emits no subtask usage rollup. `TaskCompleted.Usage`
+is a cumulative snapshot for inspection, never an additive record. Usage accounting is
+source-based: `usage.FromEvents` resolves `SourceEvent`, deduplicates by non-empty
+`event_id`, and `TokenMonitor` does the same. The HITL bridge no longer re-publishes a
+question as a local `HumanInputRequest`; the request and answer reach the parent only as
+`ChildEvent` observations while the bridge supplies the answer. See D-092 for the
+deliberately unported downlink (`DownEvent` delivery, `StreamHandle`, `DeliveryFailed`,
+cancellation registry).
 
 ### Stream & history
 - `Stream` Protocol (`ag2\context.py:33`): `id: UUID`, `history: History`, `pending_messages: list[ModelRequest]`, `send(event, context)`, `enqueue(*content)`, `spawn_background(coro)`, `where(condition) -> Stream`, `join(max_events=None)`, `subscribe(func, *, interrupt=False, sync_to_thread=True, timeout=None, condition=None) -> SubId`, `unsubscribe`, `sub_scope(...)`, `get(condition) -> Future[BaseEvent]`.
@@ -120,7 +193,79 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
   call; D-080).
 
 ### Context — `ag2\context.py:130`
-`ConversationContext` (dataclass, aliased `Context`): `stream: Stream`, `dependency_provider: Provider|None`, `variables: dict[str, Any]` (reserved prefixes `"ag:"`, `"a2a:"` stripped on the wire), `dependencies: dict[Any, Any]` (DI: agent instance, model config, KnowledgeStore, active Task), `prompt: list[str]` (system-prompt fragments), `tool_call_id: str|None`. Methods: `pending_messages` view, `enqueue(*content)` (append + announce `MessageEnqueued`, thread-safe), `spawn_background(coro)`, `async input(message, timeout) -> str` / `async ask(HumanInputRequest) -> str` (HITL; failures normalize to `HumanInputError` subclasses), `async send(event)`.
+`ConversationContext` (dataclass, aliased `Context`): `stream: Stream`, `dependency_provider: Provider|None`, `variables: MutableMapping[str, Any]` (reserved prefixes `"ag:"`, `"a2a:"` stripped on the wire), `dependencies: dict[Any, Any]` (DI: agent instance, model config, KnowledgeStore, active Task), `prompt: list[str]` (system-prompt fragments), `tool_call_id: str|None`. Methods: `pending_messages` view, `enqueue(*content)` (append + announce `MessageEnqueued`, thread-safe), `spawn_background(coro)`, `async input(message, timeout) -> str` / `async ask(HumanInputRequest) -> str` (HITL; failures normalize to `HumanInputError` subclasses), `async send(event)`.
+
+#### Scoped variables — `ag2/scopes.py` (upstream `fad570ca19`)
+A variable declaration decides what a delegated child context inherits:
+
+| `Scope` | Child sees | Mutation / rebinding |
+|---|---|---|
+| `COPIED` (default) | a deep copy | invisible to parent and siblings |
+| `LOCAL` | nothing | stays in the declaring branch |
+| `SHARED` | the same tree-wide binding | visible to the root and siblings |
+
+`ScopedValue(value, scope=COPIED)` is a declaration marker assigned into the
+variables map; it is unwrapped and never serialized. Declarations conflict with
+the ownership rules — unknown scope, SHARED on a reserved `ag:`/`a2a:` key,
+redeclaration with a different scope, a new SHARED name below the root — and
+raise `ScopeError`. Reserved-prefix keys (including the approval bypass key) are
+never inherited.
+
+Delegation uses the same three helpers as Python:
+
+- `merge_variables(defaults, inherited)` — root: fresh store, every default
+  deep-copied. Inherited: declare defaults first (conflict → `ScopeError`), fill
+  only missing keys, inherited values win.
+- `overlay_variables(variables, values)` — apply continuation/plugin values in
+  place while preserving declarations.
+- `derive_child_variables(variables)` — drop LOCAL, SHARED and reserved keys,
+  deep-copy the rest, reuse the parent's shared-binding table, mark the child
+  non-root.
+
+AGo contract (`context/scopes.go`):
+
+```go
+type Scope string // ScopeCopied | ScopeLocal | ScopeShared
+type ScopedValue struct { Value any; Scope Scope }
+type ScopeError struct { Key string; Scope Scope; Detail string } // Unwrap → ErrScope
+type Clone interface { Clone() any }
+func DeepCopy(value any) any
+
+type Variables struct{...} // concurrency-safe store: own + declarations + shared bindings
+func NewVariables(values map[string]any) (*Variables, error)
+func (v *Variables) Get(key string) (any, bool)
+func (v *Variables) Set(key string, value any) error
+func (v *Variables) SetScoped(key string, value any, scope Scope) error
+func (v *Variables) Declare(key string, scope Scope) error
+func (v *Variables) Delete(key string) bool
+func (v *Variables) Keys() []string
+func (v *Variables) Len() int
+func (v *Variables) Snapshot() map[string]any // resolved; declarations not exported
+func (v *Variables) Declared() map[string]Scope
+func (v *Variables) IsRoot() bool
+func (v *Variables) Branch() *Variables
+func DeriveChildVariables(parent *Variables) *Variables
+func MergeVariables(defaults map[string]any, inherited *Variables) (*Variables, error)
+func OverlayVariables(vars *Variables, values map[string]any) (*Variables, error)
+
+func ReservedVariablePrefixes() []string // copy of the unexported prefix array
+func IsReservedVariable(key string) bool
+func (c *Context) VariableStore() *Variables // lazy init, safe for zero-value Context
+```
+
+`ConversationContext.Variables` is a `*Variables`; `Context.Clone` takes a
+same-branch `Branch` (continuation keeps the shared binding table), while a
+delegation derives a child branch. `DeepCopy` prefers the explicit `Clone` hook;
+its reflection fallback copies pointers, maps, slices, arrays, structs and
+interfaces, preserves cycles and aliases (one memo per store; slice memo keys
+include the view length), shallow-copies unexported struct fields and shares
+funcs/chans/unsafe pointers. SHARED bindings give visibility, not
+synchronization: compound mutations (append / read-modify-write) need a
+caller-supplied lock, which can travel through `dependencies`. Declaring SHARED
+drops a stale branch value so `Get`/`Snapshot`/`Keys` always agree (D-090a).
+`Snapshot`/`Keys`/`Len` include a shared name only when the branch's declaration
+map knows it is SHARED, so a late root declaration stays invisible to a live
+child branch exactly as `Get` reports it.
 
 ### Run / result / usage
 - `AgentRun` (`ag2\agent.py:473`): `stream`, `enqueue()`, `start()`, `async result() -> AgentReply` (idempotent, re-raises same failure); turn scope dies with the `async with` block.
@@ -129,6 +274,63 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 
 ### Task — `ag2\task.py`
 `TaskState` enum (`created/running/completed/failed/expired/cancelled`), `TERMINAL_TASK_STATES`; `TaskSpec(title, description="", payload={}, capability=None)`; `TaskMetadata(task_id, owner_id, spec, state, created_at, started_at, completed_at, expires_at, last_progress_at, progress: dict, result, error, channel_id)` with `to_dict`/`from_dict`; `Task` async CM (`progress()`, `complete(result)`, `fail(error)`, `expire()`, `cancel(reason)`, `checkpoint(state)`, `resumed_state`) auto-completes on clean exit / auto-fails on exception; `CheckpointStore` Protocol (`write(task_id, state)`, `read(task_id)`); `TaskInject = Annotated[Task | None, Inject("ag2.task")]`.
+
+AGo splits construction from entry: `task.New(ctx, owner, spec, opts...)` builds
+an unstarted handle and `(*Task).Start()` performs the `__aenter__` side; the
+package-level `task.Start` stays `New`+`Start` and returns nil on failure.
+Lifecycle options: `WithTaskID`, `WithParentToolCallID`, `WithPublisher`
+(publish through a relay instead of the bound stream), `WithoutInjection`
+(do not stamp `ag:task`). The handle adopts a matching external terminal
+(`TaskExpired` from an observer) without emitting a second one, and
+`CompleteWithUsage(result, usage)` carries the run-lifecycle snapshot.
+Cancellation auto-cancels only when the owner selects it (Go has no exceptions);
+the run lifecycle maps `context.Canceled` to `TaskCancelled` (D-093b).
+
+### Run lifecycle — `ag2/_run_lifecycle.py`, ADR 0034/0035 (+ `d716fcbefe`)
+
+A model run and a delegation share one task lifecycle. `agent/lifecycle.go`
+(`runLifecycle`) is the only place that opens a `task.Task` and publishes its
+terminal; `AgentRun` owns one per invocation and `runTaskOn` drives the same
+implementation for delegations.
+
+- **Opt-in for ordinary runs.** Python's `ask`/`run`/reply continuations/
+  `resume` accept `capability=` and `ttl_seconds=`; either enables the
+  lifecycle, and an ordinary call without them emits no Task events. AGo maps
+  those to `RunOptions{Capability, TTL}` plus `AskWith`/`RunWith`/`ResumeWith`
+  and `AgentReply.AskWith`/`RunWith` (D-093a); `Ask`/`Run`/`Resume` are the
+  zero-options spelling.
+- **Title.** An opted-in run publishes `TaskSpec{Title: agentName, Capability}`
+  with `objective` equal to the agent name; the prompt never enters a Task
+  event (Task events are inert and reach the network mirror). A delegation
+  keeps its objective and now also carries a `TaskSpec`, its existing task id
+  and `parent_tool_call_id`. `Agent.Task` remains the standalone, deprecated
+  path (D-083); its replacement is direct construction.
+- **Terminal on every outcome.** The lifecycle starts after the per-stream turn
+  lock (and, for a delegation, the relay) and before the remaining setup.
+  `AgentRun.Close` cancels and awaits the turn, unsubscribes run-scoped
+  subscribers, publishes the terminal while the relay and lock are held, and
+  only then stops the relay and releases the lock. Success publishes
+  `TaskCompleted` (with a cumulative `Usage` snapshot); `context.Canceled`
+  publishes `TaskCancelled`; any other failure publishes `TaskFailed`; a panic
+  recovered by `executeTurn` is a failure. `Run.Result` leaves the scope open —
+  the terminal follows on `Close`; `Ask` publishes it before returning. A
+  failed `Start` after the lifecycle opened still publishes the terminal.
+- **Delegation reject.** Failures before the turn scope existed
+  (`ErrNestedSameStream`, `newRunWith`/`MergeVariables`) publish
+  `TaskStarted`+terminal straight to the parent through `forwarder.reject`,
+  never touching a busy child stream.
+- **Cancellation.** `AsTool`/`run_subtask(s)` start the child on the parent
+  turn's `Context.TurnContext()`, so a parent cancellation reaches the child and
+  is reported as `TaskCancelled{reason: "parent cancelled"}`
+  (`agent.ParentCancelledReason`); an ordinary run reports `"cancelled"`. A call
+  cancelled while waiting for the lock opens no lifecycle.
+- **Usage.** `TaskCompleted.Usage` is a snapshot of
+  `usage.FromEvents(streamHistory + retainedAccounting)` deduplicated by
+  `event_id`, never an additive record. Before the terminal, source records the
+  relay captured but the stream did not persist are appended
+  (`persistUsageAccounting`); a retention failure decides the terminal when no
+  earlier failure exists, otherwise it is logged. A usage read failure falls
+  back to the retained accounting.
 
 ### Response schemas — `ag2\response\`
 `ResponseProto[T]` protocol (`proto.py`): `name`, `description`, `json_schema`, `system_prompt`, `async validate(response, context, provider) -> T`. `ResponseSchema[T]` (`schema.py`) wraps pydantic `TypeAdapter`; scalars embedded into `{"data": ...}`. `RawSchema` = raw JSON schema. `PromptedSchema` (`prompted.py`), `response_schema` decorator (`callable.py`), `DecisionSpec/Question/DecisionOption` (`decision.py`). `AgentSpec` (`ag2\spec.py:87`): `name`, `prompt: list[str]`, `tool_names: list[str]`, `response_schema: ResponseSchemaSpec|None`; `from_agent()` / `to_agent(...)`.

@@ -36,26 +36,42 @@ func Not(c Condition) Condition {
 }
 
 // TypeOf matches events whose dynamic type is T (value or pointer form).
+// Delivery wrappers are unwrapped: a routed copy keeps the authored type, so
+// typed subscriptions still receive it.
 func TypeOf[T Event]() Condition {
 	t := reflect.TypeOf((*T)(nil)).Elem()
-	pt := reflect.PointerTo(t)
 	return func(ev Event) bool {
-		rt := reflect.TypeOf(ev)
-		return rt == t || rt == pt
+		return typeMatches(reflect.TypeOf(AsValue(ev)), t)
 	}
 }
 
 // TypeOfAny matches events whose dynamic type is one of the given types.
 func TypeOfAny(types ...reflect.Type) Condition {
 	return func(ev Event) bool {
-		rt := reflect.TypeOf(ev)
+		rt := reflect.TypeOf(AsValue(ev))
 		for _, t := range types {
-			if rt == t || rt == reflect.PointerTo(t) {
+			if typeMatches(rt, t) {
 				return true
 			}
 		}
 		return false
 	}
+}
+
+// typeMatches accepts both the value and pointer spelling of a type, including
+// T itself being spelled as a pointer.
+func typeMatches(rt, t reflect.Type) bool {
+	if rt == nil || t == nil {
+		return false
+	}
+	if rt == t || rt == reflect.PointerTo(t) {
+		return true
+	}
+	if t.Kind() == reflect.Pointer {
+		e := t.Elem()
+		return rt == e || rt == reflect.PointerTo(e)
+	}
+	return false
 }
 
 // Equal matches when the extracted comparable value equals want.

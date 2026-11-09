@@ -295,11 +295,17 @@ func (d *DuckDuckGoSearch) Register(cx *agocontext.Context, mw []middleware.Midd
 // --- Tavily -------------------------------------------------------------------
 
 // TavilySearchResult is one hit (Python parity: search.tavily.SearchResult).
+// RawContent and Favicon are optional: the API returns them only when
+// include_raw_content / include_favicon were requested.
 type TavilySearchResult struct {
-	Title   string   `json:"title"`
-	URL     string   `json:"url"`
-	Content string   `json:"content"`
-	Score   *float64 `json:"score,omitempty"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
+	// AGO-DEVIATION: absent optional values omit their wire key (omitempty)
+	// where Python's asdict emits an explicit null; this covers all three.
+	Score      *float64 `json:"score,omitempty"`
+	RawContent *string  `json:"raw_content,omitempty"`
+	Favicon    *string  `json:"favicon,omitempty"`
 }
 
 // TavilySearchResponse is the tool result (Python parity: search.tavily.
@@ -400,6 +406,33 @@ func WithTavilyIncludeAnswer(v bool) TavilyOption {
 	return func(t *TavilySearch) error { t.options["include_answer"] = v; return nil }
 }
 
+// WithTavilyIncludeRawContent sets include_raw_content: true/false, or
+// "markdown"/"text" for the raw page text (Python parity: IncludeRawContent).
+// Leaving the option out keeps the parameter off the request, matching
+// upstream's None filtering, so the API default (off) applies.
+func WithTavilyIncludeRawContent(v any) TavilyOption {
+	return func(t *TavilySearch) error {
+		switch val := v.(type) {
+		case bool:
+			t.options["include_raw_content"] = val
+		case string:
+			if val != "markdown" && val != "text" {
+				return fmt.Errorf("toolpacks: tavily include_raw_content must be a bool, \"markdown\" or \"text\", got %q", val)
+			}
+			t.options["include_raw_content"] = val
+		default:
+			return fmt.Errorf("toolpacks: tavily include_raw_content must be a bool, \"markdown\" or \"text\", got %T", v)
+		}
+		return nil
+	}
+}
+
+// WithTavilyIncludeFavicon asks the API for each result's favicon URL (Python
+// parity: include_favicon; omitted when unset).
+func WithTavilyIncludeFavicon(v bool) TavilyOption {
+	return func(t *TavilySearch) error { t.options["include_favicon"] = v; return nil }
+}
+
 // WithTavilyAPIKeyVariable reads the key from the conversation variable
 // "tavily_api_key" instead of the constructor argument (a missing variable is a
 // call-time error).
@@ -460,13 +493,15 @@ func (t *TavilySearch) search(key, query string) (TavilySearchResponse, error) {
 		payload[k] = v
 	}
 	var raw struct {
-		Query   string  `json:"query"`
+		Query   *string `json:"query"`
 		Answer  *string `json:"answer"`
 		Results []struct {
-			Title   string   `json:"title"`
-			URL     string   `json:"url"`
-			Content string   `json:"content"`
-			Score   *float64 `json:"score"`
+			Title      string   `json:"title"`
+			URL        string   `json:"url"`
+			Content    string   `json:"content"`
+			Score      *float64 `json:"score"`
+			RawContent *string  `json:"raw_content"`
+			Favicon    *string  `json:"favicon"`
 		} `json:"results"`
 		Images []json.RawMessage `json:"images"`
 	}
@@ -474,9 +509,11 @@ func (t *TavilySearch) search(key, query string) (TavilySearchResponse, error) {
 		map[string]string{"Authorization": "Bearer " + key}, payload, &raw); err != nil {
 		return TavilySearchResponse{}, err
 	}
-	out := TavilySearchResponse{Query: raw.Query, Results: []TavilySearchResult{}, Images: []string{}}
-	if out.Query == "" {
-		out.Query = query
+	// Python parity: raw.get("query", query) — only a missing key falls back,
+	// so an empty echoed query stays empty.
+	out := TavilySearchResponse{Query: query, Results: []TavilySearchResult{}, Images: []string{}}
+	if raw.Query != nil {
+		out.Query = *raw.Query
 	}
 	out.Answer = raw.Answer
 	for _, r := range raw.Results {

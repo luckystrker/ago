@@ -10,7 +10,7 @@ import (
 func TestToJSONLError(t *testing.T) {
 	// A prop value encoding/json cannot express (a func) must surface as an
 	// error, not a panic, and must not emit partial output.
-	bad := []Message{{Version: VersionV1, UpdateComponents: &UpdateComponents{
+	bad := []Message{{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 		SurfaceID: "s1",
 		Components: []Component{
 			{ID: "c1", Kind: "Text", Props: map[string]any{"text": func() {}}},
@@ -38,7 +38,7 @@ func TestToJSONLError(t *testing.T) {
 	}
 
 	// The failing message is named by index even when others are fine.
-	good := Message{Version: VersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}}
+	good := Message{Version: WireVersionV1, DeleteSurface: &DeleteSurface{SurfaceID: "s1"}}
 	if _, err = ToJSONL([]Message{good, {}}); err == nil || !errors.Is(err, ErrNoPayload) {
 		t.Errorf("second message failure: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestServerUnserializableMessageFailsCleanly(t *testing.T) {
 	// The HTTP path must not panic either: the frame builder turns a
 	// marshal failure into a 500 before the status is committed.
 	srv := NewServer(WithPromptHandler(func(context.Context, string) (Turn, error) {
-		return Turn{Messages: []Message{{Version: VersionV1, UpdateComponents: &UpdateComponents{
+		return Turn{Messages: []Message{{Version: WireVersionV1, UpdateComponents: &UpdateComponents{
 			SurfaceID: "s1",
 			Components: []Component{
 				{ID: "c1", Kind: "Text", Props: map[string]any{"text": make(chan int)}},

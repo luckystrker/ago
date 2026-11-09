@@ -18,6 +18,7 @@ type TaskSpec struct {
 // parent_context.tool_call_id); the Task primitive leaves it empty.
 type TaskStarted struct {
 	Base
+	InertEvent
 	TaskID           string    `json:"task_id"`
 	AgentName        string    `json:"agent_name"`
 	Objective        string    `json:"objective,omitempty"`
@@ -28,11 +29,12 @@ type TaskStarted struct {
 
 func (TaskStarted) EventType() string    { return "TaskStarted" }
 func (TaskStarted) Transient() bool      { return false }
-func (TaskStarted) Conversational() bool { return true }
+func (TaskStarted) Conversational() bool { return false }
 
 // TaskProgress is a mid-flight progress update (transient).
 type TaskProgress struct {
 	Base
+	InertEvent
 	TaskID    string         `json:"task_id"`
 	AgentName string         `json:"agent_name"`
 	Objective string         `json:"objective,omitempty"`
@@ -50,6 +52,7 @@ func (TaskProgress) Conversational() bool { return false }
 // zero value, matching the Python default_factory).
 type TaskCompleted struct {
 	Base
+	InertEvent
 	TaskID     string `json:"task_id"`
 	AgentName  string `json:"agent_name"`
 	Objective  string `json:"objective,omitempty"`
@@ -60,11 +63,12 @@ type TaskCompleted struct {
 
 func (TaskCompleted) EventType() string    { return "TaskCompleted" }
 func (TaskCompleted) Transient() bool      { return false }
-func (TaskCompleted) Conversational() bool { return true }
+func (TaskCompleted) Conversational() bool { return false }
 
 // TaskFailed closes a task with an error.
 type TaskFailed struct {
 	Base
+	InertEvent
 	TaskID    string `json:"task_id"`
 	AgentName string `json:"agent_name"`
 	Objective string `json:"objective,omitempty"`
@@ -73,30 +77,34 @@ type TaskFailed struct {
 
 func (TaskFailed) EventType() string    { return "TaskFailed" }
 func (TaskFailed) Transient() bool      { return false }
-func (TaskFailed) Conversational() bool { return true }
+func (TaskFailed) Conversational() bool { return false }
 
 // TaskExpired closes a task past its TTL.
 type TaskExpired struct {
 	Base
+	InertEvent
 	TaskID    string `json:"task_id"`
 	AgentName string `json:"agent_name"`
+	Objective string `json:"objective,omitempty"`
 }
 
 func (TaskExpired) EventType() string    { return "TaskExpired" }
 func (TaskExpired) Transient() bool      { return false }
-func (TaskExpired) Conversational() bool { return true }
+func (TaskExpired) Conversational() bool { return false }
 
 // TaskCancelled closes a task on request.
 type TaskCancelled struct {
 	Base
+	InertEvent
 	TaskID    string `json:"task_id"`
 	AgentName string `json:"agent_name"`
+	Objective string `json:"objective,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 }
 
 func (TaskCancelled) EventType() string    { return "TaskCancelled" }
 func (TaskCancelled) Transient() bool      { return false }
-func (TaskCancelled) Conversational() bool { return true }
+func (TaskCancelled) Conversational() bool { return false }
 
 func init() {
 	RegisterEvent(TaskStarted{})

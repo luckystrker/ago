@@ -17,6 +17,7 @@ import (
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/tools"
+	"github.com/luckystrker/ago/usage"
 )
 
 // failingConfig is a model config whose client creation fails (delegation parity:
@@ -54,7 +55,7 @@ type taskEvents struct {
 	started   []events.TaskStarted
 	completed []events.TaskCompleted
 	failed    []events.TaskFailed
-	rollups   []events.UsageEvent
+	usage     []events.UsageEvent
 }
 
 func collectTaskEvents(t *testing.T, s stream.Stream) taskEvents {
@@ -73,9 +74,7 @@ func collectTaskEvents(t *testing.T, s stream.Stream) taskEvents {
 		case events.TaskFailed:
 			out.failed = append(out.failed, e)
 		case events.UsageEvent:
-			if e.Kind == events.UsageKindSubtask {
-				out.rollups = append(out.rollups, e)
-			}
+			out.usage = append(out.usage, e)
 		}
 	}
 	return out
@@ -230,17 +229,38 @@ func TestSubtaskBridgesHitlToParent(t *testing.T) {
 	if len(te.completed) != 1 || te.completed[0].Result != "child saw pong" {
 		t.Fatalf("child did not receive the answer: %+v", te.completed)
 	}
-	// The parent stream carries the forwarded question stamped with the task id.
+	// The parent stream carries the question and the answer as ChildEvent
+	// observations whose envelopes name the delegation; the request is not
+	// re-published as a local trigger, so the answer is seen exactly once.
 	started := te.started[0]
 	evs, _ := base.History().GetEvents()
-	var stamped bool
+	var requestID string
+	stamped, answers := false, 0
 	for _, ev := range evs {
-		if hr, ok := events.AsValue(ev).(events.HumanInputRequest); ok && hr.Content == "ping?" {
-			stamped = hr.TaskID == started.TaskID && started.TaskID != ""
+		if _, local := events.AsValue(ev).(events.HumanInputRequest); local {
+			t.Fatal("bridge re-published the question as a local HumanInputRequest")
+		}
+		ce, ok := events.AsValue(ev).(events.ChildEvent)
+		if !ok {
+			continue
+		}
+		switch inner := events.AsValue(ce.Inner).(type) {
+		case events.HumanInputRequest:
+			if inner.Content == "ping?" {
+				stamped = ce.TaskID == started.TaskID && started.TaskID != ""
+				requestID = inner.ID
+			}
+		case events.HumanMessage:
+			if inner.ParentID == requestID && inner.Content == "pong" {
+				answers++
+			}
 		}
 	}
 	if !stamped {
-		t.Fatal("forwarded question missing the delegation stamp on the parent stream")
+		t.Fatal("forwarded question missing the delegation envelope on the parent stream")
+	}
+	if answers != 1 {
+		t.Fatalf("forwarded answers = %d, want 1", answers)
 	}
 }
 
@@ -367,10 +387,11 @@ func TestSubtaskChildErrorIsToolResultText(t *testing.T) {
 	}
 }
 
-// TestSubtaskRollupAttribution pins the rollup attribution parity (_sole_pair):
-// exactly one (provider, model) pair is stamped onto the rollup, a mixed spend
-// stays unlabelled, and separate delegations are attributed independently.
-func TestSubtaskRollupAttribution(t *testing.T) {
+// TestSubtaskSourceUsageCarriesProvenance pins the delegation accounting
+// contract: a child's model call reaches the parent as the original source
+// UsageEvent (kind model_call, its own provider/model), stamped with the task
+// id, agent name and path. There is no subtask rollup to reconcile.
+func TestSubtaskSourceUsageCarriesProvenance(t *testing.T) {
 	resp := func(content, model string) *events.ModelResponse {
 		return &events.ModelResponse{
 			Message:  &events.ModelMessage{Content: content},
@@ -379,27 +400,55 @@ func TestSubtaskRollupAttribution(t *testing.T) {
 			Usage:    events.Usage{PromptTokens: events.I64(1), TotalTokens: events.I64(1)},
 		}
 	}
-	t.Run("single pair", func(t *testing.T) {
-		base := stream.NewMemoryStream()
-		parentCfg := agotest.NewTestConfig(
-			toolResp("run_subtask", `{"task":"go"}`),
-			textResp("wrap"),
-		)
-		childCfg := agotest.NewTestConfig(resp("child result", "m"))
-		a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
-			WithTasks(TaskConfig{Config: childCfg}))
-		if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
-			t.Fatalf("ask: %v", err)
+	base := stream.NewMemoryStream()
+	parentCfg := agotest.NewTestConfig(
+		toolResp("run_subtask", `{"task":"go"}`),
+		textResp("wrap"),
+	)
+	childCfg := agotest.NewTestConfig(resp("child result", "m"))
+	a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
+		WithTasks(TaskConfig{Config: childCfg}))
+	if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	te := collectTaskEvents(t, base)
+	var childUsage []events.UsageEvent
+	for _, u := range te.usage {
+		if u.AgentName != "" {
+			childUsage = append(childUsage, u)
 		}
-		te := collectTaskEvents(t, base)
-		if len(te.rollups) != 1 {
-			t.Fatalf("rollups: %d", len(te.rollups))
+	}
+	if len(childUsage) != 1 {
+		t.Fatalf("forwarded usage events: %d, want 1 (no rollup)", len(childUsage))
+	}
+	ue := childUsage[0]
+	if ue.Kind != events.UsageKindModelCall {
+		t.Fatalf("kind = %q, want %q", ue.Kind, events.UsageKindModelCall)
+	}
+	if ue.Model != "m" || ue.Provider != "testprov" {
+		t.Fatalf("attribution: model=%q provider=%q", ue.Model, ue.Provider)
+	}
+	if ue.AgentName != "subtask" || ue.TaskID == "" || len(ue.Path) != 1 || ue.Path[0] != ue.TaskID {
+		t.Fatalf("provenance: agent=%q task=%q path=%v", ue.AgentName, ue.TaskID, ue.Path)
+	}
+	if te.usage[0].Kind == events.UsageKindSubtask {
+		t.Fatal("a subtask rollup must not be emitted for source accounting")
+	}
+}
+
+// TestSubtaskSourceUsageMixedAndSequential pins that each model call keeps its
+// own provider/model pair and delegation identity: no rollup flattens or
+// unlabels a mixed-model delegation, and sequential delegations stay separate.
+func TestSubtaskSourceUsageMixedAndSequential(t *testing.T) {
+	resp := func(content, model string) *events.ModelResponse {
+		return &events.ModelResponse{
+			Message:  &events.ModelMessage{Content: content},
+			Model:    model,
+			Provider: "testprov",
+			Usage:    events.Usage{PromptTokens: events.I64(1), TotalTokens: events.I64(1)},
 		}
-		if te.rollups[0].Model != "m" || te.rollups[0].Provider != "testprov" {
-			t.Fatalf("rollup attribution: model=%q provider=%q", te.rollups[0].Model, te.rollups[0].Provider)
-		}
-	})
-	t.Run("mixed pairs stay unlabelled", func(t *testing.T) {
+	}
+	t.Run("mixed pairs keep their models", func(t *testing.T) {
 		base := stream.NewMemoryStream()
 		parentCfg := agotest.NewTestConfig(
 			toolResp("run_subtask", `{"task":"go"}`),
@@ -410,7 +459,6 @@ func TestSubtaskRollupAttribution(t *testing.T) {
 		if err != nil {
 			t.Fatalf("tool: %v", err)
 		}
-		// One delegation, two model calls on different models.
 		childCfg := agotest.NewTestConfig(
 			withModel(toolResp("echo", `{"x":"1"}`), "m1"),
 			resp("child result", "m2"),
@@ -420,16 +468,21 @@ func TestSubtaskRollupAttribution(t *testing.T) {
 		if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
 			t.Fatalf("ask: %v", err)
 		}
-		te := collectTaskEvents(t, base)
-		if len(te.rollups) != 1 {
-			t.Fatalf("rollups: %d", len(te.rollups))
+		models := map[string]bool{}
+		for _, u := range collectTaskEvents(t, base).usage {
+			if u.AgentName == "" {
+				continue
+			}
+			if u.Kind == events.UsageKindSubtask {
+				t.Fatal("subtask rollup emitted")
+			}
+			models[u.Model] = true
 		}
-		if te.rollups[0].Model != "" || te.rollups[0].Provider != "" {
-			t.Fatalf("mixed rollup must stay unlabelled, got model=%q provider=%q",
-				te.rollups[0].Model, te.rollups[0].Provider)
+		if len(models) != 2 || !models["m1"] || !models["m2"] {
+			t.Fatalf("forwarded models = %v, want m1 and m2", models)
 		}
 	})
-	t.Run("per invocation", func(t *testing.T) {
+	t.Run("sequential delegations are separate publications", func(t *testing.T) {
 		base := stream.NewMemoryStream()
 		parentCfg := agotest.NewTestConfig(
 			toolResp("run_subtasks", `{"tasks":["a","b"],"parallel":false}`),
@@ -441,15 +494,23 @@ func TestSubtaskRollupAttribution(t *testing.T) {
 		if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
 			t.Fatalf("ask: %v", err)
 		}
-		te := collectTaskEvents(t, base)
-		if len(te.rollups) != 2 {
-			t.Fatalf("rollups: %d", len(te.rollups))
+		var got []events.UsageEvent
+		for _, u := range collectTaskEvents(t, base).usage {
+			if u.AgentName != "" {
+				got = append(got, u)
+			}
 		}
-		if te.rollups[0].Model != "m1" || te.rollups[1].Model != "m2" {
-			t.Fatalf("per-invocation attribution: %q / %q", te.rollups[0].Model, te.rollups[1].Model)
+		if len(got) != 2 {
+			t.Fatalf("forwarded usage events: %d, want 2", len(got))
 		}
-		if te.rollups[0].Label != "subtask-0" || te.rollups[1].Label != "subtask-1" {
-			t.Fatalf("rollup labels: %q / %q", te.rollups[0].Label, te.rollups[1].Label)
+		if got[0].Model != "m1" || got[1].Model != "m2" {
+			t.Fatalf("per-invocation models: %q / %q", got[0].Model, got[1].Model)
+		}
+		if got[0].AgentName != "subtask-0" || got[1].AgentName != "subtask-1" {
+			t.Fatalf("agent names: %q / %q", got[0].AgentName, got[1].AgentName)
+		}
+		if got[0].TaskID == got[1].TaskID || got[0].Path[0] != got[0].TaskID || got[1].Path[0] != got[1].TaskID {
+			t.Fatalf("delegation identities collided: %+v / %+v", got[0], got[1])
 		}
 	})
 }
@@ -461,11 +522,10 @@ func withModel(r *events.ModelResponse, model string) *events.ModelResponse {
 	return r
 }
 
-// TestSubtaskRollupFlattensNestedDelegation pins the Parts flattening parity
-// (`event.parts or [event]`): a nested delegation's rollup is replaced by the
-// calls it aggregated, and its unlabelled pair leaves the outer rollup
-// unattributed.
-func TestSubtaskRollupFlattensNestedDelegation(t *testing.T) {
+// TestSubtaskNestedUsageKeepsLeafProvenance pins the nested tree: each source
+// call reaches the lead once, with the delegation path that names the hops it
+// travelled (one id for the child's own calls, two for the grandchild's).
+func TestSubtaskNestedUsageKeepsLeafProvenance(t *testing.T) {
 	outerResp := func(content, model string) *events.ModelResponse {
 		return &events.ModelResponse{
 			Message:  &events.ModelMessage{Content: content},
@@ -489,35 +549,36 @@ func TestSubtaskRollupFlattensNestedDelegation(t *testing.T) {
 	if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	te := collectTaskEvents(t, base)
-	if len(te.rollups) != 1 {
-		t.Fatalf("outer rollups: %d", len(te.rollups))
-	}
-	ue := te.rollups[0]
-	if ue.Model != "" || ue.Provider != "" {
-		t.Fatalf("nested delegation must leave the outer rollup unlabelled, got model=%q provider=%q",
-			ue.Model, ue.Provider)
-	}
-	// Parts are the flattened per-call events of the child stream — the child's
-	// own two calls plus the grandchild call unfolded from the nested rollup —
-	// never the nested rollup itself, and never the lead's own call.
-	if len(ue.Parts) != 3 {
-		t.Fatalf("outer rollup parts: %d, want 3 (inner two calls, flattened grandchild call)", len(ue.Parts))
-	}
-	for _, p := range ue.Parts {
-		if p.Kind != events.UsageKindModelCall {
-			t.Fatalf("flattened part carries kind %q, want %q", p.Kind, events.UsageKindModelCall)
+	var forwarded []events.UsageEvent
+	for _, u := range collectTaskEvents(t, base).usage {
+		if len(u.Path) > 0 {
+			forwarded = append(forwarded, u)
 		}
 	}
-	models := map[string]bool{}
-	for _, p := range ue.Parts {
-		models[p.Model] = true
+	if len(forwarded) != 3 {
+		t.Fatalf("forwarded usage events: %d, want 3 (child's two calls and the grandchild)", len(forwarded))
 	}
-	if !models["inner-m1"] || !models["inner-m2"] || !models["grand-m"] {
-		t.Fatalf("flattened parts models: %v", models)
+	models := map[string]int{}
+	for _, u := range forwarded {
+		if u.Kind != events.UsageKindModelCall {
+			t.Fatalf("kind = %q, want model_call", u.Kind)
+		}
+		models[u.Model]++
 	}
-	if models[""] || models["outer-m"] {
-		t.Fatalf("parts must not carry the nested rollup or the lead's own call: %v", models)
+	if models["inner-m1"] != 1 || models["inner-m2"] != 1 || models["grand-m"] != 1 {
+		t.Fatalf("forwarded models = %v", models)
+	}
+	if models["outer-m"] != 0 {
+		t.Fatal("the lead's own call must not be forwarded")
+	}
+	for _, u := range forwarded {
+		want := 1
+		if u.Model == "grand-m" {
+			want = 2
+		}
+		if len(u.Path) != want {
+			t.Fatalf("%s path = %v, want %d hops", u.Model, u.Path, want)
+		}
 	}
 }
 
@@ -941,19 +1002,17 @@ func TestAsToolChildKeepsOwnState(t *testing.T) {
 	}
 }
 
-// TestSubtaskRollupPartialTotalTokens pins the _rollup_usage rule: the subtask
-// rollup's total_tokens survives only when every counted call reported one — a
-// partial sum falls below the counts it is meant to cover — while
-// TaskCompleted.Usage keeps the plain sum (Python parity: reply.usage().total).
-func TestSubtaskRollupPartialTotalTokens(t *testing.T) {
+// TestSubtaskSourceUsageKeepsPerCallTotals pins that source accounting is not
+// flattened: each model call keeps its own usage (including an absent
+// total_tokens), and the aggregate report is the field-wise sum of those
+// source records, with no subtask rollup to void or re-label them.
+func TestSubtaskSourceUsageKeepsPerCallTotals(t *testing.T) {
 	withUsage := func(content string, prompt, total *int64) *events.ModelResponse {
 		return &events.ModelResponse{
 			Message: &events.ModelMessage{Content: content},
 			Usage:   events.Usage{PromptTokens: prompt, TotalTokens: total},
 		}
 	}
-	// A tool-call response: it keeps the child's turn going so the second
-	// scripted call (and its usage) is spent too.
 	callWithUsage := func(prompt, total *int64) *events.ModelResponse {
 		return &events.ModelResponse{
 			ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{{
@@ -967,106 +1026,44 @@ func TestSubtaskRollupPartialTotalTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tool: %v", err)
 	}
-	t.Run("a call without total_tokens voids the rollup total", func(t *testing.T) {
-		base := stream.NewMemoryStream()
-		parentCfg := agotest.NewTestConfig(
-			toolResp("run_subtask", `{"task":"go"}`),
-			textResp("wrap"),
-		)
-		childCfg := agotest.NewTestConfig(
-			callWithUsage(events.I64(2), events.I64(5)),
-			withUsage("child final", events.I64(3), nil),
-		)
-		a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
-			WithTasks(TaskConfig{Config: childCfg, ExtraTools: []tools.Tool{echo}}))
-		if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
-			t.Fatalf("ask: %v", err)
-		}
-		te := collectTaskEvents(t, base)
-		if len(te.rollups) != 1 {
-			t.Fatalf("rollups: %d", len(te.rollups))
-		}
-		ue := te.rollups[0]
-		if ue.Usage.TotalTokens != nil {
-			t.Fatalf("rollup total_tokens = %v, want nil (one call did not report it)", *ue.Usage.TotalTokens)
-		}
-		if ue.Usage.PromptTokens == nil || *ue.Usage.PromptTokens != 5 {
-			t.Fatalf("rollup prompt_tokens = %v, want 5", ue.Usage.PromptTokens)
-		}
-		// TaskCompleted.Usage is the plain sum, total included.
-		cu := te.completed[0].Usage
-		if cu.TotalTokens == nil || *cu.TotalTokens != 5 || cu.PromptTokens == nil || *cu.PromptTokens != 5 {
-			t.Fatalf("TaskCompleted usage = %+v, want the plain sum (prompt 5, total 5)", cu)
-		}
-	})
-	t.Run("every call reported total_tokens", func(t *testing.T) {
-		base := stream.NewMemoryStream()
-		parentCfg := agotest.NewTestConfig(
-			toolResp("run_subtask", `{"task":"go"}`),
-			textResp("wrap"),
-		)
-		childCfg := agotest.NewTestConfig(
-			callWithUsage(events.I64(2), events.I64(5)),
-			withUsage("child final", events.I64(3), events.I64(7)),
-		)
-		a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
-			WithTasks(TaskConfig{Config: childCfg, ExtraTools: []tools.Tool{echo}}))
-		if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
-			t.Fatalf("ask: %v", err)
-		}
-		te := collectTaskEvents(t, base)
-		if len(te.rollups) != 1 {
-			t.Fatalf("rollups: %d", len(te.rollups))
-		}
-		ue := te.rollups[0]
-		if ue.Usage.TotalTokens == nil || *ue.Usage.TotalTokens != 12 {
-			t.Fatalf("rollup total_tokens = %v, want 12", ue.Usage.TotalTokens)
-		}
-	})
-}
-
-// TestRollupUsageSkipsUnreportedUsage pins the voting gate of rollupUsage: a
-// UsageEvent whose token counts are all nil/zero is suppressed upstream by the
-// same Reported gate, so if one reaches the child transcript it must not vote
-// in the (Provider, Model) attribution and must not void the rollup's
-// total_tokens (Python parity: _sole_pair / _rollup_usage).
-func TestRollupUsageSkipsUnreportedUsage(t *testing.T) {
-	child := stream.NewMemoryStream()
-	reported := &events.UsageEvent{
-		Usage:    events.Usage{PromptTokens: events.I64(3), TotalTokens: events.I64(5)},
-		Kind:     events.UsageKindModelCall,
-		Provider: "prov",
-		Model:    "model",
+	base := stream.NewMemoryStream()
+	parentCfg := agotest.NewTestConfig(
+		toolResp("run_subtask", `{"task":"go"}`),
+		textResp("wrap"),
+	)
+	childCfg := agotest.NewTestConfig(
+		callWithUsage(events.I64(2), events.I64(5)),
+		withUsage("child final", events.I64(3), nil),
+	)
+	a := New("parent", "", WithConfig(parentCfg), WithStreamBase(base),
+		WithTasks(TaskConfig{Config: childCfg, ExtraTools: []tools.Tool{echo}}))
+	if _, err := a.Ask(stdcontext.Background(), "delegate please"); err != nil {
+		t.Fatalf("ask: %v", err)
 	}
-	unreported := &events.UsageEvent{
-		Usage:    events.Usage{},
-		Kind:     events.UsageKindModelCall,
-		Provider: "stray",
-		Model:    "stray-model",
-	}
-	for _, ev := range []*events.UsageEvent{reported, unreported} {
-		if err := child.Send(ev); err != nil {
-			t.Fatalf("seed child stream: %v", err)
+	var got []events.UsageEvent
+	for _, u := range collectTaskEvents(t, base).usage {
+		if u.AgentName != "" {
+			got = append(got, u)
 		}
 	}
-	parent := agocontext.New(stream.NewMemoryStream())
-	total, spent := rollupUsage(parent, "label", child, 0)
-	if !spent {
-		t.Fatal("rollup ignored the reported usage")
+	if len(got) != 2 {
+		t.Fatalf("forwarded usage events: %d, want 2", len(got))
 	}
-	if total.PromptTokens == nil || *total.PromptTokens != 3 || total.TotalTokens == nil || *total.TotalTokens != 5 {
-		t.Fatalf("cumulative total = %+v, want the reported call only (prompt 3, total 5)", total)
+	if got[0].Usage.TotalTokens == nil || *got[0].Usage.TotalTokens != 5 {
+		t.Fatalf("first call total_tokens = %v, want 5", got[0].Usage.TotalTokens)
 	}
-	te := collectTaskEvents(t, parent.Stream)
-	if len(te.rollups) != 1 {
-		t.Fatalf("rollups = %d, want 1", len(te.rollups))
+	if got[1].Usage.TotalTokens != nil {
+		t.Fatalf("second call total_tokens = %v, want absent", *got[1].Usage.TotalTokens)
 	}
-	ue := te.rollups[0]
-	if ue.Provider != "prov" || ue.Model != "model" {
-		t.Fatalf("attribution = %q/%q, want prov/model: an unreported usage must not vote", ue.Provider, ue.Model)
+	for _, u := range got {
+		if u.Kind != events.UsageKindModelCall {
+			t.Fatalf("kind = %q, want model_call", u.Kind)
+		}
 	}
-	if ue.Usage.TotalTokens == nil || *ue.Usage.TotalTokens != 5 {
-		t.Fatalf("rollup total_tokens = %v, want 5: an unreported usage must not void it", ue.Usage.TotalTokens)
+	childEvents := []events.Event{&got[0], &got[1]}
+	report := usage.FromEvents(childEvents)
+	if report.Total.PromptTokens == nil || *report.Total.PromptTokens != 5 {
+		t.Fatalf("report prompt_tokens = %v, want 5", report.Total.PromptTokens)
 	}
 }
 
@@ -1233,11 +1230,15 @@ func TestSubtasksBridgeHitlInParallel(t *testing.T) {
 	}
 	stamped := map[string]bool{}
 	for _, ev := range evs {
-		if hr, ok := events.AsValue(ev).(events.HumanInputRequest); ok && hr.Content == "ping?" {
-			if hr.TaskID == "" || !ids[hr.TaskID] {
-				t.Fatalf("forwarded question stamped with unknown task id %q", hr.TaskID)
+		ce, ok := events.AsValue(ev).(events.ChildEvent)
+		if !ok {
+			continue
+		}
+		if hr, ok := events.AsValue(ce.Inner).(events.HumanInputRequest); ok && hr.Content == "ping?" {
+			if ce.TaskID == "" || !ids[ce.TaskID] {
+				t.Fatalf("forwarded question stamped with unknown task id %q", ce.TaskID)
 			}
-			stamped[hr.TaskID] = true
+			stamped[ce.TaskID] = true
 		}
 	}
 	if len(stamped) != 2 {
@@ -1245,12 +1246,11 @@ func TestSubtasksBridgeHitlInParallel(t *testing.T) {
 	}
 }
 
-// TestAsToolPersistentStreamRollupPerInvocation pins the per-invocation rollup
-// scoping on a reused child stream (Python parity: run_task registers its usage
-// subscription per call, so the persistent_stream configuration of AsTool
-// reports only this invocation's spend in each rollup, while TaskCompleted.Usage
-// stays the stream's running total — reply.usage().total).
-func TestAsToolPersistentStreamRollupPerInvocation(t *testing.T) {
+// TestAsToolPersistentStreamForwardsOnlyThisInvocation pins the persistent
+// stream contract after source accounting: a reused child stream does not
+// re-forward earlier spend, so the parent sees each invocation's UsageEvents
+// once, while TaskCompleted.Usage remains the stream's cumulative snapshot.
+func TestAsToolPersistentStreamForwardsOnlyThisInvocation(t *testing.T) {
 	resp := func(content string, prompt int64) *events.ModelResponse {
 		return &events.ModelResponse{
 			Message:  &events.ModelMessage{Content: content},
@@ -1276,19 +1276,20 @@ func TestAsToolPersistentStreamRollupPerInvocation(t *testing.T) {
 		t.Fatalf("ask: %v", err)
 	}
 	te := collectTaskEvents(t, base)
-	if len(te.rollups) != 2 {
-		t.Fatalf("rollups: %d, want 2", len(te.rollups))
+	var forwarded []events.UsageEvent
+	for _, u := range te.usage {
+		if u.AgentName == "specialist" {
+			forwarded = append(forwarded, u)
+		}
 	}
-	// Each rollup counts only its own invocation: the second must not re-report
-	// the first delegation's spend (prompt 20, not 30) and carries only its call.
-	if got := te.rollups[0].Usage.PromptTokens; got == nil || *got != 10 {
-		t.Fatalf("rollup[0] prompt_tokens = %v, want 10", got)
+	if len(forwarded) != 2 {
+		t.Fatalf("forwarded usage events: %d, want 2 (one per invocation)", len(forwarded))
 	}
-	if got := te.rollups[1].Usage.PromptTokens; got == nil || *got != 20 {
-		t.Fatalf("rollup[1] prompt_tokens = %v, want 20 (per invocation, not 30)", got)
+	if got := forwarded[0].Usage.PromptTokens; got == nil || *got != 10 {
+		t.Fatalf("forwarded[0] prompt_tokens = %v, want 10", got)
 	}
-	if len(te.rollups[1].Parts) != 1 {
-		t.Fatalf("rollup[1] parts: %d, want 1 (this invocation's call only)", len(te.rollups[1].Parts))
+	if got := forwarded[1].Usage.PromptTokens; got == nil || *got != 20 {
+		t.Fatalf("forwarded[1] prompt_tokens = %v, want 20 (not re-forwarded 10+20)", got)
 	}
 	// TaskCompleted.Usage is the cumulative stream total at completion time.
 	for i, want := range []int64{10, 30} {

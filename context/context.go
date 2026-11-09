@@ -26,9 +26,21 @@ type Context struct {
 	// Dependencies holds injected values addressed by string id (DI parity:
 	// Python ctx.dependencies / fast_depends Inject).
 	Dependencies map[string]any
-	// Variables holds serializable per-conversation variables; prefixes "ag:" and
-	// "a2a:" are reserved for framework use and stripped on the wire.
-	Variables map[string]any
+	// Variables holds per-conversation values; prefixes "ag:" and "a2a:" are
+	// reserved for framework use and stripped on the wire. Declarations
+	// (ScopedValue) decide what a delegated child inherits: COPIED deep-copies
+	// (default), LOCAL is not inherited, SHARED is one tree-wide binding.
+	//
+	// AGO-DEVIATION: Python exposes an untyped MutableMapping supporting
+	// ctx.variables[key] = value; Go maps cannot intercept that syntax, so the
+	// field is a *Variables store and reads/writes go through
+	// Variable/SetVariable (docs/DECISIONS.md D-090).
+	//
+	// New/NewWithDeps/NewWithVariables install the store before the Context is
+	// shared, so reading the field directly is safe there. A zero-value Context
+	// must go through VariableStore (or the Variable/SetVariable methods), which
+	// initializes the store under the context mutex.
+	Variables *Variables
 	// Prompt holds system-prompt fragments joined for each model call.
 	Prompt []string
 	// ToolCallID is set while a tool executes (parity: Python tool_call_id).
@@ -40,20 +52,41 @@ type Context struct {
 }
 
 func New(s stream.Stream) *Context {
+	vars, _ := NewVariables(nil)
 	return &Context{
 		Stream:       s,
 		Dependencies: map[string]any{},
-		Variables:    map[string]any{},
+		Variables:    vars,
 	}
 }
 
-func NewWithDeps(s stream.Stream, deps map[string]any, vars map[string]any) *Context {
+// NewWithDeps builds a context from plain dependency and variable maps. Scoped
+// declarations are accepted as ScopedValue entries; an invalid declaration is
+// returned as an error instead of being silently ignored.
+func NewWithDeps(s stream.Stream, deps map[string]any, vars map[string]any) (*Context, error) {
 	c := New(s)
 	for k, v := range deps {
 		c.Dependencies[k] = v
 	}
-	for k, v := range vars {
-		c.Variables[k] = v
+	if len(vars) > 0 {
+		built, err := NewVariables(vars)
+		if err != nil {
+			return nil, err
+		}
+		c.Variables = built
+	}
+	return c, nil
+}
+
+// NewWithVariables builds a context around an already-constructed variable
+// store (the delegation path: a child branch derived from its parent).
+func NewWithVariables(s stream.Stream, deps map[string]any, vars *Variables) *Context {
+	c := New(s)
+	for k, v := range deps {
+		c.Dependencies[k] = v
+	}
+	if vars != nil {
+		c.Variables = vars
 	}
 	return c
 }
@@ -82,8 +115,11 @@ func (c *Context) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Inp
 	return c.Stream.EnqueueOrigin(origin, parts...)
 }
 
-// Send publishes an event on the conversation stream.
-func (c *Context) Send(ev events.Event) error { return c.Stream.Send(ev) }
+// Send publishes an event on the conversation stream. An inert event carrying
+// inherited delegation provenance is published as a local copy: a republished
+// usage/task record must not impersonate the descendant that authored it
+// (upstream Context.send calls InertEvent.as_local).
+func (c *Context) Send(ev events.Event) error { return c.Stream.Send(events.AsLocal(ev)) }
 
 // SpawnBackground runs fn on a stream-tracked goroutine.
 func (c *Context) SpawnBackground(ctx stdcontext.Context, fn func(stdcontext.Context)) {
@@ -128,32 +164,49 @@ func (c *Context) DependenciesSnapshot() map[string]any {
 	return out
 }
 
-// VariablesSnapshot returns a shallow copy of the variables map, taken under
-// the lock (Python parity: ctx.variables.copy()).
+// VariablesSnapshot returns a shallow copy of the resolved variables (scopes
+// are not exported), taken under the variable lock (Python parity:
+// ctx.variables.copy()).
 func (c *Context) VariablesSnapshot() map[string]any {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make(map[string]any, len(c.Variables))
-	for k, v := range c.Variables {
-		out[k] = v
+	vars := c.variables()
+	if vars == nil {
+		return map[string]any{}
 	}
-	return out
+	return vars.Snapshot()
 }
 
 func (c *Context) Variable(name string) (any, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	v, ok := c.Variables[name]
-	return v, ok
+	vars := c.variables()
+	if vars == nil {
+		return nil, false
+	}
+	return vars.Get(name)
 }
 
-func (c *Context) SetVariable(name string, v any) {
+// SetVariable binds a variable. A ScopedValue declares its scope; scope
+// conflicts are returned as *ScopeError.
+func (c *Context) SetVariable(name string, v any) error {
+	return c.VariableStore().Set(name, v)
+}
+
+// VariableStore returns the scoped variable store, initializing an empty one
+// for a zero-value Context. It is safe for concurrent use; use it instead of
+// reading the Variables field on a Context that was not built by New/NewWith*.
+func (c *Context) VariableStore() *Variables {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.Variables == nil {
-		c.Variables = map[string]any{}
+		c.Variables, _ = NewVariables(nil)
 	}
-	c.Variables[name] = v
+	return c.Variables
+}
+
+// variables reads the store pointer under the context lock; a zero-value
+// Context (tests use one to model an unset stream) has no store yet.
+func (c *Context) variables() *Variables {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Variables
 }
 
 // AddPrompt appends system-prompt fragments.
@@ -172,8 +225,10 @@ func (c *Context) PromptLines() []string {
 	return out
 }
 
-// Clone shares the stream and hook but copies the mutable maps (per-invocation
-// overrides are applied to the clone, Python parity: replace(context, ...)).
+// Clone shares the stream and hook but branches the mutable state: dependencies
+// and prompt are copied and the variable store takes a same-branch Branch, so
+// per-invocation overrides stay isolated while SHARED bindings remain one
+// tree-wide binding (Python parity: replace(context, ...)).
 func (c *Context) Clone() *Context {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -187,9 +242,9 @@ func (c *Context) Clone() *Context {
 	for k, v := range c.Dependencies {
 		cc.Dependencies[k] = v
 	}
-	cc.Variables = make(map[string]any, len(c.Variables))
-	for k, v := range c.Variables {
-		cc.Variables[k] = v
+	cc.Variables = nil
+	if c.Variables != nil {
+		cc.Variables = c.Variables.Branch()
 	}
 	cc.Prompt = make([]string, len(c.Prompt))
 	copy(cc.Prompt, c.Prompt)
@@ -295,8 +350,8 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 			getErr <- err
 			return
 		}
-		if hm, ok := ev.(*events.HumanMessage); ok {
-			got <- hm
+		if hm, ok := events.AsValue(ev).(events.HumanMessage); ok {
+			got <- &hm
 		}
 	}()
 
@@ -394,12 +449,14 @@ func sanitizeTimeout(t float64) float64 {
 
 // humanRequest extracts the request behind an event: ToolApprovalRequest embeds
 // HumanInputRequest, and Go type identity keeps the embedded value from matching
-// a direct assertion.
+// a direct assertion. AsValue unwraps routed copies and pointer/value spellings;
+// it does not unwrap a ChildEvent, so a forwarded descendant question stays an
+// observation rather than a local trigger.
 func humanRequest(ev events.Event) (*events.HumanInputRequest, bool) {
-	switch t := ev.(type) {
-	case *events.HumanInputRequest:
-		return t, true
-	case *events.ToolApprovalRequest:
+	switch t := events.AsValue(ev).(type) {
+	case events.HumanInputRequest:
+		return &t, true
+	case events.ToolApprovalRequest:
 		return &t.HumanInputRequest, true
 	}
 	return nil, false
