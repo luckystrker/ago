@@ -3444,8 +3444,14 @@ There is no subtask usage rollup: accounting reads source records and dedups by
 - **Forwarding is upward-only (D-092a).** `agent/forwarding.go` subscribes as an
   interrupt handler before the child HITL hook, so a swallowed question is still
   observed by the parent. It is installed by the child's turn scope after the
-  per-stream lock is held and stopped before the lock is released, so concurrent
-  delegations reusing one `WithStreamBase` cannot cross-forward events. It relays through `Stream.Send`, not `Context.Send`,
+  per-stream lock is held and stopped before the lock is released. The turn lock
+  is process-wide by stream/conversation id (`agent/turnlock.go`), not per
+  `Agent`: two agents handed the same `WithStreamBase` serialize on the same
+  event bus, so their relays cannot cross-forward. `Close` cancels and waits for
+  the turn goroutine (`<-done`) before dropping the relay and lock; a late event
+  from a client that ignores cancellation therefore cannot land in the next
+  delegation's relay. A delegation is still one-conversation-per-stream: using
+  the *same* stream object as both parent and child would re-enter its lock. It relays through `Stream.Send`, not `Context.Send`,
   because the latter would call `AsLocal` and strip the stamped provenance. An
   already-enveloped `ChildEvent` is relayed unchanged (leaf identity preserved),
   and a delegation reusing its caller's stream disables the relay to avoid an
@@ -3473,7 +3479,9 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   events embed `InertEvent` and are no longer conversational (upstream
   `TaskEvent(InertEvent)`); this aligns compaction/rendering. `runTaskOn` emits
   `TaskStarted`/`TaskCompleted`/`TaskFailed` (and `TaskCancelled` on
-  `context.Canceled`) on the child stream, and the forwarder relays them. The
+  `context.Canceled`) on the child stream, and the forwarder relays them. All
+  task terminals carry `objective`: `runTaskOn` sets it on cancellation and the
+  `task.Task` primitive sets `spec.title` on `Cancel`/`Expire`. The
   HITL bridge no longer publishes a stamped `HumanInputRequest` locally: the
   request and answer reach the parent only as `ChildEvent` observations, and the
   bridge just calls the parent hook.
@@ -3483,7 +3491,11 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   `event_id` (id-less legacy fixtures remain distinct). Compaction now retains
   every source usage record from before the rewrite, matching upstream
   `_with_usage_events`; the old AGo deviation that dropped spend outside the
-  retained window is gone. `TokenMonitor` deduplicates by `event_id`;
+  retained window is gone. A forwarder also retains source records it relayed
+  and, if upward publication failed, best-effort accounting written to the
+  parent; `TaskCompleted.Usage` combines the child history with that accounting
+  (deduplicated by `event_id`), matching upstream `history + accounting`.
+  `TokenMonitor` deduplicates by `event_id`;
   `LoopDetector` observes local and `ChildEvent` responses with per-origin state
   and puts `task_id`/`path` in the alert data so sibling histories cannot merge.
 - **Telemetry/otelx unchanged.** The contrib module has no `UsageEvent`
