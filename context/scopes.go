@@ -69,6 +69,8 @@ func NewScopedValue(value any, scope Scope) (ScopedValue, error) {
 func normalizeScope(scope Scope) (Scope, error) {
 	switch scope {
 	case "":
+		// AGO-DEVIATION: a zero Scope means the COPIED default; upstream
+		// Scope("") raises ScopeError (docs/DECISIONS.md D-090a).
 		return ScopeCopied, nil
 	case ScopeCopied, ScopeLocal, ScopeShared:
 		return scope, nil
@@ -77,15 +79,22 @@ func normalizeScope(scope Scope) (Scope, error) {
 	}
 }
 
-// ReservedVariablePrefixes are the framework's control-plane key prefixes.
+// ReservedVariablePrefixes returns the framework's control-plane key prefixes.
 // They are never inherited by a child context and can never be declared SHARED
-// (parity: ag2/context.py RESERVED_VARIABLE_PREFIXES).
-var ReservedVariablePrefixes = []string{"ag:", "a2a:"}
+// (parity: ag2/context.py RESERVED_VARIABLE_PREFIXES). The returned slice is a
+// copy, so callers cannot mutate the package's list.
+func ReservedVariablePrefixes() []string {
+	out := make([]string, len(reservedVariablePrefixes))
+	copy(out, reservedVariablePrefixes[:])
+	return out
+}
+
+var reservedVariablePrefixes = [...]string{"ag:", "a2a:"}
 
 // IsReservedVariable reports whether key belongs to the framework control
 // plane.
 func IsReservedVariable(key string) bool {
-	for _, p := range ReservedVariablePrefixes {
+	for _, p := range reservedVariablePrefixes {
 		if strings.HasPrefix(key, p) {
 			return true
 		}
@@ -126,6 +135,9 @@ func DeepCopy(value any) any {
 type copyVisit struct {
 	typ reflect.Type
 	ptr uintptr
+	// length distinguishes slice views over one backing array: buf[:3] and
+	// buf[:2] share the data pointer but are distinct values.
+	length int
 }
 
 func deepCopyValue(v reflect.Value, seen map[copyVisit]reflect.Value) reflect.Value {
@@ -187,7 +199,7 @@ func deepCopyValue(v reflect.Value, seen map[copyVisit]reflect.Value) reflect.Va
 		if v.Len() == 0 {
 			return reflect.MakeSlice(v.Type(), 0, 0)
 		}
-		key := copyVisit{typ: v.Type(), ptr: v.Pointer()}
+		key := copyVisit{typ: v.Type(), ptr: v.Pointer(), length: v.Len()}
 		if out, ok := seen[key]; ok {
 			return out
 		}
@@ -298,8 +310,10 @@ type Variables struct {
 	root     bool
 }
 
-// NewVariables builds a root store. Every value is deep-copied, so the caller
-// keeps ownership of the input map; a ScopedValue value declares its scope.
+// NewVariables builds a root store. Every value is deep-copied in one pass
+// (preserving aliases between equal values, like Python deepcopy's memo), so
+// the caller keeps ownership of the input map; a ScopedValue value declares its
+// scope.
 func NewVariables(values map[string]any) (*Variables, error) {
 	v := &Variables{
 		own:      map[string]any{},
@@ -307,14 +321,18 @@ func NewVariables(values map[string]any) (*Variables, error) {
 		shared:   newSharedStore(),
 		root:     true,
 	}
-	for key, value := range values {
+	copied, ok := DeepCopy(values).(map[string]any)
+	if !ok {
+		copied = map[string]any{}
+	}
+	for key, value := range copied {
 		if sv, ok := value.(ScopedValue); ok {
-			if err := v.SetScoped(key, DeepCopy(sv.Value), sv.Scope); err != nil {
+			if err := v.SetScoped(key, sv.Value, sv.Scope); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		if err := v.Set(key, DeepCopy(value)); err != nil {
+		if err := v.Set(key, value); err != nil {
 			return nil, err
 		}
 	}
@@ -403,6 +421,12 @@ func (v *Variables) declareLocked(key string, scope Scope) error {
 	if !v.root && scope == ScopeShared && current != ScopeShared {
 		return &ScopeError{Key: key, Scope: scope, Detail: "new shared variables cannot be declared below the root"}
 	}
+	// AGO-DEVIATION: declaring SHARED drops the stale branch value, so
+	// Get/Snapshot/Keys stay consistent; upstream keeps the own value and its
+	// copy() then raises KeyError (docs/DECISIONS.md D-090a).
+	if scope == ScopeShared && v.own != nil {
+		delete(v.own, key)
+	}
 	v.declared[key] = scope
 	return nil
 }
@@ -420,11 +444,22 @@ func (v *Variables) ensureSharedLocked() {
 }
 
 // Delete removes the binding but leaves the scope declaration in place, so a
-// later Set still targets the same kind of binding (parity).
+// later Set still targets the same kind of binding.
+//
+// AGO-DEVIATION: returns false when the name is absent instead of raising
+// KeyError like Python's __delitem__ (docs/DECISIONS.md D-090a).
 func (v *Variables) Delete(key string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.declared[key] == ScopeShared {
+		// Defensive cleanup for stores built before the declaration rule: a
+		// SHARED key must not leave a resurrectable branch value behind.
+		if v.own != nil {
+			delete(v.own, key)
+		}
+		if v.shared == nil {
+			return false
+		}
 		return v.shared.delete(key)
 	}
 	if _, ok := v.own[key]; !ok {
@@ -434,11 +469,17 @@ func (v *Variables) Delete(key string) bool {
 	return true
 }
 
-// Keys returns the union of branch and shared names, sorted for determinism.
+// Keys returns the union of branch and shared names.
+//
+// AGO-DEVIATION: the result is sorted for deterministic output; upstream
+// preserves Python dict insertion order (docs/DECISIONS.md D-090a).
 func (v *Variables) Keys() []string {
 	v.mu.RLock()
 	seen := make(map[string]struct{}, len(v.own))
 	for k := range v.own {
+		if v.declared[k] == ScopeShared {
+			continue
+		}
 		seen[k] = struct{}{}
 	}
 	shared := v.shared
@@ -458,11 +499,16 @@ func (v *Variables) Keys() []string {
 func (v *Variables) Len() int { return len(v.Keys()) }
 
 // Snapshot returns the resolved values as a plain map, without declarations.
-// The map is a new allocation; values themselves are not deep-copied.
+// The map is a new allocation; values themselves are not deep-copied. A key
+// declared SHARED is read from the shared table only, never from a stale
+// branch value.
 func (v *Variables) Snapshot() map[string]any {
 	v.mu.RLock()
 	out := make(map[string]any, len(v.own))
 	for k, value := range v.own {
+		if v.declared[k] == ScopeShared {
+			continue
+		}
 		out[k] = value
 	}
 	shared := v.shared
@@ -508,6 +554,9 @@ func (v *Variables) Branch() *Variables {
 		root:     v.root,
 	}
 	for k, value := range v.own {
+		if v.declared[k] == ScopeShared {
+			continue
+		}
 		out.own[k] = value
 	}
 	for k, scope := range v.declared {
@@ -517,8 +566,14 @@ func (v *Variables) Branch() *Variables {
 }
 
 // DeriveChildVariables builds a child branch: LOCAL, SHARED and reserved keys
-// are not inherited; surviving own values are deep-copied; the child shares the
-// parent's tree-wide binding table and may not declare new SHARED names.
+// are not inherited; surviving own values are deep-copied in one pass (aliases
+// preserved); the child shares the parent's tree-wide binding table and may not
+// declare new SHARED names.
+//
+// AGO-DEVIATION: only branch values are considered, never the shared table, so
+// a SHARED name declared after this branch was derived can never leak into a
+// grandchild as a deep copy; upstream iterates own ∪ shared and can do that
+// (docs/DECISIONS.md D-090a).
 func DeriveChildVariables(parent *Variables) *Variables {
 	if parent == nil {
 		return &Variables{
@@ -545,8 +600,8 @@ func DeriveChildVariables(parent *Variables) *Variables {
 	parent.mu.RUnlock()
 
 	own := make(map[string]any, len(shallow))
-	for key, value := range shallow {
-		own[key] = DeepCopy(value)
+	if copied, ok := DeepCopy(shallow).(map[string]any); ok {
+		own = copied
 	}
 	childDeclared := make(map[string]Scope, len(declared))
 	for key, scope := range declared {
@@ -577,12 +632,21 @@ func MergeVariables(defaults map[string]any, inherited *Variables) (*Variables, 
 	}
 	for key, value := range defaults {
 		sv, scoped := value.(ScopedValue)
+		existing, had := inherited.Get(key)
 		if scoped {
 			if err := inherited.Declare(key, sv.Scope); err != nil {
 				return nil, err
 			}
 		}
-		if _, ok := inherited.Get(key); ok {
+		if had {
+			// A SHARED declaration drops the branch value; restore the
+			// inherited one so the inherited view still wins (upstream merge
+			// semantics: the overrides map supplies the value).
+			if scoped && inherited.Declared()[key] == ScopeShared {
+				if err := inherited.Set(key, existing); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		if scoped {

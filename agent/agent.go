@@ -64,9 +64,16 @@ func WithMiddleware(fs ...middleware.Factory) Option {
 	return func(o *options) { o.middleware = append(o.middleware, fs...) }
 }
 func WithDependencies(deps map[string]any) Option { return func(o *options) { o.dependencies = deps } }
-func WithVariables(vars map[string]any) Option    { return func(o *options) { o.variables = vars } }
-func WithResponseSchema(p response.Proto) Option  { return func(o *options) { o.schema = p } }
-func WithStreamBase(s stream.Stream) Option       { return func(o *options) { o.streamBase = s } }
+
+// WithVariables seeds the conversation variables. Values may be plain values
+// (ScopeCopied by default: a delegated child gets a deep copy) or
+// context.ScopedValue declarations: context.ScopeLocal keeps a value out of
+// child branches, context.ScopeShared makes one binding for the whole
+// invocation tree. Invalid declarations surface as *context.ScopeError from
+// Run/Ask.
+func WithVariables(vars map[string]any) Option   { return func(o *options) { o.variables = vars } }
+func WithResponseSchema(p response.Proto) Option { return func(o *options) { o.schema = p } }
+func WithStreamBase(s stream.Stream) Option      { return func(o *options) { o.streamBase = s } }
 func WithPromptHook(h PromptHook) Option {
 	return func(o *options) { o.promptHooks = append(o.promptHooks, h) }
 }

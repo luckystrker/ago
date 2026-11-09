@@ -686,3 +686,165 @@ func TestVariablesConcurrentBranchesStress(t *testing.T) {
 		t.Fatalf("child keys = %d, want 2", got)
 	}
 }
+
+// TestDeepCopySliceViewsKeepTheirLength is the regression for the memo key:
+// two views of one backing buffer share the data pointer, so the key must
+// include the view length or the second view silently gets the first's length.
+func TestDeepCopySliceViewsKeepTheirLength(t *testing.T) {
+	buf := []int{1, 2, 3, 4}
+	type views struct {
+		A []int
+		B []int
+	}
+	in := views{A: buf[:3], B: buf[:2]}
+	out, ok := DeepCopy(in).(views)
+	if !ok {
+		t.Fatalf("DeepCopy returned %T", DeepCopy(in))
+	}
+	if len(out.A) != 3 || len(out.B) != 2 {
+		t.Fatalf("view lengths = %d,%d, want 3,2", len(out.A), len(out.B))
+	}
+	if !slices.Equal(out.A, []int{1, 2, 3}) || !slices.Equal(out.B, []int{1, 2}) {
+		t.Fatalf("view contents = %v,%v", out.A, out.B)
+	}
+	out.A[0] = 99
+	if buf[0] != 1 {
+		t.Fatal("copied view aliases the original buffer")
+	}
+}
+
+// TestSharedDeclarationClearsOwnValue pins the own/shared consistency rule:
+// declaring a key SHARED drops its branch value, so Snapshot/Keys cannot
+// resurrect a value Get no longer sees (upstream raises KeyError here).
+func TestSharedDeclarationClearsOwnValue(t *testing.T) {
+	root, err := NewVariables(map[string]any{"k": "plain"})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	if err := root.SetScoped("k", "shared", ScopeShared); err != nil {
+		t.Fatalf("set scoped: %v", err)
+	}
+	if v, ok := root.Get("k"); !ok || v != "shared" {
+		t.Fatalf("shared k = %v (ok=%v)", v, ok)
+	}
+	if err := root.Declare("k", ScopeShared); err != nil {
+		t.Fatalf("redeclare same scope: %v", err)
+	}
+	if !root.Delete("k") {
+		t.Fatal("shared delete")
+	}
+	if _, ok := root.Get("k"); ok {
+		t.Fatal("deleted shared value still visible")
+	}
+	if snap := root.Snapshot(); len(snap) != 0 {
+		t.Fatalf("snapshot resurrected deleted value: %v", snap)
+	}
+	if keys := root.Keys(); len(keys) != 0 {
+		t.Fatalf("keys resurrected deleted value: %v", keys)
+	}
+	if root.Len() != 0 {
+		t.Fatalf("len = %d, want 0", root.Len())
+	}
+
+	// Declaring SHARED without a value must also drop the old branch value.
+	declared, err := NewVariables(map[string]any{"k": "plain"})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	if err := declared.Declare("k", ScopeShared); err != nil {
+		t.Fatalf("declare: %v", err)
+	}
+	if _, ok := declared.Get("k"); ok {
+		t.Fatal("declared SHARED without a value resurrects the branch value")
+	}
+	if snap := declared.Snapshot(); len(snap) != 0 {
+		t.Fatalf("declare snapshot = %v", snap)
+	}
+	if keys := declared.Keys(); len(keys) != 0 {
+		t.Fatalf("declare keys = %v", keys)
+	}
+}
+
+// TestContextSnapshotAfterSharedDelete mirrors the agui/a2a state export path:
+// the snapshot must agree with Variable after a SHARED declaration + delete.
+func TestContextSnapshotAfterSharedDelete(t *testing.T) {
+	c, err := NewWithDeps(nil, nil, map[string]any{"k": "plain"})
+	if err != nil {
+		t.Fatalf("new context: %v", err)
+	}
+	if err := c.SetVariable("k", ScopedValue{Value: "shared", Scope: ScopeShared}); err != nil {
+		t.Fatalf("set shared: %v", err)
+	}
+	if !c.VariableStore().Delete("k") {
+		t.Fatal("delete shared")
+	}
+	if _, ok := c.Variable("k"); ok {
+		t.Fatal("variable still visible")
+	}
+	if snap := c.VariablesSnapshot(); len(snap) != 0 {
+		t.Fatalf("context snapshot resurrected deleted value: %v", snap)
+	}
+}
+
+// TestDeepCopyPreservesAliasingAcrossValues pins Python deepcopy memo parity:
+// one store-level copy must keep {"x": m, "y": m} aliased in both the root and
+// a derived child.
+func TestDeepCopyPreservesAliasingAcrossValues(t *testing.T) {
+	shared := map[string]int{"n": 1}
+	root, err := NewVariables(map[string]any{"x": shared, "y": shared})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	x, _ := root.Get("x")
+	y, _ := root.Get("y")
+	x.(map[string]int)["n"] = 2
+	if y.(map[string]int)["n"] != 2 {
+		t.Fatal("root lost aliasing between equal values")
+	}
+	if shared["n"] != 1 {
+		t.Fatal("root values alias the input map")
+	}
+
+	child := DeriveChildVariables(root)
+	cx, _ := child.Get("x")
+	cy, _ := child.Get("y")
+	cx.(map[string]int)["n"] = 3
+	if cy.(map[string]int)["n"] != 3 {
+		t.Fatal("child lost aliasing between equal values")
+	}
+	if v, _ := root.Get("x"); v.(map[string]int)["n"] != 2 {
+		t.Fatal("child copy mutated the parent")
+	}
+}
+
+// TestReservedVariablePrefixesAreImmutable: the exported accessor must not hand
+// out the package's backing storage.
+func TestReservedVariablePrefixesAreImmutable(t *testing.T) {
+	prefixes := ReservedVariablePrefixes()
+	if len(prefixes) == 0 {
+		t.Fatal("no reserved prefixes")
+	}
+	prefixes[0] = "zz:"
+	if !IsReservedVariable("ag:private") {
+		t.Fatal("caller mutated the package's reserved prefixes")
+	}
+}
+
+// TestContextVariableStoreZeroValue: a zero-value Context must be usable and
+// expose one lazily initialized store through the accessor.
+func TestContextVariableStoreZeroValue(t *testing.T) {
+	var zero Context
+	store := zero.VariableStore()
+	if store == nil {
+		t.Fatal("zero Context did not initialize a store")
+	}
+	if again := zero.VariableStore(); again != store {
+		t.Fatal("accessor replaced an initialized store")
+	}
+	if err := zero.SetVariable("x", 1); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if v, ok := zero.Variable("x"); !ok || v != 1 {
+		t.Fatalf("zero context x = %v (ok=%v)", v, ok)
+	}
+}

@@ -97,14 +97,20 @@ middleware and observers receive: the stream, the system-prompt fragments, depen
 (DI) and variable maps, and the HITL hook.
 
 ```go
-cx := agocontext.New(s)          // or NewWithDeps(s, deps, vars)
+cx := agocontext.New(s)          // or NewWithDeps(s, deps, vars) / NewWithVariables(s, deps, store)
 cx.AddPrompt("Extra fragment.")  // system-prompt lines
 cx.SetDependency("db", pool)     // DI: tools.Inject reads this
-cx.SetVariable("tone", "terse")  // variables: tools.Variable reads this
+if err := cx.SetVariable("tone", "terse"); err != nil {
+	return err // *agocontext.ScopeError: conflicting scope declaration
+}
+tone, _ := cx.Variable("tone")   // tools.Variable reads this too
 ```
 
-It is safe for concurrent use; `Clone()` shares the stream but copies the maps (the
-agent clones the context between turns, so per-turn mutations do not leak backwards).
+It is safe for concurrent use. `Clone()` shares the stream and branches the variable
+store: branch values are copied between turns, while a `ScopeShared` binding stays one
+tree-wide value across a continuation. Declare delegation scopes with
+`agocontext.ScopedValue` (`ScopeCopied` default, `ScopeLocal`, `ScopeShared`); a delegated
+child receives a derived branch (deep copy / drop / reuse) rather than a flat copy.
 
 ## Agents
 

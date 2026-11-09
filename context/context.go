@@ -35,6 +35,11 @@ type Context struct {
 	// ctx.variables[key] = value; Go maps cannot intercept that syntax, so the
 	// field is a *Variables store and reads/writes go through
 	// Variable/SetVariable (docs/DECISIONS.md D-090).
+	//
+	// New/NewWithDeps/NewWithVariables install the store before the Context is
+	// shared, so reading the field directly is safe there. A zero-value Context
+	// must go through VariableStore (or the Variable/SetVariable methods), which
+	// initializes the store under the context mutex.
 	Variables *Variables
 	// Prompt holds system-prompt fragments joined for each model call.
 	Prompt []string
@@ -178,7 +183,19 @@ func (c *Context) Variable(name string) (any, bool) {
 // SetVariable binds a variable. A ScopedValue declares its scope; scope
 // conflicts are returned as *ScopeError.
 func (c *Context) SetVariable(name string, v any) error {
-	return c.ensureVariables().Set(name, v)
+	return c.VariableStore().Set(name, v)
+}
+
+// VariableStore returns the scoped variable store, initializing an empty one
+// for a zero-value Context. It is safe for concurrent use; use it instead of
+// reading the Variables field on a Context that was not built by New/NewWith*.
+func (c *Context) VariableStore() *Variables {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Variables == nil {
+		c.Variables, _ = NewVariables(nil)
+	}
+	return c.Variables
 }
 
 // variables reads the store pointer under the context lock; a zero-value
@@ -186,15 +203,6 @@ func (c *Context) SetVariable(name string, v any) error {
 func (c *Context) variables() *Variables {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.Variables
-}
-
-func (c *Context) ensureVariables() *Variables {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.Variables == nil {
-		c.Variables, _ = NewVariables(nil)
-	}
 	return c.Variables
 }
 

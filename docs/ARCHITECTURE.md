@@ -206,6 +206,7 @@ func (c *Context) Dependency(id string) (any, bool)
 func (c *Context) MustDependency(id string) (any, error)
 func (c *Context) SetVariable(name string, v any) error
 func (c *Context) Variable(name string) (any, bool)
+func (c *Context) VariableStore() *Variables // lazy init, safe for zero-value Context
 func (c *Context) VariablesSnapshot() map[string]any
 func (c *Context) Clone() *Context   // shares Stream, branches Variables, copies maps
 ```

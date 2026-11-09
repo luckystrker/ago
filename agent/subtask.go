@@ -297,7 +297,7 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return taskResult{taskID: taskID, objective: objective, childStream: childStream, err: err}, nil
 	}
 
-	run, err := child.newRunWith(childStream, context.DeriveChildVariables(parentCX.Variables), prompt)
+	run, err := child.newRunWith(childStream, context.DeriveChildVariables(parentCX.VariableStore()), prompt)
 	if err != nil {
 		return fail(err)
 	}

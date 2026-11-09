@@ -174,16 +174,22 @@ func (v *Variables) Branch() *Variables
 func DeriveChildVariables(parent *Variables) *Variables
 func MergeVariables(defaults map[string]any, inherited *Variables) (*Variables, error)
 func OverlayVariables(vars *Variables, values map[string]any) (*Variables, error)
+
+func ReservedVariablePrefixes() []string // copy of the unexported prefix array
+func IsReservedVariable(key string) bool
+func (c *Context) VariableStore() *Variables // lazy init, safe for zero-value Context
 ```
 
 `ConversationContext.Variables` is a `*Variables`; `Context.Clone` takes a
 same-branch `Branch` (continuation keeps the shared binding table), while a
 delegation derives a child branch. `DeepCopy` prefers the explicit `Clone` hook;
 its reflection fallback copies pointers, maps, slices, arrays, structs and
-interfaces, preserves cycles, shallow-copies unexported struct fields and shares
+interfaces, preserves cycles and aliases (one memo per store; slice memo keys
+include the view length), shallow-copies unexported struct fields and shares
 funcs/chans/unsafe pointers. SHARED bindings give visibility, not
 synchronization: compound mutations (append / read-modify-write) need a
-caller-supplied lock, which can travel through `dependencies`.
+caller-supplied lock, which can travel through `dependencies`. Declaring SHARED
+drops a stale branch value so `Get`/`Snapshot`/`Keys` always agree (D-090a).
 
 ### Run / result / usage
 - `AgentRun` (`ag2\agent.py:473`): `stream`, `enqueue()`, `start()`, `async result() -> AgentReply` (idempotent, re-raises same failure); turn scope dies with the `async with` block.

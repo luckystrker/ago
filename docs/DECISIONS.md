@@ -3235,9 +3235,24 @@ unknown scope and a different redeclaration are `*ScopeError` values wrapping
 - **Deep copy: explicit `Clone` + reflection fallback (D-090a).** Python uses
   `copy.deepcopy`; the stdlib-only port checks a `context.Clone` interface
   first, then reflects over pointers/maps/slices/arrays/structs/interfaces,
-  preserving cycles. Limits are documented on `DeepCopy`: unexported struct
-  fields stay shallow (reflection cannot set them), funcs/chans/unsafe pointers
-  are shared, and concurrent mutation during a copy is the caller's race.
+  preserving cycles and aliases through one memo per store (Python deepcopy
+  parity). Slice memo keys include the view length: Go `buf[:3]` and `buf[:2]`
+  share a data pointer but are distinct values, unlike Python list objects.
+  Limits are documented on `DeepCopy`: unexported struct fields stay shallow
+  (reflection cannot set them), funcs/chans/unsafe pointers are shared, and
+  concurrent mutation during a copy is the caller's race.
+- **own/shared consistency (D-090a).** Declaring SHARED (or `Declare` without a
+  value) removes the stale branch value, and `Snapshot`/`Keys`/`Branch` skip a
+  SHARED key even if a legacy store still holds one. `Delete(SHARED)` removes
+  the binding and any stale own value. AGO-DEVIATION: upstream leaves the own
+  value in place and its `copy()` then raises `KeyError`; AGo keeps `Get`,
+  `Snapshot`, `Keys` and the agui/a2a state export consistent. `MergeVariables`
+  restores an inherited value dropped by the declaration so inherited values
+  still win. Comment: `context/scopes.go`, `declareLocked`/`Delete`/`Snapshot`.
+- **Three small Go-shape deviations (D-090a).** A zero `Scope` normalizes to
+  COPIED (upstream `Scope("")` raises); `Keys()` sorts names for deterministic
+  output (upstream keeps insertion order); `Delete` returns `bool` instead of
+  raising `KeyError`. Comments on `normalizeScope`, `Keys`, `Delete`.
 - **SHARED is visible, not synchronized (D-090a).** `Variables` protects its
   maps and the shared-binding table with RWMutexes (lock order branch → shared);
   sibling rebinding is `-race` safe. Compound mutation of a shared value
@@ -3246,14 +3261,27 @@ unknown scope and a different redeclaration are `*ScopeError` values wrapping
   `findings_lock`. Go also cannot make an `append` to an injected SHARED slice
   visible through the store, because a slice is a header; rebind it with `Set`
   or share a map/pointer. Code comment: `context/scopes.go`, type `Variables`.
+- **Child derivation ignores the shared table (D-090a).** Only branch values are
+  copied, so a SHARED name declared after a branch was derived can never leak
+  into a grandchild as a deep copy. Upstream iterates `own ∪ shared` and can do
+  that on this rare interleaving; AGo treats shared bindings strictly as a
+  reused tree-wide reference. Comment: `DeriveChildVariables`.
 - **No wire representation (D-090a).** `ScopedValue`/`Scope` never enter an
   event or transport payload; `Snapshot` and a2a context updates carry resolved
   values only, so no `@type`/snake_case wire change. `ReservedVariablePrefixes`
-  now lives in `context` and drives the scope checks; the `a2a` transport keeps
-  its leaf copy (D-056).
+  is an accessor over an unexported array (callers cannot mutate the package
+  list); `a2a.StripReservedVariables` and `agui`'s state filter reuse
+  `context.IsReservedVariable` instead of local copies, and the mutable
+  `a2a.ReservedVariablePrefixes` slice is removed (use the context accessor).
 - **`OverlayVariables` is exposed but unused by the agent (D-090a).** AGo has no
   per-`ask` `variables=` override or turn-scoped plugin defaults, so the helper
   exists for parity and is covered by tests rather than wired into a call site.
+- **Zero-value Context uses `VariableStore()` (D-090a).** The accessor
+  initializes the store under the context mutex, so lazy initialization cannot
+  race with an internal reader. Contexts built by `New`/`NewWithDeps`/
+  `NewWithVariables` install the pointer before use, so direct field reads stay
+  safe there. `tools.resolveDILookup` now propagates a `SetVariable` error
+  (wrapped with `%w`) instead of dropping it.
 
 Gates run green: `go build ./...`, `go vet ./...`, `go test ./...`. The intended
 `go test -race ./context/ ./agent/` could not run on this runner (no cgo
