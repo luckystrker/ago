@@ -94,6 +94,22 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 			evs:  toolStep(events.ToolCallEvent{ID: "call-1", Name: "search", Arguments: `{}`}),
 			want: map[string]any{"search": "skip_thought_signature_validator"},
 		},
+		{
+			name: "text before the call in one model step does not block the placeholder",
+			evs: []events.Event{
+				userText("Think, then find it."),
+				events.ModelResponse{
+					Message:   &events.ModelMessage{Content: "Let me search."},
+					ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{{ID: "call-1", Name: "search", Arguments: `{}`}}},
+				},
+				events.ToolResultsEvent{Results: []events.ToolResultEvent{{
+					ParentID: "call-1",
+					Name:     "search",
+					Result:   events.NewToolResult(false, "ok"),
+				}}},
+			},
+			want: map[string]any{"search": "skip_thought_signature_validator"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,6 +191,32 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "model", Parts: []map[string]any{call("new")}},
 			},
 			want: map[string]any{"old": "old-signature", "new": SkipThoughtSignature},
+		},
+		{
+			// The turn boundary is the last user content itself, not the content
+			// before it: a previous-turn model step that sits directly before the
+			// new user message must stay unsigned.
+			name: "a previous-turn call directly before a new user stays unsigned",
+			contents: []wireContent{
+				{Role: "user", Parts: []map[string]any{{"text": "first"}}},
+				{Role: "model", Parts: []map[string]any{call("old")}},
+				{Role: "user", Parts: []map[string]any{{"text": "second"}}},
+				{Role: "model", Parts: []map[string]any{call("new")}},
+			},
+			want: map[string]any{"old": nil, "new": SkipThoughtSignature},
+		},
+		{
+			name: "a signed later call keeps its signature",
+			contents: []wireContent{
+				{Role: "user", Parts: []map[string]any{{"text": "q"}}},
+				{Role: "model", Parts: []map[string]any{call("first"), signed("second", "real-signature")}},
+			},
+			want: map[string]any{"first": SkipThoughtSignature, "second": "real-signature"},
+		},
+		{
+			name:     "empty contents is a no-op",
+			contents: nil,
+			want:     map[string]any{},
 		},
 		{
 			name: "a nil signature is treated as missing",
