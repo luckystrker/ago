@@ -251,7 +251,7 @@ func projectEvents(visible []visibleEnvelope, participant string) []events.Event
 	for _, v := range visible {
 		if v.env.SenderID == participant {
 			for _, part := range v.parts {
-				if ti, ok := part.(*events.TextInput); ok {
+				if ti, ok := events.AsValue(part).(events.TextInput); ok {
 					out = append(out, events.ModelMessage{Content: ti.Content})
 				}
 			}
@@ -276,7 +276,7 @@ func projectNamedEvents(visible []visibleEnvelope, participant string, nameFor N
 		parts := make([]events.Input, len(v.parts))
 		copy(parts, v.parts)
 		if len(parts) > 0 {
-			if ti, ok := parts[0].(*events.TextInput); ok {
+			if ti, ok := events.AsValue(parts[0]).(events.TextInput); ok {
 				parts[0] = &events.TextInput{Content: label + " " + ti.Content}
 			} else {
 				parts = append([]events.Input{&events.TextInput{Content: label}}, parts...)

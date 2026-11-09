@@ -195,7 +195,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 		events.TypeOf[events.ToolResultsEvent](),
 	)
 	r.subs = append(r.subs, r.stream.Subscribe(func(ev events.Event) error {
-		if _, drained := ev.(*events.DrainedModelRequest); drained {
+		if _, drained := events.AsValue(ev).(events.DrainedModelRequest); drained {
 			return nil
 		}
 		return r.llmTrigger(ev)
@@ -203,8 +203,10 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 
 	// 2. Halt check: records the halt; the LLM trigger turns it into a synthetic
 	// response (Python parity: _HaltCheckMiddleware + AlertPolicy's HaltEvent).
+	// AsValue keeps value-form events and routed copies working; a forwarded
+	// descendant halt stays inside ChildEvent and must not stop this turn.
 	r.subs = append(r.subs, r.stream.Subscribe(func(ev events.Event) error {
-		if he, ok := ev.(*events.HaltEvent); ok {
+		if he, ok := events.AsValue(ev).(events.HaltEvent); ok {
 			r.haltMu.Lock()
 			r.halted, r.haltReason = true, he.Reason
 			r.haltMu.Unlock()

@@ -212,7 +212,7 @@ func (m *TaskMirror) Detach(s stream.Stream) {
 // onStarted seeds the store: state running, the agent-side absolute
 // deadline carried through so networked task TTLs stay enforceable.
 func (m *TaskMirror) onStarted(ev events.Event) {
-	started, ok := ev.(events.TaskStarted)
+	started, ok := events.AsValue(ev).(events.TaskStarted)
 	if !ok {
 		return
 	}
@@ -255,7 +255,7 @@ func (m *TaskMirror) updateSwallowingMissing(taskID string, state task.State, pr
 }
 
 func (m *TaskMirror) onProgress(ev events.Event) {
-	p, ok := ev.(events.TaskProgress)
+	p, ok := events.AsValue(ev).(events.TaskProgress)
 	if !ok {
 		return
 	}
@@ -263,7 +263,7 @@ func (m *TaskMirror) onProgress(ev events.Event) {
 }
 
 func (m *TaskMirror) onCompleted(ev events.Event) {
-	c, ok := ev.(events.TaskCompleted)
+	c, ok := events.AsValue(ev).(events.TaskCompleted)
 	if !ok {
 		return
 	}
@@ -275,7 +275,7 @@ func (m *TaskMirror) onCompleted(ev events.Event) {
 }
 
 func (m *TaskMirror) onFailed(ev events.Event) {
-	f, ok := ev.(events.TaskFailed)
+	f, ok := events.AsValue(ev).(events.TaskFailed)
 	if !ok {
 		return
 	}
@@ -283,7 +283,7 @@ func (m *TaskMirror) onFailed(ev events.Event) {
 }
 
 func (m *TaskMirror) onExpired(ev events.Event) {
-	e, ok := ev.(events.TaskExpired)
+	e, ok := events.AsValue(ev).(events.TaskExpired)
 	if !ok {
 		return
 	}
@@ -291,7 +291,7 @@ func (m *TaskMirror) onExpired(ev events.Event) {
 }
 
 func (m *TaskMirror) onCancelled(ev events.Event) {
-	c, ok := ev.(events.TaskCancelled)
+	c, ok := events.AsValue(ev).(events.TaskCancelled)
 	if !ok {
 		return
 	}
