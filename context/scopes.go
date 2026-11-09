@@ -423,8 +423,9 @@ func (v *Variables) declareLocked(key string, scope Scope) error {
 	}
 	// AGO-DEVIATION: declaring SHARED drops the stale branch value, so
 	// Get/Snapshot/Keys stay consistent; upstream keeps the own value and its
-	// copy() then raises KeyError (docs/DECISIONS.md D-090a).
-	if scope == ScopeShared && v.own != nil {
+	// copy() then raises KeyError (docs/DECISIONS.md D-090a). delete on a nil
+	// map is a no-op, so a zero-value store needs no guard.
+	if scope == ScopeShared {
 		delete(v.own, key)
 	}
 	v.declared[key] = scope
@@ -454,9 +455,8 @@ func (v *Variables) Delete(key string) bool {
 	if v.declared[key] == ScopeShared {
 		// Defensive cleanup for stores built before the declaration rule: a
 		// SHARED key must not leave a resurrectable branch value behind.
-		if v.own != nil {
-			delete(v.own, key)
-		}
+		// (delete on a nil map is a no-op.)
+		delete(v.own, key)
 		if v.shared == nil {
 			return false
 		}
@@ -469,7 +469,10 @@ func (v *Variables) Delete(key string) bool {
 	return true
 }
 
-// Keys returns the union of branch and shared names.
+// Keys returns the union of branch and shared names visible in this branch:
+// a shared name is included only when this branch's declaration map knows it is
+// SHARED, matching Get. A root that declares a new SHARED name after a child
+// branch was derived therefore does not leak it into the child's Keys.
 //
 // AGO-DEVIATION: the result is sorted for deterministic output; upstream
 // preserves Python dict insertion order (docs/DECISIONS.md D-090a).
@@ -482,9 +485,18 @@ func (v *Variables) Keys() []string {
 		}
 		seen[k] = struct{}{}
 	}
+	sharedKeys := make(map[string]struct{}, len(v.declared))
+	for k, scope := range v.declared {
+		if scope == ScopeShared {
+			sharedKeys[k] = struct{}{}
+		}
+	}
 	shared := v.shared
 	v.mu.RUnlock()
 	for _, k := range shared.keys() {
+		if _, ok := sharedKeys[k]; !ok {
+			continue
+		}
 		seen[k] = struct{}{}
 	}
 	out := make([]string, 0, len(seen))
@@ -501,7 +513,8 @@ func (v *Variables) Len() int { return len(v.Keys()) }
 // Snapshot returns the resolved values as a plain map, without declarations.
 // The map is a new allocation; values themselves are not deep-copied. A key
 // declared SHARED is read from the shared table only, never from a stale
-// branch value.
+// branch value, and a shared name this branch's declaration map does not know
+// is omitted (matching Get).
 func (v *Variables) Snapshot() map[string]any {
 	v.mu.RLock()
 	out := make(map[string]any, len(v.own))
@@ -511,11 +524,20 @@ func (v *Variables) Snapshot() map[string]any {
 		}
 		out[k] = value
 	}
+	sharedKeys := make(map[string]struct{}, len(v.declared))
+	for k, scope := range v.declared {
+		if scope == ScopeShared {
+			sharedKeys[k] = struct{}{}
+		}
+	}
 	shared := v.shared
 	v.mu.RUnlock()
 	if shared != nil {
 		shared.mu.RLock()
 		for k, value := range shared.values {
+			if _, ok := sharedKeys[k]; !ok {
+				continue
+			}
 			out[k] = value
 		}
 		shared.mu.RUnlock()
@@ -639,12 +661,15 @@ func MergeVariables(defaults map[string]any, inherited *Variables) (*Variables, 
 			}
 		}
 		if had {
-			// A SHARED declaration drops the branch value; restore the
-			// inherited one so the inherited view still wins (upstream merge
-			// semantics: the overrides map supplies the value).
-			if scoped && inherited.Declared()[key] == ScopeShared {
-				if err := inherited.Set(key, existing); err != nil {
-					return nil, err
+			// AGO-DEVIATION: a SHARED declaration drops the branch value;
+			// restore the inherited one so the inherited view still wins
+			// (upstream leaves own in place and later copy() raises KeyError;
+			// docs/DECISIONS.md D-090a).
+			if scoped {
+				if inherited.Declared()[key] == ScopeShared {
+					if err := inherited.Set(key, existing); err != nil {
+						return nil, err
+					}
 				}
 			}
 			continue

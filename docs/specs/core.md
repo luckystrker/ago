@@ -190,6 +190,9 @@ funcs/chans/unsafe pointers. SHARED bindings give visibility, not
 synchronization: compound mutations (append / read-modify-write) need a
 caller-supplied lock, which can travel through `dependencies`. Declaring SHARED
 drops a stale branch value so `Get`/`Snapshot`/`Keys` always agree (D-090a).
+`Snapshot`/`Keys`/`Len` include a shared name only when the branch's declaration
+map knows it is SHARED, so a late root declaration stays invisible to a live
+child branch exactly as `Get` reports it.
 
 ### Run / result / usage
 - `AgentRun` (`ag2\agent.py:473`): `stream`, `enqueue()`, `start()`, `async result() -> AgentReply` (idempotent, re-raises same failure); turn scope dies with the `async with` block.

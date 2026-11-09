@@ -3265,14 +3265,19 @@ unknown scope and a different redeclaration are `*ScopeError` values wrapping
   copied, so a SHARED name declared after a branch was derived can never leak
   into a grandchild as a deep copy. Upstream iterates `own ∪ shared` and can do
   that on this rare interleaving; AGo treats shared bindings strictly as a
-  reused tree-wide reference. Comment: `DeriveChildVariables`.
+  reused tree-wide reference. The same live branch also keeps `Get`/`Snapshot`/
+  `Keys`/`Len` consistent: a shared name its copied declaration map does not
+  know is omitted from all of them. Comment: `DeriveChildVariables` and the
+  `Keys`/`Snapshot` docs.
 - **No wire representation (D-090a).** `ScopedValue`/`Scope` never enter an
   event or transport payload; `Snapshot` and a2a context updates carry resolved
   values only, so no `@type`/snake_case wire change. `ReservedVariablePrefixes`
   is an accessor over an unexported array (callers cannot mutate the package
   list); `a2a.StripReservedVariables` and `agui`'s state filter reuse
-  `context.IsReservedVariable` instead of local copies, and the mutable
-  `a2a.ReservedVariablePrefixes` slice is removed (use the context accessor).
+  `context.IsReservedVariable` instead of local copies. The old mutable
+  `a2a.ReservedVariablePrefixes` slice stays as a deprecated snapshot alias
+  (`// Deprecated:`), so existing code still compiles; mutating it does not
+  change the context contract.
 - **`OverlayVariables` is exposed but unused by the agent (D-090a).** AGo has no
   per-`ask` `variables=` override or turn-scoped plugin defaults, so the helper
   exists for parity and is covered by tests rather than wired into a call site.

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
+
+	agocontext "github.com/luckystrker/ago/context"
 )
 
 // TestExtractContextUpdate covers the extract contract: absent metadata, a
@@ -46,6 +48,23 @@ func TestStripReservedVariables(t *testing.T) {
 	}
 	if got := StripReservedVariables(nil); got == nil || len(got) != 0 {
 		t.Fatalf("nil payload → %v", got)
+	}
+}
+
+// TestReservedVariablePrefixesDeprecatedAlias keeps the pre-sync a2a symbol
+// usable: it is a snapshot of the context contract and must not be the context
+// package's backing storage.
+func TestReservedVariablePrefixesDeprecatedAlias(t *testing.T) {
+	if len(ReservedVariablePrefixes) != len(agocontext.ReservedVariablePrefixes()) {
+		t.Fatalf("alias = %v", ReservedVariablePrefixes)
+	}
+	if len(ReservedVariablePrefixes) > 0 {
+		original := ReservedVariablePrefixes[0]
+		ReservedVariablePrefixes[0] = "zz:"
+		if !agocontext.IsReservedVariable("ag:turn") {
+			t.Fatal("mutating the a2a alias changed the context contract")
+		}
+		ReservedVariablePrefixes[0] = original
 	}
 }
 

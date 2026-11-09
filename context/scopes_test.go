@@ -848,3 +848,97 @@ func TestContextVariableStoreZeroValue(t *testing.T) {
 		t.Fatalf("zero context x = %v (ok=%v)", v, ok)
 	}
 }
+
+// TestDeclareNonSharedKeepsValue pins the "Declare records a scope without
+// touching the bound value" contract: only SHARED declarations may drop the
+// branch value. It kills the ==/!= and &&/|| mutants on declareLocked's delete
+// guard.
+func TestDeclareNonSharedKeepsValue(t *testing.T) {
+	root, err := NewVariables(map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	if err := root.Declare("k", ScopeCopied); err != nil {
+		t.Fatalf("declare copied: %v", err)
+	}
+	if v, ok := root.Get("k"); !ok || v != "v" {
+		t.Fatalf("Declare(COPIED) lost the value: v=%v (ok=%v)", v, ok)
+	}
+	if v, ok := root.Snapshot()["k"]; !ok || v != "v" {
+		t.Fatalf("Declare(COPIED) lost the snapshot value: %v", root.Snapshot())
+	}
+
+	// The same guard is reached through MergeVariables: a scoped COPIED
+	// default over an inherited key must not delete the inherited value.
+	child, err := NewVariables(map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("new child root: %v", err)
+	}
+	derived := DeriveChildVariables(child)
+	merged, err := MergeVariables(map[string]any{
+		"k": ScopedValue{Value: "default", Scope: ScopeCopied},
+	}, derived)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if v, ok := merged.Get("k"); !ok || v != "v" {
+		t.Fatalf("COPIED default over inherited key lost the inherited value: v=%v (ok=%v)", v, ok)
+	}
+}
+
+// TestMergeSharedDefaultRestoresInheritedOwnValue covers the restore branch:
+// a SHARED default over a root's plain key must move the inherited value into
+// the shared table (the key was not there yet). It kills the ==/!= mutant on
+// the restoration condition.
+func TestMergeSharedDefaultRestoresInheritedOwnValue(t *testing.T) {
+	root, err := NewVariables(map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	merged, err := MergeVariables(map[string]any{
+		"k": ScopedValue{Value: "default", Scope: ScopeShared},
+	}, root)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if v, ok := merged.Get("k"); !ok || v != "v" {
+		t.Fatalf("restored inherited value = %v (ok=%v), want v", v, ok)
+	}
+	if v, ok := merged.Snapshot()["k"]; !ok || v != "v" {
+		t.Fatalf("snapshot lost the restored shared value: %v", merged.Snapshot())
+	}
+}
+
+// TestLateSharedDeclarationInvisibleToLiveBranch pins Get/Snapshot/Keys
+// consistency when the root declares a new SHARED name after a child branch was
+// derived. The child shares the live binding table but its declaration map is a
+// snapshot, so Get cannot see the name; the exports must agree.
+func TestLateSharedDeclarationInvisibleToLiveBranch(t *testing.T) {
+	root, err := NewVariables(map[string]any{"a": 1})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	child := DeriveChildVariables(root)
+	if err := root.SetScoped("late", "v", ScopeShared); err != nil {
+		t.Fatalf("late shared: %v", err)
+	}
+	if v, ok := child.Get("late"); ok {
+		t.Fatalf("child sees a late SHARED name: %v", v)
+	}
+	if _, ok := child.Snapshot()["late"]; ok {
+		t.Fatalf("child snapshot leaks a late SHARED name: %v", child.Snapshot())
+	}
+	if slices.Contains(child.Keys(), "late") {
+		t.Fatalf("child keys leak a late SHARED name: %v", child.Keys())
+	}
+	// The root, which owns the declaration, sees it everywhere.
+	if v, ok := root.Get("late"); !ok || v != "v" {
+		t.Fatalf("root lost the late shared value: %v (ok=%v)", v, ok)
+	}
+	if v, ok := root.Snapshot()["late"]; !ok || v != "v" {
+		t.Fatalf("root snapshot lost the late shared value: %v", root.Snapshot())
+	}
+	if !slices.Contains(root.Keys(), "late") {
+		t.Fatalf("root keys lost the late shared name: %v", root.Keys())
+	}
+}

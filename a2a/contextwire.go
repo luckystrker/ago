@@ -21,6 +21,11 @@ const (
 // Reserved control-plane prefixes come from the context package's contract
 // (parity: ag2/ag2/context.py:289 RESERVED_VARIABLE_PREFIXES); the transport
 // does not keep its own copy.
+//
+// Deprecated: use agocontext.ReservedVariablePrefixes or
+// agocontext.IsReservedVariable. This slice is a snapshot copy provided only
+// for source compatibility; mutating it does not change the context contract.
+var ReservedVariablePrefixes = agocontext.ReservedVariablePrefixes()
 
 // ExtractContextUpdate returns the context.variables delta carried on msg's
 // metadata; an empty map when absent or not an object — callers can merge the

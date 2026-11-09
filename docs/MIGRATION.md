@@ -68,10 +68,13 @@ compile; code that wants to surface a scope conflict must now check it.
 
 **`AgentReply.Context()` is new** — additive, Python `reply.context` parity.
 
-**`a2a.ReservedVariablePrefixes` was removed.** The control-plane prefixes now
+**`a2a.ReservedVariablePrefixes` is deprecated.** The control-plane prefixes
 have a single source in `context`: use `agocontext.ReservedVariablePrefixes()`
-(returns a copy) or `agocontext.IsReservedVariable(key)`.
-`a2a.StripReservedVariables` and agui's state export already delegate to it.
+(returns a copy) or `agocontext.IsReservedVariable(key)`. The old
+`a2a.ReservedVariablePrefixes` variable remains as a snapshot alias for source
+compatibility (mutating it does not affect the context contract);
+`a2a.StripReservedVariables` and agui's state export already delegate to the
+context helper.
 
 `Context.Clone()` keeps the existing cross-turn isolation for branch values and
 keeps one SHARED binding table for the continuation; a delegated child instead
