@@ -25,6 +25,14 @@ import (
 // ErrConfigNotProvided matches Python ConfigNotProvidedError: Ask/Run without a model config.
 var ErrConfigNotProvided = errors.New("agent: no model config provided (pass WithConfig)")
 
+// ErrNestedSameStream reports a delegation whose child stream is already owned
+// by an enclosing turn in the same call chain. Taking the per-stream turn lock
+// again would deadlock, so runTaskOn rejects the delegation instead.
+//
+// AGO-DEVIATION: upstream's non-reentrant asyncio.Lock would queue such a child
+// forever; AGo fails fast with this sentinel instead (D-092b).
+var ErrNestedSameStream = errors.New("agent: nested delegation on the same stream is not supported")
+
 // ErrMaxToolRounds is returned by a turn whose model kept requesting tools
 // after the WithMaxToolRounds budget of executed tool rounds ran out. The
 // transcript is repaired (unanswered calls closed) exactly as on a HITL

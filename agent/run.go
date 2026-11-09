@@ -93,9 +93,13 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	r.maxToolRounds = opts.maxToolRounds
 
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
-	// the per-stream turn lock in _turn_scope).
-	r.lock = acquireTurnLock(r.stream.ID())
-	r.lock.mu.Lock()
+	// the per-stream turn lock in _turn_scope). Acquiring honors ctx: a caller
+	// queued behind another turn returns its deadline error instead of parking.
+	var lockErr error
+	r.lock, lockErr = acquireTurnLock(ctx, r.stream.ID())
+	if lockErr != nil {
+		return lockErr
+	}
 	// A failed scope entry releases everything the scope took, so a forgotten
 	// Close after a Start error cannot strand the stream for later asks
 	// (Python parity: the _turn_scope async-with releases the lock when the
@@ -115,10 +119,14 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	if r.delegation != nil {
 		r.delegation.start()
 		if r.delegationStart != nil {
+			// Mark the attempt before publishing: the relay is an interrupt
+			// subscriber, so the parent may already have TaskStarted even if the
+			// child's persistence fails. fail() then must not publish it again
+			// (upstream sets Forwarder.started before sending).
+			r.delegationStarted = true
 			if err := r.stream.Send(r.delegationStart); err != nil {
 				return fmt.Errorf("agent: send task started: %w", err)
 			}
-			r.delegationStarted = true
 			r.delegationStart = nil
 		}
 	}
@@ -300,9 +308,10 @@ func (r *AgentRun) Enqueue(parts ...events.Input) error {
 // Stream exposes the conversation stream.
 func (r *AgentRun) Stream() stream.Stream { return r.stream }
 
-// Close ends the turn scope: cancels an in-flight turn, unsubscribes and
-// releases the per-stream lock. Safe to call multiple times; safe before Start
-// (no-op).
+// Close ends the turn scope: cancels an in-flight turn, waits for its goroutine
+// to finish, unsubscribes and releases the per-stream lock. It is blocking by
+// design: a model client that ignores cancellation can make Close wait until
+// the call returns. Safe to call multiple times; safe before Start (no-op).
 func (r *AgentRun) Close() {
 	r.closeOnce.Do(func() {
 		// Stop a turn still in flight before tearing the scope down: otherwise its
