@@ -2,9 +2,13 @@ package events
 
 import (
 	"encoding/json"
+	"errors"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func testUsageEvent(id string) *UsageEvent {
@@ -392,4 +396,298 @@ func TestDelegationConcurrentRead(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestDelegationConstructors(t *testing.T) {
+	inner := testUsageEvent("origin")
+	path := []string{"root", "child"}
+
+	child := NewChildEvent(inner, "child", path, "worker", "origin")
+	if child.Direction != DirectionUp {
+		t.Fatalf("NewChildEvent direction = %q, want %q", child.Direction, DirectionUp)
+	}
+	if child.TaskID != "child" || child.AgentName != "worker" || child.OriginEventID != "origin" {
+		t.Fatalf("NewChildEvent dropped provenance: %#v", child)
+	}
+	if !reflect.DeepEqual(child.Path, path) {
+		t.Fatalf("NewChildEvent path = %#v, want %#v", child.Path, path)
+	}
+	if got := SourceEvent(child); got != Event(inner) {
+		t.Fatalf("SourceEvent(NewChildEvent) = %T, want the authored event", got)
+	}
+
+	down := NewDownEvent(inner, "child", path, "worker")
+	if down.Direction != DirectionDown {
+		t.Fatalf("NewDownEvent direction = %q, want %q", down.Direction, DirectionDown)
+	}
+	if down.TaskID != "child" || down.AgentName != "worker" {
+		t.Fatalf("NewDownEvent dropped provenance: %#v", down)
+	}
+	if !reflect.DeepEqual(down.Path, path) {
+		t.Fatalf("NewDownEvent path = %#v, want %#v", down.Path, path)
+	}
+}
+
+// wireObject marshals ev through the public entry point (so the @type
+// discriminator is present) and returns the decoded JSON object.
+func wireObject(t *testing.T, ev Event) map[string]any {
+	t.Helper()
+	data, err := MarshalEvent(ev)
+	if err != nil {
+		t.Fatalf("marshal %T: %v", ev, err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(data, &obj); err != nil {
+		t.Fatalf("decode %T JSON: %v", ev, err)
+	}
+	return obj
+}
+
+func assertWireKeys(t *testing.T, obj map[string]any, want ...string) {
+	t.Helper()
+	got := make([]string, 0, len(obj))
+	for k := range obj {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("wire fields = %v, want %v (upstream snake_case names)", got, want)
+	}
+}
+
+func TestDelegationWireFieldsMatchUpstream(t *testing.T) {
+	inner := testUsageEvent("inner")
+
+	child := NewChildEvent(inner, "t1", []string{"root", "t1"}, "worker", "inner")
+	obj := wireObject(t, child)
+	assertWireKeys(t, obj, "@type", "created_at", "inner", "task_id", "path", "agent_name", "origin_event_id", "direction")
+	if obj["@type"] != "ChildEvent" || obj["direction"] != DirectionUp {
+		t.Fatalf("ChildEvent discriminator/defaults = %v/%v", obj["@type"], obj["direction"])
+	}
+	innerObj, ok := obj["inner"].(map[string]any)
+	if !ok || innerObj["@type"] != "UsageEvent" || innerObj["event_id"] != "inner" {
+		t.Fatalf("nested inner = %#v, want a UsageEvent carrying its event_id", obj["inner"])
+	}
+	if _, ok := obj["source_event"]; ok {
+		t.Fatal("source_event is derived, never serialized")
+	}
+
+	down := NewDownEvent(inner, "t2", []string{"root", "t2"}, "worker")
+	down.OriginTaskID = "t1"
+	down.OriginPath = []string{"root"}
+	down.OriginStreamID = "stream-1"
+	obj = wireObject(t, down)
+	assertWireKeys(t, obj, "@type", "created_at", "inner", "task_id", "path", "agent_name", "direction",
+		"origin_task_id", "origin_path", "origin_stream_id")
+	if obj["@type"] != "DownEvent" || obj["direction"] != DirectionDown {
+		t.Fatalf("DownEvent discriminator/defaults = %v/%v", obj["@type"], obj["direction"])
+	}
+
+	// task_id is None upstream; AGo omits an empty optional field.
+	obj = wireObject(t, &DeliveryFailed{Reason: "gone"})
+	assertWireKeys(t, obj, "@type", "created_at", "reason")
+	obj = wireObject(t, &DeliveryFailed{TaskID: "t3", Reason: "gone"})
+	assertWireKeys(t, obj, "@type", "created_at", "task_id", "reason")
+}
+
+func TestDownEventWireNormalizesDefaults(t *testing.T) {
+	down := &DownEvent{Inner: testUsageEvent("d"), TaskID: "t", AgentName: "w"}
+	obj := wireObject(t, down)
+	if obj["direction"] != DirectionDown {
+		t.Fatalf("direction = %v, want %q", obj["direction"], DirectionDown)
+	}
+	if path, ok := obj["path"].([]any); !ok || len(path) != 0 {
+		t.Fatalf("path = %#v, want []", obj["path"])
+	}
+	if originPath, ok := obj["origin_path"].([]any); !ok || len(originPath) != 0 {
+		t.Fatalf("origin_path = %#v, want []", obj["origin_path"])
+	}
+
+	raw := []byte(`{"@type":"DownEvent","inner":{"@type":"UsageEvent","event_id":"d","kind":"model_call","usage":{}},"task_id":"t","agent_name":"w"}`)
+	back, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("unmarshal down without direction: %v", err)
+	}
+	decoded, ok := back.(*DownEvent)
+	if !ok || decoded.Direction != DirectionDown {
+		t.Fatalf("decoded = %#v, want direction %q", back, DirectionDown)
+	}
+}
+
+func TestRoutedDelegatesShape(t *testing.T) {
+	created := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name           string
+		inner          Event
+		transient      bool
+		conversational bool
+	}{
+		{"usage", &UsageEvent{Base: Base{CreatedAt: created}}, false, false},
+		{"chunk", &ModelMessageChunk{Base: Base{CreatedAt: created}}, true, false},
+		{"text", &TextInput{Base: Base{CreatedAt: created}, Content: "x"}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			routed := Routed(tc.inner, Delivery{})
+			if got := routed.EventType(); got != tc.inner.EventType() {
+				t.Fatalf("EventType = %q, want %q", got, tc.inner.EventType())
+			}
+			if got := routed.Transient(); got != tc.transient {
+				t.Fatalf("Transient = %v, want %v", got, tc.transient)
+			}
+			if got := routed.Conversational(); got != tc.conversational {
+				t.Fatalf("Conversational = %v, want %v", got, tc.conversational)
+			}
+			if got := routed.At(); !got.Equal(created) {
+				t.Fatalf("At = %v, want %v", got, created)
+			}
+		})
+	}
+
+	empty := Routed(nil, Delivery{})
+	if !empty.At().IsZero() || empty.Transient() || empty.Conversational() {
+		t.Fatalf("nil inner must delegate to zero values: %v %v %v",
+			empty.At(), empty.Transient(), empty.Conversational())
+	}
+	if got := empty.EventType(); got != "RoutedEvent" {
+		t.Fatalf("nil inner EventType = %q", got)
+	}
+}
+
+func TestTypeOfAnySeesRoutedAuthorType(t *testing.T) {
+	responseType := reflect.TypeOf(ModelResponse{})
+	routed := Routed(&ModelResponse{Message: &ModelMessage{Content: "hi"}}, Delivery{})
+	if !TypeOfAny(responseType)(routed) {
+		t.Fatal("TypeOfAny must match the authored type through a routed wrapper")
+	}
+	if !TypeOfAny(responseType)(&ModelResponse{}) {
+		t.Fatal("TypeOfAny must keep matching an ordinary pointer event")
+	}
+	if TypeOfAny(responseType)(nil) {
+		t.Fatal("TypeOfAny must not match a nil event")
+	}
+
+	observation := Routed(&ChildEvent{Inner: &ModelResponse{}}, Delivery{})
+	if !TypeOfAny(reflect.TypeOf(ChildEvent{}))(observation) {
+		t.Fatal("a routed ChildEvent keeps the observation type, not its inner type")
+	}
+	if TypeOfAny(responseType)(observation) {
+		t.Fatal("routing must not turn an observation into a local response")
+	}
+
+	if typeMatches(nil, nil) || typeMatches(nil, responseType) || typeMatches(responseType, nil) {
+		t.Fatal("typeMatches must reject nil types instead of panicking")
+	}
+}
+
+func TestAllOfIgnoresNilConditions(t *testing.T) {
+	ev := &ModelResponse{}
+	if !AllOf(nil, TypeOf[ModelResponse]())(ev) {
+		t.Fatal("AllOf must ignore a nil condition")
+	}
+	if !AllOf(nil)(ev) {
+		t.Fatal("AllOf(nil) matches everything")
+	}
+	if AllOf(nil, TypeOf[ModelResponse]())(&TextInput{Content: "x"}) {
+		t.Fatal("AllOf must still require its non-nil conditions")
+	}
+}
+
+func TestRegisterEventIsIdempotent(t *testing.T) {
+	before := RegisteredTypes()
+	RegisterEvent(UsageEvent{})
+	RegisterEvent(ChildEvent{})
+	if after := RegisteredTypes(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("re-registering a type changed the registry: %v -> %v", before, after)
+	}
+	back, err := UnmarshalEvent([]byte(`{"@type":"UsageEvent","event_id":"x","kind":"model_call","usage":{}}`))
+	if err != nil {
+		t.Fatalf("unmarshal after re-registration: %v", err)
+	}
+	if got := back.(*UsageEvent).EventID; got != "x" {
+		t.Fatalf("re-registration replaced the factory: event_id = %q", got)
+	}
+}
+
+// marshalFailEvent exercises the nested-event error path: its payload cannot
+// be serialized, so an envelope must surface the error instead of guessing.
+type marshalFailEvent struct{}
+
+func (marshalFailEvent) EventType() string    { return "MarshalFailEvent" }
+func (marshalFailEvent) At() time.Time        { return time.Time{} }
+func (marshalFailEvent) Transient() bool      { return false }
+func (marshalFailEvent) Conversational() bool { return false }
+func (marshalFailEvent) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("marshalFailEvent: boom")
+}
+
+func TestDelegationNestedErrorsAreReported(t *testing.T) {
+	if _, err := MarshalEvent(&ChildEvent{Inner: marshalFailEvent{}}); err == nil {
+		t.Fatal("ChildEvent must propagate an inner marshal error")
+	}
+	if _, err := MarshalEvent(&DownEvent{Inner: marshalFailEvent{}}); err == nil {
+		t.Fatal("DownEvent must propagate an inner marshal error")
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"@type":"ChildEvent","inner":{"no_type":true}}`),
+		[]byte(`{"@type":"DownEvent","inner":{"no_type":true}}`),
+	} {
+		if _, err := UnmarshalEvent(raw); err == nil {
+			t.Fatalf("inner payload without @type must fail: %s", raw)
+		}
+	}
+	var usage UsageEvent
+	if err := usage.UnmarshalJSON([]byte(`{`)); err == nil {
+		t.Fatal("UsageEvent must report malformed JSON")
+	}
+}
+
+func TestSourceEventAndAsValueAreCycleSafe(t *testing.T) {
+	// A malformed self-referential envelope must terminate instead of hanging.
+	child := &ChildEvent{TaskID: "cycle"}
+	child.Inner = child
+	if got := SourceEvent(child); got != Event(child) {
+		t.Fatalf("SourceEvent(cycle) = %T, want the envelope after the bounded walk", got)
+	}
+
+	var nilRouted *RoutedEvent
+	if got := SourceEvent(nilRouted); got != nil {
+		t.Fatalf("SourceEvent(nil routed) = %v, want nil", got)
+	}
+
+	routed := &RoutedEvent{}
+	routed.Inner = routed
+	if got := AsValue(routed); got != Event(routed) {
+		t.Fatalf("AsValue(cycle) = %T, want the wrapper after the bounded walk", got)
+	}
+}
+
+func TestChildEventArchivedInnerGetsEventID(t *testing.T) {
+	// An archived observation whose usage payload predates event_id: the inner
+	// record must decode with a generated id so ancestors can deduplicate it.
+	raw := []byte(`{"@type":"ChildEvent","inner":{"@type":"UsageEvent","kind":"model_call","usage":{"total_tokens":30}},"task_id":"t","path":["t"],"agent_name":"w","origin_event_id":"legacy","direction":"up"}`)
+	back, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("unmarshal archived ChildEvent: %v", err)
+	}
+	child, ok := back.(*ChildEvent)
+	if !ok {
+		t.Fatalf("decoded %T, want *ChildEvent", back)
+	}
+	inner, ok := child.Inner.(*UsageEvent)
+	if !ok {
+		t.Fatalf("inner = %T, want *UsageEvent", child.Inner)
+	}
+	if len(inner.EventID) != 32 || strings.Contains(inner.EventID, "-") {
+		t.Fatalf("generated inner event_id = %q, want 32 hex chars", inner.EventID)
+	}
+	if got := SourceEvent(child); got != Event(inner) {
+		t.Fatalf("SourceEvent(archived child) = %T, want the generated UsageEvent", got)
+	}
+	obj := wireObject(t, child)
+	innerObj, ok := obj["inner"].(map[string]any)
+	if !ok || innerObj["event_id"] != inner.EventID {
+		t.Fatalf("re-marshaled inner event_id = %#v, want %q", innerObj["event_id"], inner.EventID)
+	}
 }
