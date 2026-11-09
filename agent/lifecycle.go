@@ -7,10 +7,17 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/hitl"
+	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/observers"
+	"github.com/luckystrker/ago/plugin"
+	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
 	"github.com/luckystrker/ago/task"
+	"github.com/luckystrker/ago/tools"
 	"github.com/luckystrker/ago/usage"
 )
 
@@ -20,10 +27,12 @@ import (
 // "cancelled".
 const ParentCancelledReason = "parent cancelled"
 
-// RunOptions are the per-invocation task-lifecycle options (Python parity:
-// capability= and ttl_seconds= keyword arguments of ask/run/resume). Either
-// field enables the lifecycle; zero options keep an ordinary call emitting no
-// Task events (upstream ADR 0035).
+// RunOptions are the per-invocation options of one ask/run/resume (Python
+// parity: the keyword arguments those methods accept). Capability and TTL drive
+// the task lifecycle: either one enables it, zero options keep an ordinary call
+// emitting no Task events (upstream ADR 0035). Every other field is an override
+// that applies to this invocation only; its zero value keeps the agent's
+// configuration, so the struct is backward compatible.
 //
 // AGO-DEVIATION: Go has no keyword arguments, so the options travel as this
 // value through the AskWith/RunWith/ResumeWith family; Ask/Run/Resume stay the
@@ -35,6 +44,56 @@ type RunOptions struct {
 	// TTL is the task's observation deadline. It only populates metadata and
 	// TaskStarted.expires_at — an external observer calls Expire (Python parity).
 	TTL time.Duration
+
+	// Stream runs the invocation on an existing stream instead of the agent's
+	// stream base or a fresh one (Python parity: stream= of ask/run/resume). For
+	// a resume the seeded trajectory replaces that stream's history. Continuations
+	// (AgentReply.Ask/Run) keep the reply's stream and ignore it.
+	Stream stream.Stream
+	// Config replaces the agent's model config for this invocation (Python
+	// parity: config=). nil keeps the agent's config.
+	Config config.ModelConfig
+	// Tools are appended to the agent's tools for this invocation (Python
+	// parity: tools=). They are not visible to delegated children, exactly like
+	// tools attached at construction.
+	Tools []tools.Tool
+	// Middleware is appended after the agent's middleware, so it lands innermost
+	// in the turn onion (Python parity: middleware=).
+	Middleware []middleware.Factory
+	// Observers are appended after the agent's observers; they register on the
+	// turn's stream and are bracketed by ObserverStarted/ObserverCompleted
+	// (Python parity: observers=).
+	Observers []observers.Observer
+	// Plugins apply their contributions for this invocation only (Python
+	// parity: plugins=). Unlike construction-time plugins (WithPlugin), the
+	// attachments do not persist past the turn.
+	//
+	// AGO-DEVIATION: a plugin's dynamic prompt hooks run only on a turn that
+	// seeds its prompt (a fresh conversation); a continuation keeps the prompt it
+	// cloned, so re-running the hooks would duplicate their fragments.
+	Plugins []plugin.Plugin
+	// HitlHook replaces the agent's human-input hook for this invocation
+	// (Python parity: hitl_hook=). nil keeps the agent's hook; a non-nil hook
+	// takes precedence over it for this call only.
+	HitlHook hitl.HumanHook
+	// Dependencies overlay the agent's dependencies for this invocation (Python
+	// parity: dependencies=).
+	Dependencies map[string]any
+	// Variables overlay the conversation variables for this invocation (Python
+	// parity: variables=); scoped declarations are honored.
+	Variables map[string]any
+	// Prompt replaces the system-prompt fragments for this invocation (Python
+	// parity: prompt=). A non-empty slice suppresses the agent's own static
+	// fragments for the call; nil keeps them.
+	Prompt []string
+	// ResponseSchema replaces the agent's response schema for this invocation
+	// (Python parity: the response_schema= argument). nil keeps the agent's.
+	ResponseSchema response.Proto
+	// FreeText asks for free-text replies on this invocation even when the agent
+	// has a response schema (Python parity: response_schema=None, which its
+	// `omit` sentinel distinguishes from "not passed"). FreeText wins over
+	// ResponseSchema.
+	FreeText bool
 }
 
 // enabled reports whether the options ask for a task lifecycle.

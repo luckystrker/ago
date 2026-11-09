@@ -21,6 +21,19 @@ import (
 // fresh MemoryStream, seeded with the agent's dependencies (WithDependencies)
 // so injected values resolve the same way they do inside a turn.
 func (a *Agent) Task(ctx stdcontext.Context, title string, opts ...task.Option) (*task.Task, error) {
+	return a.TaskWithSpec(ctx, task.Spec{Title: title}, opts...)
+}
+
+// TaskWithSpec opens a task from a full specification, so the deprecated
+// convenience entry point still carries what Python's agent.task does:
+// description, payload and capability (Python parity:
+// agent.task(title, description=..., payload=..., capability=...)).
+//
+// AGO-DEVIATION: Agent.Task's signature cannot grow the three fields without
+// breaking every caller (its variadic is already task.Option, and Go allows one
+// variadic parameter), so the full spec travels through a second method rather
+// than keyword arguments.
+func (a *Agent) TaskWithSpec(ctx stdcontext.Context, spec task.Spec, opts ...task.Option) (*task.Task, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -40,7 +53,7 @@ func (a *Agent) Task(ctx stdcontext.Context, title string, opts ...task.Option) 
 	if taskStreamProbe != nil {
 		taskStreamProbe(s, cx)
 	}
-	return task.Start(cx, a.name, task.Spec{Title: title}, opts...)
+	return task.Start(cx, a.name, spec, opts...)
 }
 
 // taskStreamProbe is a test seam: when non-nil it receives the private stream

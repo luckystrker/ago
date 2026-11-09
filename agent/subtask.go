@@ -169,7 +169,14 @@ func heldStreamsOf(cx *context.Context) []string {
 	return nil
 }
 
-// runTaskOn runs child as a sub-task of the conversation parentCX and reports
+// runTaskOn runs child as a sub-task of the conversation parentCX with the
+// default stream selection (the child's stream base, else a fresh stream over
+// the parent's storage).
+func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, objective, contextStr string) (taskResult, error) {
+	return runTaskWith(ctx, parentCX, child, objective, contextStr, nil, "")
+}
+
+// runTaskWith runs child as a sub-task of the conversation parentCX and reports
 // the delegation on the parent stream (Python parity:
 // tools/subagents/run_task.py run_task): TaskStarted before the child turn,
 // TaskCompleted/TaskFailed/TaskCancelled after, all authored on the child stream
@@ -184,13 +191,20 @@ func heldStreamsOf(cx *context.Context) []string {
 // and the parent has one, questions asked inside the child are bridged: the
 // child's request is forwarded as a ChildEvent and the parent's hook answers.
 //
+// factory builds this delegation's stream (nil falls back to the child's stream
+// base and then to a fresh stream) and taskID pins the delegation's id (empty
+// generates one), which is how AsTool's stream options and the background tool
+// address one delegation.
+//
 // A hitl failure comes back as the error result — it must end the calling turn
 // (Python parity: run_task re-raises HumanInputError). Any other failure is
 // reported in the returned taskResult with completed=false and becomes the
 // delegating tool's "Error: ..." output; the terminal task event is emitted on
 // both paths.
-func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, objective, contextStr string) (taskResult, error) {
-	taskID := strings.ReplaceAll(uuid.New(), "-", "") // Python parity: uuid4().hex
+func runTaskWith(ctx stdcontext.Context, parentCX *context.Context, child *Agent, objective, contextStr string, factory DelegationStreamFactory, taskID string) (taskResult, error) {
+	if taskID == "" {
+		taskID = strings.ReplaceAll(uuid.New(), "-", "") // Python parity: uuid4().hex
+	}
 	prompt := objective
 	if contextStr != "" {
 		prompt = objective + "\n\n## Context\n" + contextStr
@@ -198,12 +212,17 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 
 	// The child transcript persists where the parent's does, under the child's
 	// own stream id (Python parity: MemoryStream(storage=parent ...storage)).
-	// A stream base set on the child agent keeps the persistent-stream behavior
-	// of AsTool users.
-	child.mu.Lock()
-	base := child.opts.streamBase
-	child.mu.Unlock()
-	childStream := base
+	// A per-delegation factory wins over the child's stream base, which keeps
+	// the persistent-stream behavior of AsTool users.
+	var childStream stream.Stream
+	if factory != nil {
+		childStream = factory(child, parentCX)
+	}
+	if childStream == nil {
+		child.mu.Lock()
+		childStream = child.opts.streamBase
+		child.mu.Unlock()
+	}
 	if childStream == nil {
 		childStream = stream.NewMemoryStream(stream.WithStorage(parentCX.Stream.History().Storage()))
 	}
@@ -379,6 +398,12 @@ func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
 		Task string `json:"task" agschema:"description=The objective for the subtask agent,required"`
 	}
 	fn := func(args subtaskArgs, cx *context.Context) (string, error) {
+		// The singular tool draws from the same per-agent pool as the fan-out
+		// tool, so one parent turn (or several) can never exceed
+		// TaskConfig.MaxConcurrency (Python parity: _spawn_subtask's
+		// _task_slots_for, shared with run_subtasks).
+		release := r.agent.acquireTaskSlot(maxConcurrency(tc.MaxConcurrency))
+		defer release()
 		res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, "subtask"), args.Task, "")
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
@@ -415,12 +440,17 @@ func (r *AgentRun) newRunSubtasksTool(tc *TaskConfig) tools.Tool {
 			hitlErr error
 			mu      sync.Mutex
 			wg      sync.WaitGroup
-			sem     chan struct{}
 		)
+		// One pool per agent, shared with the singular tool and with other turns
+		// on the same agent (Python parity: Agent._task_slots_for). Every
+		// delegation, sequential or concurrent, draws a slot.
+		limit := maxConcurrency(tc.MaxConcurrency)
 		// runOne renders one sub-task: failures become "Error: ..." text inside
 		// the combined output (Python parity: `_spawn_subtask` returns
 		// f"Error: {result.error}"), hitl failures end the whole call.
 		runOne := func(i int, task string) error {
+			release := r.agent.acquireTaskSlot(limit)
+			defer release()
 			res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
 			if err != nil {
 				return err
@@ -437,13 +467,10 @@ func (r *AgentRun) newRunSubtasksTool(tc *TaskConfig) tools.Tool {
 			return nil
 		}
 		if parallel {
-			sem = make(chan struct{}, maxConcurrency(tc.MaxConcurrency))
 			for i, task := range args.Tasks {
 				wg.Add(1)
-				sem <- struct{}{}
 				go func(i int, task string) {
 					defer wg.Done()
-					defer func() { <-sem }()
 					if err := runOne(i, task); err != nil {
 						mu.Lock()
 						if hitlErr == nil {
@@ -488,4 +515,57 @@ func maxConcurrency(n int) int {
 		return 16 // a sane default so one call cannot fork unbounded goroutines
 	}
 	return n
+}
+
+// acquireTaskSlot takes one slot from the agent's shared subtask pool and
+// returns the release function. The pool is created on first use and reused by
+// every turn of the agent, so run_subtask and run_subtasks across concurrent
+// parent turns share the same cap (Python parity: Agent._task_slots_for, one
+// semaphore per agent).
+//
+// AGO-DEVIATION: Python keys the pool by event loop and drops closed loops; Go
+// has no loop object, so one process-wide pool per agent is the equivalent.
+// A different limit replaces the pool (TaskConfig is fixed per agent, so this
+// only happens if an agent is reconfigured).
+func (a *Agent) acquireTaskSlot(limit int) func() {
+	if limit <= 0 {
+		return func() {}
+	}
+	a.taskSlotsMu.Lock()
+	if a.taskSlots == nil || a.taskSlotsLimit != limit {
+		a.taskSlots = make(chan struct{}, limit)
+		a.taskSlotsLimit = limit
+	}
+	sem := a.taskSlots
+	a.taskSlotsMu.Unlock()
+	sem <- struct{}{}
+	return func() { <-sem }
+}
+
+// PersistentStream returns a delegation stream factory that reuses one stream
+// per delegated agent for the lifetime of a conversation (Python parity:
+// tools/subagents/persistent_stream.py). The stream id is cached in the caller's
+// dependencies under "ag:<agent>:stream"; each delegation rebuilds a stream from
+// that id and the parent's storage, so the worker reads back its own accumulated
+// history while each delegation still gets its own subscriber set and turn lock.
+//
+// The same warning as Python's applies: the sub-agent becomes stateful, and
+// token cost grows with every delegation.
+func PersistentStream() DelegationStreamFactory {
+	return func(agent *Agent, cx *context.Context) stream.Stream {
+		if agent == nil || cx == nil {
+			return nil
+		}
+		key := "ag:" + agent.Name() + ":stream"
+		id, _ := cx.Dependency(key)
+		streamID, _ := id.(string)
+		if streamID == "" {
+			streamID = "s-" + uuid.New()
+			cx.SetDependency(key, streamID)
+		}
+		return stream.NewMemoryStream(
+			stream.WithStorage(cx.Stream.History().Storage()),
+			stream.WithStreamID(streamID),
+		)
+	}
 }

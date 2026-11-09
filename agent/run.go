@@ -13,6 +13,7 @@ import (
 	"github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/observers"
 	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
 	"github.com/luckystrker/ago/task"
@@ -67,7 +68,10 @@ type AgentRun struct {
 	// delegation (always) or for an ordinary run whose RunOptions enable it, and
 	// publishes the terminal when the scope closes.
 	lifecycle *runLifecycle
-	// runOpts are the per-invocation lifecycle options (capability/ttl).
+	// observerNames are the observers this invocation registered, in order, so
+	// Close can publish their ObserverCompleted pair.
+	observerNames []string
+	// runOpts are the per-invocation options (lifecycle and overrides).
 	runOpts    RunOptions
 	running    atomic.Bool
 	haltMu     sync.Mutex
@@ -152,6 +156,13 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 		}
 	}
 
+	// Per-invocation context overrides (dependencies/variables/prompt) land
+	// before anything reads the context, under the turn lock (Python parity:
+	// _ContextOverrides.apply in _turn_scope).
+	if err := r.applyRunOverrides(); err != nil {
+		return err
+	}
+
 	// The turn's input enters the inbox only now, under the lock: a sibling
 	// delegation blocked on this stream must not have its objective drained by
 	// the turn that owns the lock (audit M-25). Public ask/run input is a user
@@ -165,8 +176,12 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 		r.pendingInput = nil
 	}
 
-	// Model config → client (Python parity: _prepare_turn).
+	// Model config → client (Python parity: _prepare_turn). A per-invocation
+	// config replaces the agent's for this call only (config=).
 	cfg := opts.cfg
+	if r.runOpts.Config != nil {
+		cfg = r.runOpts.Config
+	}
 	if cfg == nil {
 		return ErrConfigNotProvided
 	}
@@ -184,6 +199,10 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 		return err
 	}
 
+	// Invocation plugins contribute to several scopes of this turn (prompt,
+	// tools, middleware); snapshot them once (Python parity: _TurnPlugins).
+	pc := r.runOpts.contributions()
+
 	// System prompt: static fragments + dynamic hooks, seeded only when the
 	// context carries no prompt yet — continuations clone the previous turn's
 	// context and re-seeding would duplicate every fragment on the wire
@@ -197,21 +216,47 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 			}
 			r.cx.AddPrompt(fr...)
 		}
+		// Invocation plugins contribute their prompt only on a turn that seeds
+		// its prompt; a continuation keeps the cloned prompt, so re-running the
+		// hooks would duplicate their fragments (see RunOptions.Plugins).
+		r.cx.AddPrompt(pc.fragments...)
+		for _, h := range pc.hooks {
+			fr, err := h(r.cx)
+			if err != nil {
+				return fmt.Errorf("agent: invocation plugin prompt hook: %w", err)
+			}
+			r.cx.AddPrompt(fr...)
+		}
 	}
 
-	// Tools: static + auto-injected subtask tools (Python parity: resolve_tools).
+	// Tools: static + auto-injected subtask tools + invocation plugins +
+	// per-call tools (Python parity: resolve_tools over chain(self.tools,
+	// self._additional_tools, additional_tools)).
 	allTools := append([]tools.Tool{}, opts.tools...)
 	allTools = append(allTools, r.subtaskTools(opts)...)
+	allTools = append(allTools, pc.tools...)
+	allTools = append(allTools, r.runOpts.Tools...)
 	resolved, err := tools.ResolveTools(allTools, r.cx)
 	if err != nil {
 		return fmt.Errorf("agent: resolve tools: %w", err)
 	}
 	r.resolved = resolved
 	r.schema = opts.schema
+	if r.runOpts.ResponseSchema != nil {
+		r.schema = r.runOpts.ResponseSchema
+	}
+	if r.runOpts.FreeText {
+		// Python's `response_schema=None` (distinct from the omit sentinel).
+		r.schema = nil
+	}
 
-	// Middleware instances, one per turn (Python parity: MiddlewareFactory).
-	r.instances = make([]middleware.Middleware, len(opts.middleware))
-	for i, f := range opts.middleware {
+	// Middleware instances, one per turn (Python parity: MiddlewareFactory),
+	// agent middleware first, then invocation plugins, then the call's own.
+	factories := append([]middleware.Factory{}, opts.middleware...)
+	factories = append(factories, pc.middleware...)
+	factories = append(factories, r.runOpts.Middleware...)
+	r.instances = make([]middleware.Middleware, len(factories))
+	for i, f := range factories {
 		r.instances[i] = f()
 	}
 
@@ -223,8 +268,13 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 	// dispatch before persistence). A hook that ignores its context outlives the
 	// deadline — Go cannot cancel a goroutine, so Ask abandons it (AGO-DEVIATION:
 	// Python cancels the in-flight hook; see docs/DECISIONS.md D-032).
-	if opts.hitl != nil {
-		userHook := opts.hitl
+	hitlHook := opts.hitl
+	if r.runOpts.HitlHook != nil {
+		// A per-invocation hook replaces the agent's for this call (hitl_hook=).
+		hitlHook = r.runOpts.HitlHook
+	}
+	if hitlHook != nil {
+		userHook := hitlHook
 		r.cx.SetHitlHook(func(hctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
 			// The middleware chain carries no stdlib context, so the per-request
 			// context is bound into the head of the chain here, per invocation.
@@ -279,6 +329,16 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 		return fmt.Errorf("agent: register tool executor: %w", err)
 	}
 	r.subs = append(r.subs, execSubs...)
+
+	// Observers: the agent's own, then the invocation's, registered on the
+	// turn's stream and bracketed by ObserverStarted (Python parity:
+	// _observer_lifecycle inside _drive_scope).
+	obs := append(append([]observers.Observer{}, opts.observers...), r.runOpts.Observers...)
+	names, err := r.startObservers(obs)
+	if err != nil {
+		return err
+	}
+	r.observerNames = names
 
 	// Re-entry trigger for Resume (after subscriptions are live). The scan
 	// position is recorded before the send so the turn loop does not miss the
@@ -367,6 +427,11 @@ func (r *AgentRun) Close() {
 			r.cancel()
 		}
 		r.awaitTurn()
+		// ObserverCompleted goes out while the observers' own subscriptions are
+		// still live (they are stream-scoped, not in r.subs), before the agent's
+		// turn subscribers come down (Python parity: _observer_lifecycle's
+		// finally runs before the ExitStack unwinds).
+		r.finishObservers()
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
 		}
