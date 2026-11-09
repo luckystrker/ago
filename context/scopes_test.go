@@ -2,8 +2,10 @@ package context
 
 import (
 	"errors"
+	"math"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -393,5 +395,294 @@ func TestVariablesConcurrentShared(t *testing.T) {
 	wg.Wait()
 	if v, ok := root.Get("shared"); !ok || v == nil {
 		t.Fatalf("shared lost: %v (ok=%v)", v, ok)
+	}
+}
+
+// foreignClone returns a different dynamic type; DeepCopy must fall back to
+// reflection rather than hand the caller a value it cannot use.
+type foreignClone struct{ N int }
+
+func (foreignClone) Clone() any { return "not a foreignClone" }
+
+// nilClone returns nil; DeepCopy must yield the type's zero value.
+type nilClone struct{ N int }
+
+func (nilClone) Clone() any { return nil }
+
+func TestDeepCopyNilAndArrayEdges(t *testing.T) {
+	var ptr *int
+	if got, ok := DeepCopy(ptr).(*int); !ok || got != nil {
+		t.Fatalf("nil pointer copied to %v (%T)", got, DeepCopy(ptr))
+	}
+	var m map[string]int
+	if got, ok := DeepCopy(m).(map[string]int); !ok || got != nil {
+		t.Fatalf("nil map copied to %v (%T)", got, DeepCopy(m))
+	}
+	var sl []int
+	if got, ok := DeepCopy(sl).([]int); !ok || got != nil {
+		t.Fatalf("nil slice copied to %v (%T)", got, DeepCopy(sl))
+	}
+	// A nil any stays untyped nil; a typed nil keeps its dynamic type.
+	var iface any
+	if got := DeepCopy(iface); got != nil {
+		t.Fatalf("nil interface copied to %v", got)
+	}
+	typedNil := (*int)(nil)
+	if got, ok := DeepCopy(any(typedNil)).(*int); !ok || got != nil {
+		t.Fatalf("typed nil interface = %v (%T)", got, DeepCopy(any(typedNil)))
+	}
+
+	// Arrays are values too: every element must be copied independently.
+	arr := [2]map[string]int{{"a": 1}, {"b": 2}}
+	got := DeepCopy(arr).([2]map[string]int)
+	got[0]["a"] = 9
+	if arr[0]["a"] != 1 {
+		t.Fatal("array element aliases the original")
+	}
+	if got[1]["b"] != 2 {
+		t.Fatalf("array tail not copied: %v", got)
+	}
+}
+
+func TestDeepCopyCloneFallbacks(t *testing.T) {
+	if got := DeepCopy(foreignClone{N: 3}).(foreignClone); got.N != 3 {
+		t.Fatalf("wrong-typed Clone must fall back to reflection: %+v", got)
+	}
+	if got := DeepCopy(nilClone{N: 4}).(nilClone); got.N != 0 {
+		t.Fatalf("nil Clone must yield the zero value: %+v", got)
+	}
+}
+
+func TestScopeErrorMessage(t *testing.T) {
+	msg := (&ScopeError{Key: "k", Scope: ScopeShared, Detail: "conflict"}).Error()
+	if !strings.Contains(msg, `"k"`) || !strings.Contains(msg, "conflict") {
+		t.Fatalf("message %q must name the key and the conflict", msg)
+	}
+	if got := (&ScopeError{Detail: "plain"}).Error(); got != "context: plain" {
+		t.Fatalf("keyless message = %q", got)
+	}
+}
+
+func TestDeleteOwnAndMissing(t *testing.T) {
+	root, err := NewVariables(map[string]any{"own": 1})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	if !root.Delete("own") {
+		t.Fatal("delete existing own binding")
+	}
+	if _, ok := root.Get("own"); ok {
+		t.Fatal("own binding survived delete")
+	}
+	if root.Delete("own") {
+		t.Fatal("second delete must report absent")
+	}
+	if root.Delete("missing") {
+		t.Fatal("delete of a missing name must report absent")
+	}
+}
+
+func TestMultipleSharedBindings(t *testing.T) {
+	root, err := NewVariables(map[string]any{
+		"a": ScopedValue{Value: 1, Scope: ScopeShared},
+		"b": ScopedValue{Value: 2, Scope: ScopeShared},
+	})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	for key, want := range map[string]any{"a": 1, "b": 2} {
+		if got, ok := root.Get(key); !ok || got != want {
+			t.Fatalf("%s = %v (ok=%v), want %v", key, got, ok, want)
+		}
+	}
+	child := DeriveChildVariables(root)
+	if err := child.Set("a", 10); err != nil {
+		t.Fatalf("set shared: %v", err)
+	}
+	if v, _ := root.Get("a"); v != 10 {
+		t.Fatalf("rebound a = %v, want 10", v)
+	}
+	if v, _ := root.Get("b"); v != 2 {
+		t.Fatalf("unrelated shared binding b = %v, want 2", v)
+	}
+}
+
+// TestMergeVariablesScopedDefaultOnMissingKey drives the SetScoped path of the
+// inherited branch (a scoped default whose key the child does not have yet).
+func TestMergeVariablesScopedDefaultOnMissingKey(t *testing.T) {
+	root, err := NewVariables(map[string]any{"s": ScopedValue{Value: 0, Scope: ScopeShared}})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	child := DeriveChildVariables(root)
+	merged, err := MergeVariables(map[string]any{
+		"extra": ScopedValue{Value: []string{"x"}, Scope: ScopeCopied},
+	}, child)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if merged != child {
+		t.Fatal("merge must return the inherited view")
+	}
+	if v, ok := merged.Get("extra"); !ok || !slices.Equal(v.([]string), []string{"x"}) {
+		t.Fatalf("extra = %v (ok=%v)", v, ok)
+	}
+}
+
+func TestOverlayVariablesScopedInPlaceAndPlainRoot(t *testing.T) {
+	over, err := OverlayVariables(nil, map[string]any{
+		"s": ScopedValue{Value: "v", Scope: ScopeShared},
+	})
+	if err != nil {
+		t.Fatalf("overlay nil: %v", err)
+	}
+	over2, err := OverlayVariables(over, map[string]any{
+		"s": ScopedValue{Value: "w", Scope: ScopeShared},
+	})
+	if err != nil {
+		t.Fatalf("scoped overlay in place: %v", err)
+	}
+	if over2 != over {
+		t.Fatal("scoped overlay must update the given store")
+	}
+	if v, _ := over.Get("s"); v != "w" {
+		t.Fatalf("scoped overlay s = %v, want w", v)
+	}
+
+	plain, err := OverlayVariables(nil, map[string]any{"p": 7})
+	if err != nil {
+		t.Fatalf("plain overlay nil: %v", err)
+	}
+	if !plain.IsRoot() {
+		t.Fatal("plain overlay must build a root")
+	}
+	if v, _ := plain.Get("p"); v != 7 {
+		t.Fatalf("plain overlay p = %v", v)
+	}
+}
+
+func TestVariablesDeclaredAndBranch(t *testing.T) {
+	root, err := NewVariables(map[string]any{
+		"plain":  map[string]int{"n": 1},
+		"shared": ScopedValue{Value: 0, Scope: ScopeShared},
+	})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	declared := root.Declared()
+	if declared["shared"] != ScopeShared {
+		t.Fatalf("declared shared = %q", declared["shared"])
+	}
+	if _, ok := declared["plain"]; ok {
+		t.Fatal("undeclared key must not appear in Declared")
+	}
+
+	branch := root.Branch()
+	if !branch.IsRoot() {
+		t.Fatal("a continuation keeps the branch's rootness")
+	}
+	if branch.Declared()["shared"] != ScopeShared {
+		t.Fatal("Branch must carry declarations")
+	}
+	// Branch copies own values shallowly (the continuation contract), while
+	// SHARED rebinding stays tree-wide.
+	bv, _ := branch.Get("plain")
+	bv.(map[string]int)["n"] = 2
+	if v, _ := root.Get("plain"); v.(map[string]int)["n"] != 2 {
+		t.Fatal("Branch must stay shallow")
+	}
+	if err := branch.Set("shared", 5); err != nil {
+		t.Fatalf("set shared: %v", err)
+	}
+	if v, _ := root.Get("shared"); v != 5 {
+		t.Fatalf("Branch broke the shared binding: %v", v)
+	}
+}
+
+func TestContextNewWithVariablesAndZeroValue(t *testing.T) {
+	store, err := NewVariables(map[string]any{"k": 1})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	c := NewWithVariables(nil, map[string]any{"dep": 2}, store)
+	if v, ok := c.Variable("k"); !ok || v != 1 {
+		t.Fatalf("provided store ignored: k=%v (ok=%v)", v, ok)
+	}
+	if v, ok := c.Dependency("dep"); !ok || v != 2 {
+		t.Fatalf("dependency dep = %v (ok=%v)", v, ok)
+	}
+	if NewWithVariables(nil, nil, nil) == nil {
+		t.Fatal("nil store must fall back to an empty store")
+	}
+
+	var zero Context
+	if got := zero.VariablesSnapshot(); len(got) != 0 {
+		t.Fatalf("zero context snapshot = %v", got)
+	}
+	if _, ok := zero.Variable("x"); ok {
+		t.Fatal("zero context must not report a binding")
+	}
+	if err := zero.SetVariable("x", 3); err != nil {
+		t.Fatalf("zero context set: %v", err)
+	}
+	if v, ok := zero.Variable("x"); !ok || v != 3 {
+		t.Fatalf("zero context x = %v (ok=%v)", v, ok)
+	}
+}
+
+func TestSanitizeTimeoutRejectsNonFinite(t *testing.T) {
+	for _, in := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1} {
+		if got := sanitizeTimeout(in); got != 0 {
+			t.Fatalf("sanitizeTimeout(%v) = %v, want 0", in, got)
+		}
+	}
+	if got := sanitizeTimeout(1.5); got != 1.5 {
+		t.Fatalf("finite timeout changed: %v", got)
+	}
+}
+
+// TestVariablesConcurrentBranchesStress drives many sibling branches through
+// every read path at once. Without -race this still catches deadlocks and map
+// corruption; lock order is branch -> shared everywhere.
+func TestVariablesConcurrentBranchesStress(t *testing.T) {
+	root, err := NewVariables(map[string]any{
+		"shared": ScopedValue{Value: 0, Scope: ScopeShared},
+		"copied": 0,
+	})
+	if err != nil {
+		t.Fatalf("new root: %v", err)
+	}
+	const (
+		goroutines = 16
+		iterations = 100
+	)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		child := DeriveChildVariables(root)
+		wg.Add(1)
+		go func(i int, child *Variables) {
+			defer wg.Done()
+			for n := 0; n < iterations; n++ {
+				if err := child.Set("shared", i*iterations+n); err != nil {
+					return
+				}
+				_, _ = child.Get("shared")
+				if err := child.Set("copied", n); err != nil {
+					return
+				}
+				_ = child.Snapshot()
+				_ = child.Keys()
+				_ = child.Declared()
+				_ = child.Len()
+				_ = child.Branch()
+			}
+		}(i, child)
+	}
+	wg.Wait()
+	if v, ok := root.Get("shared"); !ok || v == nil {
+		t.Fatalf("shared lost: %v (ok=%v)", v, ok)
+	}
+	if got := len(DeriveChildVariables(root).Keys()); got != 2 {
+		t.Fatalf("child keys = %d, want 2", got)
 	}
 }
