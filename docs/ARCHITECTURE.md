@@ -187,13 +187,14 @@ events (all if PersistAll). Errors from normal subscribers: log + continue (Pyth
 type Context struct {
     Stream        stream.Stream
     Dependencies  map[string]any          // DI values, keyed by string id
-    Variables     map[string]any          // serializable; reserved prefixes "ag:", "a2a:"
+    Variables     *Variables              // scoped values; reserved prefixes "ag:", "a2a:"
     Prompt        []string                // system-prompt fragments
     ToolCallID    string
     // private: hitl hook, mutex, background wg
 }
 func New(s stream.Stream) *Context
-func NewWithDeps(s stream.Stream, deps map[string]any, vars map[string]any) *Context
+func NewWithDeps(s stream.Stream, deps map[string]any, vars map[string]any) (*Context, error)
+func NewWithVariables(s stream.Stream, deps map[string]any, vars *Variables) *Context
 func (c *Context) Enqueue(parts ...events.Input) error
 func (c *Context) Pending() []*events.ModelRequest
 func (c *Context) Send(ev events.Event) error
@@ -203,9 +204,19 @@ func (c *Context) Ask(ctx context.Context, req *events.HumanInputRequest) (strin
 func (c *Context) SetHitlHook(h hitl.HumanHook)
 func (c *Context) Dependency(id string) (any, bool)
 func (c *Context) MustDependency(id string) (any, error)
-func (c *Context) Clone() *Context   // shares Stream, copies maps
+func (c *Context) SetVariable(name string, v any) error
+func (c *Context) Variable(name string) (any, bool)
+func (c *Context) VariablesSnapshot() map[string]any
+func (c *Context) Clone() *Context   // shares Stream, branches Variables, copies maps
 ```
-Concurrency-safe (mutex around Variables/Prompt mutation). `Ask` sends `HumanInputRequest`, waits
+
+Variables carry delegation scopes (`context/scopes.go`, D-090): `ScopedValue`
+declares `ScopeCopied` (default, deep-copied per child), `ScopeLocal` (not
+inherited) or `ScopeShared` (one tree-wide binding). `DeriveChildVariables`
+builds a child branch; `MergeVariables` overlays agent defaults. `DeepCopy`
+uses an explicit `Clone` hook with a reflection fallback.
+
+Concurrency-safe (`Variables` and `Prompt` mutation). `Ask` sends `HumanInputRequest`, waits
 for the matching `HumanMessage` (parent_id == req.ID) via `Stream.Get`, normalizes all failures to
 hitl errors (see `hitl`).
 

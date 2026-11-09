@@ -3211,3 +3211,50 @@ content carrying any part that is not a `functionResponse`; only the first `func
 part of each `model` step is signed.
 
 Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./config/gemini/...` green 2026-11-09.
+
+## D-090 — 2026-11-09 — context: scoped invocation variables (`Scope` COPIED/LOCAL/SHARED)
+
+Ports upstream `fad570ca19` (`ag2/scopes.py`) to `context/scopes.go` and replaces
+the flat variable copy in `agent/subtask.go` with `DeriveChildVariables` +
+`MergeVariables`. `COPIED` (default) deep-copies per child branch, `LOCAL` is not
+inherited, `SHARED` is one tree-wide binding whose rebinding is visible in the
+root and siblings. Reserved `ag:`/`a2a:` keys (including the approval bypass) are
+never inherited; a new SHARED name below the root, a reserved SHARED key, an
+unknown scope and a different redeclaration are `*ScopeError` values wrapping
+`ErrScope`.
+
+- **Variables are a store type, not a map (API shape change).** Go maps cannot
+  intercept `m[key] = value`, so keeping `Context.Variables map[string]any`
+  would silently bypass SHARED rebinding and scope declarations. It is now
+  `*context.Variables` with `Get`/`Set`/`SetScoped`/`Declare`/`Snapshot`/
+  `Declared`/`Branch`. `NewWithDeps` and `Context.SetVariable` return errors
+  because a declaration can fail; statement-only call sites are unaffected.
+  Behavior matches Python's scoped `MutableMapping`. `AgentReply.Context()` is
+  added so turn state (Python `reply.context`) is readable after a reply. Code:
+  `context/scopes.go`, `context/context.go`, `agent/run.go`.
+- **Deep copy: explicit `Clone` + reflection fallback (D-090a).** Python uses
+  `copy.deepcopy`; the stdlib-only port checks a `context.Clone` interface
+  first, then reflects over pointers/maps/slices/arrays/structs/interfaces,
+  preserving cycles. Limits are documented on `DeepCopy`: unexported struct
+  fields stay shallow (reflection cannot set them), funcs/chans/unsafe pointers
+  are shared, and concurrent mutation during a copy is the caller's race.
+- **SHARED is visible, not synchronized (D-090a).** `Variables` protects its
+  maps and the shared-binding table with RWMutexes (lock order branch → shared);
+  sibling rebinding is `-race` safe. Compound mutation of a shared value
+  (`append`, read-modify-write) still needs a caller-supplied lock, matching the
+  upstream contract; the test passes one through `dependencies` like upstream's
+  `findings_lock`. Go also cannot make an `append` to an injected SHARED slice
+  visible through the store, because a slice is a header; rebind it with `Set`
+  or share a map/pointer. Code comment: `context/scopes.go`, type `Variables`.
+- **No wire representation (D-090a).** `ScopedValue`/`Scope` never enter an
+  event or transport payload; `Snapshot` and a2a context updates carry resolved
+  values only, so no `@type`/snake_case wire change. `ReservedVariablePrefixes`
+  now lives in `context` and drives the scope checks; the `a2a` transport keeps
+  its leaf copy (D-056).
+- **`OverlayVariables` is exposed but unused by the agent (D-090a).** AGo has no
+  per-`ask` `variables=` override or turn-scoped plugin defaults, so the helper
+  exists for parity and is covered by tests rather than wired into a call site.
+
+Gates run green: `go build ./...`, `go vet ./...`, `go test ./...`. The intended
+`go test -race ./context/ ./agent/` could not run on this runner (no cgo
+compiler), see the T7 dev report; the concurrency tests are written for it.

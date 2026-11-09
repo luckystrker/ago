@@ -33,7 +33,10 @@ func (a *Agent) Task(ctx stdcontext.Context, title string, opts ...task.Option) 
 		deps[k] = v
 	}
 	a.mu.Unlock()
-	cx := context.NewWithDeps(s, deps, map[string]any{})
+	cx, err := context.NewWithDeps(s, deps, nil)
+	if err != nil {
+		return nil, err
+	}
 	if taskStreamProbe != nil {
 		taskStreamProbe(s, cx)
 	}

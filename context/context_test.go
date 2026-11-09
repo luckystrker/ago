@@ -108,7 +108,10 @@ func TestAskHookFailure(t *testing.T) {
 
 func TestDependenciesVariablesClone(t *testing.T) {
 	s := stream.NewMemoryStream()
-	c := NewWithDeps(s, map[string]any{"agent": "main"}, map[string]any{"k": "v"})
+	c, err := NewWithDeps(s, map[string]any{"agent": "main"}, map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("context: %v", err)
+	}
 	c.AddPrompt("system line")
 	c.SetHitlHook(func(ctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
 		return &events.HumanMessage{Content: "hooked"}, nil
