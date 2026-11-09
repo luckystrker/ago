@@ -3447,11 +3447,23 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   per-stream lock is held and stopped before the lock is released. The turn lock
   is process-wide by stream/conversation id (`agent/turnlock.go`), not per
   `Agent`: two agents handed the same `WithStreamBase` serialize on the same
-  event bus, so their relays cannot cross-forward. `Close` cancels and waits for
-  the turn goroutine (`<-done`) before dropping the relay and lock; a late event
-  from a client that ignores cancellation therefore cannot land in the next
-  delegation's relay. A delegation is still one-conversation-per-stream: using
-  the *same* stream object as both parent and child would re-enter its lock. It relays through `Stream.Send`, not `Context.Send`,
+  event bus, so their relays cannot cross-forward. Acquiring the lock honors the
+  caller's `context.Context` (channel semaphore + `select`), and a canceled wait
+  drops its reference so the registry entry cannot leak.
+  `Close` cancels and waits for the turn goroutine (`<-done`) before dropping the
+  relay and lock; a late event from a client that ignores cancellation therefore
+  cannot land in the next delegation's relay. `Close` is deliberately blocking:
+  a client that never returns keeps `Close` (and a deferred `Close` inside
+  `Ask`) waiting. On a caller-cancellation failure, `runTaskOn` closes/waits the
+  child turn and removes its relay before publishing `TaskCancelled`, so the
+  terminal is the last event the parent observes.
+- **Same-stream nested delegation is rejected, not deadlocked (D-092b).**
+  Upstream's per-stream `asyncio.Lock` is not reentrant either; a child whose
+  stream is the caller's (or any ancestor's) would queue forever. AGo carries
+  the chain of held stream ids through the delegated context
+  (`ago:held-streams`) and `runTaskOn` returns `ErrNestedSameStream` before
+  entering the child turn. This is a deliberate behavior choice (no hang), not
+  a wire change; nested delegations normally use a fresh child stream. It relays through `Stream.Send`, not `Context.Send`,
   because the latter would call `AsLocal` and strip the stamped provenance. An
   already-enveloped `ChildEvent` is relayed unchanged (leaf identity preserved),
   and a delegation reusing its caller's stream disables the relay to avoid an
