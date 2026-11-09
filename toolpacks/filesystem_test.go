@@ -92,6 +92,100 @@ func TestFilesystemGlob(t *testing.T) {
 	}
 }
 
+// TestFilesystemGlobRecursiveWildcardPrefix pins recursive patterns whose prefix
+// carries wildcards (upstream 5125cb5dfc): "**" must only change segment
+// recursion, never rewrite the prefix, so src*/**/*.go and packages/[aw]*/src/**
+// keep matching. AGo already matches segments directly; this is regression-only.
+func TestFilesystemGlobRecursiveWildcardPrefix(t *testing.T) {
+	f, root := newFS(t)
+	_, cx := newTestContext()
+	for _, p := range []string{
+		"packages/api/src/main.go",
+		"packages/api/src/util/helper.go",
+		"packages/web/src/app.go",
+		"packages/nested/worker/src/job.go",
+		"packages/api/tests/test_main.go",
+		"src/root.go",
+		"srcgen/deep/tool.go",
+	} {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "packages", "api", "src", "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		pattern  string
+		expected []string
+	}{
+		{
+			pattern:  "src*/**/*.go",
+			expected: []string{"src/root.go", "srcgen/deep/tool.go"},
+		},
+		{
+			pattern: "packages/*/src/**",
+			expected: []string{
+				"packages/api/src/main.go",
+				"packages/api/src/util/helper.go",
+				"packages/web/src/app.go",
+			},
+		},
+		{
+			pattern: "packages/a?i/src/**",
+			expected: []string{
+				"packages/api/src/main.go",
+				"packages/api/src/util/helper.go",
+			},
+		},
+		{
+			pattern: "packages/[aw]*/src/**",
+			expected: []string{
+				"packages/api/src/main.go",
+				"packages/api/src/util/helper.go",
+				"packages/web/src/app.go",
+			},
+		},
+		{
+			pattern: "packages/**/src/**",
+			expected: []string{
+				"packages/api/src/main.go",
+				"packages/api/src/util/helper.go",
+				"packages/nested/worker/src/job.go",
+				"packages/web/src/app.go",
+			},
+		},
+		{
+			pattern: "**/src/**",
+			expected: []string{
+				"packages/api/src/main.go",
+				"packages/api/src/util/helper.go",
+				"packages/nested/worker/src/job.go",
+				"packages/web/src/app.go",
+				"src/root.go",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.pattern, func(t *testing.T) {
+			args := `{"pattern":` + quoteGo(tc.pattern) + `}`
+			ev := callTool(t, f, cx, "find_files", args)
+			var got []string
+			if err := json.Unmarshal([]byte(firstDataJSON(t, ev)), &got); err != nil {
+				t.Fatalf("decode glob: %v", err)
+			}
+			if strings.Join(got, "|") != strings.Join(tc.expected, "|") {
+				t.Fatalf("%s = %v, want %v", tc.pattern, got, tc.expected)
+			}
+		})
+	}
+}
+
 func TestFilesystemGuard(t *testing.T) {
 	f, root := newFS(t)
 	_, cx := newTestContext()

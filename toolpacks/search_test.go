@@ -124,6 +124,94 @@ func TestTavilySearch(t *testing.T) {
 	}
 }
 
+// TestTavilySearchOptionalResultFields pins the API's optional raw_content and
+// favicon on their way to the model (upstream d503c8ddc8): present fields reach
+// the tool result under their snake_case API names, absent ones are omitted.
+func TestTavilySearchOptionalResultFields(t *testing.T) {
+	strp := func(s string) *string { return &s }
+	tests := []struct {
+		name     string
+		body     string
+		wantRaw  *string
+		wantIcon *string
+	}{
+		{
+			name: "fields present",
+			body: `{"query":"q","results":[
+				{"title":"T","url":"https://a.example/","content":"c","score":0.8,
+				 "raw_content":"# Full text","favicon":"https://a.example/favicon.ico"}
+			]}`,
+			wantRaw:  strp("# Full text"),
+			wantIcon: strp("https://a.example/favicon.ico"),
+		},
+		{
+			name: "fields absent",
+			body: `{"query":"q","results":[
+				{"title":"T","url":"https://a.example/","content":"c","score":0.8}
+			]}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			tv, err := NewTavilySearch("tvly-secret", WithTavilyBaseURL(srv.URL))
+			if err != nil {
+				t.Fatalf("NewTavilySearch: %v", err)
+			}
+			_, cx := newTestContext()
+			ev := callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)
+			data := firstDataJSON(t, ev)
+
+			var resp TavilySearchResponse
+			if err := json.Unmarshal([]byte(data), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if len(resp.Results) != 1 {
+				t.Fatalf("results = %+v, want 1", resp.Results)
+			}
+			got := resp.Results[0]
+			if !sameOptionalString(got.RawContent, tc.wantRaw) {
+				t.Fatalf("raw_content = %v, want %v", got.RawContent, tc.wantRaw)
+			}
+			if !sameOptionalString(got.Favicon, tc.wantIcon) {
+				t.Fatalf("favicon = %v, want %v", got.Favicon, tc.wantIcon)
+			}
+
+			var wire map[string]any
+			if err := json.Unmarshal([]byte(data), &wire); err != nil {
+				t.Fatalf("decode wire: %v", err)
+			}
+			first, ok := wire["results"].([]any)[0].(map[string]any)
+			if !ok {
+				t.Fatalf("results[0] shape = %T", wire["results"].([]any)[0])
+			}
+			for key, want := range map[string]*string{"raw_content": tc.wantRaw, "favicon": tc.wantIcon} {
+				got, present := first[key]
+				if want == nil {
+					if present {
+						t.Fatalf("%s = %v, want the key omitted", key, got)
+					}
+					continue
+				}
+				if !present || got != *want {
+					t.Fatalf("%s = %v (present %v), want %q", key, got, present, *want)
+				}
+			}
+		})
+	}
+}
+
+func sameOptionalString(got, want *string) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
 func TestTavilySearchKeyVariable(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -295,11 +295,15 @@ func (d *DuckDuckGoSearch) Register(cx *agocontext.Context, mw []middleware.Midd
 // --- Tavily -------------------------------------------------------------------
 
 // TavilySearchResult is one hit (Python parity: search.tavily.SearchResult).
+// RawContent and Favicon are optional: the API returns them only when
+// include_raw_content / include_favicon were requested.
 type TavilySearchResult struct {
-	Title   string   `json:"title"`
-	URL     string   `json:"url"`
-	Content string   `json:"content"`
-	Score   *float64 `json:"score,omitempty"`
+	Title      string   `json:"title"`
+	URL        string   `json:"url"`
+	Content    string   `json:"content"`
+	Score      *float64 `json:"score,omitempty"`
+	RawContent *string  `json:"raw_content,omitempty"`
+	Favicon    *string  `json:"favicon,omitempty"`
 }
 
 // TavilySearchResponse is the tool result (Python parity: search.tavily.
@@ -463,10 +467,12 @@ func (t *TavilySearch) search(key, query string) (TavilySearchResponse, error) {
 		Query   string  `json:"query"`
 		Answer  *string `json:"answer"`
 		Results []struct {
-			Title   string   `json:"title"`
-			URL     string   `json:"url"`
-			Content string   `json:"content"`
-			Score   *float64 `json:"score"`
+			Title      string   `json:"title"`
+			URL        string   `json:"url"`
+			Content    string   `json:"content"`
+			Score      *float64 `json:"score"`
+			RawContent *string  `json:"raw_content"`
+			Favicon    *string  `json:"favicon"`
 		} `json:"results"`
 		Images []json.RawMessage `json:"images"`
 	}
