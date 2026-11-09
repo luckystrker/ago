@@ -191,13 +191,10 @@ func (r *AgentRun) llmTrigger(ev events.Event) error {
 	// Token accounting is event-sourced: one UsageEvent per model call, before
 	// the durable response (Python parity: UsageEvent then ModelResponse).
 	if usage.Reported(resp.Usage) {
-		ue := &events.UsageEvent{
-			Usage:        resp.Usage,
-			Kind:         events.UsageKindModelCall,
-			Model:        resp.Model,
-			Provider:     resp.Provider,
-			FinishReason: resp.FinishReason,
-		}
+		ue := events.NewUsageEvent(resp.Usage, events.UsageKindModelCall)
+		ue.Model = resp.Model
+		ue.Provider = resp.Provider
+		ue.FinishReason = resp.FinishReason
 		if err := r.cx.Send(ue); err != nil {
 			return err
 		}

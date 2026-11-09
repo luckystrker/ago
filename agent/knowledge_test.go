@@ -457,8 +457,8 @@ func TestKnowledgeCompactWiring(t *testing.T) {
 	if c.Agent != "kp" {
 		t.Errorf("CompactionCompleted.Agent = %q, want %q", c.Agent, "kp")
 	}
-	if c.EventsBefore != 6 || c.EventsAfter != 4 {
-		t.Errorf("CompactionCompleted before/after = %d/%d, want 6/4 (summary + kept tail + telemetry)",
+	if c.EventsBefore != 6 || c.EventsAfter != 5 {
+		t.Errorf("CompactionCompleted before/after = %d/%d, want 6/5 (retained usage + summary + kept tail)",
 			c.EventsBefore, c.EventsAfter)
 	}
 	if c.LLMCalls != 0 {
@@ -484,8 +484,8 @@ func TestKnowledgeCompactWiring(t *testing.T) {
 	if summaries[0].Content != "COMPACT-STUB-SUMMARY" {
 		t.Errorf("summary content = %q, want the stub's answer", summaries[0].Content)
 	}
-	if n := len(evs); n != 4 {
-		t.Errorf("final history holds %d events, want 4 (summary + the second turn's three)", n)
+	if n := len(evs); n != 5 {
+		t.Errorf("final history holds %d events, want 5 (retained usage + summary + the second turn's three)", n)
 	}
 }
 

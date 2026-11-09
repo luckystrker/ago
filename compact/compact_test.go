@@ -250,17 +250,19 @@ func TestCompactionReplacesHistory(t *testing.T) {
 		t.Fatalf("turn result = %v, want the model response", got)
 	}
 
-	// History is now the summary plus the fresh range: the last two
-	// conversational events (u6 and the turn's response) and the telemetry
-	// interleaved between them (ue2); ue1 went with the old span.
+	// History is now every source usage record from before the rewrite (ue1 and
+	// ue2), the summary, and the fresh conversational range (u6 and the turn's
+	// response). Telemetry is never dropped by compaction: spend outside the
+	// retained window must stay reportable.
 	evs, err := ctx.Stream.History().GetEvents()
 	if err != nil {
 		t.Fatalf("GetEvents: %v", err)
 	}
 	want := []string{
+		"UsageEvent:",
+		"UsageEvent:",
 		"CompactionSummary:[Summary of earlier conversation]\nold stuff summarized",
 		"ModelRequest:User: u6",
-		"UsageEvent:",
 		"ModelResponse:Assistant: done",
 	}
 	if !equalStrs(fingerprint(evs), want) {
@@ -318,9 +320,10 @@ func TestCompactionLifecycleFields(t *testing.T) {
 		t.Fatalf("started = %+v", started)
 	}
 	// The snapshot is taken after the turn: 7 conversational seed events plus
-	// the turn's response, plus 2 telemetry records = 10; 4 events after.
-	if completed.EventsBefore != 10 || completed.EventsAfter != 4 {
-		t.Fatalf("completed counts = before %d after %d, want 10 and 4", completed.EventsBefore, completed.EventsAfter)
+	// the turn's response, plus 2 telemetry records = 10; 5 events after (both
+	// usage records are retained, then summary + fresh u6 + response).
+	if completed.EventsBefore != 10 || completed.EventsAfter != 5 {
+		t.Fatalf("completed counts = before %d after %d, want 10 and 5", completed.EventsBefore, completed.EventsAfter)
 	}
 	if completed.Agent != "tester" || completed.Strategy != "strategyFunc" {
 		t.Fatalf("completed = %+v", completed)

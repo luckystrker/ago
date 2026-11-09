@@ -254,3 +254,34 @@ func usageEqual(a, b events.Usage) bool {
 		same(a.CacheCreationExtendedInputTokens, b.CacheCreationExtendedInputTokens) &&
 		same(a.ThinkingTokens, b.ThinkingTokens)
 }
+
+// TestFromEventsDeduplicatesSourceRecords pins the delegation accounting rule:
+// the same source event_id counts once even when a forwarded copy and an
+// archived observation envelope both carry it; records without an id stay
+// distinct, preserving compatibility with hand-built fixtures.
+func TestFromEventsDeduplicatesSourceRecords(t *testing.T) {
+	source := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(30)}, events.UsageKindModelCall)
+	source.Model = "leaf"
+	report := FromEvents([]events.Event{source, source})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 30 {
+		t.Fatalf("total = %v, want 30", report.Total.TotalTokens)
+	}
+	if len(report.Records) != 1 {
+		t.Fatalf("records = %d, want 1", len(report.Records))
+	}
+
+	wrapped := events.NewChildEvent(source, "t", []string{"t"}, "leaf", source.EventID)
+	report = FromEvents([]events.Event{source, wrapped})
+	if report.Total.TotalTokens == nil || *report.Total.TotalTokens != 30 {
+		t.Fatalf("wrapped total = %v, want 30", report.Total.TotalTokens)
+	}
+	if _, ok := EventFrom(wrapped); !ok {
+		t.Fatal("EventFrom did not resolve an archived ChildEvent envelope")
+	}
+
+	legacyA, legacyB := modelCall(1, 0, "m", "p"), modelCall(1, 0, "m", "p")
+	report = FromEvents([]events.Event{legacyA, legacyB})
+	if report.Total.PromptTokens == nil || *report.Total.PromptTokens != 2 {
+		t.Fatalf("id-less fixtures collapsed: %v", report.Total.PromptTokens)
+	}
+}

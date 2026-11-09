@@ -111,12 +111,10 @@ func (s *LLMStrategy) Aggregate(ctx *agocontext.Context, summaries []string, evs
 
 	if usage.Reported(resp.Usage) {
 		// Best-effort telemetry: a subscriber failure must not fail the aggregation.
-		_ = ctx.Send(&events.UsageEvent{
-			Usage:    resp.Usage,
-			Kind:     events.UsageKindAggregation,
-			Model:    resp.Model,
-			Provider: resp.Provider,
-		})
+		ue := events.NewUsageEvent(resp.Usage, events.UsageKindAggregation)
+		ue.Model = resp.Model
+		ue.Provider = resp.Provider
+		_ = ctx.Send(ue)
 	}
 	return resp.Content(), nil
 }

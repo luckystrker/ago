@@ -212,3 +212,41 @@ func TestLoopDetectorClampsRepeats(t *testing.T) {
 		t.Fatalf("NewLoopDetector(5).Repeats() = %d, want 5", got)
 	}
 }
+
+// TestLoopDetectorSeparatesDelegatedHistories pins per-origin state: a
+// descendant's repeated response alerts under its own task id and path, and
+// sibling histories never combine into a false loop.
+func TestLoopDetectorSeparatesDelegatedHistories(t *testing.T) {
+	s, cx := newConversation()
+	alerts := collectAlerts(s)
+	detector := NewLoopDetector(2)
+	if err := detector.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	child := func(task string, path []string, content string) *events.ChildEvent {
+		return events.NewChildEvent(&events.ModelResponse{Message: &events.ModelMessage{Content: content}},
+			task, path, "leaf", task+"-event")
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.Send(child("a", []string{"root", "a"}, "again")); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	if got := alerts(); len(got) != 1 {
+		t.Fatalf("alerts = %d, want one for descendant a", len(got))
+	}
+	a := alerts()[0]
+	if a.Data["task_id"] != "a" {
+		t.Fatalf("alert task_id = %v, want a", a.Data["task_id"])
+	}
+	if path, ok := a.Data["path"].([]string); !ok || len(path) != 2 || path[1] != "a" {
+		t.Fatalf("alert path = %v", a.Data["path"])
+	}
+	// A single response from sibling b must not combine with a's run.
+	if err := s.Send(child("b", []string{"root", "b"}, "again")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := alerts(); len(got) != 1 {
+		t.Fatalf("alerts = %d after sibling b, want still 1", len(got))
+	}
+}

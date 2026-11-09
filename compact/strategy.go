@@ -100,12 +100,9 @@ func (s LLMStrategy) Summarize(ctx *agocontext.Context, evs []events.Event) (str
 	// carries it through the history rewrite).
 	zero := events.Usage{}
 	if ctx != nil && resp.Usage != zero {
-		ue := &events.UsageEvent{
-			Usage:    resp.Usage,
-			Kind:     events.UsageKindCompaction,
-			Model:    resp.Model,
-			Provider: resp.Provider,
-		}
+		ue := events.NewUsageEvent(resp.Usage, events.UsageKindCompaction)
+		ue.Model = resp.Model
+		ue.Provider = resp.Provider
 		if err := ctx.Send(ue); err != nil {
 			return "", fmt.Errorf("compact: send compaction usage: %w", err)
 		}

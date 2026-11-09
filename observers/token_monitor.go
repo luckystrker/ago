@@ -13,19 +13,22 @@ import (
 // one ObserverAlert (severity error) when the accumulated total rises above the
 // budget. The alert fires once; subsequent usage does not repeat it (Reset
 // re-arms). It reads UsageEvent — the same accounting source as the usage
-// package's reports — so every billable unit counts: the main model loop, subtask
-// rollups, compaction and aggregation.
+// package's reports — so every billable unit counts: the main model loop,
+// forwarded descendant calls, compaction and aggregation. A source record is
+// counted once per monitor, keyed by its event_id: a record observed both
+// locally and through a delegation hop cannot spend the budget twice.
 type TokenMonitor struct {
 	mu      sync.Mutex
 	budget  int64
 	total   int64
 	alerted bool
+	seen    map[string]struct{}
 }
 
 // NewTokenMonitor watches UsageEvent events against budget; the alert fires when
 // the accumulated billable total rises strictly above it.
 func NewTokenMonitor(budget int64) *TokenMonitor {
-	return &TokenMonitor{budget: budget}
+	return &TokenMonitor{budget: budget, seen: map[string]struct{}{}}
 }
 
 // Name returns "token_monitor" — the alert source, fixed by the package contract.
@@ -46,11 +49,11 @@ func (m *TokenMonitor) Register(ctx *agocontext.Context) error {
 		return err
 	}
 	ctx.Stream.Subscribe(func(ev events.Event) error {
-		u, ok := events.AsValue(ev).(events.UsageEvent)
+		u, ok := events.AsValue(events.SourceEvent(ev)).(events.UsageEvent)
 		if !ok {
 			return nil
 		}
-		alert, fire := m.observe(u.Usage)
+		alert, fire := m.observe(u)
 		if !fire {
 			return nil
 		}
@@ -61,10 +64,16 @@ func (m *TokenMonitor) Register(ctx *agocontext.Context) error {
 
 // observe folds one usage record into the total and returns the alert to emit,
 // if any.
-func (m *TokenMonitor) observe(u events.Usage) (*events.ObserverAlert, bool) {
+func (m *TokenMonitor) observe(u events.UsageEvent) (*events.ObserverAlert, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.total += billable(u)
+	if u.EventID != "" {
+		if _, dup := m.seen[u.EventID]; dup {
+			return nil, false
+		}
+		m.seen[u.EventID] = struct{}{}
+	}
+	m.total += billable(u.Usage)
 	if m.alerted || m.total <= m.budget {
 		return nil, false
 	}
@@ -82,6 +91,7 @@ func (m *TokenMonitor) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.total, m.alerted = 0, false
+	m.seen = map[string]struct{}{}
 }
 
 // billable returns the tokens a usage record charges against the budget.

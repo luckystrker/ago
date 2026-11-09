@@ -173,3 +173,30 @@ func TestTokenMonitorRegisterErrors(t *testing.T) {
 		t.Fatalf("Register(no stream) = %v, want ErrNoStream", err)
 	}
 }
+
+// TestTokenMonitorCountsSourceEventOnce pins the delegation-safe accounting:
+// the same source UsageEvent seen twice (local publication plus a forwarded hop,
+// or a replayed transcript) charges the budget once.
+func TestTokenMonitorCountsSourceEventOnce(t *testing.T) {
+	s, cx := newConversation()
+	monitor := NewTokenMonitor(1000)
+	if err := monitor.Register(cx); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ev := events.NewUsageEvent(events.Usage{TotalTokens: events.I64(30)}, events.UsageKindModelCall)
+	for i := 0; i < 2; i++ {
+		if err := s.Send(ev); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("total = %d, want 30 (source event counted once)", got)
+	}
+	monitor.Reset()
+	if err := s.Send(ev); err != nil {
+		t.Fatalf("Send after reset: %v", err)
+	}
+	if got := monitor.Total(); got != 30 {
+		t.Fatalf("total after reset = %d, want 30 (dedup memory cleared)", got)
+	}
+}
