@@ -275,6 +275,63 @@ child branch exactly as `Get` reports it.
 ### Task — `ag2\task.py`
 `TaskState` enum (`created/running/completed/failed/expired/cancelled`), `TERMINAL_TASK_STATES`; `TaskSpec(title, description="", payload={}, capability=None)`; `TaskMetadata(task_id, owner_id, spec, state, created_at, started_at, completed_at, expires_at, last_progress_at, progress: dict, result, error, channel_id)` with `to_dict`/`from_dict`; `Task` async CM (`progress()`, `complete(result)`, `fail(error)`, `expire()`, `cancel(reason)`, `checkpoint(state)`, `resumed_state`) auto-completes on clean exit / auto-fails on exception; `CheckpointStore` Protocol (`write(task_id, state)`, `read(task_id)`); `TaskInject = Annotated[Task | None, Inject("ag2.task")]`.
 
+AGo splits construction from entry: `task.New(ctx, owner, spec, opts...)` builds
+an unstarted handle and `(*Task).Start()` performs the `__aenter__` side; the
+package-level `task.Start` stays `New`+`Start` and returns nil on failure.
+Lifecycle options: `WithTaskID`, `WithParentToolCallID`, `WithPublisher`
+(publish through a relay instead of the bound stream), `WithoutInjection`
+(do not stamp `ag:task`). The handle adopts a matching external terminal
+(`TaskExpired` from an observer) without emitting a second one, and
+`CompleteWithUsage(result, usage)` carries the run-lifecycle snapshot.
+Cancellation auto-cancels only when the owner selects it (Go has no exceptions);
+the run lifecycle maps `context.Canceled` to `TaskCancelled` (D-093b).
+
+### Run lifecycle — `ag2/_run_lifecycle.py`, ADR 0034/0035 (+ `d716fcbefe`)
+
+A model run and a delegation share one task lifecycle. `agent/lifecycle.go`
+(`runLifecycle`) is the only place that opens a `task.Task` and publishes its
+terminal; `AgentRun` owns one per invocation and `runTaskOn` drives the same
+implementation for delegations.
+
+- **Opt-in for ordinary runs.** Python's `ask`/`run`/reply continuations/
+  `resume` accept `capability=` and `ttl_seconds=`; either enables the
+  lifecycle, and an ordinary call without them emits no Task events. AGo maps
+  those to `RunOptions{Capability, TTL}` plus `AskWith`/`RunWith`/`ResumeWith`
+  and `AgentReply.AskWith`/`RunWith` (D-093a); `Ask`/`Run`/`Resume` are the
+  zero-options spelling.
+- **Title.** An opted-in run publishes `TaskSpec{Title: agentName, Capability}`
+  with `objective` equal to the agent name; the prompt never enters a Task
+  event (Task events are inert and reach the network mirror). A delegation
+  keeps its objective and now also carries a `TaskSpec`, its existing task id
+  and `parent_tool_call_id`. `Agent.Task` remains the standalone, deprecated
+  path (D-083); its replacement is direct construction.
+- **Terminal on every outcome.** The lifecycle starts after the per-stream turn
+  lock (and, for a delegation, the relay) and before the remaining setup.
+  `AgentRun.Close` cancels and awaits the turn, unsubscribes run-scoped
+  subscribers, publishes the terminal while the relay and lock are held, and
+  only then stops the relay and releases the lock. Success publishes
+  `TaskCompleted` (with a cumulative `Usage` snapshot); `context.Canceled`
+  publishes `TaskCancelled`; any other failure publishes `TaskFailed`; a panic
+  recovered by `executeTurn` is a failure. `Run.Result` leaves the scope open —
+  the terminal follows on `Close`; `Ask` publishes it before returning. A
+  failed `Start` after the lifecycle opened still publishes the terminal.
+- **Delegation reject.** Failures before the turn scope existed
+  (`ErrNestedSameStream`, `newRunWith`/`MergeVariables`) publish
+  `TaskStarted`+terminal straight to the parent through `forwarder.reject`,
+  never touching a busy child stream.
+- **Cancellation.** `AsTool`/`run_subtask(s)` start the child on the parent
+  turn's `Context.TurnContext()`, so a parent cancellation reaches the child and
+  is reported as `TaskCancelled{reason: "parent cancelled"}`
+  (`agent.ParentCancelledReason`); an ordinary run reports `"cancelled"`. A call
+  cancelled while waiting for the lock opens no lifecycle.
+- **Usage.** `TaskCompleted.Usage` is a snapshot of
+  `usage.FromEvents(streamHistory + retainedAccounting)` deduplicated by
+  `event_id`, never an additive record. Before the terminal, source records the
+  relay captured but the stream did not persist are appended
+  (`persistUsageAccounting`); a retention failure decides the terminal when no
+  earlier failure exists, otherwise it is logged. A usage read failure falls
+  back to the retained accounting.
+
 ### Response schemas — `ag2\response\`
 `ResponseProto[T]` protocol (`proto.py`): `name`, `description`, `json_schema`, `system_prompt`, `async validate(response, context, provider) -> T`. `ResponseSchema[T]` (`schema.py`) wraps pydantic `TypeAdapter`; scalars embedded into `{"data": ...}`. `RawSchema` = raw JSON schema. `PromptedSchema` (`prompted.py`), `response_schema` decorator (`callable.py`), `DecisionSpec/Question/DecisionOption` (`decision.py`). `AgentSpec` (`ag2\spec.py:87`): `name`, `prompt: list[str]`, `tool_names: list[str]`, `response_schema: ResponseSchemaSpec|None`; `from_agent()` / `to_agent(...)`.
 

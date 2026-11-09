@@ -187,7 +187,14 @@ func (a *Agent) PromptFragments() []string {
 
 // Ask runs one blocking turn and returns the reply (Python parity: agent.ask).
 func (a *Agent) Ask(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, error) {
-	run, err := a.Run(ctx, msgs...)
+	return a.AskWith(ctx, RunOptions{}, msgs...)
+}
+
+// AskWith runs one blocking turn with per-invocation task-lifecycle options
+// (Python parity: agent.ask(capability=..., ttl_seconds=...)). Either option
+// enables TaskStarted/TaskCompleted/TaskFailed/TaskCancelled for this turn.
+func (a *Agent) AskWith(ctx stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error) {
+	run, err := a.RunWith(ctx, opts, msgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,13 +206,25 @@ func (a *Agent) Ask(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, erro
 }
 
 // Run prepares an observable turn (Python parity: agent.run): Start launches the
-// turn, Result awaits the reply, Close ends the turn scope.
-func (a *Agent) Run(_ stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
+// turn, Result awaits the reply, Close ends the turn scope and publishes the
+// task terminal.
+func (a *Agent) Run(ctx stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
+	return a.RunWith(ctx, RunOptions{}, msgs...)
+}
+
+// RunWith is Run with per-invocation task-lifecycle options (Python parity:
+// agent.run(capability=..., ttl_seconds=...)).
+func (a *Agent) RunWith(_ stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error) {
 	s := a.opts.streamBase
 	if s == nil {
 		s = stream.NewMemoryStream()
 	}
-	return a.newRun(s, msgs...)
+	run, err := a.newRun(s, msgs...)
+	if err != nil {
+		return nil, err
+	}
+	run.runOpts = opts
+	return run, nil
 }
 
 // newRun builds a turn over an explicit stream. Continuations (AgentReply.ask)
@@ -275,6 +294,12 @@ func (a *Agent) newRunOn(prev *context.Context, msgs ...Sendable) (*AgentRun, er
 // trigger re-enters through the inbox; any other event (e.g. ToolResultsEvent) is
 // sent directly and the turn continues from the model's next response.
 func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply, error) {
+	return a.ResumeWith(ctx, RunOptions{}, evs...)
+}
+
+// ResumeWith is Resume with per-invocation task-lifecycle options. Each resume
+// is a fresh task identity (upstream ADR 0035).
+func (a *Agent) ResumeWith(ctx stdcontext.Context, opts RunOptions, evs ...events.Event) (*AgentReply, error) {
 	if len(evs) == 0 {
 		return nil, errors.New("agent: resume needs at least one event")
 	}
@@ -286,6 +311,7 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 	if err != nil {
 		return nil, err
 	}
+	run.runOpts = opts
 	defer run.Close()
 	switch last := events.AsValue(evs[len(evs)-1]).(type) {
 	case events.ModelRequest:
@@ -338,9 +364,11 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 		Context   string `json:"context" agschema:"description=Optional additional context for the subtask agent"`
 	}
 	fn := func(args subArgs, cx *context.Context) (string, error) {
-		// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-		// delegation cannot be cancelled through the caller's tool call.
-		res, err := runTaskOn(stdcontext.Background(), cx, a, args.Objective, args.Context)
+		// The parent turn's cancellable context is installed on its conversation
+		// context (Context.TurnContext), so a parent cancellation reaches the
+		// delegated run and reports PARENT_CANCELLED (upstream run_task's
+		// origin-cancelled path).
+		res, err := runTaskOn(cx.TurnContext(), cx, a, args.Objective, args.Context)
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).

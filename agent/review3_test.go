@@ -182,10 +182,10 @@ func TestTerminalIsLastEventOnCancellation(t *testing.T) {
 	}
 }
 
-// TestChildStreamUsageFallsBackToAccounting pins the storage-error branch:
-// when the child history cannot be read, TaskCompleted.Usage still includes the
-// source usage the relay retained.
-func TestChildStreamUsageFallsBackToAccounting(t *testing.T) {
+// TestSnapshotUsageFallsBackToAccounting pins the storage-error branch: when
+// the child history cannot be read, the lifecycle's terminal usage snapshot
+// still includes the source usage the relay retained.
+func TestSnapshotUsageFallsBackToAccounting(t *testing.T) {
 	parent := agocontext.New(stream.NewMemoryStream())
 	childStream := stream.NewMemoryStream(stream.WithStorage(brokenReadStorage{stream.NewMemoryStorage()}))
 	f := newForwarder(parent, childStream, "t", "child")
@@ -196,22 +196,21 @@ func TestChildStreamUsageFallsBackToAccounting(t *testing.T) {
 	if err := childStream.Send(src); err == nil {
 		t.Fatal("child send succeeded despite the broken storage")
 	}
-	got := childStreamUsage(childStream, f).TotalTokens
+	got := snapshotUsage(childStream, f.accountingEvents()).TotalTokens
 	if got == nil || *got != 10 {
 		t.Fatalf("child usage = %v, want 10 from accounting", got)
 	}
 }
 
-// TestForwarderPublishBeforeScopeOpensRelays pins the direct-relay branch of
-// publish: before the turn scope exists (started=false) and for a distinct
-// child stream, the event must reach the parent as an observation, not stay on
-// the child stream.
-func TestForwarderPublishBeforeScopeOpensRelays(t *testing.T) {
+// TestForwarderRejectPublishesBeforeScopeOpens pins the pre-turn reject path:
+// a delegation that never installed a relay still publishes started/terminal
+// straight to the parent as observations (upstream Forwarder.reject).
+func TestForwarderRejectPublishesBeforeScopeOpens(t *testing.T) {
 	parent := agocontext.New(stream.NewMemoryStream())
 	childStream := stream.NewMemoryStream()
 	f := newForwarder(parent, childStream, "t", "child")
-	if err := f.publish(childStream, false, &events.ModelResponse{Message: &events.ModelMessage{Content: "early"}}); err != nil {
-		t.Fatalf("publish: %v", err)
+	if err := f.reject(&events.ModelResponse{Message: &events.ModelMessage{Content: "early"}}); err != nil {
+		t.Fatalf("reject: %v", err)
 	}
 	parentEvents, _ := parent.Stream.History().GetEvents()
 	if len(parentEvents) != 1 {

@@ -10,12 +10,11 @@ import (
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/context"
-	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/hitl"
 	"github.com/luckystrker/ago/internal/uuid"
 	"github.com/luckystrker/ago/stream"
+	"github.com/luckystrker/ago/task"
 	"github.com/luckystrker/ago/tools"
-	"github.com/luckystrker/ago/usage"
 )
 
 // TaskConfig configures the auto-injected subtask tools (Python parity:
@@ -170,22 +169,6 @@ func heldStreamsOf(cx *context.Context) []string {
 	return nil
 }
 
-// childStreamUsage reports the cumulative spend recorded on the delegation's
-// own stream plus source records the forwarder retained while publishing
-// upward. It is a snapshot for inspection (TaskCompleted.Usage), never an
-// additive record: the source UsageEvents have already been forwarded to the
-// parent, so a report that summed this field as well would double count.
-func childStreamUsage(childStream stream.Stream, f *forwarder) events.Usage {
-	if f != nil {
-		return f.usage(childStream)
-	}
-	evs, err := childStream.History().GetEvents()
-	if err != nil {
-		return events.Usage{}
-	}
-	return usage.FromEvents(evs).Total
-}
-
 // runTaskOn runs child as a sub-task of the conversation parentCX and reports
 // the delegation on the parent stream (Python parity:
 // tools/subagents/run_task.py run_task): TaskStarted before the child turn,
@@ -241,67 +224,49 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	// The relay is installed by the child turn scope, after the per-stream lock
 	// is held: a delegation queued behind another one on a shared stream must not
 	// capture that invocation's events (upstream Forwarder.execution inside
-	// _turn_scope). TaskStarted is the first event the scope publishes.
+	// _turn_scope). The lifecycle publishes TaskStarted as the first event.
 	forwarder := newForwarder(parentCX, childStream, taskID, child.Name())
-	startedEvent := &events.TaskStarted{
-		TaskID:           taskID,
-		AgentName:        child.Name(),
-		Objective:        objective,
-		ParentToolCallID: parentCX.ToolCallID,
-	}
-	scopeOpen, startedPublished := false, false
 	var run *AgentRun
 
-	// publish authors an event on the child stream. While the turn scope is
-	// open the ordinary stream path persists and the relay forwards it.
-	publish := func(ev events.Event) error {
-		return forwarder.publish(childStream, scopeOpen, ev)
-	}
-
 	// fail reports a failed delegation the way Python's except branch does:
-	// terminal task event on every path, hitl failures re-raised so they end the
-	// calling turn. A cancelled run reports TaskCancelled and is a normal
-	// (non-hitl) result for the delegating tool. Terminal publication is
-	// best-effort but no longer silent: a broken parent stream is logged.
+	// exactly one terminal task event on every path, hitl failures re-raised so
+	// they end the calling turn. A cancelled run reports TaskCancelled and is a
+	// normal (non-hitl) result for the delegating tool.
 	//
-	// Ordering mirrors upstream Forwarder.execution's finally: cancel and await
-	// the turn goroutine first, publish the terminal while the relay still holds
-	// the per-stream lock, and only then close the scope. Publishing before the
-	// close keeps a queued sibling on the same stream from relaying this
-	// invocation's terminal under its own provenance.
+	// A failure inside an entered scope closes the run, which awaits the turn,
+	// publishes the terminal through the still-installed relay under the
+	// per-stream lock, and only then stops the relay and releases the lock
+	// (upstream Forwarder.execution's finally). A failure before the scope was
+	// entered uses lifecycle.reject: started+terminal go straight to the parent,
+	// without touching the child stream.
 	fail := func(err error) (taskResult, error) {
-		if scopeOpen {
-			run.awaitTurn()
+		lc := (*runLifecycle)(nil)
+		if run != nil {
+			lc = run.lifecycle
 		}
-		// A pre-turn rejection never entered a turn: like upstream reject, it
-		// publishes directly to the parent without touching the child stream.
-		// A failure after TaskStarted keeps scopeOpen true and uses the child
-		// stream/finally path above instead.
-		emit := func(ev events.Event) error {
-			if scopeOpen {
-				return publish(ev)
-			}
-			return forwarder.reject(ev)
+		if lc == nil {
+			lc = rejectLifecycle(child, childStream, forwarder, taskID, objective, parentCX.ToolCallID)
 		}
-		if !startedPublished {
-			if serr := emit(startedEvent); serr != nil {
-				slog.Error("agent: delegation TaskStarted send failed", "agent", child.Name(), "err", serr)
-			}
-			startedPublished = true
+		if lc.failure == nil {
+			lc.failure = err
 		}
-		if errors.Is(err, stdcontext.Canceled) {
-			terminal := &events.TaskCancelled{
-				TaskID:    taskID,
-				AgentName: child.Name(),
-				Objective: objective,
-				Reason:    err.Error(),
+		lc.cancelReason = ParentCancelledReason
+		if lc.started() {
+			if run != nil {
+				run.Close()
+			} else if ferr := lc.finish(); ferr != nil {
+				slog.Error("agent: delegation terminal publication failed", "agent", child.Name(), "err", ferr)
 			}
-			if serr := emit(terminal); serr != nil {
-				slog.Error("agent: delegation TaskCancelled send failed", "agent", child.Name(), "err", serr)
+		} else {
+			lc.publisher = forwarder.reject
+			if ferr := lc.reject(err); ferr != nil {
+				slog.Error("agent: rejected delegation lifecycle failed", "agent", child.Name(), "err", ferr)
 			}
 			if run != nil {
 				run.Close()
 			}
+		}
+		if errors.Is(err, stdcontext.Canceled) {
 			return taskResult{
 				taskID:      taskID,
 				objective:   objective,
@@ -309,18 +274,6 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 				childStream: childStream,
 				err:         err,
 			}, nil
-		}
-		terminal := &events.TaskFailed{
-			TaskID:    taskID,
-			AgentName: child.Name(),
-			Objective: objective,
-			Error:     err.Error(),
-		}
-		if serr := emit(terminal); serr != nil {
-			slog.Error("agent: delegation TaskFailed send failed", "agent", child.Name(), "err", serr)
-		}
-		if run != nil {
-			run.Close()
 		}
 		if hitl.IsError(err) {
 			return taskResult{}, err
@@ -338,8 +291,18 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return fail(err)
 	}
 	defer run.Close()
+
+	// The delegation uses the same lifecycle as an ordinary run: same Task
+	// transitions, objective title, the caller's task id and tool-call id. The
+	// forwarder keeps addressing/forwarding; it constructs no terminal events of
+	// its own (upstream Forwarder.lifecycle).
+	lc := newRunLifecycle(child.Name(), task.Spec{Title: objective}, run.cx)
+	lc.taskID = taskID
+	lc.parentToolCallID = parentCX.ToolCallID
+	lc.accounting = forwarder.accountingEvents
+	lc.cancelReason = ParentCancelledReason
+	run.lifecycle = lc
 	run.delegation = forwarder
-	run.delegationStart = startedEvent
 
 	// The child run starts from the parent's dependencies merged over the child
 	// agent's own option maps (newRun already seeded those): Python passes
@@ -374,19 +337,9 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		// the tool layer as a turn-ending hitl error.
 	}
 
-	// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-	// delegation cannot be cancelled through the caller's tool call.
 	if err := run.Start(ctx); err != nil {
-		startedPublished = run.delegationStarted
-		// A failure after the delegation scope was entered (config/knowledge/
-		// prompt/tools/subscriber preparation) still owns the child stream and
-		// its relay; publish the terminal there before closing, as upstream's
-		// Forwarder.execution finally does. Only failures before TaskStarted use
-		// the parent-only reject path.
-		scopeOpen = run.delegationStarted
 		return fail(err)
 	}
-	scopeOpen, startedPublished = true, true
 	reply, err := run.Result(ctx)
 	if err != nil {
 		return fail(err)
@@ -394,19 +347,9 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 
 	// The completed event carries the child stream's cumulative spend for
 	// inspection; the additive accounting already travelled as source
-	// UsageEvents, so a reader must never sum this snapshot.
-	total := childStreamUsage(childStream, forwarder)
-	terminal := &events.TaskCompleted{
-		TaskID:     taskID,
-		AgentName:  child.Name(),
-		Objective:  objective,
-		Result:     reply.Body(),
-		TaskStream: childStream.ID(),
-		Usage:      total,
-	}
-	if serr := publish(terminal); serr != nil {
-		slog.Error("agent: delegation TaskCompleted send failed", "agent", child.Name(), "err", serr)
-	}
+	// UsageEvents, so a reader must never sum this snapshot. The deferred Close
+	// publishes it (with the forwarder's retained accounting merged in).
+	lc.result = reply.Body()
 	return taskResult{
 		taskID:      taskID,
 		objective:   objective,
@@ -416,6 +359,19 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 	}, nil
 }
 
+// rejectLifecycle builds the lifecycle of a delegation that never entered its
+// turn. Its publisher is the forwarder's reject path, so the started and
+// terminal events reach the parent without touching the child stream (which may
+// be owned by a busy enclosing turn).
+func rejectLifecycle(child *Agent, childStream stream.Stream, f *forwarder, taskID, objective, parentToolCallID string) *runLifecycle {
+	lc := newRunLifecycle(child.Name(), task.Spec{Title: objective}, context.New(childStream))
+	lc.taskID = taskID
+	lc.parentToolCallID = parentToolCallID
+	lc.publisher = f.reject
+	lc.cancelReason = ParentCancelledReason
+	return lc
+}
+
 // run_subtask tool -----------------------------------------------------------
 
 func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
@@ -423,9 +379,7 @@ func (r *AgentRun) newRunSubtaskTool(tc *TaskConfig) tools.Tool {
 		Task string `json:"task" agschema:"description=The objective for the subtask agent,required"`
 	}
 	fn := func(args subtaskArgs, cx *context.Context) (string, error) {
-		// AGO-DEVIATION: no stdlib context flows through tool execution, so the
-		// delegation cannot be cancelled through the caller's tool call.
-		res, err := runTaskOn(stdcontext.Background(), cx, r.childAgent(tc, "subtask"), args.Task, "")
+		res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, "subtask"), args.Task, "")
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
@@ -467,8 +421,7 @@ func (r *AgentRun) newRunSubtasksTool(tc *TaskConfig) tools.Tool {
 		// the combined output (Python parity: `_spawn_subtask` returns
 		// f"Error: {result.error}"), hitl failures end the whole call.
 		runOne := func(i int, task string) error {
-			// AGO-DEVIATION: no stdlib context flows through tool execution.
-			res, err := runTaskOn(stdcontext.Background(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
+			res, err := runTaskOn(cx.TurnContext(), cx, r.childAgent(tc, fmt.Sprintf("subtask-%d", i)), task, "")
 			if err != nil {
 				return err
 			}

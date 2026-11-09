@@ -95,20 +95,6 @@ func (f *forwarder) stop() {
 	f.sub = 0
 }
 
-// publish sends an event authored by the child on its stream. Once the turn
-// scope is open the ordinary stream path persists and the interrupt relay
-// forwards it; a failure before the scope opened (for example a variable/merge
-// error) has no subscription yet, so the event is relayed directly.
-func (f *forwarder) publish(childStream stream.Stream, started bool, ev events.Event) error {
-	if f == nil || f.parent == nil || f.parent.Stream == nil {
-		return childStream.Send(ev)
-	}
-	if started || childStream.ID() == f.parent.Stream.ID() {
-		return childStream.Send(ev)
-	}
-	return f.forward(ev)
-}
-
 // forward is the subscriber. A failure to publish upward fails the child Send,
 // matching upstream: a parent that cannot observe the tree is a broken turn,
 // not a silently truncated one. Accounting is best-effort retained on the
@@ -177,23 +163,18 @@ func (f *forwarder) forwardToParent(ev events.Event) error {
 	return f.parent.Stream.Send(ce)
 }
 
-// usage reports this delegation's cumulative spend: the child transcript plus
-// source records this relay retained while publishing upward. Both sources
-// carry the same event ids, so usage.FromEvents deduplicates a record that
-// exists on both sides.
-func (f *forwarder) usage(childStream stream.Stream) events.Usage {
-	evs, err := childStream.History().GetEvents()
-	if err != nil {
-		evs = nil
+// accountingEvents returns a snapshot of the source UsageEvents this relay
+// retained while publishing upward. The run lifecycle persists them before its
+// terminal and merges them into the TaskCompleted usage snapshot.
+func (f *forwarder) accountingEvents() []events.Event {
+	if f == nil {
+		return nil
 	}
 	f.accountingMu.Lock()
-	acc := make([]events.Event, len(f.accounting))
-	copy(acc, f.accounting)
-	f.accountingMu.Unlock()
-	all := make([]events.Event, 0, len(evs)+len(acc))
-	all = append(all, evs...)
-	all = append(all, acc...)
-	return usage.FromEvents(all).Total
+	defer f.accountingMu.Unlock()
+	out := make([]events.Event, len(f.accounting))
+	copy(out, f.accounting)
+	return out
 }
 
 // persistAccounting retains a source UsageEvent in the parent history when the

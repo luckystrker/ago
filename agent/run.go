@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
+	"github.com/luckystrker/ago/task"
 	"github.com/luckystrker/ago/tools"
 	"github.com/luckystrker/ago/usage"
 )
@@ -60,13 +62,17 @@ type AgentRun struct {
 	// per-stream turn lock is held and stops before the lock is released, so a
 	// queued delegation on a shared stream cannot capture another invocation's
 	// events (upstream Forwarder.execution inside _turn_scope).
-	delegation        *forwarder
-	delegationStart   events.Event
-	delegationStarted bool
-	running           atomic.Bool
-	haltMu            sync.Mutex
-	halted            bool
-	haltReason        string
+	delegation *forwarder
+	// lifecycle is the task lifecycle of this invocation. It is created for a
+	// delegation (always) or for an ordinary run whose RunOptions enable it, and
+	// publishes the terminal when the scope closes.
+	lifecycle *runLifecycle
+	// runOpts are the per-invocation lifecycle options (capability/ttl).
+	runOpts    RunOptions
+	running    atomic.Bool
+	haltMu     sync.Mutex
+	halted     bool
+	haltReason string
 }
 
 // Start opens the turn scope and launches the turn goroutine. Idempotent.
@@ -77,7 +83,7 @@ func (r *AgentRun) Start(ctx stdcontext.Context) error {
 	return r.startErr
 }
 
-func (r *AgentRun) open(ctx stdcontext.Context) error {
+func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 	a := r.agent
 	a.mu.Lock()
 	opts := a.opts
@@ -103,36 +109,46 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	// A failed scope entry releases everything the scope took, so a forgotten
 	// Close after a Start error cannot strand the stream for later asks
 	// (Python parity: the _turn_scope async-with releases the lock when the
-	// body fails).
+	// body fails). A failure inside an already-entered delegation scope leaves
+	// the scope open for runTaskOn.fail: the terminal must be published on the
+	// child stream through the live relay, under the lock, inside finish. Every
+	// other failed Start releases the scope here, publishing the terminal for an
+	// ordinary opted-in run even if the caller forgets Close.
 	opened := false
 	defer func() {
-		// A failure inside an already-entered delegation scope leaves the scope
-		// open for runTaskOn.fail: the terminal must be published on the child
-		// stream through the live relay, under the lock, before Close (upstream
-		// Forwarder.execution's finally). Every other failed Start releases the
-		// scope here.
-		if !opened && !r.delegationStarted {
-			r.Close()
+		if opened {
+			return
 		}
+		if r.delegation != nil && r.lifecycleStarted() {
+			return
+		}
+		if err != nil && r.lifecycle != nil && r.lifecycle.failure == nil {
+			r.lifecycle.failure = err
+		}
+		r.Close()
 	}()
 
 	// Delegation relay: installed only now, under the per-stream turn lock, so
 	// a queued invocation on a shared stream cannot observe another turn's
-	// events. TaskStarted is the first event of the child transcript; the relay
-	// forwards it (and every later event) to the parent similarly to upstream
-	// Forwarder.execution inside _turn_scope.
+	// events (upstream Forwarder.execution inside _turn_scope).
 	if r.delegation != nil {
 		r.delegation.start()
-		if r.delegationStart != nil {
-			// Mark the attempt before publishing: the relay is an interrupt
-			// subscriber, so the parent may already have TaskStarted even if the
-			// child's persistence fails. fail() then must not publish it again
-			// (upstream sets Forwarder.started before sending).
-			r.delegationStarted = true
-			if err := r.stream.Send(r.delegationStart); err != nil {
-				return fmt.Errorf("agent: send task started: %w", err)
-			}
-			r.delegationStart = nil
+	}
+
+	// Task lifecycle: a delegation always reports one; an ordinary run opts in
+	// through RunOptions. It starts after the lock and the relay, so TaskStarted
+	// is authored inside the scope and travels through the relay, and a setup
+	// failure below still reaches a terminal (upstream lifecycle.scope entered
+	// before drive, started on the drive/failure path).
+	if r.lifecycle == nil && r.runOpts.enabled() {
+		// The title is published to observers and mirrored to the hub, so it is
+		// the agent name, never the caller's prompt (upstream ADR 0035).
+		r.lifecycle = newRunLifecycle(a.name, task.Spec{Title: a.name, Capability: r.runOpts.Capability}, r.cx)
+		r.lifecycle.ttl = r.runOpts.TTL
+	}
+	if r.lifecycle != nil {
+		if lerr := r.lifecycle.start(); lerr != nil {
+			return fmt.Errorf("agent: start task lifecycle: %w", lerr)
 		}
 	}
 
@@ -330,10 +346,17 @@ func (r *AgentRun) awaitTurn() {
 	}
 }
 
+// lifecycleStarted reports whether the run has already published its task
+// start, i.e. the invocation entered its scope.
+func (r *AgentRun) lifecycleStarted() bool {
+	return r != nil && r.lifecycle != nil && r.lifecycle.started()
+}
+
 // Close ends the turn scope: cancels an in-flight turn, waits for its goroutine
-// to finish, unsubscribes and releases the per-stream lock. It is blocking by
-// design: a model client that ignores cancellation can make Close wait until
-// the call returns. Safe to call multiple times; safe before Start (no-op).
+// to finish, unsubscribes, publishes the task terminal, stops the delegation
+// relay and releases the per-stream lock. It is blocking by design: a model
+// client that ignores cancellation can make Close wait until the call returns.
+// Safe to call multiple times; safe before Start (no-op).
 func (r *AgentRun) Close() {
 	r.closeOnce.Do(func() {
 		// Stop a turn still in flight before tearing the scope down: otherwise its
@@ -346,6 +369,35 @@ func (r *AgentRun) Close() {
 		r.awaitTurn()
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
+		}
+		// The terminal is published after the run-scoped subscribers are gone,
+		// while the relay and the per-stream lock are still held: it is the last
+		// event of this invocation and a queued sibling cannot relay it under its
+		// own provenance (upstream lifecycle terminal in the turn-scope finally).
+		if lc := r.lifecycle; lc != nil {
+			if lc.failure == nil {
+				switch {
+				case r.err != nil:
+					lc.failure = r.err
+				case r.startErr != nil:
+					lc.failure = r.startErr
+				case r.reply == nil && r.turnCtx != nil && r.turnCtx.Err() != nil:
+					// The caller gave up (or Close cancelled the turn) before a
+					// reply existed: the invocation did not complete, so the
+					// terminal is a cancellation, not a success.
+					lc.failure = r.turnCtx.Err()
+				}
+			}
+			if r.reply != nil && lc.result == nil {
+				lc.result = r.reply.Body()
+			}
+			if ferr := lc.finish(); ferr != nil {
+				name := ""
+				if r.agent != nil {
+					name = r.agent.name
+				}
+				slog.Error("agent: publish task terminal failed", "agent", name, "err", ferr)
+			}
 		}
 		// Stop the delegation relay before the turn lock is released: the next
 		// invocation on a shared child stream must not inherit this turn's
@@ -429,7 +481,7 @@ func ContentAs[T any](ctx stdcontext.Context, r *AgentReply, retries int) (T, er
 			return out, err
 		}
 		// Re-ask with the validation error appended (same stream/client).
-		next, aerr := reply.continueAsk(ctx, "Your previous response failed validation: "+
+		next, aerr := reply.continueAsk(ctx, RunOptions{}, "Your previous response failed validation: "+
 			err.Error()+". Answer again, valid this time.")
 		if aerr != nil {
 			return out, aerr
@@ -450,16 +502,28 @@ func (r *AgentReply) Usage() *usage.Report {
 // Ask continues the conversation on the same stream and returns the next reply
 // (Python parity: AgentReply.ask).
 func (r *AgentReply) Ask(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, error) {
-	return r.continueAsk(ctx, msgs...)
+	return r.AskWith(ctx, RunOptions{}, msgs...)
+}
+
+// AskWith is Ask with per-invocation task-lifecycle options; each continuation
+// opens a fresh task (upstream ADR 0035).
+func (r *AgentReply) AskWith(ctx stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error) {
+	return r.continueAsk(ctx, opts, msgs...)
 }
 
 // Run continues the conversation on the same stream and returns the run handle
 // (Python parity: AgentReply.run).
 func (r *AgentReply) Run(ctx stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
+	return r.RunWith(ctx, RunOptions{}, msgs...)
+}
+
+// RunWith is Run with per-invocation task-lifecycle options.
+func (r *AgentReply) RunWith(ctx stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error) {
 	run, err := r.agent.newRunOn(r.cx, msgs...)
 	if err != nil {
 		return nil, err
 	}
+	run.runOpts = opts
 	if err := run.Start(ctx); err != nil {
 		run.Close()
 		return nil, err
@@ -469,11 +533,12 @@ func (r *AgentReply) Run(ctx stdcontext.Context, msgs ...Sendable) (*AgentRun, e
 
 // continueAsk opens the next turn on the same stream, cloning this turn's context
 // so variables and dependencies carry over.
-func (r *AgentReply) continueAsk(ctx stdcontext.Context, msgs ...Sendable) (*AgentReply, error) {
+func (r *AgentReply) continueAsk(ctx stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error) {
 	run, err := r.agent.newRunOn(r.cx, msgs...)
 	if err != nil {
 		return nil, err
 	}
+	run.runOpts = opts
 	defer run.Close()
 	if err := run.Start(ctx); err != nil {
 		return nil, err

@@ -171,13 +171,14 @@ func TestForwarderRetainsAccountingBesideForeignUsage(t *testing.T) {
 	}
 }
 
-// TestForwarderPublishSameStreamSendsLocally pins the publish fast path: an
-// event authored on the parent's own stream must still be persisted there.
-func TestForwarderPublishSameStreamSendsLocally(t *testing.T) {
+// TestForwarderRejectOnSameStreamPersistsLocally pins the reject fast path: a
+// pre-turn terminal for a delegation configured with the caller's stream is
+// persisted there (the relay has no echo guard for a rejected attempt).
+func TestForwarderRejectOnSameStreamPersistsLocally(t *testing.T) {
 	s := stream.NewMemoryStream()
 	f := newForwarder(agocontext.New(s), s, "t", "a")
-	if err := f.publish(s, false, &events.ModelResponse{Message: &events.ModelMessage{Content: "once"}}); err != nil {
-		t.Fatalf("publish: %v", err)
+	if err := f.reject(&events.ModelResponse{Message: &events.ModelMessage{Content: "once"}}); err != nil {
+		t.Fatalf("reject: %v", err)
 	}
 	evs, _ := s.History().GetEvents()
 	if len(evs) != 1 {
@@ -204,7 +205,7 @@ func TestForwarderUsageIncludesRetainedAccounting(t *testing.T) {
 	if err := child.Send(src); err == nil {
 		t.Fatal("child send succeeded")
 	}
-	if got := f.usage(child).TotalTokens; got == nil || *got != 10 {
+	if got := snapshotUsage(child, f.accountingEvents()).TotalTokens; got == nil || *got != 10 {
 		t.Fatalf("forwarder usage = %v, want 10 from retained accounting", got)
 	}
 }
@@ -229,17 +230,13 @@ func (c slowLateClient) Call(stdcontext.Context, []events.Event, *agocontext.Con
 	}, nil
 }
 
-// TestForwarderPublishAndAccountingNilGuards pins the defensive paths used by
-// rejected/partial delegations: a forwarder without a parent stream must still
-// publish locally and must not panic while trying to retain accounting.
-func TestForwarderPublishAndAccountingNilGuards(t *testing.T) {
-	s := stream.NewMemoryStream()
+// TestForwarderNilGuards pins the defensive paths used by rejected/partial
+// delegations: a forwarder without a parent or stream must not panic while
+// rejecting or retaining accounting.
+func TestForwarderNilGuards(t *testing.T) {
 	var f forwarder
-	if err := f.publish(s, false, &events.ModelResponse{Message: &events.ModelMessage{Content: "once"}}); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if evs, _ := s.History().GetEvents(); len(evs) != 1 {
-		t.Fatalf("history = %d, want the local event", len(evs))
+	if err := f.reject(&events.ModelResponse{Message: &events.ModelMessage{Content: "once"}}); err != nil {
+		t.Fatalf("reject: %v", err)
 	}
 	f.persistAccounting(events.NewUsageEvent(events.Usage{TotalTokens: events.I64(1)}, events.UsageKindModelCall), "id")
 	f.persistAccounting(nil, "")

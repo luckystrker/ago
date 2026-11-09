@@ -3492,9 +3492,13 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   per-delegation `cancel func` registry or downlink transport. Consequently an
   observer cannot address a delegation with `HaltEvent`, and cancelling a root
   turn does not necessarily stop an already-running child: tool execution has
-  no stdlib context (`runTaskOn` is called with `context.Background()` in
-  `AsTool`/`run_subtask(s)`), which was already true before T8, so this is a
-  pre-existing gap rather than a T8 regression. Follow-up scope: origin handle
+  no stdlib context (`runTaskOn` was called with `context.Background()` in
+  `AsTool`/`run_subtask(s)`), which was already true before T8, so that was a
+  pre-existing gap rather than a T8 regression. D-093 closed the cancellation
+  half: delegations now start on the parent turn's `Context.TurnContext()`, so
+  a parent cancellation reaches the child and is reported as
+  `TaskCancelled{reason: "parent cancelled"}`. The downlink (addressing,
+  registry, `DeliveryFailed`) remains deferred. Follow-up scope: origin handle
   + registry keyed by task id, downlink delivery/validation, cancel cascade and
   settlement, cancelled-tool-call repair, then user-facing observability.
   `DownEvent` stays a vocabulary type (T6); `Delivery` is now validated by
@@ -3539,3 +3543,105 @@ usage/observer dedup tests. Gates (2026-11-09): `go build ./...`, `go vet ./...`
 `go test -race` could not run in this container (no cgo/gcc:
 `C compiler "gcc" not found`), as recorded in the T8 dev report; the
 stateful-package race tests are written but were not executed here.
+
+## D-093 — 2026-11-09 — agent: one task lifecycle for model runs and delegations (upstream `d716fcbefe`)
+
+Ported upstream `ag2/_run_lifecycle.py` and ADR 0034/0035. A model run and a
+delegation now use the same `task.Task` transitions, the same terminal
+selection, and the same usage snapshot. `agent/lifecycle.go`'s unexported
+`runLifecycle` is the only place that opens a task and publishes its terminal;
+`AgentRun` owns it, and `runTaskOn` no longer constructs
+`TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` by hand.
+
+- **Ordinary runs opt in (D-093a).** `RunOptions{Capability, TTL}` plus
+  `AskWith`/`RunWith`/`ResumeWith` and the reply continuations mirror
+  upstream's `capability=`/`ttl_seconds=` keyword arguments; `Ask`/`Run`/
+  `Resume` are the zero-options spelling and stay byte-identical to the
+  pre-lifecycle behavior (ADR 0035: "ordinary calls without either remain
+  unchanged"). AGO-DEVIATION: Go has no keyword arguments, so the options
+  travel as a value through a `...With` family instead of extra parameters on
+  the existing methods. Delegations always open a lifecycle, with the existing
+  task id, parent tool-call id and objective title. `emit_events=False` is not
+  ported: AGo never exposed an opt-out surface for it, so no behavior is lost.
+- **The title is the agent name (D-093a).** An opted-in run publishes
+  `TaskSpec{Title: agentName, Capability: ...}` and `Objective` equal to the
+  agent name; the caller's prompt never enters a Task event. `TaskStarted` is
+  inert and reaches the network mirror, so this is the privacy boundary.
+  Delegations keep their objective as the title and now also carry a
+  `TaskSpec` (upstream: "Delegated TaskStarted now carries a TaskSpec").
+- **Terminal on every outcome (D-093a).** `AgentRun.open` starts the lifecycle
+  after acquiring the per-stream turn lock (unchanged T8 ordering) and before
+  the remaining setup. `Close` cancels and awaits the turn, unsubscribes the
+  run's own subscribers, publishes the terminal while the relay and the lock
+  are still held, then stops the relay and releases the lock. The terminal is
+  therefore the last event and covers: success, turn error, `context.Canceled`
+  (`TaskCancelled`, reason `"cancelled"` for a run and `"parent cancelled"` for
+  a delegation), a panic recovered by `executeTurn`, a session that returned no
+  reply after its caller gave up, and a usage read failure. `Run.Result`
+  leaves the scope open as upstream does; the terminal follows on `Close`, and
+  `Ask` publishes it before returning. A `Start` failure after the lifecycle
+  started releases the scope and publishes the terminal even when the caller
+  forgets `Close`; a delegation keeps the scope open so the terminal travels
+  through its relay under the lock.
+- **Delegation reject goes through the same lifecycle (D-093a).**
+  `ErrNestedSameStream` and `newRunWith`/`MergeVariables` failures happen
+  before the turn scope exists; `runTaskOn` builds a lifecycle whose publisher
+  is `forwarder.reject`, so started+terminal go straight to the parent and the
+  (possibly busy) child stream is never touched. Failures after the scope
+  opened publish on the child stream and are relayed as before.
+- **PARENT_CANCELLED closes the D-092 cancellation gap (D-093a).** `AsTool`
+  and `run_subtask(s)` now start the delegated run on `cx.TurnContext()`
+  instead of `context.Background()`. The parent turn's cancellable context is
+  installed on its conversation context, so a parent cancellation reaches the
+  child turn; the child reports `TaskCancelled{reason: "parent cancelled"}`
+  and the delegating tool renders the cancelled result. A call cancelled while
+  waiting for the per-stream lock still opens no lifecycle for an ordinary run
+  (ADR 0035); a delegation reports that attempt through `reject`.
+- **Usage snapshot and retention (D-093a).** `TaskCompleted.Usage` is
+  `usage.FromEvents(streamHistory + forwarderRetainedAccounting)`, deduplicated
+  by `event_id`, so it stays a snapshot (D-092/D-093 contract: never additive).
+  Before the terminal, source records the relay captured but the stream never
+  persisted are appended (upstream `persist_accounting`); a retention write
+  failure decides the terminal when nothing failed before and is logged and
+  suppressed behind an earlier failure. A usage read failure falls back to the
+  retained accounting and does not replace the task outcome (upstream
+  `snapshot_usage`).
+- **`task.New` + `Task.Start` (D-093b).** Upstream splits Task construction
+  from `_start`, and the lifecycle needs a handle that survives a failed
+  `TaskStarted` send so it can still publish a terminal. AGo adds `task.New`
+  (builds an unstarted handle) and `(*Task).Start`; the package-level
+  `task.Start` remains `New`+`Start` and still returns a nil handle on failure,
+  preserving its public contract. `WithoutInjection` keeps the lifecycle out of
+  the `ag:task` dependency slot, as upstream `inject=False` does, so a tagged
+  run inside an owner's `TaskInject` block does not steal the binding.
+  `WithTaskID`/`WithParentToolCallID` carry the delegation identity, and
+  `WithPublisher` routes events away from the bound stream for the reject path.
+  The task subscribes to its stream's `Task*` terminals and adopts a matching
+  external terminal (same task id) without emitting a second one; the
+  subscription, `Done` and dependency rollback are released by the terminal
+  itself, so `task.Start` users need no scope object. `CompleteWithUsage`
+  carries the snapshot. `Agent.Task` keeps its doc-only deprecation (D-083);
+  the compatible replacement is now `task.New`/`task.Start` with a `task.Spec`.
+- **Panics.** Upstream fails a task on any `BaseException` from a tool. AGo's
+  tool layer already recovers every tool panic into a `ToolErrorEvent`
+  (`tools.FunctionTool.callFn`), so a panicking tool is a tool error and the
+  run still reaches `TaskCompleted`; the panic never escapes. A panic in
+  middleware or elsewhere in the turn goroutine is recovered by
+  `executeTurn`, surfaces as the run error, and reaches `TaskFailed`. Both
+  paths are covered by tests.
+- **Not ported (D-093b).** TTL remains an external observation deadline (no
+  timer); `TaskExpired` adoption from an observer is supported. Upstream's
+  `DelegationRegistry`/`settle_descendants`/`cancel_descendants` and the
+  downlink remain out of scope (D-092). `Agent.task()` still emits no runtime
+  `DeprecationWarning` (D-083).
+
+Verified by `agent/lifecycle_test.go` (untagged calls, tagged ask/run,
+terminal-on-close, undriven scope, TTL, setup failure, cancellation, middleware
+and tool panics, continuations, delegation spec/parent-call, parent
+cancellation to the child, usage read failure, delegated turn panic, retention)
+and `task/start_test.go` (New/Start split, publisher bypass, external identity,
+non-injection, adoption, failed start keeps a terminal-capable handle).
+Regression: the T8 suite, including the order-sensitive delegation tests
+(`-count=200`) and `go test ./agent/ -count=20`. Gates (2026-11-09):
+`go build ./...`, `go vet ./...`, `go test ./...` (three consecutive green
+runs). `go test -race` still cannot run in this container (no cgo/gcc).

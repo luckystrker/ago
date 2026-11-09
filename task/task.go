@@ -26,6 +26,7 @@ import (
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/internal/uuid"
+	"github.com/luckystrker/ago/stream"
 )
 
 // DepKey is the context dependency id under which the active Task is stamped
@@ -246,9 +247,14 @@ func parseTimeLenient(s string) time.Time {
 }
 
 // Task is the lifecycle handle for a unit of work. Created via Start (the
-// Agent.task wrapper delegates here). Safe for concurrent use.
+// Agent.task wrapper delegates here) or via New followed by Start when the
+// owner needs the handle before the first event (the run/delegation lifecycle).
+// Safe for concurrent use.
 type Task struct {
 	ctx     *agocontext.Context
+	owner   string
+	spec    Spec
+	opts    options
 	store   CheckpointStore
 	resumed []byte
 	// prevDep is the task the "ag:task" slot held when this task entered,
@@ -259,17 +265,26 @@ type Task struct {
 	// extra lock.
 	prevDep *Task
 
-	mu      sync.Mutex
-	md      Metadata
-	started bool
-	done    chan struct{}
+	mu       sync.Mutex
+	md       Metadata
+	started  bool
+	done     chan struct{}
+	doneOnce sync.Once
+	// sub observes the stream's terminal Task events so an external terminal
+	// (for example an observer-driven TaskExpired) is adopted instead of being
+	// contradicted by a late owner transition (upstream _observe_terminal).
+	sub stream.SubID
 }
 
 type options struct {
-	ttl        time.Duration
-	store      CheckpointStore
-	resumeFrom string
-	channelID  string
+	ttl              time.Duration
+	store            CheckpointStore
+	resumeFrom       string
+	channelID        string
+	taskID           string
+	parentToolCallID string
+	publisher        func(events.Event) error
+	noInject         bool
 }
 
 // Option configures Start.
@@ -302,42 +317,97 @@ func WithChannelID(id string) Option {
 	return func(o *options) { o.channelID = id }
 }
 
-// Start opens a task: stamps "ag:task" into the context dependencies (keeping
-// the nearest still-running predecessor for rollback), emits TaskStarted and
-// leaves the task in the running state. The context is required — standalone
-// streams without a conversation should build a Context over a fresh stream
-// first.
-func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*Task, error) {
-	if ctx == nil {
-		return nil, errors.New("task: Start requires a conversation context")
+// WithTaskID assigns an external task id instead of a fresh uuid. The run and
+// delegation lifecycle supplies the id it already published to the caller
+// (upstream `_start(task_id=...)`).
+func WithTaskID(id string) Option {
+	return func(o *options) { o.taskID = id }
+}
+
+// WithParentToolCallID records the tool call that requested the task; it rides
+// on TaskStarted so observers can reconstruct the delegation tree.
+func WithParentToolCallID(id string) Option {
+	return func(o *options) { o.parentToolCallID = id }
+}
+
+// WithPublisher routes every lifecycle event through fn instead of the bound
+// stream. A delegation rejected before it entered its stream publishes straight
+// to the parent this way, leaving the (possibly busy) child stream untouched
+// (upstream RunLifecycle(publisher=forwarder.forward)).
+func WithPublisher(fn func(events.Event) error) Option {
+	return func(o *options) {
+		if fn != nil {
+			o.publisher = fn
+		}
 	}
+}
+
+// WithoutInjection keeps the task out of the "ag:task" dependency slot. Model
+// runs and delegations use it: they report a lifecycle but do not steal the
+// enclosing TaskInject binding (upstream RunLifecycle starts its Task with
+// inject=False).
+func WithoutInjection() Option {
+	return func(o *options) { o.noInject = true }
+}
+
+// New builds an unstarted Task handle over ctx. The caller drives it with Start;
+// this is the direct-construction path ADR 0034 replaces Agent.task with. A nil
+// context is reported by Start, not by New, so callers can keep the handle.
+func New(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) *Task {
 	var o options
 	for _, apply := range opts {
 		apply(&o)
 	}
-	t := &Task{ctx: ctx, store: o.store, done: make(chan struct{})}
+	return &Task{ctx: ctx, owner: owner, spec: spec, opts: o, store: o.store, done: make(chan struct{})}
+}
 
-	if o.resumeFrom != "" && o.store != nil {
-		state, err := o.store.Read(o.resumeFrom)
+// Start opens a task: stamps "ag:task" into the context dependencies (keeping
+// the nearest still-running predecessor for rollback, unless WithoutInjection
+// was set), emits TaskStarted and leaves the task in the running state. The
+// context is required — standalone streams without a conversation should build
+// a Context over a fresh stream first.
+//
+// A failed TaskStarted send leaves the handle in the running state: the owner
+// can still publish a terminal through it, so a storage failure cannot swallow
+// the task's outcome (upstream runs the same finally on a failed _start).
+func (t *Task) Start() error {
+	if t == nil || t.ctx == nil {
+		return errors.New("task: Start requires a conversation context")
+	}
+	t.mu.Lock()
+	if t.started {
+		t.mu.Unlock()
+		return errors.New("task: already started")
+	}
+	t.mu.Unlock()
+
+	if t.opts.resumeFrom != "" && t.store != nil {
+		state, err := t.store.Read(t.opts.resumeFrom)
 		if err != nil {
-			return nil, fmt.Errorf("task: read checkpoint %q: %w", o.resumeFrom, err)
+			return fmt.Errorf("task: read checkpoint %q: %w", t.opts.resumeFrom, err)
 		}
 		t.resumed = state
 	}
 
 	now := time.Now().UTC()
+	id := t.opts.taskID
+	if id == "" {
+		id = uuid.New()
+	}
+	t.mu.Lock()
 	t.md = Metadata{
-		TaskID:    uuid.New(),
-		OwnerID:   owner,
-		Spec:      spec,
+		TaskID:    id,
+		OwnerID:   t.owner,
+		Spec:      t.spec,
 		State:     StateRunning,
 		CreatedAt: now,
 		StartedAt: now,
-		ExpiresAt: expiry(o.ttl, now),
+		ExpiresAt: expiry(t.opts.ttl, now),
 		Progress:  map[string]any{},
-		ChannelID: o.channelID,
+		ChannelID: t.opts.channelID,
 	}
 	t.started = true
+	t.mu.Unlock()
 
 	// The "ag:task" slot is a single register shared by sibling tasks on one
 	// context: entering keeps the last still-running predecessor, walking the
@@ -345,22 +415,47 @@ func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*T
 	// resolves to the latest active task (Python parity: __aenter__ with
 	// _nearest_active). A non-*Task slot value counts as absent — the slot is
 	// reserved for the framework (upstream types it Task | None).
-	if prev, ok := ctx.Dependency(DepKey); ok {
-		if pt, isTask := prev.(*Task); isTask {
-			t.prevDep = nearestActive(pt)
+	if !t.opts.noInject {
+		if prev, ok := t.ctx.Dependency(DepKey); ok {
+			if pt, isTask := prev.(*Task); isTask {
+				t.prevDep = nearestActive(pt)
+			}
 		}
+		t.ctx.SetDependency(DepKey, t)
 	}
-	ctx.SetDependency(DepKey, t)
 
-	if err := ctx.Send(&events.TaskStarted{
-		TaskID:    t.md.TaskID,
-		AgentName: owner,
-		Objective: spec.Title,
-		Spec:      specEvent(spec),
-		ExpiresAt: isoOrEmpty(t.md.ExpiresAt),
+	if t.ctx.Stream != nil {
+		id := t.ctx.Stream.Subscribe(func(ev events.Event) error {
+			t.observeTerminal(ev)
+			return nil
+		}, stream.SubscribeOptions{Condition: terminalTaskCondition})
+		t.mu.Lock()
+		t.sub = id
+		t.mu.Unlock()
+	}
+
+	if err := t.send(&events.TaskStarted{
+		TaskID:           t.md.TaskID,
+		AgentName:        t.owner,
+		Objective:        t.spec.Title,
+		Spec:             specEvent(t.spec),
+		ExpiresAt:        isoOrEmpty(t.md.ExpiresAt),
+		ParentToolCallID: t.opts.parentToolCallID,
 	}); err != nil {
 		t.restoreDep()
-		return nil, fmt.Errorf("task: send TaskStarted: %w", err)
+		t.unsubscribe()
+		return fmt.Errorf("task: send TaskStarted: %w", err)
+	}
+	return nil
+}
+
+// Start builds and starts a task in one call (the Agent.task path). It returns a
+// nil handle on failure, preserving the pre-New contract; use New followed by
+// (*Task).Start when the handle is needed even after a failed start.
+func Start(ctx *agocontext.Context, owner string, spec Spec, opts ...Option) (*Task, error) {
+	t := New(ctx, owner, spec, opts...)
+	if err := t.Start(); err != nil {
+		return nil, err
 	}
 	return t, nil
 }
@@ -447,8 +542,8 @@ func (t *Task) ResumedState() []byte {
 	return out
 }
 
-// Done is closed when the task reaches a terminal state. It is nil for a task
-// that never started.
+// Done is closed when the task reaches a terminal state. A handle built by New
+// but never started never closes it; a nil task returns nil.
 func (t *Task) Done() <-chan struct{} {
 	if t == nil {
 		return nil
@@ -495,6 +590,18 @@ func (t *Task) Progress(update map[string]any) error {
 // Complete closes the task successfully with result (nil = no result) and
 // emits TaskCompleted. No-op when already terminal.
 func (t *Task) Complete(result any) error {
+	return t.complete(result, events.Usage{})
+}
+
+// CompleteWithUsage is Complete plus the cumulative usage snapshot the run and
+// delegation lifecycle attaches to TaskCompleted. The snapshot is inspection
+// data, never an additive usage record (source UsageEvents already travelled as
+// themselves).
+func (t *Task) CompleteWithUsage(result any, usage events.Usage) error {
+	return t.complete(result, usage)
+}
+
+func (t *Task) complete(result any, usage events.Usage) error {
 	md, out := t.transition(StateCompleted, func(m *Metadata) { m.Result = result })
 	if out != transitioned {
 		return out.err()
@@ -505,6 +612,7 @@ func (t *Task) Complete(result any) error {
 		Objective:  md.Spec.Title,
 		Result:     resultString(result),
 		TaskStream: t.streamID(),
+		Usage:      usage,
 	})
 }
 
@@ -616,11 +724,81 @@ func (t *Task) transition(state State, apply func(*Metadata)) (Metadata, transit
 	if apply != nil {
 		apply(&t.md)
 	}
-	close(t.done)
+	t.closeDone()
 	snapshot := copyMetadata(&t.md)
 	t.mu.Unlock()
+	t.unsubscribe()
 	t.restoreDep()
 	return snapshot, transitioned
+}
+
+// terminalTaskCondition matches the four immutable terminals of any Task on the
+// stream; observeTerminal filters by task id and current state.
+func terminalTaskCondition(ev events.Event) bool {
+	switch events.AsValue(ev).(type) {
+	case events.TaskCompleted, events.TaskFailed, events.TaskExpired, events.TaskCancelled:
+		return true
+	}
+	return false
+}
+
+// observeTerminal adopts an externally published terminal for this task so a
+// late owner transition cannot contradict it (upstream _observe_terminal). It
+// never emits a terminal of its own.
+func (t *Task) observeTerminal(ev events.Event) {
+	if t == nil {
+		return
+	}
+	var taskID string
+	var apply func(*Metadata)
+	switch e := events.AsValue(ev).(type) {
+	case events.TaskCompleted:
+		taskID = e.TaskID
+		apply = func(m *Metadata) { m.State = StateCompleted; m.Result = e.Result }
+	case events.TaskFailed:
+		taskID = e.TaskID
+		apply = func(m *Metadata) { m.State = StateFailed; m.Error = e.Error }
+	case events.TaskExpired:
+		taskID = e.TaskID
+		apply = func(m *Metadata) { m.State = StateExpired }
+	case events.TaskCancelled:
+		taskID = e.TaskID
+		apply = func(m *Metadata) { m.State = StateCancelled; m.Error = e.Reason }
+	default:
+		return
+	}
+	t.mu.Lock()
+	if !t.started || taskID != t.md.TaskID || t.md.State.Terminal() {
+		t.mu.Unlock()
+		return
+	}
+	apply(&t.md)
+	t.md.CompletedAt = time.Now().UTC()
+	t.closeDone()
+	t.mu.Unlock()
+	t.unsubscribe()
+	t.restoreDep()
+}
+
+// closeDone closes Done exactly once; the caller holds t.mu (or is the only
+// writer), and sync.Once keeps the transition and adoption paths from racing.
+func (t *Task) closeDone() {
+	t.doneOnce.Do(func() {
+		if t.done != nil {
+			close(t.done)
+		}
+	})
+}
+
+// unsubscribe releases the terminal-observation subscription, if any.
+func (t *Task) unsubscribe() {
+	t.mu.Lock()
+	id := t.sub
+	t.sub = 0
+	t.mu.Unlock()
+	if id != 0 && t.ctx != nil && t.ctx.Stream != nil {
+		t.ctx.Stream.Unsubscribe(id)
+	}
 }
 
 // restoreDep rolls the "ag:task" dependency back — the role of the Python
@@ -659,6 +837,12 @@ func nearestActive(t *Task) *Task {
 }
 
 func (t *Task) send(ev events.Event) error {
+	if t.opts.publisher != nil {
+		if err := t.opts.publisher(ev); err != nil {
+			return fmt.Errorf("task: send %s: %w", ev.EventType(), err)
+		}
+		return nil
+	}
 	if t.ctx == nil {
 		return errors.New("task: no context bound")
 	}

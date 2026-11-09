@@ -429,11 +429,16 @@ type Metadata struct { TaskID, OwnerID string; Spec Spec; State State; CreatedAt
     Result any; Error string; ChannelID string }  // to/from JSON
 type CheckpointStore interface { Write(taskID string, state []byte) error; Read(taskID string) ([]byte, error) }
 type Task struct{...}
-func Start(ctx *context.Context, owner string, spec Spec, opts ...Option) (*Task, error)
+func New(ctx *context.Context, owner string, spec Spec, opts ...Option) *Task   // unstarted handle
+func Start(ctx *context.Context, owner string, spec Spec, opts ...Option) (*Task, error) // New+Start
+func (t *Task) Start() error
 func (t *Task) Progress(update map[string]any)   // emits TaskProgress (transient)
-func (t *Task) Complete(result any); Fail(err error); Cancel(reason string); Expire()
+func (t *Task) Complete(result any); CompleteWithUsage(result any, usage events.Usage)
+func (t *Task) Fail(err error); Cancel(reason string); Expire()
 func (t *Task) Checkpoint(state []byte); ResumedState() []byte
 func (t *Task) Done() <-chan struct{}
+// Options: WithTTL, WithCheckpointStore, WithResumeFrom, WithChannelID,
+// WithTaskID, WithParentToolCallID, WithPublisher, WithoutInjection (D-093b).
 ```
 
 ### package `knowledge`
@@ -480,8 +485,11 @@ func New(name, prompt string, opts ...Option) *Agent
 func (a *Agent) Name() string
 func (a *Agent) PromptHook(fn func(ctx *context.Context) ([]string, error))  // dynamic prompt fragments
 func (a *Agent) Ask(ctx context.Context, msgs ...Sendable) (*AgentReply, error)
+func (a *Agent) AskWith(ctx context.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error)
 func (a *Agent) Run(ctx context.Context, msgs ...Sendable) (*AgentRun, error)
+func (a *Agent) RunWith(ctx context.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error)
 func (a *Agent) Resume(ctx context.Context, evs ...events.Event) (*AgentReply, error)
+func (a *Agent) ResumeWith(ctx context.Context, opts RunOptions, evs ...events.Event) (*AgentReply, error)
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool   // SubagentTool: description, name
 func (a *Agent) Task(ctx context.Context, title string, opts ...TaskOption) (*task.Task, error)
 func (a *Agent) Spec() (*spec.AgentSpec, error)  // in spec pkg; method forwards
@@ -504,7 +512,14 @@ func (r *AgentReply) Files() []events.BinaryResult
 func (r *AgentReply) History() *stream.History
 func (r *AgentReply) Usage(ctx context.Context) *usage.Report
 func (r *AgentReply) Ask(ctx context.Context, msgs ...Sendable) (*AgentReply, error)  // continuation, same stream
+func (r *AgentReply) AskWith(ctx context.Context, opts RunOptions, msgs ...Sendable) (*AgentReply, error)
 func (r *AgentReply) Run(ctx context.Context, msgs ...Sendable) (*AgentRun, error)
+func (r *AgentReply) RunWith(ctx context.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error)
+
+// RunOptions { Capability string; TTL time.Duration } enables the shared task
+// lifecycle for one invocation (AskWith/RunWith/ResumeWith); zero options keep
+// an ordinary call emitting no Task events. An agent run's task title is the
+// agent name (D-093a).
 
 // TaskConfig { Config config.ModelConfig; Prompt string; IncludeTools []string; ExcludeTools []string;
 //              ExtraTools []tools.Tool; MaxConcurrency int }  // IncludeTools: nil = all parent tools (Python None), empty = none, else allowlist (D-039)
@@ -520,7 +535,10 @@ drives next call); final drain of leftover inbox into one extra model call. Huma
 CloseUnansweredToolCalls history repair → propagate. HaltEvent → synthetic response "HALTED: <reason>".
 Subtasks: run_subtask/run_subtasks tools spawning child Agents (TaskConfig), child events
 forwarded upward as ChildEvent observations, source UsageEvent/Task* with provenance
-(path/task_id/agent_name) and usage deduplicated by EventID (D-092).
+(path/task_id/agent_name) and usage deduplicated by EventID (D-092). Models runs and
+delegations share one task lifecycle (`agent/lifecycle.go`, D-093): a terminal is always
+published, the run title is the agent name, and delegations start on the parent turn's
+cancellable context (PARENT_CANCELLED).
 
 ### package `spec`
 
