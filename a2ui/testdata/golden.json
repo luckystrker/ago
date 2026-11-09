@@ -3,12 +3,14 @@
   "mime_type": "application/a2ui+json",
   "open_tag": "<a2ui-json>",
   "close_tag": "</a2ui-json>",
-  "prompt_example_rendered": "[{\"version\": \"v1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"v1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
-  "message_types_md": "Each message in the JSON array must be one of:\n- `createSurface`: Initialize a new surface. Requires `surfaceId`. `catalogId` (\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\") sets the surface's default catalog. It may also carry the initial `components` array and `dataModel` object, so a whole UI can be sent in this single message.\n- `updateComponents`: Add/update components on a surface. Requires `surfaceId` and `components` array.\n- `updateDataModel`: Update the data model. Requires `surfaceId` and `value`; `path` is optional. Set `value` to `null` to delete the key at `path`.\n- `deleteSurface`: Remove a surface. Requires `surfaceId`.\n- `callRendererFunction`: Ask the renderer to run a catalog function. Requires `functionCallId` (a unique id the renderer copies verbatim into its response) and `callFunction` (with `@call`, the function name, and `catalogId`; `args` is optional). Only functions the catalog allows an agent to call can be used.\n\nAll messages must include `\"version\": \"v1.0\"`.\n\nDo not emit `agentFunctionResponse`: the server sends it itself when the renderer calls a server function.\n\n### Data Binding and Function Calls\n\nTo bind a component's value to the data model, use a **DataBinding object** with an `@path` property — NOT a bare string and NOT a plain `path` key.\n\nCorrect: `\"value\": {\"@path\": \"/customTime\"}`\nWrong: `\"value\": \"/customTime\"`, `\"value\": {\"path\": \"/customTime\"}`\n\nThis applies to ChoicePicker `value`, TextField `value`, Slider `value`, and any other component that reads from or writes to the data model. Button action context also uses this format: `\"context\": {\"time\": {\"@path\": \"/customTime\"}}`.\n\nTo call a catalog function inside a property, use a **FunctionCall object** with an `@call` property: `{\"@call\": \"formatString\", \"args\": {\"value\": \"Hello ${/user/name}\"}}`.\n\nTwo places keep the plain `path` spelling: a list template, `\"children\": {\"componentId\": \"itemTemplate\", \"path\": \"/items\"}`, and the `path` of an `updateDataModel` message.\n\n### Calling a renderer function (v1.0)\n\nTo run a function on the renderer, emit a `callRendererFunction` message; the renderer replies with the result, and that reply reaches you as your next input:\n\n`{\"version\": \"v1.0\", \"callRendererFunction\": {\"functionCallId\": \"fc-1\", \"callFunction\": {\"@call\": \"myFunction\", \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\", \"args\": {...}}}}`",
-  "catalog_instructions": "For layout, use the Row and Column components to organize other components.\n\n## Catalog Guidelines\n\n1. String Concatenation & Formatting: A2UI does not support binary operators like '+' or formatting symbols. To concatenate strings or dynamically inject data bindings into text, you must use the catalog function `formatString(value)` where the value string contains placeholders formatted as `${expression}`:\n   formatString(\"Hello ${/user/name}\")\n\n2. Strict Hierarchy: You must strictly adhere to the requested component nesting and hierarchy. If the prompt specifies that a component is 'inside' or 'contained in' another component, you MUST place it as a child of that specific component, not as a sibling or in a different container.\n\n3. Validation Checks: When components support validation checks, specify any custom error messages directly as the 'message' inside the check. Do NOT create separate text-display components to display validation errors.\n\n## Examples\n\nExample 1: Dynamic text form\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"main\",\n      \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Column\",\n          \"children\": [\"repField\", \"valueField\"]\n        },\n        {\n          \"id\": \"repField\",\n          \"component\": \"TextField\",\n          \"label\": \"Representative\",\n          \"value\": {\"@path\": \"/form/rep\"},\n          \"placeholder\": \"Enter name\"\n        },\n        {\n          \"id\": \"valueField\",\n          \"component\": \"TextField\",\n          \"label\": \"Deal Value\",\n          \"value\": {\"@path\": \"/form/value\"},\n          \"placeholder\": \"0.00\",\n          \"variant\": \"number\",\n          \"checks\": [\n            {\n              \"condition\": {\n                \"@call\": \"required\",\n                \"args\": {\"value\": {\"@path\": \"/form/value\"}}\n              },\n              \"message\": \"Deal value is required.\"\n            }\n          ]\n        }\n      ],\n      \"dataModel\": {\n        \"form\": {\n          \"rep\": \"John Doe\",\n          \"value\": 1500.00\n        }\n      }\n    }\n  }\n]\n```\n\nExample 2: Dynamic list with templates\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"main\",\n      \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Card\",\n          \"child\": \"breedList\"\n        },\n        {\n          \"id\": \"breedList\",\n          \"component\": \"List\",\n          \"children\": {\n            \"path\": \"/breeds\",\n            \"componentId\": \"breedTemplate\"\n          },\n          \"direction\": \"horizontal\"\n        },\n        {\n          \"id\": \"breedTemplate\",\n          \"component\": \"Image\",\n          \"url\": {\"@path\": \"url\"}\n        }\n      ],\n      \"dataModel\": {\n        \"breeds\": [\n          {\n            \"url\": \"https://example.com/poodle.jpg\"\n          },\n          {\n            \"url\": \"https://example.com/lab.jpg\"\n          }\n        ]\n      }\n    }\n  }\n]\n```",
-  "to_jsonl_typed": "{\"version\":\"v1.0\",\"createSurface\":{\"surfaceId\":\"s1\",\"catalogId\":\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}}\n{\"version\":\"v1.0\",\"updateDataModel\":{\"surfaceId\":\"s1\",\"path\":\"/count\",\"value\":2}}\n{\"version\":\"v1.0\",\"deleteSurface\":{\"surfaceId\":\"s1\"}}\n{\"version\":\"v1.0\",\"callRendererFunction\":{\"surfaceId\":\"s1\",\"functionCallId\":\"fc-1\",\"callFunction\":{\"@call\":\"openUrl\",\"catalogId\":\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\"args\":{\"url\":\"https://a2ui.org\"}}}}\n{\"version\":\"v1.0\",\"agentFunctionResponse\":{\"functionCallId\":\"fc-1\",\"value\":{\"ok\":true}}}",
+  "wire_version": "1.0",
+  "protocol_version": "v1.0",
+  "prompt_example_rendered": "[{\"version\": \"1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
+  "message_types_md": "Each message in the JSON array must be one of:\n- `createSurface`: Initialize a new surface. Requires `surfaceId`. `catalogId` (\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\") sets the surface's default catalog. It may also carry the initial `components` array and `dataModel` object, so a whole UI can be sent in this single message.\n- `updateComponents`: Add/update components on a surface. Requires `surfaceId` and `components` array.\n- `updateDataModel`: Update the data model. Requires `surfaceId` and `value`; `path` is optional. Set `value` to `null` to delete the key at `path`.\n- `deleteSurface`: Remove a surface. Requires `surfaceId`.\n- `callRendererFunction`: Ask the renderer to run a catalog function. Requires `functionCallId` (a unique id the renderer copies verbatim into its response) and `callFunction` (with `@call`, the function name, and `catalogId`; `args` is optional). Only functions the catalog allows an agent to call can be used.\n\nAll messages must include `\"version\": \"1.0\"`.\n\nDo not emit `agentFunctionResponse`: the server sends it itself when the renderer calls a server function.\n\n### Data Binding and Function Calls\n\nTo bind a component's value to the data model, use a **DataBinding object** with an `@path` property — NOT a bare string and NOT a plain `path` key.\n\nCorrect: `\"value\": {\"@path\": \"/customTime\"}`\nWrong: `\"value\": \"/customTime\"`, `\"value\": {\"path\": \"/customTime\"}`\n\nThis applies to ChoicePicker `value`, TextField `value`, Slider `value`, and any other component that reads from or writes to the data model. Button action context also uses this format: `\"context\": {\"time\": {\"@path\": \"/customTime\"}}`.\n\nTo call a catalog function inside a property, use a **FunctionCall object** with an `@call` property: `{\"@call\": \"formatString\", \"args\": {\"value\": \"Hello ${/user/name}\"}}`.\n\nTwo places keep the plain `path` spelling: a list template, `\"children\": {\"componentId\": \"itemTemplate\", \"path\": \"/items\"}`, and the `path` of an `updateDataModel` message.\n\n### Calling a renderer function (v1.0)\n\nTo run a function on the renderer, emit a `callRendererFunction` message; the renderer replies with the result, and that reply reaches you as your next input:\n\n`{\"version\": \"1.0\", \"callRendererFunction\": {\"functionCallId\": \"fc-1\", \"callFunction\": {\"@call\": \"myFunction\", \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\", \"args\": {...}}}}`",
+  "catalog_instructions": "For layout, use the Row and Column components to organize other components.\n\n## Catalog Guidelines\n\n1. String Concatenation & Formatting: A2UI does not support binary operators like '+' or formatting symbols. To concatenate strings or dynamically inject data bindings into text, you must use the catalog function `formatString(value)` where the value string contains placeholders formatted as `${expression}`:\n   formatString(\"Hello ${/user/name}\")\n\n2. Strict Hierarchy: You must strictly adhere to the requested component nesting and hierarchy. If the prompt specifies that a component is 'inside' or 'contained in' another component, you MUST place it as a child of that specific component, not as a sibling or in a different container.\n\n3. Validation Checks: When components support validation checks, specify any custom error messages directly as the 'message' inside the check. Do NOT create separate text-display components to display validation errors.\n\n## Examples\n\nExample 1: Dynamic text form\n```json\n[\n  {\n    \"version\": \"1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"main\",\n      \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Column\",\n          \"children\": [\"repField\", \"valueField\"]\n        },\n        {\n          \"id\": \"repField\",\n          \"component\": \"TextField\",\n          \"label\": \"Representative\",\n          \"value\": {\"@path\": \"/form/rep\"},\n          \"placeholder\": \"Enter name\"\n        },\n        {\n          \"id\": \"valueField\",\n          \"component\": \"TextField\",\n          \"label\": \"Deal Value\",\n          \"value\": {\"@path\": \"/form/value\"},\n          \"placeholder\": \"0.00\",\n          \"variant\": \"number\",\n          \"checks\": [\n            {\n              \"condition\": {\n                \"@call\": \"required\",\n                \"args\": {\"value\": {\"@path\": \"/form/value\"}}\n              },\n              \"message\": \"Deal value is required.\"\n            }\n          ]\n        }\n      ],\n      \"dataModel\": {\n        \"form\": {\n          \"rep\": \"John Doe\",\n          \"value\": 1500.00\n        }\n      }\n    }\n  }\n]\n```\n\nExample 2: Dynamic list with templates\n```json\n[\n  {\n    \"version\": \"1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"main\",\n      \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Card\",\n          \"child\": \"breedList\"\n        },\n        {\n          \"id\": \"breedList\",\n          \"component\": \"List\",\n          \"children\": {\n            \"path\": \"/breeds\",\n            \"componentId\": \"breedTemplate\"\n          },\n          \"direction\": \"horizontal\"\n        },\n        {\n          \"id\": \"breedTemplate\",\n          \"component\": \"Image\",\n          \"url\": {\"@path\": \"url\"}\n        }\n      ],\n      \"dataModel\": {\n        \"breeds\": [\n          {\n            \"url\": \"https://example.com/poodle.jpg\"\n          },\n          {\n            \"url\": \"https://example.com/lab.jpg\"\n          }\n        ]\n      }\n    }\n  }\n]\n```",
+  "to_jsonl_typed": "{\"version\":\"1.0\",\"createSurface\":{\"surfaceId\":\"s1\",\"catalogId\":\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}}\n{\"version\":\"1.0\",\"updateDataModel\":{\"surfaceId\":\"s1\",\"path\":\"/count\",\"value\":2}}\n{\"version\":\"1.0\",\"deleteSurface\":{\"surfaceId\":\"s1\"}}\n{\"version\":\"1.0\",\"callRendererFunction\":{\"surfaceId\":\"s1\",\"functionCallId\":\"fc-1\",\"callFunction\":{\"@call\":\"openUrl\",\"catalogId\":\"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\",\"args\":{\"url\":\"https://a2ui.org\"}}}}\n{\"version\":\"1.0\",\"agentFunctionResponse\":{\"functionCallId\":\"fc-1\",\"value\":{\"ok\":true}}}",
   "to_jsonl_empty": "",
-  "to_jsonl_component_list": "{\"version\":\"v1.0\",\"updateComponents\":{\"surfaceId\":\"s1\",\"components\":[{\"id\":\"root\",\"component\":\"Card\",\"child\":\"layout1\"},{\"id\":\"layout1\",\"component\":\"Column\",\"children\":[\"text1\",\"btn1\"]},{\"id\":\"text1\",\"component\":\"Text\",\"text\":\"Hello World\"},{\"id\":\"btn1\",\"component\":\"Button\",\"child\":\"btn1_text\",\"action\":{\"event\":{\"name\":\"click\"}}},{\"id\":\"btn1_text\",\"component\":\"Text\",\"text\":\"Click Me\"}]}}",
+  "to_jsonl_component_list": "{\"version\":\"1.0\",\"updateComponents\":{\"surfaceId\":\"s1\",\"components\":[{\"id\":\"root\",\"component\":\"Card\",\"child\":\"layout1\"},{\"id\":\"layout1\",\"component\":\"Column\",\"children\":[\"text1\",\"btn1\"]},{\"id\":\"text1\",\"component\":\"Text\",\"text\":\"Hello World\"},{\"id\":\"btn1\",\"component\":\"Button\",\"child\":\"btn1_text\",\"action\":{\"event\":{\"name\":\"click\"}}},{\"id\":\"btn1_text\",\"component\":\"Text\",\"text\":\"Click Me\"}]}}",
   "typed_valid_set_is_valid": true,
   "typed_valid_set_errors": [],
   "call_renderer_openurl_is_valid": false,
@@ -22,14 +24,14 @@
       "text": "Here is the UI you requested.",
       "operations": [
         {
-          "version": "v1.0",
+          "version": "1.0",
           "createSurface": {
             "surfaceId": "s1",
             "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
           }
         },
         {
-          "version": "v1.0",
+          "version": "1.0",
           "updateComponents": {
             "surfaceId": "s1",
             "components": [
@@ -71,7 +73,7 @@
         }
       ],
       "has_a2ui": true,
-      "raw_json": "[{\"version\": \"v1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"v1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
+      "raw_json": "[{\"version\": \"1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
       "parse_error": null
     },
     "no_block": {
@@ -82,18 +84,18 @@
     "missing_close": {
       "text": "Before",
       "has_a2ui": true,
-      "raw_json": "[{\"version\": \"v1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"v1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
+      "raw_json": "[{\"version\": \"1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
       "parse_error": null,
       "operations": [
         {
-          "version": "v1.0",
+          "version": "1.0",
           "createSurface": {
             "surfaceId": "s1",
             "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
           }
         },
         {
-          "version": "v1.0",
+          "version": "1.0",
           "updateComponents": {
             "surfaceId": "s1",
             "components": [
@@ -138,17 +140,17 @@
     "fenced_block": {
       "text": "Pre Post",
       "has_a2ui": true,
-      "raw_json": "[{\"version\": \"v1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"v1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
+      "raw_json": "[{\"version\": \"1.0\",\"createSurface\": {\"surfaceId\": \"s1\",\"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"}},{\"version\": \"1.0\",\"updateComponents\": {\"surfaceId\": \"s1\",\"components\": [{\"id\": \"root\",\"component\": \"Card\",\"child\": \"layout1\"},{\"id\": \"layout1\",\"component\": \"Column\",\"children\": [\"text1\",\"btn1\"]},{\"id\": \"text1\",\"component\": \"Text\",\"text\": \"Hello World\"},{\"id\": \"btn1\",\"component\": \"Button\",\"child\": \"btn1_text\",\"action\": {\"event\": {\"name\": \"click\"}}},{\"id\": \"btn1_text\",\"component\": \"Text\",\"text\": \"Click Me\"}]}}]",
       "operations": [
         {
-          "version": "v1.0",
+          "version": "1.0",
           "createSurface": {
             "surfaceId": "s1",
             "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
           }
         },
         {
-          "version": "v1.0",
+          "version": "1.0",
           "updateComponents": {
             "surfaceId": "s1",
             "components": [
@@ -192,11 +194,11 @@
     },
     "single_line_fence": {
       "text": "",
-      "raw_json": "{\"version\": \"v1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}",
+      "raw_json": "{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}",
       "has_a2ui": true,
       "operations": [
         {
-          "version": "v1.0",
+          "version": "1.0",
           "deleteSurface": {
             "surfaceId": "s1"
           }
@@ -206,17 +208,17 @@
     "jsonl_block": {
       "text": "",
       "has_a2ui": true,
-      "raw_json": "{\"version\": \"v1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}\n{\"version\": \"v1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": 1}}",
+      "raw_json": "{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}\n{\"version\": \"1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": 1}}",
       "parse_error": null,
       "operations": [
         {
-          "version": "v1.0",
+          "version": "1.0",
           "deleteSurface": {
             "surfaceId": "s1"
           }
         },
         {
-          "version": "v1.0",
+          "version": "1.0",
           "updateDataModel": {
             "surfaceId": "s1",
             "value": 1
@@ -280,6 +282,10 @@
       "is_valid": true,
       "errors": []
     },
+    "text_field_missing_value": {
+      "is_valid": false,
+      "error_count": 1
+    },
     "string_where_binding_expected": {
       "is_valid": true,
       "error_count": 0
@@ -289,7 +295,7 @@
       "error_count": 1
     }
   },
-  "format_validation_error": "Your A2UI output had validation errors:\n- Operation 0: something is wrong\n- JSON parse error: Invalid JSON: Expecting ',' delimiter: line 1 column 6 (char 5)\n\nPlease fix these errors and regenerate the A2UI JSON. Make sure each message includes \"version\": \"v1.0\" and all required properties. The user never sees this exchange: do not mention the errors or the correction in your reply.",
+  "format_validation_error": "Your A2UI output had validation errors:\n- Operation 0: something is wrong\n- JSON parse error: Invalid JSON: Expecting ',' delimiter: line 1 column 6 (char 5)\n\nPlease fix these errors and regenerate the A2UI JSON. Make sure each message includes \"version\": \"1.0\" and all required properties. The user never sees this exchange: do not mention the errors or the correction in your reply.",
   "incoming": {
     "action": {
       "kind": "A2UIIncomingActionResult",

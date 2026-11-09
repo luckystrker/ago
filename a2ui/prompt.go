@@ -20,9 +20,9 @@ func DefaultPromptSectionOptions() PromptSectionOptions {
 
 // PromptExample renders the v1.0 example response the prompt section shows
 // (schema_manager.py _build_prompt_example): the vendored prompt_example
-// template re-emitted with Python's separators (",", ": ") and the active
-// catalog id substituted in. The template's literal key order survives via
-// the typed message marshal.
+// template re-emitted with Python's separators (",", ": "), the active catalog
+// id and the wire version substituted in. The template's literal key order
+// survives via the typed message marshal.
 func (m *SchemaManager) PromptExample() string {
 	var example []Message
 	if err := unmarshalJSON(promptExampleJSON, &example); err != nil {
@@ -37,7 +37,8 @@ func (m *SchemaManager) PromptExample() string {
 		lines = append(lines, spacedColonsJSON(string(b)))
 	}
 	rendered := "[" + strings.Join(lines, ",") + "]"
-	return strings.ReplaceAll(rendered, "{catalog_id}", m.catalogID)
+	rendered = strings.ReplaceAll(rendered, "{catalog_id}", m.catalogID)
+	return strings.ReplaceAll(rendered, "{version_string}", m.VersionString())
 }
 
 // PromptSection generates the A2UI portion of the system prompt for the
@@ -66,7 +67,7 @@ func (m *SchemaManager) PromptSection(actions []Action, opts PromptSectionOption
 		VersionV1, VersionV1, JSONOpenTag, JSONCloseTag, JSONOpenTag, exampleJSON, JSONCloseTag))
 
 	messageTypes := strings.ReplaceAll(promptMessageTypesMD, "{catalog_id}", m.catalogID)
-	messageTypes = strings.ReplaceAll(messageTypes, "{version_string}", VersionV1)
+	messageTypes = strings.ReplaceAll(messageTypes, "{version_string}", m.VersionString())
 	sections = append(sections, fmt.Sprintf("\n\n## A2UI Message Types\n\n%s", messageTypes))
 
 	if catalog != nil {

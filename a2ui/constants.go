@@ -9,9 +9,15 @@
 // deferred (D-076).
 package a2ui
 
-// VersionV1 is the only protocol version this package speaks. Every emitted
-// message carries it; every parsed message must declare it.
+// VersionV1 is the protocol selector: the spec directory (v1_0), the
+// catalog/schema base URI and the prompt headings spell it with the "v". It is
+// not a wire value.
 const VersionV1 = "v1.0"
+
+// WireVersionV1 is the "version" a stable v1.0 message and a version-keyed
+// capability object carry. Upstream dropped the "v" prefix when v1.0
+// stabilized (a2ui-project/a2ui#3726); v0.9.x keeps it.
+const WireVersionV1 = "1.0"
 
 const (
 	// MimeType is the A2UI media type (constants.A2UI_MIME_TYPE).

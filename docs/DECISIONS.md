@@ -3175,3 +3175,67 @@ Gates `go test -count=1 ./toolpacks/...` green 2026-11-03.
 
 Gates `go build ./...`, `go vet ./...`, `go test -count=1 ./...` green 2026-11-03 (fresh full-module
 run: 48 packages ok, 0 failures).
+
+## D-088 — 2026-11-09 — a2ui: stable v1.0 wire version split from the protocol selector; spec re-vendored
+
+Upstream `1b0c399012` (`fix(a2ui): speak the stable A2UI v1.0 wire and re-vendor the spec`)
+stabilized A2UI v1.0 (A2UI `078b3d5c`: a2ui-project/a2ui#3726 wire version, #3868
+`TextField.value`, #3999 version status, #3575 restricted `$ref`s). AGo emitted `"v1.0"` in
+every message: `VersionV1` served both as the protocol selector and as the wire version, so
+after stabilization the port wrote a version no renderer accepts. This entry supersedes the
+version half of D-076; the deferral list in D-076 otherwise stands.
+
+- **Two constants, two meanings.** `a2ui.VersionV1 = "v1.0"` is the protocol selector
+  (`v1_0` spec directory, `schemaBaseURI`, prompt headings). New
+  `a2ui.WireVersionV1 = "1.0"` is what a stable v1.0 message and a version-keyed
+  capability object carry (a2ui-project/a2ui#3726; v0.9.x keeps the `v`). `Message.Version`
+  defaults to the wire version when empty (an explicit caller value is respected, as
+  upstream `_stamp` does); `SchemaManager.VersionString()` and `Parser.VersionString()` now
+  report `"1.0"` and the new `ProtocolVersion()` accessors report `"v1.0"`. The HTTP
+  `Server` stamps `"1.0"`; the prompt example and message-type body substitute
+  `{version_string}` with `"1.0"` while the response-format heading keeps `(v1.0)`.
+- **Spec re-vendored** under `a2ui/spec/v1_0/` from upstream `1b0c399012` (A2UI
+  `078b3d5c`): `agent_to_renderer.json`/`renderer_to_agent.json` message `const` is
+  `"1.0"`; `basic_catalog.json` adds the shared `$defs/Weight` (components now `$ref` it),
+  requires `TextField.value`, tightens the regex description and renders its `instructions`
+  examples with `"1.0"`; `prompt_example.json`/`prompt_message_types.md` carry the
+  `{version_string}` template; a `README.md` records the new pin and the protocol-vs-wire
+  split. `common_types.json` is unchanged upstream. The wire break is reflected in
+  `a2ui/testdata/capture_golden.py` (parser version, message literals, a new
+  `text_field_missing_value` matrix case) and `a2ui/testdata/golden.json`
+  (`"version": "1.0"` everywhere, new `wire_version`/`protocol_version` keys).
+- **Restricted catalog `$ref`s** (`a2ui/catalog_refs.go`): the port has no custom-catalog
+  load path (deferred with D-076), so the upstream `_check_catalog_references` rule is
+  ported and applied to the vendored basic catalog at `NewSchemaManager` load time instead:
+  a local `$ref` must name a `#/components/`, `#/functions/` or leaf `#/$defs/` entry the
+  catalog declares (never `anyComponent`/`anyFunction`), and an external one must be one of
+  the listed `common_types.json#/$defs/<Type>` names. Annotations (`metadata`, `examples`,
+  `const`, `default`, `enum`, `description`) are data, not subschemas (upstream
+  `run_tests.py` parity).
+- **Not ported here** (unchanged deferrals, no code surface to change): the A2A transport
+  and therefore upstream `a2a/parts.py`'s `metadata["mimeType"]` partner for `media_type`
+  (AGo's `a2a.DataPart` has only the A2A v1.0 `mimeType` field); capabilities negotiation
+  and therefore the `_CAPABILITIES_LOCATION` map (`v1.0 → a2uiRendererCapabilities["1.0"]`,
+  `v0.9`/`v0.9.1 → a2uiClientCapabilities["v0.9"]`); the v0.9.1 spec re-vendor (only
+  `a2ui/spec/v1_0` is vendored — v0.9.x was never vendored); custom catalogs. The v1.0
+  halves the port does have (`ParseClientDataModel` reading `a2uiRendererDataModel`) already
+  match upstream's `v1.0` branch.
+
+Deviations, marked `// AGO-DEVIATION` in code:
+
+- **The restricted-`$ref` check runs on the vendored basic catalog**, where Python runs it
+  only on custom catalogs. It has no effect on a valid catalog; it is the port's substitute
+  for the deferred custom-catalog load path and keeps a bad re-vendor from reaching the
+  registry.
+- **The checker walks definitions/properties in sorted-name order**, so with several
+  invalid `$ref`s the reported first offender may differ from Python's declaration order;
+  the rule and the message shape are identical.
+
+Evidence: `a2ui/wire_version_test.go` (protocol/wire split, prompt substitution, schema
+rejection of `"v1.0"`, `TextField.value`, `#/$defs/Weight` resolution) and
+`a2ui/catalog_refs_test.go` (allowed/rejected/annotation cases, vendored catalog passes).
+Gates 2026-11-09: `go build ./...`, `go vet ./...`, `go test -count=1 ./a2ui/...` green
+(full-module `go test ./...` has one pre-existing `toolpacks` failure under the Go 1.27
+toolchain — `TestCodeRunnerUndecodableOutput` expects `\ufffd`, Go 1.27's `encoding/json`
+emits the raw U+FFFD; reproduced at HEAD without this change). `-race` could not run in
+this container (no cgo/gcc); a2ui adds no mutable state.

@@ -102,7 +102,8 @@ const (
 
 // FunctionResponseMessage builds the agentFunctionResponse answering a
 // callAgentFunction: FunctionCallID echoed verbatim, with exactly one of value
-// or error (server_action.py _function_response).
+// or error (server_action.py _function_response). version is the wire version
+// stamped on the envelope (WireVersionV1 for a stable v1.0 message).
 func FunctionResponseMessage(functionCallID, version string, value any, err *FunctionError) Message {
 	return Message{
 		Version: version,
@@ -128,7 +129,9 @@ func IsMessageEnvelope(value any) bool {
 // (server_action.py _messages_of): one message object → [it, version-stamped];
 // a non-empty list whose every item is a message → each stamped; anything
 // else → nil (a click is fire-and-forget, a plain value has no channel).
-// Both typed Message values and decoded JSON maps are accepted.
+// version is the wire version stamped on messages that carry none
+// (WireVersionV1 for a stable v1.0 message). Both typed Message values and
+// decoded JSON maps are accepted.
 func MessagesOf(result any, version string) []Message {
 	switch t := result.(type) {
 	case Message:
