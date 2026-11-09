@@ -87,7 +87,7 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 - `ModelMessage(ModelEvent)` (transient): `content: str`, `metadata: dict`.
 - `ModelMessageChunk(ModelEvent)` (transient): `content: str`. `ModelReasoning(ModelEvent)` (transient): `content: str`.
 - `ModelResponse(ModelEvent)` — the turn's final answer: `message: ModelMessage|None`, `tool_calls: ToolCallsEvent`, `usage: Usage`, `response_force: bool` (True = a `final=True` tool forced this response, ends the loop), `files: list[BinaryResult]`, tracing `model/provider/finish_reason/response_id: str|None`; properties `content`, `metadata`; `to_api()`.
-- `UsageEvent(BaseEvent)` (`__conversational__=False`): `event_id: str (uuid4 hex; source-record identity)`, `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`), `model/provider/finish_reason/label: str|None`, `parts: list[UsageEvent]`.
+- `UsageEvent(InertEvent)` (`__conversational__=False`): `event_id: str (uuid4 hex; source-record identity)`, `usage: Usage`, `kind: str` (`"model_call"|"subtask"|"compaction"|"aggregation"`; `"subtask"` is only an archived legacy kind), `model/provider/finish_reason/label: str|None`, `task_id/agent_name: str|None` (the delegation that spent the tokens), `path: tuple[str, ...]` (delegation hops), `parts: list[UsageEvent]` (legacy rollup details).
 - `HumanInputRequest(BaseEvent)`: `id: str (uuid)`, `content: str`, `timeout: float|None`, `task_id: str|None`.
 - `ToolApprovalRequest(HumanInputRequest)`: `+ tool_call_id: str`.
 - `HumanMessage(BaseEvent)`: `parent_id: str`, `content: str`.
@@ -104,11 +104,11 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 
 ### Lifecycle / task / alert events
 `events\lifecycle.py` (all transient): `ObserverStarted/Completed(name)`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent`.
-`events\task_events.py`: `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired`, `TaskCancelled(..., reason)`.
+`events\task_events.py`: `TaskEvent(InertEvent)` (`__conversational__=False`) with `path`, then `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired(task_id, agent_name, objective)`, `TaskCancelled(..., objective, reason)`.
 `events\alert.py`: `enum Severity(str)`; `ObserverAlert(BaseEvent, severity)`; `HaltEvent(BaseEvent, reason)`.
 
 ### Delegation observation events — `ag2\events\delegation.py` (+ upstream `a591d84f6e`)
-The event layer for a delegation tree (T8 wires the forwarding itself):
+The event layer for a delegation tree:
 
 - `ChildEvent(BaseEvent)` (`__conversational__=False`): an uplink observation of a
   descendant's event — `inner: BaseEvent`, `task_id: str`, `path: tuple[str, ...]`,
@@ -131,14 +131,54 @@ The event layer for a delegation tree (T8 wires the forwarding itself):
   forwarded back. `UsageEvent` carries `event_id` (uuid4 hex) so a forwarded source
   record keeps its identity for deduplication.
 
-AGo mapping (D-091): `events.ChildEvent`/`TransientChildEvent`/`DeliveryFailed`/
-`DownEvent`/`TransientDownEvent` with `[]string` paths and snake_case wire names;
-`events.SourceEvent(ev)` (function + unexported hook, since Go has no inherited
-property); `events.Delivery{Validate func() error}` plus the `*events.RoutedEvent`
-wrapper, `events.Routed`/`events.DeliveryOf`/`events.IsRouted`; `UsageEvent.EventID`
-filled by `NewUsageEvent`/`EnsureEventID`. `AsValue`/`TypeOf` unwrap routed copies, so a
-delivery keeps the authored type. Inert provenance (`path`/`origin`/`as_local`),
-forwarding and usage dedup belong to T8.
+AGo mapping (D-091, D-092): `events.ChildEvent`/`TransientChildEvent`/
+`DeliveryFailed`/`DownEvent`/`TransientDownEvent` with `[]string` paths and snake_case
+wire names; `events.SourceEvent(ev)` (function + unexported hook, since Go has no
+inherited property); `events.Delivery{Validate func() error}` plus the
+`*events.RoutedEvent` wrapper, `events.Routed`/`events.DeliveryOf`/`events.IsRouted`.
+`Stream.Send` runs `Validate` before every handler and persists a routed copy as its
+inner event. `events.InertEvent` (embedded `path`) marks UsageEvent/Task* as inert;
+`events.IsInert`/`InertPath`/`StampInert`/`AsLocal` are the provenance surface.
+`UsageEvent.EventID` is filled by `NewUsageEvent`/`EnsureEventID`. `AsValue`/`TypeOf`
+unwrap routed copies, so a delivery keeps the authored type; they do **not** unwrap
+`ChildEvent`, so an ancestor's tools, model loop and HITL never fire on a descendant's
+event.
+
+### Subagent event tree — `ag2\tools\subagents\_forwarding.py` (+ `run_task.py`, `1c27f221a5`)
+
+A delegated turn installs a `Forwarder` (`agent/forwarding.go`) as an interrupt
+subscriber on the child stream:
+
+- operational events (model/tool/HITL/lifecycle traffic) travel upward as
+  `ChildEvent`/`TransientChildEvent` (inner transient → transient envelope), with
+  `task_id`, `agent_name`, the delegation `path` and an `origin_event_id`;
+- an already-forwarded `ChildEvent` keeps the leaf's identity across further hops;
+- inert events (`UsageEvent`, `Task*`) travel as themselves: the first hop stamps
+  `path` (and a UsageEvent's `task_id`/`agent_name`), later hops preserve it;
+- the forwarder's own path is `parentForwarder.path + taskID`, published through the
+  child context's `ago:forwarder` dependency, so paths grow with nesting;
+- forwarding and the child lifecycle are installed inside the child's turn scope,
+  after the per-stream turn lock is taken and stopped before it is released, so a
+  queued delegation on a shared stream cannot capture the active invocation;
+- on success the terminal is published while the scope is open; on failure the
+  turn goroutine is awaited first, the terminal is published through the still
+  installed relay under the lock, and only then is the relay stopped; a
+  preparation failure inside `AgentRun.open` after `TaskStarted` follows the
+  same child-stream finally path; a pre-turn rejection (`ErrNestedSameStream`,
+  `MergeVariables`/`newRunWith` failure) publishes `TaskStarted`+terminal
+  directly to the parent without touching the child stream;
+- `Context.Dependencies`/`Variables` scoping (D-090) is unchanged; the child stream
+  persists into the parent's storage under its own id.
+
+`runTaskOn` authors `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` on the
+child stream (relayed upward) and emits no subtask usage rollup. `TaskCompleted.Usage`
+is a cumulative snapshot for inspection, never an additive record. Usage accounting is
+source-based: `usage.FromEvents` resolves `SourceEvent`, deduplicates by non-empty
+`event_id`, and `TokenMonitor` does the same. The HITL bridge no longer re-publishes a
+question as a local `HumanInputRequest`; the request and answer reach the parent only as
+`ChildEvent` observations while the bridge supplies the answer. See D-092 for the
+deliberately unported downlink (`DownEvent` delivery, `StreamHandle`, `DeliveryFailed`,
+cancellation registry).
 
 ### Stream & history
 - `Stream` Protocol (`ag2\context.py:33`): `id: UUID`, `history: History`, `pending_messages: list[ModelRequest]`, `send(event, context)`, `enqueue(*content)`, `spawn_background(coro)`, `where(condition) -> Stream`, `join(max_events=None)`, `subscribe(func, *, interrupt=False, sync_to_thread=True, timeout=None, condition=None) -> SubId`, `unsubscribe`, `sub_scope(...)`, `get(condition) -> Future[BaseEvent]`.

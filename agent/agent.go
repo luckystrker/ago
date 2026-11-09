@@ -25,6 +25,14 @@ import (
 // ErrConfigNotProvided matches Python ConfigNotProvidedError: Ask/Run without a model config.
 var ErrConfigNotProvided = errors.New("agent: no model config provided (pass WithConfig)")
 
+// ErrNestedSameStream reports a delegation whose child stream is already owned
+// by an enclosing turn in the same call chain. Taking the per-stream turn lock
+// again would deadlock, so runTaskOn rejects the delegation instead.
+//
+// AGO-DEVIATION: upstream's non-reentrant asyncio.Lock would queue such a child
+// forever; AGo fails fast with this sentinel instead (D-092b).
+var ErrNestedSameStream = errors.New("agent: nested delegation on the same stream is not supported")
+
 // ErrMaxToolRounds is returned by a turn whose model kept requesting tools
 // after the WithMaxToolRounds budget of executed tool rounds ran out. The
 // transcript is repaired (unanswered calls closed) exactly as on a HITL
@@ -136,30 +144,15 @@ type Agent struct {
 	name string
 	mu   sync.Mutex
 	opts options
-	// turns serializes concurrent asks per stream. Entries carry a refcount so
-	// the map shrinks when the last turn on a stream finishes: agents asked over
-	// many fresh streams (delegations, resume) must not accumulate one mutex
-	// per stream id for the process lifetime (audit L-19).
-	turnsMu sync.Mutex
-	turns   map[string]*turnLock
-
 	// knowledge bootstraps once per agent (Python parity: _KnowledgeContext's
 	// bootstrapped flag + lock).
 	knowledgeMu           sync.Mutex
 	knowledgeBootstrapped bool
 }
 
-// turnLock is the per-stream mutex serializing concurrent asks. refs counts
-// runs that acquired it (including ones still waiting to Lock), so the entry
-// is deleted only when nobody can still be holding or waiting on it.
-type turnLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
 func New(name string, prompt string, opts ...Option) *Agent {
-	a := &Agent{name: name, turns: map[string]*turnLock{}}
+	a := &Agent{name: name}
 	a.opts.fragments = append(a.opts.fragments, prompt)
 	for _, o := range opts {
 		o(&a.opts)
@@ -190,41 +183,6 @@ func (a *Agent) PromptFragments() []string {
 	out := make([]string, len(a.opts.fragments))
 	copy(out, a.opts.fragments)
 	return out
-}
-
-// acquireTurnLock takes the per-stream lock slot for a run: an existing entry
-// is shared (the run joins everyone else serializing on this stream), a missing
-// one is created. The refcount is taken under turnsMu before the caller can
-// block on the mutex, so a release that shrinks the count to zero can safely
-// delete the entry — no waiter can be left blocking on a mutex the map no
-// longer knows.
-func (a *Agent) acquireTurnLock(streamID string) *turnLock {
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	if a.turns == nil {
-		a.turns = map[string]*turnLock{}
-	}
-	l, ok := a.turns[streamID]
-	if !ok {
-		l = &turnLock{}
-		a.turns[streamID] = l
-	}
-	l.refs++
-	return l
-}
-
-// releaseTurnLock unlocks the stream mutex and drops the run's slot. The entry
-// is deleted only when this was the last reference: the mutex is released
-// first, so a run arriving between the unlock and the map cleanup finds the
-// same entry and keeps serializing instead of racing on a fresh one.
-func (a *Agent) releaseTurnLock(streamID string, l *turnLock) {
-	l.mu.Unlock()
-	a.turnsMu.Lock()
-	defer a.turnsMu.Unlock()
-	l.refs--
-	if l.refs == 0 && a.turns[streamID] == l {
-		delete(a.turns, streamID)
-	}
 }
 
 // Ask runs one blocking turn and returns the reply (Python parity: agent.ask).
@@ -354,11 +312,13 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 // AsTool exposes this agent as a delegation tool for another agent (Python
 // parity: agent.as_tool / subagent_tool.subagent_tool). Each call runs this
 // agent as a sub-task through the shared delegation machinery (runTaskOn):
-// TaskStarted/TaskCompleted/TaskFailed and one rolled-up subtask UsageEvent on
-// the caller's stream, a copy of the caller's dependencies and variables, and
-// the HITL bridge when this agent has no hook of its own. The agent's own
-// stream base (WithStreamBase) stays the delegation's stream — every
-// delegation opens a fresh stream otherwise.
+// TaskStarted/TaskCompleted/TaskFailed on the caller's stream (relayed from the
+// child stream), source UsageEvents with delegation provenance instead of a
+// rollup, a copy of the caller's dependencies and variables, and the HITL bridge
+// when this agent has no hook of its own. Operational child events reach the
+// caller as ChildEvent observations. The agent's own stream base
+// (WithStreamBase) stays the delegation's stream — every delegation opens a
+// fresh stream otherwise.
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	var o asToolOptions
 	for _, f := range opts {
@@ -385,6 +345,10 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
 			return "", err
+		}
+		if res.cancelled {
+			// Python parity: subagent_tool.py checks cancelled before failed.
+			return fmt.Sprintf("Sub-task '%s' cancelled: %s", a.name, res.err.Error()), nil
 		}
 		if !res.completed {
 			// Python parity: subagent_tool.py

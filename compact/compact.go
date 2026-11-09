@@ -22,6 +22,7 @@ import (
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/stream"
+	"github.com/luckystrker/ago/usage"
 )
 
 // CompactionMiddleware compacts the stream history after a turn when the
@@ -108,7 +109,7 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 	// so no assumption about how history grew in the meantime is needed).
 	var spent []*events.UsageEvent
 	collect := func(ev events.Event) error {
-		if u, ok := events.AsValue(ev).(events.UsageEvent); ok {
+		if u, ok := usage.EventFrom(ev); ok {
 			ue := u
 			spent = append(spent, &ue)
 		}
@@ -131,14 +132,39 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 	}
 
 	replacement := make([]events.Event, 0, 1+len(evs)-cut+len(spent))
+	// Retain every source accounting record from before the rewrite, not just
+	// the records inside the summarized window: spend that happened earlier must
+	// stay reportable after compaction (upstream _with_usage_events). The
+	// retained tail contributes its non-usage events below, so a usage record is
+	// never present twice; the ids make the report idempotent even if it is.
+	seenUsage := map[string]struct{}{}
+	for _, ev := range evs {
+		u, ok := usage.EventFrom(ev)
+		if !ok {
+			continue
+		}
+		if u.EventID != "" {
+			if _, dup := seenUsage[u.EventID]; dup {
+				continue
+			}
+			seenUsage[u.EventID] = struct{}{}
+		}
+		replacement = append(replacement, ev)
+	}
 	replacement = append(replacement, &events.CompactionSummary{Content: summary})
-	replacement = append(replacement, evs[cut:]...)
-	// AGO-DEVIATION: Python's _with_usage_events additionally re-attaches every
-	// UsageEvent from before the compaction so spend outside the retained window
-	// keeps being reportable; the AGo contract replaces history with the summary
-	// plus the fresh range, so only the records of the summarization window ride
-	// along (appended below).
+	for _, ev := range evs[cut:] {
+		if _, isUsage := usage.EventFrom(ev); isUsage {
+			continue
+		}
+		replacement = append(replacement, ev)
+	}
 	for _, ue := range spent {
+		if ue.EventID != "" {
+			if _, dup := seenUsage[ue.EventID]; dup {
+				continue
+			}
+			seenUsage[ue.EventID] = struct{}{}
+		}
 		replacement = append(replacement, ue)
 	}
 	if err := ctx.Stream.History().Replace(replacement); err != nil {

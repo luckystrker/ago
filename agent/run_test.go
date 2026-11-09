@@ -402,6 +402,7 @@ func TestRunInputWaitsForStreamLock(t *testing.T) {
 	if _, err := second.Result(stdcontext.Background()); err != nil {
 		t.Fatalf("turn B: %v", err)
 	}
+	second.Close()
 
 	hist := g.histories()
 	if len(hist) != 2 {
@@ -425,10 +426,7 @@ func TestTurnLockMapShrinksAfterRuns(t *testing.T) {
 			t.Fatalf("ask %d: %v", i, err)
 		}
 	}
-	a.turnsMu.Lock()
-	n := len(a.turns)
-	a.turnsMu.Unlock()
-	if n != 0 {
+	if n := turnLockCount(); n != 0 {
 		t.Fatalf("per-stream lock map kept %d entries after all runs finished", n)
 	}
 }
@@ -493,51 +491,75 @@ func TestMaxToolRoundsStopsLoop(t *testing.T) {
 	}
 }
 
-// TestTurnLockRefcountKeepsEntry pins the audit L-19 contract on the per-stream
-// lock map: the entry survives while other runs still serialize on it, is
-// dropped once the last reference releases, and a zero-value Agent lazily
-// creates its map. The mutex dance mirrors open(): every acquired reference
-// holds the mutex between its acquire and its release.
+// TestTurnLockRefcountKeepsEntry pins the audit L-19 contract on the
+// process-wide stream lock registry: the entry survives while other runs still
+// serialize on it, is dropped once the last reference releases, and a canceled
+// waiter drops only its own reference.
 func TestTurnLockRefcountKeepsEntry(t *testing.T) {
-	// Zero-value Agent: the lazy map initialization must hold.
-	var zero Agent
-	lz := zero.acquireTurnLock("s-zero")
-	lz.mu.Lock()
-	zero.releaseTurnLock("s-zero", lz)
+	ctx := stdcontext.Background()
+	l1, err := acquireTurnLock(ctx, "s-zero")
+	if err != nil {
+		t.Fatalf("acquire s-zero: %v", err)
+	}
+	releaseTurnLock("s-zero", l1)
 
-	a := New("a", "")
-	l1 := a.acquireTurnLock("s")
-	l1.mu.Lock()                 // run 1 owns the stream
-	l2 := a.acquireTurnLock("s") // run 2 joins the same entry, waits on the mutex
+	// The registry is process-wide: two agents sharing a stream id join the same
+	// entry.
+	a, b := New("a", ""), New("b", "")
+	_ = a
+	_ = b
+	l1, err = acquireTurnLock(ctx, "s")
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	l2 := turnLockFor("s") // run 2's reference joins the same entry
 	if l1 != l2 {
 		t.Fatal("concurrent runs on one stream must share the lock entry")
 	}
-	// Run 1 finishes while run 2 still serializes on the entry: it must survive,
-	// or a third run would start on a fresh lock and stop serializing with the
-	// run still in flight.
-	a.releaseTurnLock("s", l1)
-	l3 := a.acquireTurnLock("s")
+	releaseTurnLock("s", l1)
+	l3 := turnLockFor("s")
 	if l3 != l2 {
 		t.Fatal("lock entry deleted while another run still serializes on it")
 	}
-	l3.mu.Lock()
-	a.releaseTurnLock("s", l2) // run 2 done
-	l3.mu.Lock()               // run 3's serialized section
-	a.releaseTurnLock("s", l3) // the last reference: the entry goes away
-	a.turnsMu.Lock()
-	n := len(a.turns)
-	a.turnsMu.Unlock()
-	if n != 0 {
+	if err := l3.acquire(ctx); err != nil {
+		t.Fatalf("acquire 3: %v", err)
+	}
+	dropTurnLockRef("s", l2) // run 2 never took the slot
+	releaseTurnLock("s", l3) // the last reference: the entry goes away
+	if n := turnLockCount(); n != 0 {
 		t.Fatalf("lock map kept %d entries after the last reference released", n)
 	}
-	// The next run gets a fresh entry (the old lock is still referenced here, so
-	// its address cannot be reused).
-	l4 := a.acquireTurnLock("s")
-	l4.mu.Lock()
+	l4, err := acquireTurnLock(ctx, "s")
+	if err != nil {
+		t.Fatalf("acquire 4: %v", err)
+	}
 	if l4 == l2 {
 		t.Fatal("expected a fresh lock entry after the last reference dropped")
 	}
-	a.releaseTurnLock("s", l4)
+	releaseTurnLock("s", l4)
+}
+
+// TestTurnLockWaitHonorsContext pins the cancellation contract: a turn queued
+// behind a busy stream returns its context error instead of parking, and the
+// canceled wait leaves no registry entry behind.
+func TestTurnLockWaitHonorsContext(t *testing.T) {
+	holder, err := acquireTurnLock(stdcontext.Background(), "busy")
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := acquireTurnLock(ctx, "busy"); !errors.Is(err, stdcontext.DeadlineExceeded) {
+		t.Fatalf("queued acquire = %v, want deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("queued acquire took %v", elapsed)
+	}
+	releaseTurnLock("busy", holder)
+	if n := turnLockCount(); n != 0 {
+		t.Fatalf("canceled waiter leaked %d lock entries", n)
+	}
 }
 
 // TestReplyContentWithSchema pins AgentReply.Content: with a response schema

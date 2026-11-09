@@ -254,11 +254,10 @@ func (TransientDownEvent) EventType() string { return "TransientDownEvent" }
 func (TransientDownEvent) Transient() bool   { return true }
 
 // Delivery describes how a copy entered a stream it was not published on.
-// A routed copy is never forwarded back to the stream it came from. Once the
-// forwarding integration wires the send path (T8, D-091), the stream will call
-// Validate before each handler, so a delivery cannot reach a later turn; until
-// then no caller invokes it. Validate must be safe for concurrent use, and an
-// error means the addressed invocation has ended.
+// A routed copy is never forwarded back to the stream it came from. Stream.Send
+// calls Validate before every handler, so a delivery cannot reach a later turn.
+// Validate must be safe for concurrent use, and an error means the addressed
+// invocation has ended.
 //
 // AGO-DEVIATION: Python raises from validate and carries the marker in a hidden
 // attribute; Go returns an error and uses a wrapper type (D-091).
@@ -297,6 +296,18 @@ func (r *RoutedEvent) At() time.Time {
 		return time.Time{}
 	}
 	return r.Inner.At()
+}
+
+// StampNow forwards the stream's timestamp stamp to the authored event, so a
+// routed copy persisted without its inner having been sent directly still gets
+// a creation time.
+func (r *RoutedEvent) StampNow(now time.Time) {
+	if r == nil || r.Inner == nil {
+		return
+	}
+	if s, ok := r.Inner.(interface{ StampNow(time.Time) }); ok {
+		s.StampNow(now)
+	}
 }
 
 func (r *RoutedEvent) Transient() bool {

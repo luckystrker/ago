@@ -96,7 +96,7 @@ reused). Full contract: `docs/specs/core.md` §2 and D-090.
 | `reply.files`, `reply.history`, `await reply.usage()` | `reply.Files()`, `reply.History() *stream.History`, `reply.Usage() *usage.Report` | `Usage()` is a synchronous aggregation of the stream's `UsageEvent`s — no await |
 | `reply.ask(...)` / `reply.run(...)` | `reply.Ask(ctx, ...)` / `reply.Run(ctx, ...)` | Continuation on the same stream/context |
 | `resume(*events, ...)` | `a.Resume(ctx, evs ...events.Event) (*AgentReply, error)` | All but last event seed history; last is the re-entry trigger |
-| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed` plus one rolled-up subtask `UsageEvent` on the caller's stream; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (the forwarded question is transcribed on the parent stream — D-041). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
+| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` and the child's source `UsageEvent` records (with `path`/`task_id`/`agent_name`) on the caller's stream — **no subtask rollup**; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (request and answer reach the parent only as `ChildEvent` observations — D-041/D-092). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too). `TaskCompleted.Usage` is a cumulative child-stream snapshot — never sum it with source usage records |
 | `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards; the task always opens its own private stream (D-030) |
 | `PromptHook` (async prompt hook), `update_system_message` | `agent.WithPromptHook(fn agent.PromptHook)`, `agent.WithPromptFragments(...)` | `PromptHook func(*agocontext.Context) ([]string, error)` |
 | `Plugin` / `PluginTarget._apply_plugin` (`ag2/plugin.py`), `Agent(plugins=[...])` | `plugin.NewBundle(name)` builder (`.WithTool`, `.WithMiddleware`, `.WithPrompt`, `.WithPromptHook`) handed to `agent.WithPlugin(p plugin.Plugin)` | Applied once at agent construction — Python's turn-scoped `additional_plugins` attach/detach is not ported (D-044). Carried legs: tools append after the agent's own, middleware appends after the agent's own (innermost), fragments extend the collectors, hooks run like `WithPromptHook`. Not carried (no agent slot): plugin HITL hook, dependencies, variables, observers, assembly policies. A nil plugin contributes nothing |
@@ -311,8 +311,11 @@ still not ported).
   fatal alert produces `"HALTED: <reason>"`. `max_turns` exists only in network transitions.
 - **HITL failure path:** a `HumanInputError` escaping the turn triggers
   `events.CloseUnansweredToolCalls` history repair before propagating — same as Python.
-- **Usage roll-up:** child-agent calls stay on the child stream; only the rolled-up
-  `UsageEvent(kind="subtask")` reaches the parent — no double counting.
+- **Delegation usage:** operational child events reach the parent as `ChildEvent`
+  observations; source `UsageEvent`/`Task*` records travel as themselves with
+  `path`/`task_id`/`agent_name`. There is no subtask rollup: reports deduplicate
+  source records by `event_id`, and `TaskCompleted.Usage` is a cumulative snapshot
+  that must not be added to them (D-092).
 
 ## 7. Verification status
 

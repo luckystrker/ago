@@ -518,7 +518,9 @@ ToolCallsEvent; drain inbox → initial ModelRequest; loop: LLM call → emit Us
 ModelResponse; while tool_calls && !response_force: send ToolCallsEvent → ToolResultsEvent (executor
 drives next call); final drain of leftover inbox into one extra model call. HumanInputError escaping →
 CloseUnansweredToolCalls history repair → propagate. HaltEvent → synthetic response "HALTED: <reason>".
-Subtasks: run_subtask/run_subtasks tools spawning child Agents (TaskConfig), rolled-up UsageEvent(kind=subtask).
+Subtasks: run_subtask/run_subtasks tools spawning child Agents (TaskConfig), child events
+forwarded upward as ChildEvent observations, source UsageEvent/Task* with provenance
+(path/task_id/agent_name) and usage deduplicated by EventID (D-092).
 
 ### package `spec`
 

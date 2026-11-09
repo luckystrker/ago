@@ -728,3 +728,22 @@ func TestChildEventArchivedInnerGetsEventID(t *testing.T) {
 		t.Fatalf("re-marshaled inner event_id = %#v, want %q", innerObj["event_id"], inner.EventID)
 	}
 }
+
+// TestRoutedEventStampNowReachesInner pins timestamp stamping through the
+// transport wrapper: a routed copy that reaches the stream without its inner
+// being sent directly still gets a creation time, and nil wrappers are ignored.
+func TestRoutedEventStampNowReachesInner(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	inner := &ModelResponse{}
+	Routed(inner, Delivery{}).StampNow(now)
+	if !inner.CreatedAt.Equal(now) {
+		t.Fatalf("inner CreatedAt = %v, want %v", inner.CreatedAt, now)
+	}
+
+	// A value-form inner event has no StampNow method; the wrapper must not panic.
+	Routed(ModelResponse{}, Delivery{}).StampNow(now)
+
+	var nilRouted *RoutedEvent
+	nilRouted.StampNow(now)
+	(&RoutedEvent{}).StampNow(now)
+}

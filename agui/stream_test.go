@@ -312,3 +312,25 @@ func TestStreamUsageMapping(t *testing.T) {
 		}
 	})
 }
+
+// TestChildEventDoesNotCloseRootReasoning pins the upstream early return: a
+// forwarded descendant observation is ignored entirely, so it cannot end the
+// root agent's open reasoning span before its own answer arrives.
+func TestChildEventDoesNotCloseRootReasoning(t *testing.T) {
+	s, got := collect()
+	s.Handle(&events.ModelReasoning{Content: "thinking"})
+	s.Handle(events.NewChildEvent(&events.ToolCallEvent{ID: "c1", Name: "probe", Arguments: `{}`},
+		"child", []string{"child"}, "child", "src"))
+	s.Handle(&events.TransientChildEvent{ChildEvent: *events.NewChildEvent(
+		&events.ModelMessageChunk{Content: "working"}, "child", []string{"child"}, "child", "src2")})
+	s.Handle(&events.ModelReasoning{Content: " more"})
+
+	evs := got()
+	want := []EventType{
+		EventReasoningStart, EventReasoningMessageStart, EventReasoningMessageContent,
+		EventReasoningMessageContent,
+	}
+	if !reflect.DeepEqual(eventTypes(evs), want) {
+		t.Fatalf("types = %v, want %v (ChildEvent must not close reasoning)", eventTypes(evs), want)
+	}
+}

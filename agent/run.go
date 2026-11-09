@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/context"
@@ -54,10 +55,18 @@ type AgentRun struct {
 	maxToolRounds int
 	// scanStart is the transcript length recorded before the resume trigger was
 	// sent, so the turn loop starts scanning at the right position.
-	scanStart  int
-	haltMu     sync.Mutex
-	halted     bool
-	haltReason string
+	scanStart int
+	// delegation is the relay of a sub-agent turn. It starts after the
+	// per-stream turn lock is held and stops before the lock is released, so a
+	// queued delegation on a shared stream cannot capture another invocation's
+	// events (upstream Forwarder.execution inside _turn_scope).
+	delegation        *forwarder
+	delegationStart   events.Event
+	delegationStarted bool
+	running           atomic.Bool
+	haltMu            sync.Mutex
+	halted            bool
+	haltReason        string
 }
 
 // Start opens the turn scope and launches the turn goroutine. Idempotent.
@@ -84,19 +93,48 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	r.maxToolRounds = opts.maxToolRounds
 
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
-	// the per-stream turn lock in _turn_scope).
-	r.lock = a.acquireTurnLock(r.stream.ID())
-	r.lock.mu.Lock()
+	// the per-stream turn lock in _turn_scope). Acquiring honors ctx: a caller
+	// queued behind another turn returns its deadline error instead of parking.
+	var lockErr error
+	r.lock, lockErr = acquireTurnLock(ctx, r.stream.ID())
+	if lockErr != nil {
+		return lockErr
+	}
 	// A failed scope entry releases everything the scope took, so a forgotten
 	// Close after a Start error cannot strand the stream for later asks
 	// (Python parity: the _turn_scope async-with releases the lock when the
 	// body fails).
 	opened := false
 	defer func() {
-		if !opened {
+		// A failure inside an already-entered delegation scope leaves the scope
+		// open for runTaskOn.fail: the terminal must be published on the child
+		// stream through the live relay, under the lock, before Close (upstream
+		// Forwarder.execution's finally). Every other failed Start releases the
+		// scope here.
+		if !opened && !r.delegationStarted {
 			r.Close()
 		}
 	}()
+
+	// Delegation relay: installed only now, under the per-stream turn lock, so
+	// a queued invocation on a shared stream cannot observe another turn's
+	// events. TaskStarted is the first event of the child transcript; the relay
+	// forwards it (and every later event) to the parent similarly to upstream
+	// Forwarder.execution inside _turn_scope.
+	if r.delegation != nil {
+		r.delegation.start()
+		if r.delegationStart != nil {
+			// Mark the attempt before publishing: the relay is an interrupt
+			// subscriber, so the parent may already have TaskStarted even if the
+			// child's persistence fails. fail() then must not publish it again
+			// (upstream sets Forwarder.started before sending).
+			r.delegationStarted = true
+			if err := r.stream.Send(r.delegationStart); err != nil {
+				return fmt.Errorf("agent: send task started: %w", err)
+			}
+			r.delegationStart = nil
+		}
+	}
 
 	// The turn's input enters the inbox only now, under the lock: a sibling
 	// delegation blocked on this stream must not have its objective drained by
@@ -195,7 +233,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 		events.TypeOf[events.ToolResultsEvent](),
 	)
 	r.subs = append(r.subs, r.stream.Subscribe(func(ev events.Event) error {
-		if _, drained := ev.(*events.DrainedModelRequest); drained {
+		if _, drained := events.AsValue(ev).(events.DrainedModelRequest); drained {
 			return nil
 		}
 		return r.llmTrigger(ev)
@@ -203,8 +241,10 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 
 	// 2. Halt check: records the halt; the LLM trigger turns it into a synthetic
 	// response (Python parity: _HaltCheckMiddleware + AlertPolicy's HaltEvent).
+	// AsValue keeps value-form events and routed copies working; a forwarded
+	// descendant halt stays inside ChildEvent and must not stop this turn.
 	r.subs = append(r.subs, r.stream.Subscribe(func(ev events.Event) error {
-		if he, ok := ev.(*events.HaltEvent); ok {
+		if he, ok := events.AsValue(ev).(events.HaltEvent); ok {
 			r.haltMu.Lock()
 			r.halted, r.haltReason = true, he.Reason
 			r.haltMu.Unlock()
@@ -239,6 +279,7 @@ func (r *AgentRun) open(ctx stdcontext.Context) error {
 	}
 
 	opened = true
+	r.running.Store(true)
 	go r.executeTurn()
 	return nil
 }
@@ -272,9 +313,27 @@ func (r *AgentRun) Enqueue(parts ...events.Input) error {
 // Stream exposes the conversation stream.
 func (r *AgentRun) Stream() stream.Stream { return r.stream }
 
-// Close ends the turn scope: cancels an in-flight turn, unsubscribes and
-// releases the per-stream lock. Safe to call multiple times; safe before Start
-// (no-op).
+// awaitTurn cancels the turn and waits until its goroutine has finished, but
+// leaves the relay and the per-stream lock in place. The failure path uses it
+// to publish the terminal inside the turn scope, as upstream
+// Forwarder.execution does in its finally block.
+func (r *AgentRun) awaitTurn() {
+	if r == nil {
+		return
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.running.Load() {
+		<-r.done
+		r.running.Store(false)
+	}
+}
+
+// Close ends the turn scope: cancels an in-flight turn, waits for its goroutine
+// to finish, unsubscribes and releases the per-stream lock. It is blocking by
+// design: a model client that ignores cancellation can make Close wait until
+// the call returns. Safe to call multiple times; safe before Start (no-op).
 func (r *AgentRun) Close() {
 	r.closeOnce.Do(func() {
 		// Stop a turn still in flight before tearing the scope down: otherwise its
@@ -284,13 +343,21 @@ func (r *AgentRun) Close() {
 		if r.cancel != nil {
 			r.cancel()
 		}
+		r.awaitTurn()
 		for _, id := range r.subs {
 			r.stream.Unsubscribe(id)
+		}
+		// Stop the delegation relay before the turn lock is released: the next
+		// invocation on a shared child stream must not inherit this turn's
+		// subscription (upstream _turn_scope bracket).
+		if r.delegation != nil {
+			r.delegation.stop()
+			r.delegation = nil
 		}
 		if r.lock != nil {
 			// Releases the mutex and the run's map slot; the entry survives
 			// while other runs still serialize on this stream (audit L-19).
-			r.agent.releaseTurnLock(r.stream.ID(), r.lock)
+			releaseTurnLock(r.stream.ID(), r.lock)
 			r.lock = nil
 		}
 	})

@@ -395,24 +395,33 @@ func TestRenderForPromptLabels(t *testing.T) {
 
 // TestConversationalParity pins the Conversational flag to the Python default
 // (__conversational__ = True on durable events; ag2/events/base.py:255): the
-// answer, the tool-call batch and the task lifecycle are part of what compaction
-// counts and policies replay. Transient events are conversational-inert by
-// is_conversational, and UsageEvent is the one durable False (types.py:172).
+// answer and the tool-call batch are part of what compaction counts and policies
+// replay. Task lifecycle events are inert (upstream TaskEvent(InertEvent)) and
+// are not conversational; transient events are conversational-inert by
+// is_conversational, and UsageEvent is the other durable False (types.py:172).
 func TestConversationalParity(t *testing.T) {
 	durable := []Event{
 		&HumanMessage{ParentID: "r1", Content: "yes"},
 		&HumanInputRequest{ID: "r1", Content: "approve?"},
 		&ToolCallsEvent{Calls: []ToolCallEvent{NewToolCallEvent("search")}},
-		&TaskStarted{TaskID: "t1"},
-		&TaskCompleted{TaskID: "t1"},
-		&TaskFailed{TaskID: "t1"},
-		&TaskExpired{TaskID: "t1"},
-		&TaskCancelled{TaskID: "t1"},
 		&ModelResponse{Message: &ModelMessage{Content: "hi"}},
 	}
 	for _, ev := range durable {
 		if !ev.Conversational() {
 			t.Errorf("%s: durable event must be conversational", ev.EventType())
+		}
+	}
+	inert := []Event{
+		&TaskStarted{TaskID: "t1"},
+		&TaskCompleted{TaskID: "t1"},
+		&TaskFailed{TaskID: "t1"},
+		&TaskExpired{TaskID: "t1"},
+		&TaskCancelled{TaskID: "t1"},
+		&UsageEvent{Kind: UsageKindModelCall},
+	}
+	for _, ev := range inert {
+		if ev.Conversational() {
+			t.Errorf("%s: inert event must not be conversational", ev.EventType())
 		}
 	}
 	transient := []Event{
@@ -423,9 +432,6 @@ func TestConversationalParity(t *testing.T) {
 		if ev.Conversational() {
 			t.Errorf("%s: transient event must not count as conversational", ev.EventType())
 		}
-	}
-	if (&UsageEvent{Kind: UsageKindModelCall}).Conversational() {
-		t.Error("UsageEvent must not be conversational")
 	}
 }
 

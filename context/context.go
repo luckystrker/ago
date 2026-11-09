@@ -115,8 +115,11 @@ func (c *Context) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Inp
 	return c.Stream.EnqueueOrigin(origin, parts...)
 }
 
-// Send publishes an event on the conversation stream.
-func (c *Context) Send(ev events.Event) error { return c.Stream.Send(ev) }
+// Send publishes an event on the conversation stream. An inert event carrying
+// inherited delegation provenance is published as a local copy: a republished
+// usage/task record must not impersonate the descendant that authored it
+// (upstream Context.send calls InertEvent.as_local).
+func (c *Context) Send(ev events.Event) error { return c.Stream.Send(events.AsLocal(ev)) }
 
 // SpawnBackground runs fn on a stream-tracked goroutine.
 func (c *Context) SpawnBackground(ctx stdcontext.Context, fn func(stdcontext.Context)) {
@@ -347,8 +350,8 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 			getErr <- err
 			return
 		}
-		if hm, ok := ev.(*events.HumanMessage); ok {
-			got <- hm
+		if hm, ok := events.AsValue(ev).(events.HumanMessage); ok {
+			got <- &hm
 		}
 	}()
 
@@ -446,12 +449,14 @@ func sanitizeTimeout(t float64) float64 {
 
 // humanRequest extracts the request behind an event: ToolApprovalRequest embeds
 // HumanInputRequest, and Go type identity keeps the embedded value from matching
-// a direct assertion.
+// a direct assertion. AsValue unwraps routed copies and pointer/value spellings;
+// it does not unwrap a ChildEvent, so a forwarded descendant question stays an
+// observation rather than a local trigger.
 func humanRequest(ev events.Event) (*events.HumanInputRequest, bool) {
-	switch t := ev.(type) {
-	case *events.HumanInputRequest:
-		return t, true
-	case *events.ToolApprovalRequest:
+	switch t := events.AsValue(ev).(type) {
+	case events.HumanInputRequest:
+		return &t, true
+	case events.ToolApprovalRequest:
 		return &t.HumanInputRequest, true
 	}
 	return nil, false
