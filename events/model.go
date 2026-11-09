@@ -10,7 +10,13 @@ type Usage struct {
 	TotalTokens              *int64 `json:"total_tokens,omitempty"`
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
-	ThinkingTokens           *int64 `json:"thinking_tokens,omitempty"`
+	// CacheCreationExtendedInputTokens is the part of CacheCreationInputTokens
+	// written with the provider's extended cache retention: OpenAI's 12-hour
+	// TTL, Anthropic's 1-hour TTL. Extended writes are priced differently, so
+	// cost accounting needs the split; the duration itself is provider-specific.
+	// Nil means the provider reported no per-retention breakdown.
+	CacheCreationExtendedInputTokens *int64 `json:"cache_creation_extended_input_tokens,omitempty"`
+	ThinkingTokens                   *int64 `json:"thinking_tokens,omitempty"`
 }
 
 func addPtr(a, b *int64) *int64 {
@@ -29,12 +35,13 @@ func addPtr(a, b *int64) *int64 {
 // Add returns the field-wise sum; nil+nil stays nil.
 func (u Usage) Add(o Usage) Usage {
 	return Usage{
-		PromptTokens:             addPtr(u.PromptTokens, o.PromptTokens),
-		CompletionTokens:         addPtr(u.CompletionTokens, o.CompletionTokens),
-		TotalTokens:              addPtr(u.TotalTokens, o.TotalTokens),
-		CacheReadInputTokens:     addPtr(u.CacheReadInputTokens, o.CacheReadInputTokens),
-		CacheCreationInputTokens: addPtr(u.CacheCreationInputTokens, o.CacheCreationInputTokens),
-		ThinkingTokens:           addPtr(u.ThinkingTokens, o.ThinkingTokens),
+		PromptTokens:                     addPtr(u.PromptTokens, o.PromptTokens),
+		CompletionTokens:                 addPtr(u.CompletionTokens, o.CompletionTokens),
+		TotalTokens:                      addPtr(u.TotalTokens, o.TotalTokens),
+		CacheReadInputTokens:             addPtr(u.CacheReadInputTokens, o.CacheReadInputTokens),
+		CacheCreationInputTokens:         addPtr(u.CacheCreationInputTokens, o.CacheCreationInputTokens),
+		CacheCreationExtendedInputTokens: addPtr(u.CacheCreationExtendedInputTokens, o.CacheCreationExtendedInputTokens),
+		ThinkingTokens:                   addPtr(u.ThinkingTokens, o.ThinkingTokens),
 	}
 }
 

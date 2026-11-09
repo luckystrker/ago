@@ -2179,8 +2179,9 @@ OnToolExecution wrap next with spans `ago.turn` (internal), `ago.llm_call` (clie
 builds one instance per turn; Go has no ambient context, so the parenting is explicit
 under a mutex instead of `start_as_current_span`). `ago.llm_call` stamps model/provider
 (`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.provider.name`), the usage
-tokens (`gen_ai.usage.input/output/total_tokens` + cache_read/cache_creation/thinking)
-and finish_reasons off the ModelResponse, only for reported fields; `ago.tool_execution`
+tokens (`gen_ai.usage.input/output/total_tokens` + cache_read/cache_creation/
+cache_creation_extended/thinking) and finish_reasons off the ModelResponse, only for
+reported fields; `ago.tool_execution`
 stamps the tool name/call id/type. Pipeline errors record an exception event and set the
 span status to Error; a `ToolErrorEvent` answer (value or pointer) does the same when
 next() itself succeeded (Python parity). OnHumanInput passes through.
@@ -2191,7 +2192,11 @@ localhost:4318), registering the process-global provider.
 
 AGO-DEVIATION: span names `ago.*` instead of Python's "invoke_agent <agent>"/"chat"/
 "execute_tool <name>"; tracer scope `github.com/luckystrker/ago/contrib/otelx` instead
-of `opentelemetry.instrumentation.ag2` (same schema URL 1.11.0); InstallDefault speaks
+of `opentelemetry.instrumentation.ag2` (same schema URL 1.11.0). Usage attributes are
+nil-guarded, so a provider-reported zero is written to the span, whereas Python's
+`if usage.x:` drops it; the extended cache-write attribute (`gen_ai.usage.
+cache_creation_extended_input_tokens`) is guarded by presence in both ports.
+InstallDefault speaks
 only OTLP/HTTP — a gRPC user builds their own provider and hands it to Middleware.
 Deferred: content capture (message bodies, tool arguments/results, the 8192-char
 truncation), the constructor knobs (agent/provider/model names, span_attributes), the

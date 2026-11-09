@@ -149,6 +149,64 @@ func TestUsageAdd(t *testing.T) {
 	}
 }
 
+func TestUsageAddCacheCreationExtended(t *testing.T) {
+	a := Usage{
+		CacheCreationInputTokens:         I64(1000),
+		CacheCreationExtendedInputTokens: I64(800),
+	}
+	b := Usage{
+		CacheCreationInputTokens:         I64(50),
+		CacheCreationExtendedInputTokens: I64(20),
+	}
+	got := a.Add(b)
+	if got.CacheCreationInputTokens == nil || *got.CacheCreationInputTokens != 1050 {
+		t.Errorf("CacheCreationInputTokens: want 1050, got %v", got.CacheCreationInputTokens)
+	}
+	if got.CacheCreationExtendedInputTokens == nil || *got.CacheCreationExtendedInputTokens != 820 {
+		t.Errorf("CacheCreationExtendedInputTokens: want 820, got %v", got.CacheCreationExtendedInputTokens)
+	}
+
+	absent := Usage{}.Add(Usage{CacheCreationInputTokens: I64(7)})
+	if absent.CacheCreationExtendedInputTokens != nil {
+		t.Errorf("nil+nil should stay nil, got %v", *absent.CacheCreationExtendedInputTokens)
+	}
+	// A measured zero is a value, not an absent field.
+	zero := Usage{CacheCreationExtendedInputTokens: I64(0)}.Add(Usage{})
+	if zero.CacheCreationExtendedInputTokens == nil || *zero.CacheCreationExtendedInputTokens != 0 {
+		t.Errorf("measured zero must survive Add, got %v", zero.CacheCreationExtendedInputTokens)
+	}
+	// A count reported on one side only is carried over as-is.
+	oneSided := Usage{}.Add(Usage{CacheCreationExtendedInputTokens: I64(9)})
+	if oneSided.CacheCreationExtendedInputTokens == nil || *oneSided.CacheCreationExtendedInputTokens != 9 {
+		t.Errorf("one-sided extended count must carry over, got %v", oneSided.CacheCreationExtendedInputTokens)
+	}
+}
+
+func TestUsageCacheCreationExtendedWireRoundTrip(t *testing.T) {
+	in := &UsageEvent{
+		Usage: Usage{CacheCreationInputTokens: I64(1000), CacheCreationExtendedInputTokens: I64(0)},
+		Kind:  UsageKindModelCall,
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"cache_creation_extended_input_tokens":0`) {
+		t.Fatalf("measured zero must reach the wire: %s", data)
+	}
+	back, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, ok := AsValue(back).(UsageEvent)
+	if !ok {
+		t.Fatalf("decoded event is %T, want UsageEvent", AsValue(back))
+	}
+	if got.Usage.CacheCreationExtendedInputTokens == nil || *got.Usage.CacheCreationExtendedInputTokens != 0 {
+		t.Fatalf("extended cache writes lost in round trip: %+v", got.Usage)
+	}
+}
+
 func TestRepairUnansweredToolCalls(t *testing.T) {
 	call := NewToolCallEvent("t")
 	answered := NewToolCallEvent("ok")

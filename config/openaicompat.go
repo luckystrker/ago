@@ -480,8 +480,10 @@ func strictifySchema(schema map[string]any) map[string]any {
 // NormalizeUsage maps the Chat-Completions usage object onto events.Usage:
 // prompt/completion/total tokens, prompt_tokens_details.cached_tokens →
 // CacheReadInputTokens, cache_write_tokens → CacheCreationInputTokens,
-// completion_tokens_details.reasoning_tokens → ThinkingTokens. Fractional
-// values are rounded (D-006: token counts are integers).
+// completion_tokens_details.reasoning_tokens → ThinkingTokens. Chat
+// Completions reports no per-retention cache-write breakdown, so
+// CacheCreationExtendedInputTokens stays nil. Fractional values are rounded
+// (D-006: token counts are integers).
 func NormalizeUsage(usage map[string]any) events.Usage {
 	var u events.Usage
 	u.PromptTokens = tokenField(usage, "prompt_tokens")

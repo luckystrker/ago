@@ -558,7 +558,7 @@ func TestCallStreamUsageFinalShape(t *testing.T) {
 	srv, _ := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "event: message_start\n"+
-			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-sonnet-4\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"output_tokens_details\":{\"thinking_tokens\":0}}}}\n\n"+
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-sonnet-4\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_creation_input_tokens\":1000,\"cache_creation\":{\"ephemeral_1h_input_tokens\":800,\"ephemeral_5m_input_tokens\":200},\"output_tokens_details\":{\"thinking_tokens\":0}}}}\n\n"+
 			"event: message_delta\n"+
 			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":300,\"output_tokens_details\":{\"thinking_tokens\":50}}}\n\n"+
 			"event: message_stop\n"+
@@ -578,6 +578,10 @@ func TestCallStreamUsageFinalShape(t *testing.T) {
 	}
 	if u.ThinkingTokens == nil || *u.ThinkingTokens != 50 {
 		t.Fatalf("thinking tokens = %v, want 50 (the delta replaces the start's placeholder)", u.ThinkingTokens)
+	}
+	if u.CacheCreationInputTokens == nil || *u.CacheCreationInputTokens != 1000 ||
+		u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 800 {
+		t.Fatalf("cache creation = %v extended = %v, want 1000/800", u.CacheCreationInputTokens, u.CacheCreationExtendedInputTokens)
 	}
 }
 
@@ -710,6 +714,99 @@ func TestNormalizeUsage(t *testing.T) {
 	}{ThinkingTokens: i64ptr(3)}})
 	if withThinking.ThinkingTokens == nil || *withThinking.ThinkingTokens != 3 {
 		t.Fatalf("thinking_tokens = %v", withThinking.ThinkingTokens)
+	}
+}
+
+func TestNormalizeUsageExtendedCacheWrites(t *testing.T) {
+	// The native per-lifetime breakdown travels in cache_creation; the 1-hour
+	// part is the extended-retention subset of cache_creation_input_tokens.
+	var w wireUsage
+	if err := json.Unmarshal([]byte(`{
+		"input_tokens": 10, "output_tokens": 2,
+		"cache_creation_input_tokens": 1000,
+		"cache_creation": {"ephemeral_1h_input_tokens": 800, "ephemeral_5m_input_tokens": 200}
+	}`), &w); err != nil {
+		t.Fatalf("decode wire usage: %v", err)
+	}
+	u := NormalizeUsage(w)
+	if u.CacheCreationInputTokens == nil || *u.CacheCreationInputTokens != 1000 {
+		t.Fatalf("cache_creation_input_tokens = %v, want 1000", u.CacheCreationInputTokens)
+	}
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 800 {
+		t.Fatalf("ephemeral_1h_input_tokens = %v, want 800", u.CacheCreationExtendedInputTokens)
+	}
+
+	// No breakdown stays absent.
+	plain := NormalizeUsage(wireUsage{CacheCreationInputTokens: i64ptr(5)})
+	if plain.CacheCreationExtendedInputTokens != nil {
+		t.Fatalf("missing breakdown must stay nil, got %v", *plain.CacheCreationExtendedInputTokens)
+	}
+	// A measured zero is a value.
+	var zero wireUsage
+	if err := json.Unmarshal([]byte(`{"cache_creation":{"ephemeral_1h_input_tokens":0}}`), &zero); err != nil {
+		t.Fatalf("decode zero wire usage: %v", err)
+	}
+	u = NormalizeUsage(zero)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 0 {
+		t.Fatalf("measured zero must be preserved, got %v", u.CacheCreationExtendedInputTokens)
+	}
+
+	// A breakdown that only splits the 5-minute writes leaves the extended
+	// count absent rather than reporting a synthetic zero.
+	var fiveMinute wireUsage
+	if err := json.Unmarshal([]byte(`{
+		"cache_creation_input_tokens": 5,
+		"cache_creation": {"ephemeral_5m_input_tokens": 5}
+	}`), &fiveMinute); err != nil {
+		t.Fatalf("decode five-minute wire usage: %v", err)
+	}
+	if got := NormalizeUsage(fiveMinute).CacheCreationExtendedInputTokens; got != nil {
+		t.Fatalf("5-minute-only breakdown must leave extended nil, got %v", *got)
+	}
+}
+
+func TestMergeStreamUsageExtendedCacheWrites(t *testing.T) {
+	// message_start owns the input side but may omit the per-retention split;
+	// a delta that reports it fills the gap.
+	u := mergeStreamUsage(
+		&wireUsage{InputTokens: i64ptr(10), OutputTokens: i64ptr(1), CacheCreationInputTokens: i64ptr(100)},
+		&wireUsage{OutputTokens: i64ptr(20), CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 80 {
+		t.Fatalf("delta extended writes = %v, want 80", u.CacheCreationExtendedInputTokens)
+	}
+	// When both sides report a split, the start value wins like the other
+	// input-side counters.
+	u = mergeStreamUsage(
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)}},
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(999)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 80 {
+		t.Fatalf("start extended writes = %v, want 80", u.CacheCreationExtendedInputTokens)
+	}
+	// A measured zero on the start side is a value, not a gap for the delta.
+	u = mergeStreamUsage(
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(0)}},
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(999)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 0 {
+		t.Fatalf("measured zero from start = %v, want 0", u.CacheCreationExtendedInputTokens)
+	}
+	// A one-sided stream still reports what that side carried: message_delta
+	// alone when message_start was lost, and the reverse.
+	if got := mergeStreamUsage(nil, &wireUsage{
+		OutputTokens:  i64ptr(20),
+		CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)},
+	}).CacheCreationExtendedInputTokens; got == nil || *got != 80 {
+		t.Fatalf("delta-only extended writes = %v, want 80", got)
+	}
+	if got := mergeStreamUsage(&wireUsage{
+		CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)},
+	}, nil).CacheCreationExtendedInputTokens; got == nil || *got != 80 {
+		t.Fatalf("start-only extended writes = %v, want 80", got)
+	}
+	if got := mergeStreamUsage(nil, nil); got != (events.Usage{}) {
+		t.Fatalf("empty stream usage = %+v, want zero", got)
 	}
 }
 
