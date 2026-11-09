@@ -100,6 +100,53 @@ func TestCheckCatalogReferencesIgnoresAnnotationValues(t *testing.T) {
 	}
 }
 
+func TestCheckCatalogReferencesWalksListEntries(t *testing.T) {
+	c := catalogForRefs()
+	c["components"].(map[string]any)["Text"] = map[string]any{
+		"oneOf": []any{
+			map[string]any{"$ref": "#/components/Text"},
+			map[string]any{"$ref": "other_catalog.json#/$defs/Shared"},
+		},
+	}
+	err := checkCatalogReferences(c)
+	if err == nil {
+		t.Fatal("a $ref inside a list must be checked")
+	}
+	if !strings.Contains(err.Error(), "other_catalog.json#/$defs/Shared") {
+		t.Errorf("error %q must name the rejected list entry", err)
+	}
+	if !strings.Contains(err.Error(), "/components/Text/oneOf/1/$ref") {
+		t.Errorf("error %q must point at the list index", err)
+	}
+}
+
+func TestCheckCatalogReferencesWalksNestedSubschemas(t *testing.T) {
+	c := catalogForRefs()
+	c["components"].(map[string]any)["Text"] = map[string]any{
+		"items": map[string]any{"$ref": "other_catalog.json#/$defs/Shared"},
+	}
+	err := checkCatalogReferences(c)
+	if err == nil {
+		t.Fatal("a $ref in a nested subschema must be checked")
+	}
+	if !strings.Contains(err.Error(), "/components/Text/items/$ref") {
+		t.Errorf("error %q must point at the nested subschema", err)
+	}
+}
+
+func TestCheckCatalogReferencesSkipsNonObjectSections(t *testing.T) {
+	// A section that is not an object declares nothing; the walker must skip it
+	// rather than panic or inspect stray values.
+	c := map[string]any{
+		"components": "not an object",
+		"functions":  []any{map[string]any{"$ref": "other_catalog.json#/$defs/Shared"}},
+		"$defs":      nil,
+	}
+	if err := checkCatalogReferences(c); err != nil {
+		t.Errorf("non-object sections declare nothing and must be skipped: %v", err)
+	}
+}
+
 func TestVendoredCatalogPassesReferenceCheck(t *testing.T) {
 	mgr, err := NewSchemaManager()
 	if err != nil {
