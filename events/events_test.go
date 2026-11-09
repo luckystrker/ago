@@ -175,6 +175,11 @@ func TestUsageAddCacheCreationExtended(t *testing.T) {
 	if zero.CacheCreationExtendedInputTokens == nil || *zero.CacheCreationExtendedInputTokens != 0 {
 		t.Errorf("measured zero must survive Add, got %v", zero.CacheCreationExtendedInputTokens)
 	}
+	// A count reported on one side only is carried over as-is.
+	oneSided := Usage{}.Add(Usage{CacheCreationExtendedInputTokens: I64(9)})
+	if oneSided.CacheCreationExtendedInputTokens == nil || *oneSided.CacheCreationExtendedInputTokens != 9 {
+		t.Errorf("one-sided extended count must carry over, got %v", oneSided.CacheCreationExtendedInputTokens)
+	}
 }
 
 func TestUsageCacheCreationExtendedWireRoundTrip(t *testing.T) {

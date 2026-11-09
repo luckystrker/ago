@@ -835,6 +835,16 @@ func TestNormalizeResponsesUsageExtendedCacheWrites(t *testing.T) {
 			details: map[string]any{"cache_write_tokens": 1000},
 			want:    nil,
 		},
+		{
+			name: "breakdown without 12h writes",
+			details: map[string]any{
+				"cache_write_tokens": 1000,
+				"cache_write_tokens_details": map[string]any{
+					"ttl_30m_tokens": 1000,
+				},
+			},
+			want: nil,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

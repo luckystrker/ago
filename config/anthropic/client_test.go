@@ -750,6 +750,64 @@ func TestNormalizeUsageExtendedCacheWrites(t *testing.T) {
 	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 0 {
 		t.Fatalf("measured zero must be preserved, got %v", u.CacheCreationExtendedInputTokens)
 	}
+
+	// A breakdown that only splits the 5-minute writes leaves the extended
+	// count absent rather than reporting a synthetic zero.
+	var fiveMinute wireUsage
+	if err := json.Unmarshal([]byte(`{
+		"cache_creation_input_tokens": 5,
+		"cache_creation": {"ephemeral_5m_input_tokens": 5}
+	}`), &fiveMinute); err != nil {
+		t.Fatalf("decode five-minute wire usage: %v", err)
+	}
+	if got := NormalizeUsage(fiveMinute).CacheCreationExtendedInputTokens; got != nil {
+		t.Fatalf("5-minute-only breakdown must leave extended nil, got %v", *got)
+	}
+}
+
+func TestMergeStreamUsageExtendedCacheWrites(t *testing.T) {
+	// message_start owns the input side but may omit the per-retention split;
+	// a delta that reports it fills the gap.
+	u := mergeStreamUsage(
+		&wireUsage{InputTokens: i64ptr(10), OutputTokens: i64ptr(1), CacheCreationInputTokens: i64ptr(100)},
+		&wireUsage{OutputTokens: i64ptr(20), CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 80 {
+		t.Fatalf("delta extended writes = %v, want 80", u.CacheCreationExtendedInputTokens)
+	}
+	// When both sides report a split, the start value wins like the other
+	// input-side counters.
+	u = mergeStreamUsage(
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)}},
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(999)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 80 {
+		t.Fatalf("start extended writes = %v, want 80", u.CacheCreationExtendedInputTokens)
+	}
+	// A measured zero on the start side is a value, not a gap for the delta.
+	u = mergeStreamUsage(
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(0)}},
+		&wireUsage{CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(999)}},
+	)
+	if u.CacheCreationExtendedInputTokens == nil || *u.CacheCreationExtendedInputTokens != 0 {
+		t.Fatalf("measured zero from start = %v, want 0", u.CacheCreationExtendedInputTokens)
+	}
+	// A one-sided stream still reports what that side carried: message_delta
+	// alone when message_start was lost, and the reverse.
+	if got := mergeStreamUsage(nil, &wireUsage{
+		OutputTokens:  i64ptr(20),
+		CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)},
+	}).CacheCreationExtendedInputTokens; got == nil || *got != 80 {
+		t.Fatalf("delta-only extended writes = %v, want 80", got)
+	}
+	if got := mergeStreamUsage(&wireUsage{
+		CacheCreation: &wireCacheCreation{Ephemeral1hInputTokens: i64ptr(80)},
+	}, nil).CacheCreationExtendedInputTokens; got == nil || *got != 80 {
+		t.Fatalf("start-only extended writes = %v, want 80", got)
+	}
+	if got := mergeStreamUsage(nil, nil); got != (events.Usage{}) {
+		t.Fatalf("empty stream usage = %+v, want zero", got)
+	}
 }
 
 func TestMapStopReason(t *testing.T) {
