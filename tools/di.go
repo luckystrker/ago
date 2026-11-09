@@ -157,7 +157,7 @@ func defaultForKind(raw string, t reflect.Type) (any, error) {
 
 // resolveDILookup fetches the current value of a slot from the context, applying the
 // declared default (and materializing it into the context) when absent.
-func resolveDILookup(cx *agocontext.Context, slot diSlot) (any, bool) {
+func resolveDILookup(cx *agocontext.Context, slot diSlot) (any, bool, error) {
 	var (
 		v  any
 		ok bool
@@ -168,7 +168,7 @@ func resolveDILookup(cx *agocontext.Context, slot diSlot) (any, bool) {
 		v, ok = cx.Variable(slot.key)
 	}
 	if ok || !slot.hasDefault {
-		return v, ok
+		return v, ok, nil
 	}
 	// AGO-DEVIATION: Python materializes a declared default into the
 	// conversation-scoped dependency registry on first use. The Go Context.Clone
@@ -176,8 +176,8 @@ func resolveDILookup(cx *agocontext.Context, slot diSlot) (any, bool) {
 	// per-call context copy only. See docs/DECISIONS.md.
 	if slot.kind == diInject {
 		cx.SetDependency(slot.key, slot.def)
-	} else {
-		cx.SetVariable(slot.key, slot.def)
+	} else if err := cx.SetVariable(slot.key, slot.def); err != nil {
+		return nil, false, fmt.Errorf("tools: materialize variable %q: %w", slot.key, err)
 	}
-	return slot.def, true
+	return slot.def, true, nil
 }

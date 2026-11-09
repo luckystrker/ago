@@ -766,10 +766,5 @@ func openingSnapshot(s *Server, t *servedTurn, cx *agocontext.Context) map[strin
 // control plane (Python parity: strip_reserved_variables; the prefixes are the
 // context package's contract).
 func reservedVariable(key string) bool {
-	const (
-		agoPrefix = "ag:"
-		a2aPrefix = "a2a:"
-	)
-	return len(key) >= len(agoPrefix) && key[:len(agoPrefix)] == agoPrefix ||
-		len(key) >= len(a2aPrefix) && key[:len(a2aPrefix)] == a2aPrefix
+	return agocontext.IsReservedVariable(key)
 }

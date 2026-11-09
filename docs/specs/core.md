@@ -153,7 +153,79 @@ forwarding and usage dedup belong to T8.
   call; D-080).
 
 ### Context — `ag2\context.py:130`
-`ConversationContext` (dataclass, aliased `Context`): `stream: Stream`, `dependency_provider: Provider|None`, `variables: dict[str, Any]` (reserved prefixes `"ag:"`, `"a2a:"` stripped on the wire), `dependencies: dict[Any, Any]` (DI: agent instance, model config, KnowledgeStore, active Task), `prompt: list[str]` (system-prompt fragments), `tool_call_id: str|None`. Methods: `pending_messages` view, `enqueue(*content)` (append + announce `MessageEnqueued`, thread-safe), `spawn_background(coro)`, `async input(message, timeout) -> str` / `async ask(HumanInputRequest) -> str` (HITL; failures normalize to `HumanInputError` subclasses), `async send(event)`.
+`ConversationContext` (dataclass, aliased `Context`): `stream: Stream`, `dependency_provider: Provider|None`, `variables: MutableMapping[str, Any]` (reserved prefixes `"ag:"`, `"a2a:"` stripped on the wire), `dependencies: dict[Any, Any]` (DI: agent instance, model config, KnowledgeStore, active Task), `prompt: list[str]` (system-prompt fragments), `tool_call_id: str|None`. Methods: `pending_messages` view, `enqueue(*content)` (append + announce `MessageEnqueued`, thread-safe), `spawn_background(coro)`, `async input(message, timeout) -> str` / `async ask(HumanInputRequest) -> str` (HITL; failures normalize to `HumanInputError` subclasses), `async send(event)`.
+
+#### Scoped variables — `ag2/scopes.py` (upstream `fad570ca19`)
+A variable declaration decides what a delegated child context inherits:
+
+| `Scope` | Child sees | Mutation / rebinding |
+|---|---|---|
+| `COPIED` (default) | a deep copy | invisible to parent and siblings |
+| `LOCAL` | nothing | stays in the declaring branch |
+| `SHARED` | the same tree-wide binding | visible to the root and siblings |
+
+`ScopedValue(value, scope=COPIED)` is a declaration marker assigned into the
+variables map; it is unwrapped and never serialized. Declarations conflict with
+the ownership rules — unknown scope, SHARED on a reserved `ag:`/`a2a:` key,
+redeclaration with a different scope, a new SHARED name below the root — and
+raise `ScopeError`. Reserved-prefix keys (including the approval bypass key) are
+never inherited.
+
+Delegation uses the same three helpers as Python:
+
+- `merge_variables(defaults, inherited)` — root: fresh store, every default
+  deep-copied. Inherited: declare defaults first (conflict → `ScopeError`), fill
+  only missing keys, inherited values win.
+- `overlay_variables(variables, values)` — apply continuation/plugin values in
+  place while preserving declarations.
+- `derive_child_variables(variables)` — drop LOCAL, SHARED and reserved keys,
+  deep-copy the rest, reuse the parent's shared-binding table, mark the child
+  non-root.
+
+AGo contract (`context/scopes.go`):
+
+```go
+type Scope string // ScopeCopied | ScopeLocal | ScopeShared
+type ScopedValue struct { Value any; Scope Scope }
+type ScopeError struct { Key string; Scope Scope; Detail string } // Unwrap → ErrScope
+type Clone interface { Clone() any }
+func DeepCopy(value any) any
+
+type Variables struct{...} // concurrency-safe store: own + declarations + shared bindings
+func NewVariables(values map[string]any) (*Variables, error)
+func (v *Variables) Get(key string) (any, bool)
+func (v *Variables) Set(key string, value any) error
+func (v *Variables) SetScoped(key string, value any, scope Scope) error
+func (v *Variables) Declare(key string, scope Scope) error
+func (v *Variables) Delete(key string) bool
+func (v *Variables) Keys() []string
+func (v *Variables) Len() int
+func (v *Variables) Snapshot() map[string]any // resolved; declarations not exported
+func (v *Variables) Declared() map[string]Scope
+func (v *Variables) IsRoot() bool
+func (v *Variables) Branch() *Variables
+func DeriveChildVariables(parent *Variables) *Variables
+func MergeVariables(defaults map[string]any, inherited *Variables) (*Variables, error)
+func OverlayVariables(vars *Variables, values map[string]any) (*Variables, error)
+
+func ReservedVariablePrefixes() []string // copy of the unexported prefix array
+func IsReservedVariable(key string) bool
+func (c *Context) VariableStore() *Variables // lazy init, safe for zero-value Context
+```
+
+`ConversationContext.Variables` is a `*Variables`; `Context.Clone` takes a
+same-branch `Branch` (continuation keeps the shared binding table), while a
+delegation derives a child branch. `DeepCopy` prefers the explicit `Clone` hook;
+its reflection fallback copies pointers, maps, slices, arrays, structs and
+interfaces, preserves cycles and aliases (one memo per store; slice memo keys
+include the view length), shallow-copies unexported struct fields and shares
+funcs/chans/unsafe pointers. SHARED bindings give visibility, not
+synchronization: compound mutations (append / read-modify-write) need a
+caller-supplied lock, which can travel through `dependencies`. Declaring SHARED
+drops a stale branch value so `Get`/`Snapshot`/`Keys` always agree (D-090a).
+`Snapshot`/`Keys`/`Len` include a shared name only when the branch's declaration
+map knows it is SHARED, so a late root declaration stays invisible to a live
+child branch exactly as `Get` reports it.
 
 ### Run / result / usage
 - `AgentRun` (`ag2\agent.py:473`): `stream`, `enqueue()`, `start()`, `async result() -> AgentReply` (idempotent, re-raises same failure); turn scope dies with the `async with` block.

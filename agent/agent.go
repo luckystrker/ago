@@ -64,9 +64,16 @@ func WithMiddleware(fs ...middleware.Factory) Option {
 	return func(o *options) { o.middleware = append(o.middleware, fs...) }
 }
 func WithDependencies(deps map[string]any) Option { return func(o *options) { o.dependencies = deps } }
-func WithVariables(vars map[string]any) Option    { return func(o *options) { o.variables = vars } }
-func WithResponseSchema(p response.Proto) Option  { return func(o *options) { o.schema = p } }
-func WithStreamBase(s stream.Stream) Option       { return func(o *options) { o.streamBase = s } }
+
+// WithVariables seeds the conversation variables. Values may be plain values
+// (ScopeCopied by default: a delegated child gets a deep copy) or
+// context.ScopedValue declarations: context.ScopeLocal keeps a value out of
+// child branches, context.ScopeShared makes one binding for the whole
+// invocation tree. Invalid declarations surface as *context.ScopeError from
+// Run/Ask.
+func WithVariables(vars map[string]any) Option   { return func(o *options) { o.variables = vars } }
+func WithResponseSchema(p response.Proto) Option { return func(o *options) { o.schema = p } }
+func WithStreamBase(s stream.Stream) Option      { return func(o *options) { o.streamBase = s } }
 func WithPromptHook(h PromptHook) Option {
 	return func(o *options) { o.promptHooks = append(o.promptHooks, h) }
 }
@@ -251,21 +258,35 @@ func (a *Agent) Run(_ stdcontext.Context, msgs ...Sendable) (*AgentRun, error) {
 // would otherwise race — whichever sibling owns the lock drains the others'
 // objectives into its own prompt (audit M-25).
 func (a *Agent) newRun(s stream.Stream, msgs ...Sendable) (*AgentRun, error) {
+	return a.newRunWith(s, nil, msgs...)
+}
+
+// newRunWith is newRun with an inherited variable view (a delegation child
+// branch). Agent defaults are merged over the inherited view, so the parent's
+// values win on shared names while the child keeps its own options on the rest.
+func (a *Agent) newRunWith(s stream.Stream, inherited *context.Variables, msgs ...Sendable) (*AgentRun, error) {
+	a.mu.Lock()
+	defaults := make(map[string]any, len(a.opts.variables))
+	for k, v := range a.opts.variables {
+		defaults[k] = v
+	}
+	deps := make(map[string]any, len(a.opts.dependencies))
+	for k, v := range a.opts.dependencies {
+		deps[k] = v
+	}
+	a.mu.Unlock()
+
+	vars, err := context.MergeVariables(defaults, inherited)
+	if err != nil {
+		return nil, err
+	}
 	run := &AgentRun{
 		agent:  a,
 		stream: s,
-		cx:     context.NewWithDeps(s, map[string]any{}, map[string]any{}),
+		cx:     context.NewWithVariables(s, deps, vars),
 		done:   make(chan struct{}),
 		wake:   make(chan struct{}, 1),
 	}
-	a.mu.Lock()
-	for k, v := range a.opts.dependencies {
-		run.cx.Dependencies[k] = v
-	}
-	for k, v := range a.opts.variables {
-		run.cx.Variables[k] = v
-	}
-	a.mu.Unlock()
 	// Per-turn input goes through the inbox so mid-turn enqueues merge uniformly.
 	if len(msgs) > 0 {
 		run.pendingInput = events.EnsureRequest(msgs...).Parts

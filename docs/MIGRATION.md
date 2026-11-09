@@ -16,6 +16,71 @@ Reading conventions:
   `context`. Cancellable operations take a `context.Context` as first parameter where Python
   was `async`.
 
+## Breaking changes — v1.3.0 sync
+
+The scoped-variables port (upstream `fad570ca19`, D-090) changes the context
+variable API. Migrate external code as follows.
+
+**`Context.Variables` is a store, not a map.** A Go map cannot intercept
+`m[k] = v`, so a map field cannot declare a scope or rebind a SHARED value.
+Before/after:
+
+```go
+// before
+cx.Variables["tone"] = "terse"
+tone := cx.Variables["tone"]
+delete(cx.Variables, "tone")
+
+// after
+err := cx.SetVariable("tone", "terse")       // returns *agocontext.ScopeError on conflict
+tone, ok := cx.Variable("tone")
+cx.VariableStore().Delete("tone")
+```
+
+Declare scopes with `agocontext.ScopedValue`:
+
+```go
+agent.New("root", "", agent.WithVariables(map[string]any{
+	"findings": agocontext.ScopedValue{Value: []string{}, Scope: agocontext.ScopeShared},
+	"secret":   agocontext.ScopedValue{Value: "root only", Scope: agocontext.ScopeLocal},
+	"depth":    0, // COPIED (default): each delegated child gets a deep copy
+}))
+```
+
+**`NewWithDeps` returns `(*Context, error)`.** A malformed declaration is now
+an error instead of being silently ignored. `NewWithVariables(s, deps, store)`
+takes an already-built `*agocontext.Variables` (the delegation path).
+
+```go
+// before
+cx := agocontext.NewWithDeps(s, deps, vars)
+
+// after
+cx, err := agocontext.NewWithDeps(s, deps, vars)
+if err != nil { return err }
+// or, with a prebuilt store:
+cx = agocontext.NewWithVariables(s, deps, store)
+```
+
+**`Context.SetVariable` returns `error`.** Existing call statements still
+compile; code that wants to surface a scope conflict must now check it.
+`Context.Variable`/`VariablesSnapshot` stay the read path.
+
+**`AgentReply.Context()` is new** — additive, Python `reply.context` parity.
+
+**`a2a.ReservedVariablePrefixes` is deprecated.** The control-plane prefixes
+have a single source in `context`: use `agocontext.ReservedVariablePrefixes()`
+(returns a copy) or `agocontext.IsReservedVariable(key)`. The old
+`a2a.ReservedVariablePrefixes` variable remains as a snapshot alias for source
+compatibility (mutating it does not affect the context contract);
+`a2a.StripReservedVariables` and agui's state export already delegate to the
+context helper.
+
+`Context.Clone()` keeps the existing cross-turn isolation for branch values and
+keeps one SHARED binding table for the continuation; a delegated child instead
+gets a derived branch (COPIED deep-copied, LOCAL/reserved dropped, SHARED
+reused). Full contract: `docs/specs/core.md` §2 and D-090.
+
 ## 1. Core API
 
 ### Agent and turn lifecycle (`ag2/agent.py` → `github.com/luckystrker/ago/agent`)
@@ -31,7 +96,7 @@ Reading conventions:
 | `reply.files`, `reply.history`, `await reply.usage()` | `reply.Files()`, `reply.History() *stream.History`, `reply.Usage() *usage.Report` | `Usage()` is a synchronous aggregation of the stream's `UsageEvent`s — no await |
 | `reply.ask(...)` / `reply.run(...)` | `reply.Ask(ctx, ...)` / `reply.Run(ctx, ...)` | Continuation on the same stream/context |
 | `resume(*events, ...)` | `a.Resume(ctx, evs ...events.Event) (*AgentReply, error)` | All but last event seed history; last is the re-entry trigger |
-| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed` plus one rolled-up subtask `UsageEvent` on the caller's stream, child state = copy of the caller's dependencies/variables (approval bypass key dropped), HITL bridge to the parent's hook (the forwarded question is transcribed on the parent stream — D-041). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
+| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed` plus one rolled-up subtask `UsageEvent` on the caller's stream; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (the forwarded question is transcribed on the parent stream — D-041). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too) |
 | `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards; the task always opens its own private stream (D-030) |
 | `PromptHook` (async prompt hook), `update_system_message` | `agent.WithPromptHook(fn agent.PromptHook)`, `agent.WithPromptFragments(...)` | `PromptHook func(*agocontext.Context) ([]string, error)` |
 | `Plugin` / `PluginTarget._apply_plugin` (`ag2/plugin.py`), `Agent(plugins=[...])` | `plugin.NewBundle(name)` builder (`.WithTool`, `.WithMiddleware`, `.WithPrompt`, `.WithPromptHook`) handed to `agent.WithPlugin(p plugin.Plugin)` | Applied once at agent construction — Python's turn-scoped `additional_plugins` attach/detach is not ported (D-044). Carried legs: tools append after the agent's own, middleware appends after the agent's own (innermost), fragments extend the collectors, hooks run like `WithPromptHook`. Not carried (no agent slot): plugin HITL hook, dependencies, variables, observers, assembly policies. A nil plugin contributes nothing |
@@ -42,7 +107,7 @@ Reading conventions:
 
 | Python | Go | Differences |
 |---|---|---|
-| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `github.com/luckystrker/ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, copies maps |
+| `ConversationContext` (alias `Context`) | `agocontext.Context` (package `github.com/luckystrker/ago/context`) | Struct with exported fields `Stream`, `Dependencies`, `Variables *agocontext.Variables`, `Prompt`, `ToolCallID`; mutation via methods (`SetDependency`, `SetVariable`, `AddPrompt`, `PromptLines`). Safe for concurrent use; `Clone()` shares the stream, branches the variable store (SHARED bindings persist across the continuation) and copies dependencies/prompt. Variables support delegation scopes (`ScopedValue`, D-090) |
 | `context.enqueue/input/ask/send/spawn_background` | `Enqueue/Pending/Drain`, `Input(ctx, msg, timeout)`, `Ask(ctx, req)`, `Send`, `SpawnBackground` | `Drain()` returns and clears pending input (Python drains implicitly in the turn loop) |
 | `dependency_provider` / DI annotations `Inject`, `Variable`, `Context` | `Dependency(id)`, `MustDependency(id)`, `SetDependency`; tool-side: `tools.NewInject`, `tools.NewVariable`, a `*agocontext.Context` parameter (§2) | DI values keyed by string id (Python keys are arbitrary objects) |
 | `hitl_hook: HumanHook`, `default_hitl_hook` | `hitl.HumanHook`, `hitl.DefaultHook` (`→ hitl.ErrNotProvided`), `ctx.SetHitlHook(h)` | `HumanHook func(ctx context.Context, req *events.HumanInputRequest) (*events.HumanMessage, error)`; typed errors `NotProvidedError`/`FailedError`/`TimeoutError` match the Python `HumanInputError` family |

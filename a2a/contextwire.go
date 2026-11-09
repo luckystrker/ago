@@ -1,5 +1,7 @@
 package a2a
 
+import agocontext "github.com/luckystrker/ago/context"
+
 // Context-variable sync over the wire (parity: ag2/ag2/a2a/mappers/messages.py
 // extract_context_update / _build_message + executor.py's
 // merged_variables / _build_final_message). Deltas of the conversation's
@@ -16,14 +18,14 @@ const (
 	ContextUpdateKey = "ag2.context_update"
 )
 
-// ReservedVariablePrefixes are the framework's own control-plane prefixes,
-// stripped from every variables payload crossing the wire (parity:
-// ag2/ag2/context.py:289 RESERVED_VARIABLE_PREFIXES).
+// Reserved control-plane prefixes come from the context package's contract
+// (parity: ag2/ag2/context.py:289 RESERVED_VARIABLE_PREFIXES); the transport
+// does not keep its own copy.
 //
-// AGO-DEVIATION: declared locally instead of reusing ago/context — the Go
-// core does not export the strip helper yet, and keeping a2a a
-// transport-level leaf package outweighs the one-string duplication (D-056).
-var ReservedVariablePrefixes = []string{"ag:", "a2a:"}
+// Deprecated: use agocontext.ReservedVariablePrefixes or
+// agocontext.IsReservedVariable. This slice is a snapshot copy provided only
+// for source compatibility; mutating it does not change the context contract.
+var ReservedVariablePrefixes = agocontext.ReservedVariablePrefixes()
 
 // ExtractContextUpdate returns the context.variables delta carried on msg's
 // metadata; an empty map when absent or not an object — callers can merge the
@@ -60,14 +62,7 @@ func WithContextUpdate(msg *Message, vars map[string]any) *Message {
 func StripReservedVariables(payload map[string]any) map[string]any {
 	out := make(map[string]any, len(payload))
 	for k, v := range payload {
-		reserved := false
-		for _, p := range ReservedVariablePrefixes {
-			if len(k) >= len(p) && k[:len(p)] == p {
-				reserved = true
-				break
-			}
-		}
-		if !reserved {
+		if !agocontext.IsReservedVariable(k) {
 			out[k] = v
 		}
 	}

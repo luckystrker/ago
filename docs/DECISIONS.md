@@ -3281,6 +3281,86 @@ toolchain — `TestCodeRunnerUndecodableOutput` expects `\ufffd`, Go 1.27's `enc
 emits the raw U+FFFD; reproduced at HEAD without this change). `-race` could not run in
 this container (no cgo/gcc); a2ui adds no mutable state.
 
+## D-090 — 2026-11-09 — context: scoped invocation variables (`Scope` COPIED/LOCAL/SHARED)
+
+Ports upstream `fad570ca19` (`ag2/scopes.py`) to `context/scopes.go` and replaces
+the flat variable copy in `agent/subtask.go` with `DeriveChildVariables` +
+`MergeVariables`. `COPIED` (default) deep-copies per child branch, `LOCAL` is not
+inherited, `SHARED` is one tree-wide binding whose rebinding is visible in the
+root and siblings. Reserved `ag:`/`a2a:` keys (including the approval bypass) are
+never inherited; a new SHARED name below the root, a reserved SHARED key, an
+unknown scope and a different redeclaration are `*ScopeError` values wrapping
+`ErrScope`.
+
+- **Variables are a store type, not a map (API shape change).** Go maps cannot
+  intercept `m[key] = value`, so keeping `Context.Variables map[string]any`
+  would silently bypass SHARED rebinding and scope declarations. It is now
+  `*context.Variables` with `Get`/`Set`/`SetScoped`/`Declare`/`Snapshot`/
+  `Declared`/`Branch`. `NewWithDeps` and `Context.SetVariable` return errors
+  because a declaration can fail; statement-only call sites are unaffected.
+  Behavior matches Python's scoped `MutableMapping`. `AgentReply.Context()` is
+  added so turn state (Python `reply.context`) is readable after a reply. Code:
+  `context/scopes.go`, `context/context.go`, `agent/run.go`.
+- **Deep copy: explicit `Clone` + reflection fallback (D-090a).** Python uses
+  `copy.deepcopy`; the stdlib-only port checks a `context.Clone` interface
+  first, then reflects over pointers/maps/slices/arrays/structs/interfaces,
+  preserving cycles and aliases through one memo per store (Python deepcopy
+  parity). Slice memo keys include the view length: Go `buf[:3]` and `buf[:2]`
+  share a data pointer but are distinct values, unlike Python list objects.
+  Limits are documented on `DeepCopy`: unexported struct fields stay shallow
+  (reflection cannot set them), funcs/chans/unsafe pointers are shared, and
+  concurrent mutation during a copy is the caller's race.
+- **own/shared consistency (D-090a).** Declaring SHARED (or `Declare` without a
+  value) removes the stale branch value, and `Snapshot`/`Keys`/`Branch` skip a
+  SHARED key even if a legacy store still holds one. `Delete(SHARED)` removes
+  the binding and any stale own value. AGO-DEVIATION: upstream leaves the own
+  value in place and its `copy()` then raises `KeyError`; AGo keeps `Get`,
+  `Snapshot`, `Keys` and the agui/a2a state export consistent. `MergeVariables`
+  restores an inherited value dropped by the declaration so inherited values
+  still win. Comment: `context/scopes.go`, `declareLocked`/`Delete`/`Snapshot`.
+- **Three small Go-shape deviations (D-090a).** A zero `Scope` normalizes to
+  COPIED (upstream `Scope("")` raises); `Keys()` sorts names for deterministic
+  output (upstream keeps insertion order); `Delete` returns `bool` instead of
+  raising `KeyError`. Comments on `normalizeScope`, `Keys`, `Delete`.
+- **SHARED is visible, not synchronized (D-090a).** `Variables` protects its
+  maps and the shared-binding table with RWMutexes (lock order branch → shared);
+  sibling rebinding is `-race` safe. Compound mutation of a shared value
+  (`append`, read-modify-write) still needs a caller-supplied lock, matching the
+  upstream contract; the test passes one through `dependencies` like upstream's
+  `findings_lock`. Go also cannot make an `append` to an injected SHARED slice
+  visible through the store, because a slice is a header; rebind it with `Set`
+  or share a map/pointer. Code comment: `context/scopes.go`, type `Variables`.
+- **Child derivation ignores the shared table (D-090a).** Only branch values are
+  copied, so a SHARED name declared after a branch was derived can never leak
+  into a grandchild as a deep copy. Upstream iterates `own ∪ shared` and can do
+  that on this rare interleaving; AGo treats shared bindings strictly as a
+  reused tree-wide reference. The same live branch also keeps `Get`/`Snapshot`/
+  `Keys`/`Len` consistent: a shared name its copied declaration map does not
+  know is omitted from all of them. Comment: `DeriveChildVariables` and the
+  `Keys`/`Snapshot` docs.
+- **No wire representation (D-090a).** `ScopedValue`/`Scope` never enter an
+  event or transport payload; `Snapshot` and a2a context updates carry resolved
+  values only, so no `@type`/snake_case wire change. `ReservedVariablePrefixes`
+  is an accessor over an unexported array (callers cannot mutate the package
+  list); `a2a.StripReservedVariables` and `agui`'s state filter reuse
+  `context.IsReservedVariable` instead of local copies. The old mutable
+  `a2a.ReservedVariablePrefixes` slice stays as a deprecated snapshot alias
+  (`// Deprecated:`), so existing code still compiles; mutating it does not
+  change the context contract.
+- **`OverlayVariables` is exposed but unused by the agent (D-090a).** AGo has no
+  per-`ask` `variables=` override or turn-scoped plugin defaults, so the helper
+  exists for parity and is covered by tests rather than wired into a call site.
+- **Zero-value Context uses `VariableStore()` (D-090a).** The accessor
+  initializes the store under the context mutex, so lazy initialization cannot
+  race with an internal reader. Contexts built by `New`/`NewWithDeps`/
+  `NewWithVariables` install the pointer before use, so direct field reads stay
+  safe there. `tools.resolveDILookup` now propagates a `SetVariable` error
+  (wrapped with `%w`) instead of dropping it.
+
+Gates run green: `go build ./...`, `go vet ./...`, `go test ./...`. The intended
+`go test -race ./context/ ./agent/` could not run on this runner (no cgo
+compiler), see the T7 dev report; the concurrency tests are written for it.
+
 ## D-091 — 2026-11-09 — events: observation envelopes, source authorship and a typed delivery marker
 
 Ported the delegation-observation event layer from `663ddd1574` (`ChildEvent`,

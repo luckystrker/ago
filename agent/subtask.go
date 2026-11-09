@@ -49,10 +49,10 @@ type TaskConfig struct {
 }
 
 // bypassKey is the variables key Python's approval middleware stores "always"
-// grants under (middleware/builtin/tools/approval.py BYPASS_KEY). Tool approvals
-// are not inherited by a sub-task: exactly this key is dropped from the copied
-// variables so the child asks again (Python parity: run_task.py
-// `if k != BYPASS_KEY` — filter by key, not by prefix).
+// grants under (middleware/builtin/tools/approval.py BYPASS_KEY). It lives under
+// the reserved "ag:" prefix, so derive_child_variables never hands it to a
+// sub-task: the child asks again. The constant remains the contract used by the
+// delegation tests and documents the key the reserved-prefix rule covers.
 const bypassKey = "ag:approval_required:always"
 
 // Delegation tool descriptions (Python parity: _RUN_SUBTASK_DESCRIPTION /
@@ -231,12 +231,13 @@ func rollupUsage(parentCX *context.Context, label string, childStream stream.Str
 // tools/subagents/run_task.py run_task): TaskStarted before the child turn, one
 // rolled-up subtask UsageEvent and TaskCompleted/TaskFailed after. The child
 // transcript persists into the parent's storage under the child's own stream id;
-// the child run starts from a copy of the parent's dependencies and variables
-// (minus the approval bypass key — tool approvals are not inherited) and its
-// variable mutations stay scoped to the child run. When the child has no HITL
-// hook of its own and the parent has one, questions asked inside the child are
-// bridged: a copy stamped with the task id goes to the parent stream and the
-// parent's hook answers.
+// the child run starts from a copy of the parent's dependencies and a scoped
+// variable branch (COPIED values deep-copied, LOCAL and reserved control-plane
+// keys dropped, SHARED bindings reused), so its mutations stay scoped to the
+// branch except for SHARED rebinding. When the child has no HITL hook of its own
+// and the parent has one, questions asked inside the child are bridged: a copy
+// stamped with the task id goes to the parent stream and the parent's hook
+// answers.
 //
 // A hitl failure comes back as the error result — it must end the calling turn
 // (Python parity: run_task re-raises HumanInputError). Any other failure is
@@ -296,29 +297,21 @@ func runTaskOn(ctx stdcontext.Context, parentCX *context.Context, child *Agent, 
 		return taskResult{taskID: taskID, objective: objective, childStream: childStream, err: err}, nil
 	}
 
-	run, err := child.newRun(childStream, prompt)
+	run, err := child.newRunWith(childStream, context.DeriveChildVariables(parentCX.VariableStore()), prompt)
 	if err != nil {
 		return fail(err)
 	}
 	defer run.Close()
 
-	// The child run starts from the parent's state merged over the child agent's
-	// own option maps (newRun already seeded those): Python passes
-	// dependencies=parent_context.dependencies.copy() / variables minus the
-	// bypass key into agent.ask, and __build_context unions them as
-	// self._agent_dependencies | overrides — the delegated agent's own
-	// WithDependencies/WithVariables survive, the parent's snapshot wins only on
-	// shared keys. Replacing the maps instead would strip the child of its own
-	// injected state, which its tools read at call time. The bypass key is
-	// dropped from the parent's copy, so approvals are not inherited and
-	// concurrent sibling tasks cannot clobber each other.
+	// The child run starts from the parent's dependencies merged over the child
+	// agent's own option maps (newRun already seeded those): Python passes
+	// dependencies=parent_context.dependencies.copy() into agent.ask, and
+	// __build_context unions them as self._agent_dependencies | overrides — the
+	// delegated agent's own WithDependencies survive, the parent's snapshot wins
+	// only on shared keys. Replacing the map instead would strip the child of its
+	// own injected state, which its tools read at call time.
 	for k, v := range parentCX.DependenciesSnapshot() {
 		run.cx.Dependencies[k] = v
-	}
-	vars := parentCX.VariablesSnapshot()
-	delete(vars, bypassKey)
-	for k, v := range vars {
-		run.cx.Variables[k] = v
 	}
 
 	// HITL bridge: a child without its own hook asks through the parent's

@@ -307,6 +307,10 @@ type AgentReply struct {
 // Body returns the text of the final answer ("" when the response carries none).
 func (r *AgentReply) Body() string { return r.resp.Content() }
 
+// Context exposes the conversation context behind the reply (Python parity:
+// AgentReply.context): its variables carry the scoped values a turn produced.
+func (r *AgentReply) Context() *context.Context { return r.cx }
+
 // Response exposes the final ModelResponse event.
 func (r *AgentReply) Response() *events.ModelResponse { return r.resp }
 
