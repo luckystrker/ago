@@ -56,6 +56,19 @@ func NewSchemaManager() (*SchemaManager, error) {
 		}
 	}
 	cat := m.docs[basicCatalogJSONURI()]
+	if cat == nil {
+		return nil, fmt.Errorf("a2ui: vendored basic catalog is not registered under %q", basicCatalogJSONURI())
+	}
+	// The port has no custom catalogs (D-076), so the restricted-$ref rule is
+	// applied to the one catalog a v1.0 schema manager loads: a bad re-vendor is
+	// rejected here, not left to surface as an unresolvable reference at
+	// validation time.
+	// AGO-DEVIATION (D-089): Python applies this check only to custom catalogs;
+	// applying it to the vendored basic catalog is the port's substitute for the
+	// deferred custom-catalog load path (a valid catalog is unaffected).
+	if err := checkCatalogReferences(cat); err != nil {
+		return nil, err
+	}
 	m.catalog = cat
 	m.catalogID = DefaultCatalogID
 	instructions, _ := cat["instructions"].(string)
@@ -103,8 +116,12 @@ func (m *SchemaManager) registerDoc(doc map[string]any) error {
 	return nil
 }
 
-// VersionString reports the protocol version ("v1.0").
-func (m *SchemaManager) VersionString() string { return VersionV1 }
+// VersionString reports the wire version messages carry ("1.0").
+func (m *SchemaManager) VersionString() string { return WireVersionV1 }
+
+// ProtocolVersion reports the protocol selector ("v1.0"), which names the spec
+// directory and the schema base URI but never appears in a message.
+func (m *SchemaManager) ProtocolVersion() string { return VersionV1 }
 
 // CatalogID reports the active catalog's $id.
 func (m *SchemaManager) CatalogID() string { return m.catalogID }

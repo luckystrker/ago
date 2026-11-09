@@ -57,7 +57,7 @@ type Server struct {
 	actions         *ActionRegistry
 	prompt          PromptHandler
 	resolveFunction FunctionNameResolver
-	version         string
+	version         string // wire version stamped on emitted messages ("1.0")
 	catalogID       string
 	encoding        Encoding
 	logger          Logger
@@ -163,7 +163,7 @@ type Logger interface {
 // WithMaxConcurrentTurns, WithAuthToken).
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		version: VersionV1, catalogID: DefaultCatalogID, encoding: EncodingSSE,
+		version: WireVersionV1, catalogID: DefaultCatalogID, encoding: EncodingSSE,
 		maxBody: defaultMaxBodyBytes,
 		turns:   make(chan struct{}, defaultMaxConcurrentTurns),
 	}

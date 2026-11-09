@@ -1179,6 +1179,8 @@ answers with clicks and function calls. The package pieces:
   `UpdateComponents`, `UpdateDataModel`, `DeleteSurface`, `CallRendererFunction`,
   `AgentFunctionResponse`; exactly one payload per envelope), the flat `a2ui.Component`
   with `NewText`/`NewImage`, and `a2ui.ToJSONL(messages)` as the canonical wire form.
+  The stable v1.0 wire version is `"1.0"` (`a2ui.WireVersionV1`); `a2ui.VersionV1`
+  (`"v1.0"`) names the protocol and never appears in a message (D-089).
 - **Parser + schema** — `a2ui.NewSchemaManager()` vendors the v1.0 basic catalog;
   `a2ui.NewParser(mgr).Parse(response)` splits a model reply into prose and A2UI
   operations, `Validate` checks them against the catalog (a hand-rolled JSON-Schema

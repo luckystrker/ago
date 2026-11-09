@@ -34,17 +34,20 @@ type ValidationResult struct {
 // is conversational prose. With a SchemaManager it also validates the messages
 // against the v1.0 schema.
 type Parser struct {
-	version string
-	mgr     *SchemaManager // nil disables schema validation
+	wireVersion string
+	mgr         *SchemaManager // nil disables schema validation
 }
 
 // NewParser builds a v1.0 parser. mgr may be nil to skip schema validation.
 func NewParser(mgr *SchemaManager) *Parser {
-	return &Parser{version: VersionV1, mgr: mgr}
+	return &Parser{wireVersion: WireVersionV1, mgr: mgr}
 }
 
-// VersionString reports the protocol version the parser speaks.
-func (p *Parser) VersionString() string { return p.version }
+// VersionString reports the wire version messages carry ("1.0").
+func (p *Parser) VersionString() string { return p.wireVersion }
+
+// ProtocolVersion reports the protocol selector ("v1.0").
+func (p *Parser) ProtocolVersion() string { return VersionV1 }
 
 // stripSingleLineFenceInfo removes the info string of a single-line fence,
 // reproducing Python's `^[A-Za-z][A-Za-z0-9_-]*(?=\s|[{[])` substitution (Go's
@@ -344,7 +347,7 @@ func (p *Parser) FormatValidationError(parseResult *ParseResult, validationResul
 	lines = append(lines, "")
 	lines = append(lines,
 		"Please fix these errors and regenerate the A2UI JSON. "+
-			fmt.Sprintf(`Make sure each message includes "version": %q and all required properties. `, p.version)+
+			fmt.Sprintf(`Make sure each message includes "version": %q and all required properties. `, p.wireVersion)+
 			"The user never sees this exchange: do not mention the errors or the correction in your reply.")
 	return strings.Join(lines, "\n")
 }
