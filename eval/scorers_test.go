@@ -63,7 +63,7 @@ func TestCorrectnessNoAnswer(t *testing.T) {
 func TestTokenBudget(t *testing.T) {
 	evs := []events.Event{
 		&events.UsageEvent{Usage: usageOf(30, 10), Kind: events.UsageKindModelCall},
-		&events.UsageEvent{Usage: usageOf(2, 3), Kind: events.UsageKindSubtask}, // rollups count
+		&events.UsageEvent{Usage: usageOf(2, 3), Kind: events.UsageKindSubtask}, // archived legacy rollup still counts
 	}
 	tr := BuildTrace(evs)
 	got, err := TokenBudget{Max: 45}.Score(context.Background(), tr)

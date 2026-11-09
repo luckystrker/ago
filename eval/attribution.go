@@ -84,7 +84,7 @@ func lastIndex(t *Trace) *int {
 // the not-found event is a tool error is-a in both codebases).
 func firstToolError(t *Trace) (int, string, bool) {
 	for i, ev := range t.Events {
-		switch e := events.AsValue(ev).(type) {
+		switch e := events.AsValue(events.SourceEvent(ev)).(type) {
 		case events.ToolErrorEvent:
 			return i, e.Name, true
 		case events.ToolNotFoundEvent:
@@ -240,7 +240,7 @@ func renderAttributionSteps(t *Trace) string {
 }
 
 func describeEvent(ev events.Event) string {
-	switch e := events.AsValue(ev).(type) {
+	switch e := events.AsValue(events.SourceEvent(ev)).(type) {
 	case events.ToolErrorEvent:
 		return fmt.Sprintf("tool error: %s -> %s", e.Name, e.Error)
 	case events.ToolNotFoundEvent:
