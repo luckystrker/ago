@@ -163,8 +163,10 @@ subscriber on the child stream:
 - on success the terminal is published while the scope is open; on failure the
   turn goroutine is awaited first, the terminal is published through the still
   installed relay under the lock, and only then is the relay stopped; a
-  pre-turn rejection (`ErrNestedSameStream`, variable/config failure) publishes
-  `TaskStarted`+terminal directly to the parent without touching the child stream;
+  preparation failure inside `AgentRun.open` after `TaskStarted` follows the
+  same child-stream finally path; a pre-turn rejection (`ErrNestedSameStream`,
+  `MergeVariables`/`newRunWith` failure) publishes `TaskStarted`+terminal
+  directly to the parent without touching the child stream;
 - `Context.Dependencies`/`Variables` scoping (D-090) is unchanged; the child stream
   persists into the parent's storage under its own id.
 

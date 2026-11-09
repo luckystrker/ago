@@ -3454,22 +3454,33 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   relay and lock; a late event from a client that ignores cancellation therefore
   cannot land in the next delegation's relay. `Close` is deliberately blocking:
   a client that never returns keeps `Close` (and a deferred `Close` inside
-  `Ask`) waiting. On a failure, `runTaskOn` first cancels and awaits the child
-  turn goroutine, then publishes the terminal through the still-installed relay
-  while the per-stream lock is held, and only then closes the scope (stops the
-  relay and releases the lock). The terminal is therefore the last event the
-  parent observes, and a queued sibling cannot relay it under its own
-  provenance — matching upstream `Forwarder.execution`'s finally block.
+  `Ask`) waiting. `awaitTurn` has the same blocking contract on the failure
+  path: it cancels and waits while still holding the per-stream lock, so a
+  sibling delegation on that stream waits until its own ctx deadline (an
+  `AsTool` delegation supplies `context.Background()`, so it waits for the turn
+  to finish). On a failure, `runTaskOn` first awaits the child turn goroutine,
+  then publishes the terminal through the still-installed relay while the lock
+  is held, and only then closes the scope (stops the relay and releases the
+  lock). The terminal is therefore the last event the parent observes, and a
+  queued sibling cannot relay it under its own provenance — matching upstream
+  `Forwarder.execution`'s finally block. A preparation failure inside
+  `AgentRun.open` after `TaskStarted` follows the same finally path: because the
+  scope was entered, `runTaskOn` keeps it open, publishes the terminal on the
+  child stream through the relay, and then closes; only failures before
+  `TaskStarted` use the parent-only reject path.
 - **Same-stream nested delegation is rejected, not deadlocked (D-092b).**
   Upstream's per-stream `asyncio.Lock` is not reentrant either; a child whose
   stream is the caller's (or any ancestor's) would queue forever. AGo carries
   the chain of held stream ids through the delegated context
   (`ago:held-streams`) and `runTaskOn` returns `ErrNestedSameStream` before
-  entering the child turn. The rejection still publishes `TaskStarted` and
-  `TaskFailed` directly to the parent stream (upstream `reject` does not touch a
-  busy child stream), so observers and AG-UI see the attempt. This is a
-  deliberate behavior choice (no hang), not a wire change; nested delegations
-  normally use a fresh child stream.
+  entering the child turn (before any child `TaskStarted`). The rejection still
+  publishes `TaskStarted` and `TaskFailed` directly to the parent stream
+  (upstream `reject` does not touch a busy child stream), so observers and
+  AG-UI see the attempt. This is a deliberate behavior choice (no hang), not a
+  wire change; nested delegations normally use a fresh child stream. Failures
+  that happen after `TaskStarted` inside `AgentRun.open` are not reject-path
+  cases: the child scope is kept open and the terminal is published on the
+  child stream through the relay before closing.
 - **No downlink port (follow-up task).** Upstream's `StreamHandle`/`_Endpoint`,
   non-serialized `origin` on `InertEvent`/`ChildEvent`, `DownEvent` delivery,
   `DeliveryFailed`/`DeliveryError`, targeted `HaltEvent` addressing,
