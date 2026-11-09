@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/luckystrker/ago/events"
@@ -55,7 +56,7 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 			name: "unsigned current-turn call gets the placeholder",
 			evs: append([]events.Event{userText("Find it.")},
 				toolStep(events.ToolCallEvent{ID: "call-1", Name: "search", Arguments: `{}`})...),
-			want: map[string]any{"search": "skip_thought_signature_validator"},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 		{
 			name: "each step is signed on its first call only",
@@ -71,9 +72,9 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 					)...,
 				)...),
 			want: map[string]any{
-				"first":  "skip_thought_signature_validator",
+				"first":  skipThoughtSignatureWire,
 				"second": nil,
-				"third":  "skip_thought_signature_validator",
+				"third":  skipThoughtSignatureWire,
 				"fourth": nil,
 			},
 		},
@@ -87,12 +88,12 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 					userText("Second question."),
 				}, toolStep(events.ToolCallEvent{ID: "new-call", Name: "new", Arguments: `{}`})...)...,
 			),
-			want: map[string]any{"old": nil, "new": "skip_thought_signature_validator"},
+			want: map[string]any{"old": nil, "new": skipThoughtSignatureWire},
 		},
 		{
 			name: "a history with no user turn is treated as one current turn",
 			evs:  toolStep(events.ToolCallEvent{ID: "call-1", Name: "search", Arguments: `{}`}),
-			want: map[string]any{"search": "skip_thought_signature_validator"},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 		{
 			name: "text before the call in one model step does not block the placeholder",
@@ -108,7 +109,7 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 					Result:   events.NewToolResult(false, "ok"),
 				}}},
 			},
-			want: map[string]any{"search": "skip_thought_signature_validator"},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 	}
 	for _, tc := range cases {
@@ -128,8 +129,12 @@ func TestBuildContentsSignsCurrentTurnCalls(t *testing.T) {
 }
 
 func TestSkipThoughtSignatureValue(t *testing.T) {
-	if SkipThoughtSignature != "skip_thought_signature_validator" {
+	const sentinel = "skip_thought_signature_validator"
+	if SkipThoughtSignature != sentinel {
 		t.Fatalf("SkipThoughtSignature = %q, want Google's documented sentinel", SkipThoughtSignature)
+	}
+	if want := base64.StdEncoding.EncodeToString([]byte(SkipThoughtSignature)); skipThoughtSignatureWire != want {
+		t.Fatalf("skipThoughtSignatureWire = %q, want base64 %q", skipThoughtSignatureWire, want)
 	}
 }
 
@@ -162,7 +167,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"text": "q"}}},
 				{Role: "model", Parts: []map[string]any{{"text": "thinking"}, call("search")}},
 			},
-			want: map[string]any{"search": SkipThoughtSignature},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 		{
 			name: "model content without calls is untouched",
@@ -180,7 +185,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"functionResponse": map[string]any{"name": "step1"}}}},
 				{Role: "model", Parts: []map[string]any{call("step2")}},
 			},
-			want: map[string]any{"step1": SkipThoughtSignature, "step2": SkipThoughtSignature},
+			want: map[string]any{"step1": skipThoughtSignatureWire, "step2": skipThoughtSignatureWire},
 		},
 		{
 			name: "an earlier signed turn is not rewritten",
@@ -190,7 +195,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"text": "second"}}},
 				{Role: "model", Parts: []map[string]any{call("new")}},
 			},
-			want: map[string]any{"old": "old-signature", "new": SkipThoughtSignature},
+			want: map[string]any{"old": "old-signature", "new": skipThoughtSignatureWire},
 		},
 		{
 			// The turn boundary is the last user content itself, not the content
@@ -203,7 +208,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"text": "second"}}},
 				{Role: "model", Parts: []map[string]any{call("new")}},
 			},
-			want: map[string]any{"old": nil, "new": SkipThoughtSignature},
+			want: map[string]any{"old": nil, "new": skipThoughtSignatureWire},
 		},
 		{
 			name: "a signed later call keeps its signature",
@@ -211,7 +216,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"text": "q"}}},
 				{Role: "model", Parts: []map[string]any{call("first"), signed("second", "real-signature")}},
 			},
-			want: map[string]any{"first": SkipThoughtSignature, "second": "real-signature"},
+			want: map[string]any{"first": skipThoughtSignatureWire, "second": "real-signature"},
 		},
 		{
 			name:     "empty contents is a no-op",
@@ -227,7 +232,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 					"thoughtSignature": nil,
 				}}},
 			},
-			want: map[string]any{"search": SkipThoughtSignature},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 		{
 			name: "a nil functionCall does not count as the first call",
@@ -235,7 +240,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"text": "q"}}},
 				{Role: "model", Parts: []map[string]any{{"functionCall": nil}, call("search")}},
 			},
-			want: map[string]any{"search": SkipThoughtSignature},
+			want: map[string]any{"search": skipThoughtSignatureWire},
 		},
 		{
 			name: "a nil functionResponse part opens a new turn",
@@ -245,7 +250,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: []map[string]any{{"functionResponse": nil}}},
 				{Role: "model", Parts: []map[string]any{call("new")}},
 			},
-			want: map[string]any{"old": nil, "new": SkipThoughtSignature},
+			want: map[string]any{"old": nil, "new": skipThoughtSignatureWire},
 		},
 		{
 			name: "an empty user content does not open a new turn",
@@ -255,7 +260,7 @@ func TestSignCurrentTurnCallsKeepsSignaturesAndTracksTurns(t *testing.T) {
 				{Role: "user", Parts: nil},
 				{Role: "model", Parts: []map[string]any{call("step2")}},
 			},
-			want: map[string]any{"step1": SkipThoughtSignature, "step2": SkipThoughtSignature},
+			want: map[string]any{"step1": skipThoughtSignatureWire, "step2": skipThoughtSignatureWire},
 		},
 	}
 	for _, tc := range cases {

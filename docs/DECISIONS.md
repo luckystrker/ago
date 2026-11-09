@@ -3187,10 +3187,11 @@ of every unsigned step in the current turn Google's documented
   that no other provider package has. The placeholder still lands on the wire
   (`config/gemini/mappers.go`, `signCurrentTurnCalls`), which is what fixes the Gemini 3
   400. Code comment: `AGO-DEVIATION` at `signCurrentTurnCalls`.
-- **The wire value is the literal sentinel.** The Python SDK types the field as `bytes`
-  and its serializer base64-encodes those bytes; AGo speaks raw REST, and the API accepts
-  the literal string (Google's own `gemini-cli` sends exactly this). `SkipThoughtSignature`
-  is exported so callers/tests share one value.
+- **The wire value is base64-encoded.** The REST `thoughtSignature` field is bytes, so the
+  placeholder travels standard-base64 encoded (`c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=`),
+  exactly as the Python SDK's serializer emits the same bytes; Vertex-like endpoints accept
+  this form. `SkipThoughtSignature` stays the documented sentinel, and
+  `skipThoughtSignatureWire` is the encoded value the mapper writes.
 - **Replaying the real signature from a response is deferred.** `genPart` does not read
   `thoughtSignature`, and `ToolCallEvent` has no field for it, so every call rebuilt from
   history is unsigned and takes the placeholder. The "signed first call is left alone"

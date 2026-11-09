@@ -25,9 +25,13 @@ type wireContent struct {
 
 // SkipThoughtSignature is Google's documented placeholder for a function call
 // that has no real thought signature (Gemini 3 rejects unsigned current-turn
-// calls with 400). The raw REST API takes the literal sentinel; SDKs that type
-// the field as bytes base64-encode the same value before sending it.
+// calls with 400).
 const SkipThoughtSignature = "skip_thought_signature_validator"
+
+// skipThoughtSignatureWire is SkipThoughtSignature as the REST API expects it.
+// The thoughtSignature field is bytes, so the sentinel travels standard-base64
+// encoded, exactly as the Python SDK's serializer emits the same bytes.
+const skipThoughtSignatureWire = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
 
 // mimeByExtension infers a MIME type from a URL path extension (Python parity:
 // the gemini mapper's _URL_EXTENSION_TO_MIME; entries Gemini accepts as file data).
@@ -178,7 +182,7 @@ func signCurrentTurnCalls(contents []wireContent) {
 		if sig, ok := first["thoughtSignature"]; ok && sig != nil {
 			continue
 		}
-		first["thoughtSignature"] = SkipThoughtSignature
+		first["thoughtSignature"] = skipThoughtSignatureWire
 	}
 }
 
