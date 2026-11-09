@@ -104,7 +104,7 @@ chunks, lifecycle bookkeeping) and `__conversational__: bool` (default True; Fal
 
 ### Lifecycle / task / alert events
 `events\lifecycle.py` (all transient): `ObserverStarted/Completed(name)`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent`.
-`events\task_events.py`: `TaskEvent(InertEvent)` (`__conversational__=False`) with `path`, then `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired`, `TaskCancelled(..., reason)`.
+`events\task_events.py`: `TaskEvent(InertEvent)` (`__conversational__=False`) with `path`, then `TaskStarted(task_id, agent_name, objective, spec, expires_at)`, `TaskProgress`, `TaskCompleted(..., result, task_stream)`, `TaskFailed(..., error)`, `TaskExpired(task_id, agent_name, objective)`, `TaskCancelled(..., objective, reason)`.
 `events\alert.py`: `enum Severity(str)`; `ObserverAlert(BaseEvent, severity)`; `HaltEvent(BaseEvent, reason)`.
 
 ### Delegation observation events — `ag2\events\delegation.py` (+ upstream `a591d84f6e`)
@@ -157,6 +157,9 @@ subscriber on the child stream:
   `path` (and a UsageEvent's `task_id`/`agent_name`), later hops preserve it;
 - the forwarder's own path is `parentForwarder.path + taskID`, published through the
   child context's `ago:forwarder` dependency, so paths grow with nesting;
+- forwarding and the child lifecycle are installed inside the child's turn scope,
+  after the per-stream turn lock is taken and stopped before it is released, so a
+  queued delegation on a shared stream cannot capture the active invocation;
 - `Context.Dependencies`/`Variables` scoping (D-090) is unchanged; the child stream
   persists into the parent's storage under its own id.
 

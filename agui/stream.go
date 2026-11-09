@@ -439,9 +439,10 @@ func (s *Stream) TakeUsage() []TokenUsage {
 }
 
 // tokenUsageFromEvents groups attributed spend per (provider, model) in the
-// protocol's accounting (Python parity: usage.py). A delegation's rollup is
-// replaced by the calls it sums; absent counts stay unset unless some call
-// reported them; totalTokens is recomputed, never copied.
+// protocol's accounting (Python parity: usage.py). Live delegations forward
+// source records, so Parts only appear on archived legacy subtask rollups,
+// where the rollup is replaced by the calls it sums; absent counts stay unset
+// unless some call reported them; totalTokens is recomputed, never copied.
 func tokenUsageFromEvents(evs []events.UsageEvent) []TokenUsage {
 	type key struct{ provider, model string }
 	groups := map[key]*TokenUsage{}

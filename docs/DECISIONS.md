@@ -3443,18 +3443,31 @@ There is no subtask usage rollup: accounting reads source records and dedups by
   records byte-compatible; non-empty provenance round-trips losslessly.
 - **Forwarding is upward-only (D-092a).** `agent/forwarding.go` subscribes as an
   interrupt handler before the child HITL hook, so a swallowed question is still
-  observed by the parent. It relays through `Stream.Send`, not `Context.Send`,
+  observed by the parent. It is installed by the child's turn scope after the
+  per-stream lock is held and stopped before the lock is released, so concurrent
+  delegations reusing one `WithStreamBase` cannot cross-forward events. It relays through `Stream.Send`, not `Context.Send`,
   because the latter would call `AsLocal` and strip the stamped provenance. An
   already-enveloped `ChildEvent` is relayed unchanged (leaf identity preserved),
   and a delegation reusing its caller's stream disables the relay to avoid an
   echo loop.
-- **No downlink port.** Upstream's `StreamHandle`/`_Endpoint`, `DownEvent`
-  delivery, `DeliveryFailed`, `DeliveryError`, targeted `HaltEvent` cancellation
-  and the `DelegationRegistry`/`settle_descendants` machinery depend on
-  asyncio task cancellation. AGo has no equivalent task stack in this layer and
-  no public `origin` handle on observations; Halt addressing remains a separate
-  task. `DownEvent` stays a vocabulary type (T6) and `Delivery` is now validated
-  by `Stream.Send` before every handler (interrupt, persistence, normal), with
+- **No downlink port (follow-up task).** Upstream's `StreamHandle`/`_Endpoint`,
+  non-serialized `origin` on `InertEvent`/`ChildEvent`, `DownEvent` delivery,
+  `DeliveryFailed`/`DeliveryError`, targeted `HaltEvent` addressing,
+  `DelegationRegistry.cancel_descendants`/`settle_descendants`, and the
+  `CANCELLED_TOOL_RESULT` repair of unfinished tool calls all belong to the
+  same upstream commit but are deliberately deferred. AGo already has a
+  cancellation channel — `context.Context.TurnContext()`/`AgentRun.cancel` —
+  but observations carry no live invocation address, and there is no
+  per-delegation `cancel func` registry or downlink transport. Consequently an
+  observer cannot address a delegation with `HaltEvent`, and cancelling a root
+  turn does not necessarily stop an already-running child: tool execution has
+  no stdlib context (`runTaskOn` is called with `context.Background()` in
+  `AsTool`/`run_subtask(s)`), which was already true before T8, so this is a
+  pre-existing gap rather than a T8 regression. Follow-up scope: origin handle
+  + registry keyed by task id, downlink delivery/validation, cancel cascade and
+  settlement, cancelled-tool-call repair, then user-facing observability.
+  `DownEvent` stays a vocabulary type (T6); `Delivery` is now validated by
+  `Stream.Send` before every handler (interrupt, persistence, normal), with
   routed copies persisted as their inner event.
 - **Task lifecycle is inert and authored on the child stream (D-092a).** Task
   events embed `InertEvent` and are no longer conversational (upstream
@@ -3485,5 +3498,7 @@ There is no subtask usage rollup: accounting reads source records and dedups by
 Verified by `events/inert_test.go`, `stream/delivery_test.go`,
 `agent/forwarding_test.go`, the rewritten subtask accounting tests, and the new
 usage/observer dedup tests. Gates (2026-11-09): `go build ./...`, `go vet ./...`,
-`go test ./...`, `go build ./examples/...`, `go vet ./examples/...`; race runs
-for the stateful packages are recorded in the T8 dev report.
+`go test ./...`, `go build ./examples/...`, `go vet ./examples/...`.
+`go test -race` could not run in this container (no cgo/gcc:
+`C compiler "gcc" not found`), as recorded in the T8 dev report; the
+stateful-package race tests are written but were not executed here.
