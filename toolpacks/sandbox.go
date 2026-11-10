@@ -195,6 +195,17 @@ func factoryWorkdir(f SandboxFactory) string {
 	return defaultSandboxWorkdir
 }
 
+// hostBacked reports whether the factory's working directory is a directory of
+// this host (a SingletonFactory over a sandbox with a host view). Every other
+// factory — a container or cloud backend, even one that bind-mounts a host
+// path — works in a POSIX path of the sandbox, which host-side path handling
+// must not touch (Python parity: ShellAdapter.workdir returns a Path only for a
+// SingletonFactory).
+func hostBacked(f SandboxFactory) bool {
+	sf, ok := f.(*SingletonFactory)
+	return ok && sf.Sandbox().HostWorkdir() != ""
+}
+
 // closeFactory closes a factory that owns resources (io.Closer); others have
 // nothing to release at this level.
 func closeFactory(f SandboxFactory) error {
