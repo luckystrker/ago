@@ -7,14 +7,18 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // stdioTransport runs the server as a subprocess and exchanges newline-delimited
 // JSON-RPC 2.0 on its stdin/stdout (no Content-Length framing — the AGo minimum
 // dialect). Requests are written one line each; replies are matched by id,
-// skipping notifications. Server-initiated requests (sampling, ping) carry no
-// answer in this minimum client and are skipped too.
+// skipping notifications. A server-initiated request (ping, elicitation,
+// sampling, roots) is answered on the same pipes: ping straight from the reader
+// goroutine (so an idle or busy session still answers it), everything else by
+// the installed requestHandler on the goroutine waiting for its own reply.
 //
 // A dedicated reader goroutine owns the stdout pipe for the transport's whole
 // lifetime, so no caller ever blocks on a bare read: every wait is a select on
@@ -31,6 +35,15 @@ type stdioTransport struct {
 
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
+	// wmu serializes writes to stdin: the reader goroutine answers ping while a
+	// caller may be writing its own request.
+	wmu sync.Mutex
+
+	// handler answers server-initiated requests (nil: method not found).
+	handler requestHandler
+	// waiting is set while a caller awaits a reply; a request that shows up
+	// outside that window has nobody to answer it and is refused.
+	waiting atomic.Bool
 
 	// responses carries the server's replies, parsed by the reader goroutine.
 	// readerDone closes when the stdout pipe ends; dead closes exactly once,
@@ -99,10 +112,11 @@ func (t *stdioTransport) start() error {
 }
 
 // read is the transport's only reader of the subprocess stdout. It parses each
-// line and queues the replies; notifications, server-to-client requests (the
-// minimum client answers none) and garbled lines (a chatty banner must not kill
-// the session) are dropped, so the queue holds replies only and their count is
-// bounded by the requests the client sends.
+// line and queues replies and server-to-client requests; notifications and
+// garbled lines (a chatty banner must not kill the session) are dropped. A ping
+// is answered right here; a request arriving while no caller is waiting is
+// refused, so the queue stays bounded by what the client sends plus what a
+// server asks during one exchange.
 func (t *stdioTransport) read(stdout io.ReadCloser) {
 	defer close(t.readerDone)
 	sc := bufio.NewScanner(stdout)
@@ -116,8 +130,18 @@ func (t *stdioTransport) read(stdout io.ReadCloser) {
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
-		if msg.Method != "" || msg.ID == nil {
-			continue // notification or server-to-client request
+		switch {
+		case msg.isRequest():
+			if msg.Method == "ping" {
+				_ = t.writeLine(rpcResultReply{JSONRPC: "2.0", ID: msg.ID, Result: map[string]any{}})
+				continue
+			}
+			if !t.waiting.Load() {
+				_ = t.writeLine(rpcErrorReply{JSONRPC: "2.0", ID: msg.ID, Error: &rpcError{Code: codeInvalidRequest, Message: "no client request in flight to attach " + msg.Method + " to"}})
+				continue
+			}
+		case msg.Method != "" || !msg.hasID():
+			continue // notification
 		}
 		select {
 		case t.responses <- msg:
@@ -137,6 +161,8 @@ func (t *stdioTransport) writeLine(msg any) error {
 	if err != nil {
 		return fmt.Errorf("%w: encode request: %v", ErrProtocol, err)
 	}
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
 	if _, err := t.stdin.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("mcp: server stdin: %w", err)
 	}
@@ -150,6 +176,8 @@ func (t *stdioTransport) call(ctx context.Context, id int64, method string, para
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	t.waiting.Store(true)
+	defer t.waiting.Store(false)
 	if err := t.writeLine(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
 		return nil, err
 	}
@@ -158,30 +186,71 @@ func (t *stdioTransport) call(ctx context.Context, id int64, method string, para
 
 // matchReply reports whether msg answers the request id, and with what outcome.
 func matchReply(msg wireMessage, id int64) (json.RawMessage, bool, error) {
-	if msg.ID == nil || *msg.ID != id {
+	if !msg.replyTo(id) {
 		return nil, false, nil
 	}
-	if msg.Error != nil {
-		return nil, true, fmt.Errorf("%w: %s", ErrProtocol, msg.Error.Error())
-	}
-	return msg.Result, true, nil
+	res, err := msg.outcome()
+	return res, true, err
+}
+
+// serve answers one server-initiated request on the pipes. The handler may take
+// as long as a human needs; the shutdown of the transport cancels it.
+func (t *stdioTransport) serve(ctx context.Context, msg wireMessage) {
+	hctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-t.dead:
+			cancel()
+		case <-stop:
+		}
+	}()
+	_ = t.writeLine(answerRequest(hctx, t.handler, msg))
 }
 
 // awaitReply selects on the reply queue until the response to id shows up,
-// skipping stale answers to exchanges that already timed out. A buffered reply
-// wins even when the pipe has already ended.
+// skipping stale answers to exchanges that already timed out and answering the
+// server's own requests meanwhile (the deadline restarts after each, so a human
+// taking minutes to answer an elicitation does not burn the exchange budget). A
+// buffered reply wins even when the pipe has already ended.
 func (t *stdioTransport) awaitReply(ctx context.Context, id int64) (json.RawMessage, error) {
-	var deadline <-chan time.Time
+	var (
+		timer    *time.Timer
+		deadline <-chan time.Time
+	)
 	if t.timeout > 0 {
-		timer := time.NewTimer(t.timeout)
+		timer = time.NewTimer(t.timeout)
 		defer timer.Stop()
 		deadline = timer.C
+	}
+	rearm := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(t.timeout)
+	}
+	// take handles one queued message: a request is served, a reply matched.
+	take := func(msg wireMessage) (json.RawMessage, bool, error) {
+		if msg.isRequest() {
+			t.serve(ctx, msg)
+			rearm()
+			return nil, false, nil
+		}
+		return matchReply(msg, id)
 	}
 	pipeGone := false
 	for {
 		select {
 		case msg := <-t.responses:
-			if res, done, err := matchReply(msg, id); done {
+			if res, done, err := take(msg); done {
 				return res, err
 			}
 			continue
@@ -195,7 +264,7 @@ func (t *stdioTransport) awaitReply(ctx context.Context, id int64) (json.RawMess
 		}
 		select {
 		case msg := <-t.responses:
-			if res, done, err := matchReply(msg, id); done {
+			if res, done, err := take(msg); done {
 				return res, err
 			}
 		case <-deadline:
@@ -216,6 +285,11 @@ func (t *stdioTransport) awaitReply(ctx context.Context, id int64) (json.RawMess
 		}
 	}
 }
+
+func (t *stdioTransport) setHandler(h requestHandler) { t.handler = h }
+
+// setProtocolVersion is a no-op: stdio carries no per-request protocol header.
+func (t *stdioTransport) setProtocolVersion(string) {}
 
 func (t *stdioTransport) notify(ctx context.Context, method string, params any) error {
 	if err := t.writeLine(rpcNotification{JSONRPC: "2.0", Method: method, Params: params}); err != nil {
