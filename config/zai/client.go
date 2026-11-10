@@ -13,14 +13,27 @@ import (
 
 // chatClient is the LLMClient that ZAIConfig.Create returns: the shared
 // OpenAI-compatible chat engine bound to one validated parameter set.
-// Immutable; safe for concurrent use.
+// Immutable after construction; safe for concurrent use.
 type chatClient struct {
 	params config.CompatParams
+	// tokenAuth mints a fresh short-lived bearer token on every call (Python
+	// parity: disable_token_cache=False); params.APIKey then holds the raw key.
+	tokenAuth bool
 }
 
 // Call performs one model call (config.LLMClient).
 func (c *chatClient) Call(ctx context.Context, messages []events.Event, conv *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
-	return config.RunChatCompat(ctx, c.params, messages, conv, opts)
+	params := c.params
+	if c.tokenAuth {
+		// A turn can outlive one token (210 s): minting per request means a
+		// long tool loop never sends an expired bearer.
+		token, err := mintAuthToken(params.APIKey, nowFunc())
+		if err != nil {
+			return nil, err
+		}
+		params.APIKey = token
+	}
+	return config.RunChatCompat(ctx, params, messages, conv, opts)
 }
 
 // Compile-time contract checks.

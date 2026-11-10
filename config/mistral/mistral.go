@@ -3,10 +3,10 @@
 // is a thin binding of MistralConfig onto the shared engine
 // config.RunChatCompat.
 //
-// Parity with Python AG2 ag2/config/mistral/config.py (MistralConfig). The
-// Mistral-specific extras (guardrails, prediction, prompt_mode, logprobs,
-// Files API) are out of the wave-1 scope (D-008); the sampled fields follow
-// the porting brief plus the typed sampling and routing knobs below. See docs/specs/config-llm.md §1.
+// Parity with Python AG2 ag2/config/mistral/config.py (MistralConfig): the
+// sampled fields, the typed routing knobs and the vendor extras (guardrails,
+// prediction, prompt_mode, logprobs). The Files API stays out of scope (D-021).
+// See docs/specs/config-llm.md §1.
 package mistral
 
 import (
@@ -92,6 +92,17 @@ type MistralConfig struct {
 	// ReasoningEffort is "none", "minimal", "low", "medium", "high" or "xhigh".
 	ReasoningEffort string
 	PromptCacheKey  string
+	// Guardrails are Mistral's content-moderation configs; each entry is the
+	// SDK's GuardrailConfig object (Python parity: guardrails).
+	Guardrails []map[string]any
+	// Prediction is the predicted-output block (Python parity: prediction).
+	Prediction map[string]any
+	// PromptMode selects Mistral's reasoning prompt mode; the only value is
+	// "reasoning" (Python parity: Literal["reasoning"]).
+	PromptMode string
+	// Logprobs asks for token log probabilities; TopLogprobs caps how many
+	// alternatives come back per token.
+	Logprobs *bool
 
 	// SafePrompt asks Mistral to prepend its safety prompt to the messages.
 	// AGO-DEVIATION: Python's field is tri-state (None = omit, True/False =
@@ -171,6 +182,8 @@ func (c *MistralConfig) params() (config.CompatParams, error) {
 		ToolChoice:        c.ToolChoice,
 		ReasoningEffort:   c.ReasoningEffort,
 		PromptCacheKey:    c.PromptCacheKey,
+		Logprobs:          c.Logprobs,
+		Prediction:        c.Prediction,
 	}
 	// Mistral-only wire fields (the mistralai SDK's request model names).
 	extra := map[string]any{}
@@ -192,6 +205,12 @@ func (c *MistralConfig) params() (config.CompatParams, error) {
 	}
 	if c.Metadata != nil {
 		extra["metadata"] = c.Metadata
+	}
+	if len(c.Guardrails) > 0 {
+		extra["guardrails"] = c.Guardrails
+	}
+	if c.PromptMode != "" {
+		extra["prompt_mode"] = c.PromptMode
 	}
 	if len(extra) > 0 {
 		p.Extra = extra
@@ -261,6 +280,28 @@ func (c *MistralConfig) Clone(overrides map[string]any) (config.ModelConfig, err
 			err = setString(&out.ReasoningEffort, k, v)
 		case "promptcachekey", "prompt_cache_key":
 			err = setString(&out.PromptCacheKey, k, v)
+		case "guardrails":
+			err = setAnyMaps(&out.Guardrails, k, v)
+		case "prediction":
+			err = setAnyMap(&out.Prediction, k, v)
+		case "logprobs":
+			err = setBoolPtr(&out.Logprobs, k, v)
+		case "promptmode", "prompt_mode":
+			if v == nil {
+				out.PromptMode = ""
+				break
+			}
+			s, ok := v.(string)
+			if !ok {
+				err = fmt.Errorf("config/mistral: override %q: got %T, want string", k, v)
+				break
+			}
+			// Python parity: the field is Literal["reasoning"]; the dynamic
+			// override boundary enforces the vocabulary.
+			if s != "reasoning" {
+				return nil, fmt.Errorf("mistral: override %q must be \"reasoning\", got %q", k, s)
+			}
+			out.PromptMode = s
 		default:
 			err = fmt.Errorf("config/mistral: unknown config field %q", k)
 		}

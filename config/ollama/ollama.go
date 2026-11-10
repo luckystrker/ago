@@ -93,8 +93,9 @@ func WithPresencePenalty(v float64) Option {
 // policy. Nil keeps the default client.
 func WithHTTPClient(c *http.Client) Option { return func(cfg *OllamaConfig) { cfg.httpClient = c } }
 
-// WithStreaming toggles streaming. Streaming is not implemented yet in this
-// port: Create fails on a streaming config.
+// WithStreaming toggles streaming: the answer arrives as NDJSON chunks folded
+// into ModelMessageChunk/ModelReasoning progress events plus one final
+// ModelResponse (Python parity: streaming=True).
 func WithStreaming(v bool) Option { return func(c *OllamaConfig) { c.streaming = v } }
 
 // NewOllama builds a config for one Ollama model.
@@ -117,12 +118,6 @@ func (c *OllamaConfig) Model() string { return c.model }
 func (c *OllamaConfig) Create() (config.LLMClient, error) {
 	if c.model == "" {
 		return nil, fmt.Errorf("%w: ollama model", config.ErrNotProvided)
-	}
-	// AGO-DEVIATION: the brief defers Ollama streaming (Python streams); a
-	// streaming config refuses to create a client instead of silently
-	// degrading to non-streaming.
-	if c.streaming {
-		return nil, fmt.Errorf("%w: ollama streaming is not implemented (non-streaming only)", config.ErrUnsupportedInput)
 	}
 	host := c.host
 	if host == "" {
