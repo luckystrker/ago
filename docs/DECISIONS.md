@@ -3738,3 +3738,401 @@ Verified by `config/errors_test.go`, `config/openaicompat_options_test.go`,
 `go build/vet ./examples/...` and build+vet+test of every `contrib/*` module (run 2026-11-10 against this
 tree through each module's `replace`). The reviewer-authored part of this
 entry's first commit was cross-reviewed separately (see the gap-audit notes).
+
+## D-095 — 2026-11-10 — config/anthropic: typed extended thinking, durable thinking events, headers and cache diagnostics (gap audit 2026-11-09, wave 1)
+
+Ports the Anthropic slices W1-A confirmed missing: the thinking knob, replay of
+signed/redacted thinking, request headers/betas, metadata knobs, vendor
+`cache_control`/`citations`, and cache-miss diagnostics.
+
+- **Thinking is a typed config field, not `extra_body`.** `ThinkingConfig{Type:
+  ThinkingEnabled, BudgetTokens}` (or `ThinkingAdaptive`/`ThinkingDisabled`) is
+  validated in `Create`; an unknown mode or `BudgetTokens >= MaxTokens` returns
+  `ErrInvalidThinking`. AGO-DEVIATION: Python reaches thinking only through
+  `extra_body`, so the typed error has no Python counterpart.
+- **Sampling is dropped while thinking is on.** With enabled/adaptive thinking
+  the request carries neither `temperature` nor `top_p`: the API samples at 1
+  and AG2's API version sends neither. Comment in `config/anthropic/client.go`.
+- **Thinking replay is durable, not transient.** `ThinkingBlockEvent` (text +
+  signature) and `RedactedThinkingEvent` (data, id) are registered in the events
+  registry like `agui.AGUIEvent`; Python maps a thinking block to a transient
+  `ModelReasoning` and keeps only redacted thinking as a provider event.
+  `ConvertMessages` joins replay blocks with the following `ModelResponse` into
+  one assistant turn before `tool_use`; telemetry between them does not split
+  it. Comment in `config/anthropic/events.go`.
+- **Headers and cache metadata.** `DefaultHeaders` reach messages and the Files
+  client, and their `anthropic-beta` merges (sorted, deduped) with the
+  framework's flags instead of replacing them. `VendorMetadata["cache_control"]`
+  (5m/1h) and `["citations"]` are per-input; invalid values and citations on an
+  image are `ErrUnsupportedInput`.
+- **Cache diagnostics chain per client.** `CacheDiagnostics` emits a
+  `CacheDiagnostics` event when the API reports one and threads
+  `previous_message_id` through the client instance (null on the first call),
+  matching Python's per-`create()` chaining.
+
+Evidence: `config/anthropic/{request,replay,config,files}_test.go`. The mutation
+run leaves 18 survivors: all in old code except `client.go:443` (the redacted
+event's stream-send error path; risk 1×2, accepted below the threshold).
+
+## D-096 — 2026-11-10 — config: input acceptance by wire dialect, Chat Completions media and Mistral content arrays (gap audit 2026-11-09, wave 1)
+
+Ports W1-B's media slice on top of the shared Chat Completions engine.
+
+- **Acceptance is keyed by wire dialect, not vendor.** `InputDialect` (12 values,
+  matching Python's classes) drives `AcceptsInput`/`InputModalities`/
+  `InputMediaTypes`/`BinaryKindOf`; configs whose two protocols differ declare
+  `InputDialect` (`DialectOpenAICompletions`, `DialectOpenAIResponses`), others
+  map by `Provider()`, and an undescribed config accepts everything. AGO-DEVIATION:
+  Python keys the table by provider classes; keying by dialect is what lets one
+  Go engine serve both OpenAI protocols.
+- **The shared engine chooses the dialect.** OpenAI gets the Chat Completions
+  vocabulary (`input_audio` wav/mpeg, `file.file_data` + filename, image
+  `detail`); Mistral gets `document_url` and `image_url` + detail. Z.AI and
+  DashScope keep the pre-existing image-only mapping because their Python
+  mappers differ. AGO-DEVIATION: one Go engine covers four providers with one
+  dialect switch where Python has separate clients.
+- **Content splitting lives in the shared decoder.** Python splits array content
+  only in the Mistral client; AGo splits in the shared decoder for every dialect.
+  Only `thinking` chunks become `ModelReasoning`, so no other dialect changes.
+- **`UrlInput` has no metadata container.** Mistral document URLs therefore omit
+  `document_name` and image URLs omit `detail`; binary inputs carry both through
+  `vendor_metadata`. Comment in `config/openaicompat.go`.
+- **The acceptance table keeps Python's file rows.** `openai-completions`,
+  `responses` and `mistral` list user/tool `file` entries, but the Go mapper still
+  rejects `FileIdInput` until the Files API is a message input; the table
+  documents the reference behavior for a later wiring (D-046). Mistral
+  tool-position documents remain text-only (the tool-result mapper was already a
+  recorded deviation).
+
+Evidence: `config/input_acceptance_test.go` (full 12-dialect matrix) and the
+Chat Completions/Mistral tests; AG-UI consumes the table in D-094.
+
+## D-097 — 2026-11-10 — agent: per-run RunOptions, observers, task spec, subagent seam, background tool and concurrency pool (gap audit 2026-11-09, wave 1)
+
+Ports W1-C: the Python `ask`/`run`/`resume` keyword arguments become the
+zero-default `RunOptions` struct applied under the turn lock.
+
+- **`RunOptions` is the Go spelling of the kwargs.** `Stream`, `Config`, `Tools`,
+  `Middleware`, `Observers`, `Plugins`, `HitlHook`, `Dependencies`, `Variables`,
+  `Prompt`, `ResponseSchema` and `FreeText` travel through `AskWith`/`RunWith`/
+  `ResumeWith`; `Ask`/`Run`/`Resume` stay zero-option wrappers (D-093a). Go cannot
+  add a second variadic beside `...Sendable`, so this is a value, not options.
+- **`Agent.TaskWithSpec` instead of a wider `Task`.** `Agent.Task`'s variadic slot
+  is occupied by `task.Option`, so description/payload/capability travel through
+  `TaskWithSpec(ctx, task.Spec, opts...)`; `Task` delegates unchanged. Comment in
+  `agent/task.go`.
+- **One subtask pool per agent.** Python keys `TaskConfig.MaxConcurrency` slots by
+  event loop; Go has no loop object, so one semaphore per agent covers every
+  concurrent turn and a changed limit replaces the pool. `run_subtask` is capped
+  the same way. Comment in `agent/subtask.go`.
+- **Invocation plugins seed only a fresh prompt.** A continuation clones the
+  previous prompt; re-running dynamic plugin hooks would duplicate text, so they
+  run only when the turn has no prompt yet. Comment in `agent/lifecycle.go`.
+- **Introspection omits serializer/assembly.** `Config`, `DynamicPrompt`,
+  `Middleware`, `Dependencies`, `Variables`, `HasHitlHook`, `ResponseSchema`,
+  `Observers` and `Tasks` are exposed; Python's `serializer` and `assembly` have
+  no Go object. Comment in `agent/introspect.go`.
+- **`AsBackgroundTool` is not cancelled with the parent.** It spawns the child on
+  `context.Background()` in the stream's background scope, so a parent turn ending
+  does not stop it; the result is queued as a follow-up and the stream's
+  `WaitBackground()` method (`(*MemoryStream).WaitBackground`, exposed on
+  `Stream`) only settles the goroutine. A cancelled or lost background task can therefore
+  finish after the caller has moved on — Python `agent.py:2028` says the same,
+  although `background.py`'s docstring reads stronger.
+
+Evidence: `agent/{overrides,observers,task_spec,as_tool,background,max_concurrency,introspect}_test.go`
+and `tools/client_tool_middleware_test.go`.
+
+## D-098 — 2026-11-10 — core runtime: stream timeout/Join, usage collector, retry/approval knobs, chars-per-token and TailWindowCompact (gap audit 2026-11-09, wave 1)
+
+Ports W1-D's small runtime gaps.
+
+- **Subscriber timeout is cooperative.** `SubscribeOptions.Timeout` makes a late
+  handler return `stream.ErrSubscriberTimeout` from `Send` and stops delivery to
+  later handlers; the handler itself keeps running on its goroutine and may still
+  touch shared state because `Subscriber` has no context. A panic becomes an error
+  only when a timeout is set; otherwise it reaches the `Send` caller. AGO-DEVIATION:
+  Python raises `ValueError` for a non-positive timeout; Go treats it as "no
+  deadline" because `Subscribe` has no error return.
+- **`Join` is a function plus concrete methods, not an interface method.**
+  `stream.Join(ctx, s, JoinOptions{Condition, MaxEvents})` and
+  `(*MemoryStream).Join`/`(*SubStream).Join` return a pull iterator
+  (`Next`/`Close`, `ErrJoinDone`/`ErrJoinClosed`); adding it to `Stream` would
+  break third-party implementations. Comment in `stream/join.go`.
+- **`usage.NewCollector`** is a live `Collect(ev)` subscriber with `Records()` and
+  `Report()`, deduplicating by `event_id` like `from_events`.
+- **Retry and approval knobs.** `WithRetryOn` filters retryable errors;
+  `RetryMaxRetries(N)` is Python's `max_retries=N` (N+1 calls, no delay), while
+  `Retry(attempts)` keeps the old total-calls/linear-backoff semantics.
+  `WithApprovalMessage`/`WithDeniedMessage`/`WithAllowAlways` mirror the kwargs;
+  only `{tool_name}`/`{tool_arguments}` are substituted and the arguments stay
+  inside the M-16 fence, so other braces are literal (Python `str.format` would
+  interpret them). An explicitly empty message is used as the question.
+- **`chars_per_token` options ignore non-positive values.** `middleware`,
+  `policies` and `compact` `WithCharsPerToken(n)` treat `n <= 0` as "keep 4";
+  Python raises `ValueError`, but these Go constructors have no error return and
+  follow the existing clamp convention. Comments in the three packages.
+- **`TailWindowCompact` keeps usage records.** `NewTailWindowCompact(target)` and
+  the zero-LLM `NewTailWindow(trigger, target)` factory rewrite only the
+  transcript; Python's strategy drops pre-cut telemetry, while AGo preserves
+  source `UsageEvent`s because the event log is the usage report's source of
+  truth. Comment in `compact/compact.go`.
+- **`sync_to_thread` is not ported.** `observers.WithInterrupt`/`WithTimeout` are
+  supported; Go has no event loop or GIL, so timed callbacks run on their own
+  goroutine and untimed ones inline. Comment in `observers/observers.go`.
+
+Evidence: `stream/{join,timeout}_test.go`, `usage/collect_test.go`,
+`middleware/{retry,approval,chars_per_token}_test.go`,
+`observers/stream_options_test.go`, `policies/budget_chars_test.go`,
+`compact/{tail,trigger_chars}_test.go`.
+
+## D-099 — 2026-11-10 — toolpacks: read-only filesystem, restricted shell, custom runners and the skills runtime (gap audit 2026-11-09, wave 1)
+
+Ports W1-E's tool packs.
+
+- **Filesystem `read_only`.** `WithFilesystemReadOnly()` drops `write_file` and
+  `make_directory`; the remaining members are read-only (Python also drops
+  update/delete, which AGo never had).
+- **Restricted shell runs the checked argv.** `WithShellAllowed`,
+  `WithShellReadonly` (`ReadonlyCommands`) and `WithShellIgnore` switch on a mode
+  that tokenizes the command once and executes it without a shell, rejects shell
+  operators, matches allow/block prefixes by argv and base name, and refuses paths
+  that leave the workdir or match ignore globs. `check_ignore` resolves the
+  longest existing prefix physically before `Clean`, so `link/../x` and
+  `outlink/new` cannot escape through a symlink. AGO-DEVIATION:
+  `WithShellBlockPatterns` alone keeps its historical advisory substring match
+  (Python treats a blocked list alone as restricted mode); in restricted mode the
+  same list is matched word by word. Comment in `toolpacks/shell.go`.
+- **Custom language runners.** `LanguageRunner` (`InlineArgv` or
+  `FileExtension`+`FileRunnerArgv`) and `WithCodeRunners` override/extend
+  `DefaultLanguageRunners`; a language must have a runner before
+  `WithCodeLanguages` accepts it. **No built-in TypeScript runner** — that is the
+  recorded D-062 deferral; callers can register `tsx`/`ts-node` themselves.
+- **Skills metadata and resources.** `parseFrontmatterDocument` keeps version,
+  license, compatibility, allowed-tools and the nested `metadata` mapping;
+  lenient discovery skips a skill without a description, keeps the directory-name
+  fallback, and `ValidateSkillMetadata` is the strict install gate. Discovery
+  stops at 50 resources and reports `ResourcesTruncated`; `scripts/` is not a
+  resource.
+- **`MemorySkill`/`MemoryRuntime`.** Code-defined skills carry static or
+  per-load instructions and named resources; `NewSkillsToolkitFromRuntime` serves
+  them through the same list/load/read tools. AGO-DEVIATION: Python's
+  `MemorySkill` also carries in-process scripts; AGo omits them because
+  `run_skill_script` is deferred with the script runner (D-062).
+- **`NewSkillPlugin`.** Injects the `<available_skills>` catalog into the system
+  prompt and registers only the capability-gated tools (`load_skill`, plus
+  `read_skill_resource` when a skill has resources). XML text is escaped as
+  `& < >` only (Python `saxutils.escape`), not `xml.EscapeText`.
+
+Evidence: `toolpacks/{filesystem,shellfilter,coderunner,skills,middleware}_test.go`;
+the ignore-guard symlink attacks are pinned by `TestShellIgnoreSymlinkEscape`.
+
+## D-100 — 2026-11-10 — toolpacks/agui/mcpserver: tool-scoped middleware, AG-UI per-run client tools, MCP context provider and the HITL batch contract (gap audit 2026-11-09, waves 1e-2..1e-4)
+
+Closes the integration follow-ups between W1-C, W1-G and W1-E.
+
+- **Tool-scoped middleware on every ready-made pack.** `WithShellMiddleware`,
+  `WithFilesystemMiddleware`, `WithDDGMiddleware`, `WithTavilyMiddleware`,
+  `WithPerplexityMiddleware`, `WithDynamicMiddleware` and
+  `WithCodeRunnerMiddleware` feed `tools.WithMiddleware`; the first entry is the
+  outermost layer of the tool's own chain and agent middleware wraps it from
+  outside, matching `WithClientToolMiddleware` and Python's `middleware=`.
+- **AG-UI client tools ride the per-run seam.** `serveTurn`/`Server.begin` call
+  `RunWith(ctx, agent.RunOptions{Tools: clientToolsForRun(...)})`. The
+  construction-time `ClientTools()` option, the global per-stream map,
+  `clientToolSet` and `declareClientTools`/`withdrawTools` were deleted. Name
+  collisions with the agent's own tools (toolkit members included) are dropped
+  with a warning, and the tools live only for that run, so concurrent turns are
+  isolated and a failed history seed leaves nothing behind.
+- **The HITL batch contract is abandonment.** Python's `gather` cancels sibling
+  tasks after the first `HumanInputError`, and AGo closes `abandoned` and waits
+  for the batch goroutines (`wg.Wait`) before `Send` returns. A sibling may never
+  send its `ToolCallEvent` if it was cancelled before dispatch, so a per-call
+  event is not a contract; the batch still owes no result and no `ToolResultsEvent`
+  is published. Tests synchronize on sibling start instead of asserting an
+  unconditional per-call event.
+- **MCP request context is per request, as in Python.** `WithContextProvider`
+  runs once for `tools/list` and once for every `tools/call` (the ask and every
+  deterministic `WithTools` tool), and its `RequestScope{Variables,
+  Dependencies, Tools, Prompt}` feeds the agent's `RunOptions`,
+  `registeredToolOutcome` and `ToolMeta.Resolve`. Provider maps merge over the
+  server maps with the provider winning; nil fields keep the server default;
+  `Tools` are added and `Prompt` replaces the system prompt. A provider error is
+  a JSON-RPC `-32603` and nothing runs. `NewServer` snapshots
+  `WithVariables`/`WithDependencies`, so later writes to the caller's map do not
+  reach requests. AGO-DEVIATION: the server has no OAuth access-token store
+  (D-058), so the provider's token argument is always empty; the HTTP request
+  remains available as `RequestContext.HTTP`.
+
+Evidence: `toolpacks/middleware_test.go`, `agui/client_tools_test.go`,
+`tools/executor_test.go`, `mcpserver/agent_context_test.go`.
+
+## D-101 — 2026-11-10 — network: envelopes, manifests, passports, track record, inbox/rate and graph builders (gap audit 2026-11-09, wave 1f)
+
+Ports W1-F's single-host data-model additions.
+
+- **Labels and participant schema live on the manifest.** `Labels`,
+  `DefaultViewPolicy`, `KnobsSchema` and `ParticipantSchema` sit on
+  `ChannelManifest`; the wire key is `participant_schema` because `Participants`
+  already names the id list. The caller supplies the manifest and the hub fills
+  adapter defaults; an empty non-nil `Expectations` disables those defaults.
+- **Inbox is explicit and opt-in visible.** `Rule.Inbox{MaxPending, Overflow,
+  HighWater}` with `ErrInboxFull`, `Hub.AckInbox` and `InboxPending`.
+  `MaxPending=0` means "no cap" (Python's default is 1000); `HighWater=0` is 80%
+  and a negative value disables the signal. `drop_newest`/`drop_oldest` are real
+  policies (Python maps both to reject) and `AckInbox` decrements pending explicitly
+  instead of treating every send as acknowledgement. A client without an `Inbox`
+  rule keeps the old silent drop (`Err()==nil`, `Dropped()` counts); the rule is
+  the opt-in that makes the drop visible in `Err()` as `ErrInboxFull`. AGO-DEVIATION: an unknown
+  owner fails with `ErrNotFound` and a missing resume creates one on demand
+  (Python silently returns); the reason is recorded in `network/hubext.go`.
+- **Rate limiting is enforced by the hub.** `RateBlock`/`TokenBucket` with an
+  injectable clock and `ParseDuration`; protocol envelopes do not spend tokens.
+  Python stores `RateBlock` on the rule but never enforces it.
+- **Auth claims are not stored.** `AuthAdapter`/`NoAuth`/`ApiKeyAuth`/
+  `AuthRegistry`/`WithHubAuth` validate at `Register`; the scheme and claim live in
+  `Passport.Auth`, and the stored passport is the claim-free one (Python returns
+  the original). `remote_agent` has no check yet.
+- **Transitions drop priorities, `default_target` and `ContextEquals`.**
+  Per-transition priorities are list order; fall-through terminates, and the
+  sequence builder appends an always-matching `Terminate("sequence_complete")`
+  where Python uses `default_target`; `ContextEquals` is not ported. Discussion
+  and workflow adapter manifests do not carry Python's `turn_within` defaults
+  (no evaluator exists for that kind), and a workflow handoff target must name a
+  participant where Python trusts the tool's pick. Comments in
+  `network/transitions.go` and `network/adapters.go`.
+- **The Rule surface is flat.** The brief pins a flat eight-field `Rule`
+  (`InboundGlobs`/`OutboundGlobs`, `MaxDelegationDepth`/`MaxConcurrentChannels`,
+  `Rate`, `Inbox`, `ChannelTTLDefault`, `TaskTTLDefault`) in place of Python's
+  `limits.*` nesting; channel-type access is not ported. `ChannelTTLDefault`
+  (2h in `DefaultRule`) is applied by the TTL sweeper, while `TaskTTLDefault` is
+  stored and validated for parity but not applied — a task expires only from its
+  explicit deadline (D-104). AGO-DEVIATION comment in `network/rule.go`.
+- **Passports/resumes/track record.** Passport fields owner/provider/model/cost/
+  region/version/created_at (hub stamps version/created_at), resume fields
+  summary/domains/examples plus `AddResumeExample`, and an observed-capability
+  index updated on terminal tasks with dedup per task; `mirror_failed` has
+  `WithTaskEventHook`/`FireTaskEvent` and an ERROR log.
+- **Context helpers.** `SetContext`/`DeleteContext` (package functions and client
+  methods) validate that the channel is a workflow channel.
+
+Evidence: `network/{manifest,identity,rule,inbox,transitions,taskmirror}_test.go`.
+
+## D-102 — 2026-11-10 — mcpserver/acp: MCP tool metadata, structuredContent and ACP mode/commands (gap audit 2026-11-09, wave 1g)
+
+Ports W1-G's protocol surface. The AG-UI client-tool mechanism itself is recorded
+in D-100 after its move to the per-run seam.
+
+- **Tool metadata is per-name server config, not a tool field.**
+  `ServerConfig.ToolMeta`/`WithToolMeta` carry title, annotations, outputSchema and `_meta`
+  because `tools.Schema` has no such slots; `validateToolMeta` rejects an unknown
+  name or a non-object output schema with `ErrInvalidToolMeta`. AGO-DEVIATION:
+  Python attaches the metadata to `mcp_tool`; the Go tools.Tool value cannot.
+  Comments in `mcpserver/server.go` and `toolmeta.go`.
+- **structuredContent needs a declared output schema.** A tool that advertises an
+  output schema answers one JSON-object result as `structuredContent` as well as
+  text; without one the wire is unchanged. AGO-DEVIATION: Python answers
+  `structuredContent` for every Mapping result.
+- **The ask reply is heuristic.** The conversational `ask` reply is parsed as
+  JSON only when it looks like one object; Python validates it against the
+  agent's response schema and answers the validated object. Comment at
+  `askOutcome`.
+- **Request-scoped metadata.** `ToolMeta.Resolve(cx)` runs per request with the
+  request's variables/dependencies/`RequestDependency`; `RequestFromContext`
+  reaches the HTTP request through `cx.TurnContext()`. The per-request provider is
+  D-100.
+- **ACP typed updates.** `current_mode_update`/`available_commands_update` are
+  decoded and sent by both roles, surfaced as `acp.ModeChange`/
+  `acp.AvailableCommandsEvent` (registered in the events registry) and mapped by
+  `acp.EventOf`; `Bridge.OnUpdate` accepts them. Wire spelling follows the SDK
+  (nested `input.hint`).
+
+Evidence: `mcpserver/toolmeta_test.go`, `agui/client_tools_test.go`,
+`acp/updates_test.go`.
+
+## D-103 — 2026-11-10 — a2a/eval/live: client bindings and knobs, eval reporters/store and PCM-to-WAV (gap audit 2026-11-09, wave 1h)
+
+Ports W1-H.
+
+- **A2A client bindings are opt-in.** `Connect`/`WithTransport`/`WithPresetCard`
+  select JSON-RPC or REST lazily; `NewClient` without options keeps the old
+  JSON-RPC behavior. REST implements send/get/cancel with the documented status
+  mapping. Push-config methods on a REST-selected client return
+  `ErrBindingUnsupported` because AGo's `rest.go` serves no push routes;
+  AGO-DEVIATION: Python's SDK client carries push over whatever binding it
+  negotiated (comment in `a2a/client.go`), so the Go failure is a sentinel rather
+  than a fallback to JSON-RPC.
+  `WithInterceptors` and `WithHistoryLength` carry the remaining config knobs.
+- **`CardModifier` gets the HTTP request.** The Go hook is
+  `func(r *http.Request, card *AgentCard) (*AgentCard, error)`; Python's modifier
+  takes the card alone and reaches the caller only through the extended-card hook. The extra
+  request lets a hook vary the card by tenant/credentials (AGO-DEVIATION).
+  `CardCacheControl` sets the card route cache header; the extended-card modifier
+  is not ported because there is no extended-card route.
+- **Eval reporter replaces lifecycle events.** Python's `console_reporter`
+  subscribes to eval lifecycle events, which AGo does not emit (D-070). `Run`
+  takes a `Reporter` with `RunStarted`/`CaseEvaluated`/`RunCompleted` callbacks
+  and `ConsoleReporter` implements it; single runs only.
+- **Eval result store.** `WithStoreDir`/`WithLabel`/`StoreRun`/`LoadRun` persist a
+  `RunResult` under a sanitized `RunID` (traversal refused) and carry
+  `RunID`/`Label`/`CreatedAt`; traces stay beside the result in the existing JSON.
+- **`PCMToWAV` rejects partial frames.** Python's `wave` module silently writes a
+  trailing partial frame and leaves a header that disagrees with the data; Go
+  returns `ErrInvalidPCM` for a byte count that is not a whole frame and for bad
+  rate/channels, and `OpenAITranscriber` wraps raw PCM automatically
+  (AGO-DEVIATION).
+
+Evidence: `a2a/{clientconn,clientrest}_test.go`, `eval/{reporter,store,no_tool_errors}_test.go`,
+`live/wav_test.go`.
+
+## D-104 — 2026-11-10 — network: hub listeners, lifecycle, health, queries, checkpoints, peer cancel and client surface (gap audit 2026-11-09, wave 1b-J)
+
+Ports W1b-J's hub operations and client surface.
+
+- **Listeners and audit.** `HubListener` (nine hooks) plus `BaseHubListener` and
+  register/unregister; `AuditLog` is now a listener covering agents, channels,
+  tasks, turn failures and byte counts. `WithAuditSink` stays the narrow
+  expectation sink; the full log is `WithAuditLog`. AGO-DEVIATION: Python also
+  fires `participant_removed` and `participant_hidden`; Go has no
+  participant-index event yet. Comment in `network/listener.go`.
+- **Lifecycle, TTL and health.** `Start`/`Close`/`OpenHub`, a sweeper registry,
+  `SweepTTL` and `RegisterDefaultAdapters`; a channel without `ttl_seconds` lives
+  the default 2h from `DefaultRule` and the sweeper closes it. Task TTL is only
+  applied from an explicit deadline — `Rule.TaskTTLDefault` is stored for parity
+  and not applied, matching Python's unused field. `Health` reports
+  active tasks/sweepers but no `telemetry_log_bytes` because there are no
+  telemetry spans (AGO-DEVIATION in `network/lifecycle.go`).
+- **Queries and causation.** `QueryChannels`, `ReadWALRange`, `QueryAgents`,
+  `CanSend` (via `SendProber`, no state mutation) and `FindEnvelopeByCausation`;
+  the agent handler skips an already-answered causation envelope.
+- **Checkpoints.** `CheckpointTask`/`ReadTaskCheckpoint` are durable through the
+  WAL, first-writer wins, and `HubBackedCheckpointStore` implements
+  `task.CheckpointStore`. AGO-DEVIATION: Python binds a claim to a wire
+  connection's agent set; Go binds it to one agent id, and an empty writer is the
+  trusted in-process path that neither creates nor clears a claim. Comment in
+  `network/checkpoint.go`.
+- **Peer cancel.** The request shape and the one-cancel-per-sender limit match
+  Python; `Replay` rebuilds the limit from the WAL and terminal channels clear
+  `peerCancel` and the causation index. A panicking `Notifier` is contained and
+  reported through `OnDispatchFailed` instead of panicking the sender.
+- **Client surface.** `ResumePendingTurns`, `WaitForChannelEvent` (agent and
+  human), `SetRule`, human `OnEnvelope`/`NextEnvelope`/`ForChannel`,
+  `NewNetworkPlugin`, `ClientTask` and `ToolsFor`/`ExpectedNext`/`PendingTurnsFor`.
+  The per-channel feed is created on first delivery and bounded at 1024 with the
+  oldest evicted; each client counts evictions in `ChannelFeedDropped()` and logs
+  one warning per client (AGO-DEVIATION: Python's queue is unbounded). `say`
+  accepts one peer name because an envelope addresses one recipient, and the
+  current channel is bound by closure instead of Python's `ChannelInject`
+  (comment in `network/turns.go`).
+- **`NetworkContextPolicy` needs no assembly slot.** Python's policy prepends the
+  identity line on every LLM call as an assembly policy; the Go `plugin` package
+  has no policy slot (D-044), so `NewNetworkPlugin` ships the line as a static
+  prompt fragment. AGO-DEVIATION comment in `network/client_ext.go`.
+- **Rule shape and inbox.** The brief pins the flat eight-field `Rule`
+  (`InboundGlobs`/`OutboundGlobs`, `MaxDelegationDepth`/`MaxConcurrentChannels`,
+  `Rate`, `Inbox`, `ChannelTTLDefault`, `TaskTTLDefault`); `RateBlock` is enforced
+  (Python only stores), `MaxPending=0` means no cap (Python defaults to 1000),
+  and `RecordObservation`/`AckInbox` carry the deviations recorded in D-101.
+
+Evidence: `network/{listener,lifecycle,query,checkpoint,client_ext,turns}_test.go`;
+the channel-feed drop counter is covered by `TestChannelFeedIsBoundedAndCountsDrops`.

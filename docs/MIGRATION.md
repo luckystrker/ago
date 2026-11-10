@@ -88,7 +88,7 @@ reused). Full contract: `docs/specs/core.md` §2 and D-090.
 | Python | Go | Differences |
 |---|---|---|
 | `Agent(name, prompt=..., config=..., hitl_hook=..., tools=..., middleware=..., dependencies=..., variables=..., response_schema=..., tasks=..., stream=...)` | `agent.New(name, prompt string, opts ...agent.Option)` | Dataclass kwargs → option funcs: `WithConfig`, `WithHitlHook`, `WithTools`, `WithMiddleware`, `WithResponseSchema`, `WithDependencies`, `WithVariables`, `WithStreamBase`, `WithTasks`, `WithPromptFragments`, `WithPromptHook`, `WithPlugin` (D-044). Static prompt is one string; extra fragments via `WithPromptFragments`. No `observers`/`knowledge`/`assembly` kwargs (see §5) |
-| `await agent.ask(*msg, ...)` | `a.Ask(ctx, msgs ...agent.Sendable) (*AgentReply, error)` | Blocking convenience wrapper over `Run`. `Sendable = any` (string, `events.Input`, JSON value) replaces `*msg` variadic inputs; no per-call dependencies/variables/prompt overrides (D-037) — set `WithDependencies`/`WithVariables`/`WithPromptFragments` at construction |
+| `await agent.ask(*msg, config=, tools=, middleware=, observers=, plugins=, hitl_hook=, dependencies=, variables=, prompt=, response_schema=, stream=)` | `a.Ask(ctx, msgs ...agent.Sendable)`; per-call overrides via `a.AskWith(ctx, agent.RunOptions, msgs...)`, `a.RunWith`, `a.ResumeWith` | `Sendable = any` (string, `events.Input`, JSON value). `RunOptions` carries Stream/Config/Tools/Middleware/Observers/Plugins/HitlHook/Dependencies/Variables/Prompt/ResponseSchema/FreeText; zero value keeps the agent's settings (D-093a, D-097). `FreeText` is the explicit `response_schema=None` vs "not passed" distinction. `Ask`/`Run`/`Resume` remain the zero-option wrappers |
 | `async with agent.run(...) as run: reply = await run.result()` | `run, _ := a.Run(ctx, msgs...); run.Start(ctx); defer run.Close(); reply, err := run.Result(ctx)` | Python async context manager → explicit `Start`/`Result`/`Close`; `Close` ends the turn scope (unsubscribe, release per-stream lock) |
 | `run.enqueue(*msg)`, `run.stream` | `run.Enqueue(parts ...events.Input)`, `run.Stream() stream.Stream` | Mid-turn inbox parity |
 | `AgentReply.body` | `reply.Body() string` | `""` when the model returned no text (Python `None`) |
@@ -96,7 +96,7 @@ reused). Full contract: `docs/specs/core.md` §2 and D-090.
 | `reply.files`, `reply.history`, `await reply.usage()` | `reply.Files()`, `reply.History() *stream.History`, `reply.Usage() *usage.Report` | `Usage()` is a synchronous aggregation of the stream's `UsageEvent`s — no await |
 | `reply.ask(...)` / `reply.run(...)` | `reply.Ask(ctx, ...)` / `reply.Run(ctx, ...)` | Continuation on the same stream/context |
 | `resume(*events, ...)` | `a.Resume(ctx, evs ...events.Event) (*AgentReply, error)` | All but last event seed history; last is the re-entry trigger |
-| `as_tool(description=..., name=...)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040) /`WithToolDescription`; the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` and the child's source `UsageEvent` records (with `path`/`task_id`/`agent_name`) on the caller's stream — **no subtask rollup**; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (request and answer reach the parent only as `ChildEvent` observations — D-041/D-092). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too). `TaskCompleted.Usage` is a cumulative child-stream snapshot — never sum it with source usage records |
+| `as_tool(description=..., name=..., stream=, middleware=)` | `a.AsTool(opts ...agent.AsToolOption) tools.Tool` | Options `WithToolName` (default `task_<name>`, Python `subagent_tool.py` parity — D-040), `WithToolDescription`, `WithToolStream`, `WithToolStreamFactory` and `WithToolMiddleware`; `agent.PersistentStream()` is the shared-stream factory (D-097); the tool takes `objective` + optional `context` and each call runs the delegation machinery (`runTaskOn`): `TaskStarted`/`TaskCompleted`/`TaskFailed`/`TaskCancelled` and the child's source `UsageEvent` records (with `path`/`task_id`/`agent_name`) on the caller's stream — **no subtask rollup**; child variables are a scoped branch (COPIED deep-copied, LOCAL/reserved `ag:`/`a2a:` dropped, SHARED reused — D-090), dependencies are copied, HITL bridges to the parent's hook (request and answer reach the parent only as `ChildEvent` observations — D-041/D-092). A failed sub-task is the text `Sub-task '<name>' failed: …`; a HITL failure ends the calling turn (subtask tools `run_subtask`/`run_subtasks` live in `agent` too). `TaskCompleted.Usage` is a cumulative child-stream snapshot — never sum it with source usage records |
 | `agent.task(title, ...)` | `a.Task(ctx, title string, opts ...task.Option) (*task.Task, error)` | Checkpoint store / TTL / resume via `task.WithCheckpointStore`, `task.WithTTL`, `task.WithResumeFrom`; `agent.TaskWithCheckpointStore`, `agent.TaskWithTTL` forwards; the task always opens its own private stream (D-030) |
 | `PromptHook` (async prompt hook), `update_system_message` | `agent.WithPromptHook(fn agent.PromptHook)`, `agent.WithPromptFragments(...)` | `PromptHook func(*agocontext.Context) ([]string, error)` |
 | `Plugin` / `PluginTarget._apply_plugin` (`ag2/plugin.py`), `Agent(plugins=[...])` | `plugin.NewBundle(name)` builder (`.WithTool`, `.WithMiddleware`, `.WithPrompt`, `.WithPromptHook`) handed to `agent.WithPlugin(p plugin.Plugin)` | Applied once at agent construction — Python's turn-scoped `additional_plugins` attach/detach is not ported (D-044). Carried legs: tools append after the agent's own, middleware appends after the agent's own (innermost), fragments extend the collectors, hooks run like `WithPromptHook`. Not carried (no agent slot): plugin HITL hook, dependencies, variables, observers, assembly policies. A nil plugin contributes nothing |
@@ -113,7 +113,7 @@ reused). Full contract: `docs/specs/core.md` §2 and D-090.
 | `hitl_hook: HumanHook`, `default_hitl_hook` | `hitl.HumanHook`, `hitl.DefaultHook` (`→ hitl.ErrNotProvided`), `ctx.SetHitlHook(h)` | `HumanHook func(ctx context.Context, req *events.HumanInputRequest) (*events.HumanMessage, error)`; typed errors `NotProvidedError`/`FailedError`/`TimeoutError` match the Python `HumanInputError` family |
 | `Stream` Protocol, `MemoryStream`, `SubStream` | `stream.Stream`, `stream.MemoryStream`, `stream.SubStream` | Interfaces instead of protocols; `NewMemoryStream(opts ...MemoryOption)` with `WithStorage`/`WithStreamID`/`WithPersistAll`/`WithLogger`; `stream.LoadHistory(id, storage, evs)` to replay a saved transcript |
 | `stream.subscribe(..., interrupt=, condition=, timeout=)` | `Subscribe(fn stream.Subscriber, opts stream.SubscribeOptions) stream.SubID` | `Subscriber func(events.Event) error` (no context arg); `SubscribeOptions{Interrupt, Condition, Timeout}` |
-| `stream.where(cond)`, `stream.get(cond)`, `stream.join()` | `Where(c events.Condition) Stream`, `Get(c events.Condition) (events.Event, error)` | `Get` scans history + incoming; `join` has no direct equivalent — use `watch.EventWatch` (§5) |
+| `stream.where(cond)`, `stream.get(cond)`, `stream.join()` | `Where(c events.Condition) Stream`, `Get(c events.Condition) (events.Event, error)`, `stream.Join(ctx, s, JoinOptions{Condition, MaxEvents})` (also `(*MemoryStream).Join`/`(*SubStream).Join`) | `Get` scans history + incoming. `Join` is a pull iterator (`Next`/`Close`, `ErrJoinDone`/`ErrJoinClosed`); it is a function plus concrete methods, not a `Stream` interface method, so third-party streams keep compiling (D-098) |
 | `Storage` Protocol (`save_event/get_history/...`) | `stream.Storage` interface | `MemoryStorage` ships; the Redis backend is the optional `contrib/streamredis.NewStorage(rdb, opts...)` module (D-059). Durable logs go through `knowledge.EventLogWriter` |
 | `History.get_events()/replace()`, `unanswered_tool_calls`, `close_unanswered_tool_calls` | `stream.History.GetEvents()/Replace()`, `events.UnansweredToolCalls(evs)`, `events.CloseUnansweredToolCalls(evs)` | Repair helpers live in `events`, human-readable repair sentence preserved verbatim (Python HUMAN_INPUT_ABANDONED_TOOL_RESULT) |
 | `EstimatedTokens(event, chars_per_token=4)` | `events.EstimatedTokens(ev, charsPerToken)` | Same flat weights (image/audio 1000, video/document 2000) |
@@ -195,7 +195,7 @@ HTTP/SSE over `github.com/luckystrker/ago/internal/httpx` + `github.com/luckystr
 | `OpenAIResponsesConfig` (+ `containers.py`) | `config/openai.OpenAIResponsesConfig` — `NewOpenAIResponses(model)`; client `ResponsesClient` | **full** (D-060; closes the D-008 deferral — D-068) | Responses API over raw HTTP/SSE: input mapping incl. `FileIdInput` → `input_file.file_id`, hosted tools on the wire (web_search/file_search/code_interpreter/image_generation/shell container auto|reference/mcp/tool_search with `defer_loading`), hosted output items → builtin call/result events with second-call item replay, strict `text.format`, usage incl. cached/reasoning tokens. Fields: APIKey/BaseURL/Temperature/TopP/MaxOutputTokens/MaxToolCalls/Store(nil=default true)/ParallelToolCalls(nil=default true)/TopLogprobs/Metadata/PromptCacheKey/PromptCacheOptions/Reasoning{Effort,Summary}/ServiceTier/User/Truncation/Timeout/MaxRetries/Organization/Project/DefaultHeaders/ExtraBody; `Clone` takes Go names + snake_case aliases, nil clears. Deferred: containers, prompt-cache diagnostics events, reasoning-item replay, shell delta chunks, `websocket_base_url` |
 | `OpenAIDecisionsConfig` | `config/openai.OpenAIDecisionsConfig` — `NewOpenAIDecisions()` (model `DefaultDecisionsModel` "gpt-6-luna", `BooleanThreshold` 0.5); client `DecisionsClient` | **full** (D-060/D-068) | Decision-only schemas (bool, string enum, int enum from 0, 0..1 number — otherwise the schema-guidance error), one question per request, thresholded answers rendered through the schema, refusal as `*DecisionRefusedError{Name}`, usage normalization; `Descriptions`/`QuestionInstructions`/`SafetyIdentifier`/`ExtraBody` carried. Deferred: question-instruction parts as Input sequences |
 | `ag2/files/` (`FilesAPI`, `FilesClient` protocol), `config/openai/files.py`, `config/anthropic/files.py` | `github.com/luckystrker/ago/files`: `files.NewAPI(client files.Client) *files.API`, types `UploadedFile`/`FileContent`/`FileProvider`; provider clients via `(*openai.OpenAICompletionsConfig).CreateFilesClient()` and `(*anthropic.AnthropicConfig).CreateFilesClient()` | **full** (D-046) | `API` delegates `Upload/Read/List/Delete` and keeps Python's two upload validations (`files.ErrNoData`, `files.ErrFilenameRequired`); OpenAI: multipart upload (empty purpose → `assistants`), `has_more`/`after` pagination; Anthropic: `/v1/files` under `files-api-2025-04-14`, no purpose on upload, `next_page`/`page` pagination, 600s default timeout; non-2xx → per-provider `ErrFilesAPI`. Python's `created_at`/`media_type` survive in `Raw`. `containers.py` deferred; a file reference as a *message input* still fails fast (`events.FileIdInput` → `config.ErrUnsupportedInput`, D-017/D-020) |
-| `AnthropicConfig` | `config/anthropic.AnthropicConfig` — `NewAnthropic(model)` | **full** | Messages API over raw HTTP/SSE: `tool_use`/`tool_result` replay with orphan repair, prompt caching (`cache_control` injection on the last system block and last tool), thinking blocks + redacted-thinking handling, `default_headers` (incl. `anthropic-beta`), `metadata`/`service_tier`/`speed`, `extra_body` (merges last), `http_client`, usage incl. cache tokens; env `ANTHROPIC_API_KEY`. `Clone` keys match Go names and Python snake_case |
+| `AnthropicConfig` | `config/anthropic.AnthropicConfig` — `NewAnthropic(model)` | **full** | Messages API over raw HTTP/SSE: `tool_use`/`tool_result` replay with orphan repair, prompt caching (`cache_control` injection on the last system block and last tool), typed `ThinkingConfig` (enabled+budget/adaptive/disabled; sampling params dropped while on) with durable `ThinkingBlockEvent`/`RedactedThinkingEvent` replay before `tool_use`, `default_headers` (incl. `anthropic-beta` merged for messages and Files), per-input `cache_control`/`citations` via `VendorMetadata`, `CacheDiagnostics` with `previous_message_id` chaining, `metadata`/`service_tier`/`speed`, `extra_body` (merges last), `http_client`, usage incl. cache tokens; env `ANTHROPIC_API_KEY`. `Clone` keys match Go names and Python snake_case (D-095) |
 | `GeminiConfig` | `config/gemini.GeminiConfig` — `NewGemini(apiKey, model, opts...)` | **full** | `generateContent` + SSE streaming, function declarations, `usageMetadata` normalization (tool-use prompt tokens, thinking tokens), `WithHTTPClient` (D-094); env `GEMINI_API_KEY` |
 | `VertexAIConfig` | — (only the `ProviderVertexAI` enum value) | deferred (D-022) | Google auth chain not ported |
 | `BedrockConfig` (Converse) | `config/bedrock.BedrockConfig` — `NewBedrock(model)` | **stub** (D-008) | Config validates the model; `Create()` → `config.ErrNotImplemented` (needs SigV4 + botocore credential chain) |
@@ -205,7 +205,7 @@ HTTP/SSE over `github.com/luckystrker/ago/internal/httpx` + `github.com/luckystr
 | `ZAIConfig` | `config/zai.ZAIConfig` — `NewZAI(model)` | **full** (chat-compat subset) | Request knobs (`stop`, `seed`, `tool_choice`, `user_id`, `request_id`, `do_sample`, `meta`), `extra_headers`, `extra_body` (typed fields win, Python `_merge_extra_body`), `http_client`, `timeout`; the knowledge-base `retrieval` hosted tool is mapped (`tools.NewRetrieval`, D-094). Thinking flags, token-cache opt-out, sensitive-word check, Files API not ported (D-021); env `ZAI_API_KEY` |
 | `XAIConfig` (gRPC SDK) | `config/xai.XAIConfig` — `NewXAI(model)` | **stub** (D-008) | `Create()` → `config.ErrNotImplemented` (gRPC transport out of scope) |
 | `TypeSafeConfig` | `config/typesafe.TypeSafeConfig` — `NewTypeSafe(model)` | **stub** (D-008) | Same stub pattern (niche SDK out of scope) |
-| `input_acceptance.py` (`accepts_input`, `input_modalities`, …) | `config.AcceptsInput` / `config.DescribedDialect` (`config/input_acceptance.go`) | **ported** (W1-B, wave 1; recorded with D-094) | Static per-provider table over (position, source, kind) plus media-type filters; the provider-neutral dialect is inferred from the config type. Callers pre-check a part instead of letting the mapper fail the call, and the AG-UI server drops an unaccepted attachment with a warning (`agui/serve.go`, Python parity: `_accepted_parts`) |
+| `input_acceptance.py` (`accepts_input`, `input_modalities`, …) | `config.AcceptsInput` / `config.DescribedDialect` (`config/input_acceptance.go`) | **ported** (W1-B, wave 1; recorded with D-096) | Static per-provider table over (position, source, kind) plus media-type filters; the provider-neutral dialect is inferred from the config type. Callers pre-check a part instead of letting the mapper fail the call, and the AG-UI server drops an unaccepted attachment with a warning (`agui/serve.go`, Python parity: `_accepted_parts`) |
 | `ag2/mcp/sampling.py` pseudo-client (implements `ModelConfig` + `LLMClient`) | — | not ported | The MCP server product itself is ported (`mcpserver`, §5); the sampling pseudo-client — letting a *remote MCP client* borrow the local model — is not |
 
 Shared engine: `config.RunChatCompat` (the OpenAI Chat-Completions wire protocol used by
@@ -243,7 +243,7 @@ predicate combinators (D-005): `events.Condition`, `AllOf/AnyOf/Not/TypeOf/Equal
 | `TaskStarted/Progress/Completed/Failed/Expired/Cancelled`, `TaskSpec` | `events.TaskStarted` … `events.TaskCancelled`, `events.TaskSpec` | `TaskProgress` transient |
 | `Severity`, `ObserverAlert`, `HaltEvent` | `events.Severity` (`info…fatal`) / `events.ObserverAlert` / `events.HaltEvent` | Halt → synthetic `"HALTED: <reason>"` response in the agent |
 | Lifecycle: `ObserverStarted/Completed`, `CompactionStarted/Completed/Failed`, `AggregationStarted/Completed/Failed`, `EventLogFailed`, `UnknownEvent` | same names in `github.com/luckystrker/ago/events` | All transient |
-| `ProviderReplay` mixin + provider events (`OpenAIReasoningEvent`, `AnthropicRedactedThinkingEvent`) | — | Not separate events: provider-native replay state is handled inside each provider client's mapping |
+| `ProviderReplay` mixin + provider events (`OpenAIReasoningEvent`, `AnthropicRedactedThinkingEvent`) | `config/anthropic/ThinkingBlockEvent`/`RedactedThinkingEvent`/`CacheDiagnostics` (registered in the `events` registry and replayed by `ConvertMessages`) | Anthropic signed/redacted thinking is durable and joined with the following `ModelResponse` into one assistant turn (D-095). OpenAI reasoning items still travel in the client's `VendorMetadata` (D-060); anchor/turn roles have no Go equivalent |
 | Condition DSL (`Event.field == x`, `A \| B`, `~c`) | `events.Condition` + `AllOf/AnyOf/Not/TypeOf[T]/Equal/TypeOfAny` | Predicate functions instead of operator overloading (D-005) |
 | `events/voice.py` | — | Deferred (live/voice stack not ported) |
 
@@ -348,3 +348,75 @@ against the tree (a scratch module importing the root module and the contrib mod
 snippets name — knowledgesqlite, knowledgeredis, streamredis, otelx — via `replace`); the
 D-075/D-076 snippets (the polling watcher, the A2UI server) were compile-checked the same
 way on 2026-10-31.
+
+## 8. Gap-audit wave 1 (2026-11-09/10)
+
+New API from the wave-1 tasks, grouped by area. Symbols are the exported Go names in
+this tree; the decision records are D-095…D-104.
+
+### Agent, stream and runtime
+
+| Python | Go |
+|---|---|
+| `ask/run/resume(config=, tools=, middleware=, observers=, plugins=, hitl_hook=, dependencies=, variables=, prompt=, response_schema=, stream=)` | `AskWith`/`RunWith`/`ResumeWith` + `agent.RunOptions` |
+| `agent.task(description=, payload=, capability=)` | `(*Agent).TaskWithSpec(ctx, task.Spec, opts...)` |
+| `subagent_tool(stream=, middleware=)` / `persistent_stream()` | `AsTool(WithToolStream, WithToolStreamFactory, WithToolMiddleware)` / `agent.PersistentStream()` |
+| `background_agent_tool()` | `(*Agent).AsBackgroundTool()`; settle the goroutine with `Stream.WaitBackground()` |
+| `Agent(observers=...)` | `agent.WithObservers(obs...)` |
+| `subscribe(timeout=)` | `stream.SubscribeOptions.Timeout` + `stream.ErrSubscriberTimeout` |
+| `stream.join(max_events=, condition=)` | `stream.Join(ctx, s, stream.JoinOptions{Condition, MaxEvents})`, `Next`/`Close`, `ErrJoinDone`/`ErrJoinClosed` |
+| `collect_usage_events` | `usage.NewCollector` (`Collect`, `Records`, `Report`) |
+| `RetryMiddleware(max_retries, retry_on)` | `middleware.RetryMaxRetries` + `middleware.WithRetryOn` |
+| `ApprovalRequired(message, denied_message, allow_always)` | `middleware.WithApprovalMessage`, `WithDeniedMessage`, `WithAllowAlways` |
+| `chars_per_token` | `WithCharsPerToken` on `middleware.TokenLimiter`, `policies.TokenBudgetPolicy`, `compact.TokenTrigger` |
+| `observer(interrupt=, timeout=)` | `observers.WithInterrupt()`, `observers.WithTimeout(d)` |
+| `TailWindowCompact(target)` | `compact.NewTailWindowCompact(target)` / `compact.NewTailWindow(trigger, target)` |
+
+### Providers and media
+
+| Python | Go |
+|---|---|
+| Anthropic `thinking=` (via `extra_body`) | `anthropic.ThinkingConfig` (`Enabled`+`BudgetTokens`/`Adaptive`/`Disabled`), `ErrInvalidThinking` |
+| Anthropic thinking replay events | `anthropic.ThinkingBlockEvent`, `anthropic.RedactedThinkingEvent`, `anthropic.CacheDiagnostics` in the `events` registry |
+| `default_headers`, `anthropic-beta`, cache diagnostics | `AnthropicConfig.DefaultHeaders`, `CacheDiagnostics bool` |
+| `accepts_input` / `input_modalities` / `input_media_types` / `binary_kind_of` | `config.AcceptsInput`, `config.InputModalities`, `config.InputMediaTypes`, `config.BinaryKindOf`, `config.InputDialect` |
+| Chat Completions `input_audio`, `file`, `image_url.detail` | shared engine (`config/openaicompat.go`), `ErrUnsupportedInput` for invalid values |
+| Mistral `document_url`, array `content`/`ThinkChunk` | shared engine mapping to `ModelReasoning` (stream and non-stream) |
+
+### Tools, toolpacks and skills
+
+| Python | Go |
+|---|---|
+| `FilesystemToolkit(read_only=True)` | `NewFilesystemToolkit(root, WithFilesystemReadOnly())` |
+| `SandboxShellTool(allowed=, blocked=, ignore=, readonly=)` | `WithShellAllowed`, `WithShellBlockPatterns`, `WithShellIgnore`, `WithShellReadonly`; `ReadonlyCommands()` |
+| `CodeAdapter(runners=)` / `LanguageRunner` | `LanguageRunner{InlineArgv}` or `{FileExtension, FileRunnerArgv}`, `WithCodeRunners`, `DefaultLanguageRunners` |
+| `middleware=` on shell/filesystem/search/dynamic/code tools | `WithShellMiddleware`, `WithFilesystemMiddleware`, `WithDDGMiddleware`, `WithTavilyMiddleware`, `WithPerplexityMiddleware`, `WithDynamicMiddleware`, `WithCodeRunnerMiddleware` |
+| `SkillLoader.validate_skill_metadata`, `resources_truncated` | `toolpacks.ValidateSkillMetadata`, `SkillInfo.ResourcesTruncated` |
+| `MemorySkill` / `MemoryRuntime` | `toolpacks.NewMemorySkill`, `toolpacks.NewMemoryRuntime`, `NewSkillsToolkitFromRuntime` |
+| `SkillPlugin(...)` | `toolpacks.NewSkillPlugin(toolkit)` (catalog + capability-gated tools) |
+| `ClientTool(middleware=)` | `tools.WithClientToolMiddleware` |
+
+### AG-UI, MCP and ACP
+
+| Python | Go |
+|---|---|
+| `RunAgentInput.tools` (per-ask tools) | automatic: `ServeAgent`/`Server.begin` pass them as `agent.RunOptions.Tools`; no construction-time option |
+| `mcp_tool(title=, annotations=, output_schema=, meta=)` | `mcpserver.ServerConfig.ToolMeta` / `mcpserver.WithToolMeta(name, ToolMeta)`; `ToolMeta.Resolve` |
+| `MCPExecutionContext` / `MCP_REQUEST_CONTEXT_DEP` / `MCPRequestContextField` | `mcpserver.RequestDependency` + `*RequestContext`, `ServerConfig.Variables`/`Dependencies` |
+| `context_provider(get_access_token())` | `mcpserver.WithContextProvider(func(ctx, token, *RequestContext) (RequestScope, error))`; `RequestScope{Variables, Dependencies, Tools, Prompt}` |
+| `current_mode_update` / `available_commands_update` | `acp.ModeChange`, `acp.AvailableCommandsEvent`, `acp.EventOf`; `Emitter.Mode`/`AvailableCommands` |
+
+### Network, A2A, eval and live
+
+| Python | Go |
+|---|---|
+| envelope `task_id`/`trace_id`; manifest `labels`/`default_view_policy`/`knobs_schema`/`participant_schema` | `network.Envelope.TaskID`/`TraceID`; `network.ChannelManifest.Labels`/`DefaultViewPolicy`/`KnobsSchema`/`ParticipantSchema` |
+| passport/resume fields, `record_observation`, `agents_with_capability` | `network.Passport`, `network.Resume`, `AddResumeExample`, `Hub.RecordObservation`, `Hub.AgentsWithCapability` |
+| `LimitsBlock.inbox` (pending count decremented on outbound, `hub/core.py:2172`), `LimitsBlock.rate` | `network.InboxBlock`, `Hub.AckInbox` (explicit acknowledgement), `Hub.InboxPending`, `Rule.Rate`, `Hub.SetRule` |
+| `round_robin` / `sequence` graph builders | `network.NewRoundRobinGraph`, `network.NewSequenceGraph` |
+| auth adapters, `set_context`/`delete_context` | `network.AuthAdapter`/`NoAuth`/`ApiKeyAuth`/`AuthRegistry`/`WithHubAuth`; `SetContext`/`DeleteContext` and client methods |
+| hub listeners, health, queries, checkpoints, peer cancel, pending turns | `network.HubListener`/`BaseHubListener`, `Hub.Health`, `QueryChannels`/`ReadWALRange`/`QueryAgents`/`CanSend`, `CheckpointTask`/`ReadTaskCheckpoint`/`HubBackedCheckpointStore`, `ResumePendingTurns`/`WaitForChannelEvent`, `NewNetworkPlugin`, `ClientTask`, `ToolsFor`/`ExpectedNext` |
+| `A2AConfig(prefer=)` / `preset_card` / `interceptors` / `history_length` | `(*a2a.Client).Connect` + `a2a.WithTransport`, `WithPresetCard`, `WithInterceptors`, `WithHistoryLength` |
+| `card_modifier` / `card_cache_control` | `a2a.ServerConfig.CardModifier` / `CardCacheControl` |
+| `no_tool_errors()` / `console_reporter` / `store_dir`/`load_run` | `eval.NoToolErrors{}`, `eval.NewConsoleReporter`+`WithReporter`, `WithStoreDir`/`StoreRun`/`LoadRun` |
+| `voice_to_wav_buffer` | `live.PCMToWAV` (automatic in `OpenAITranscriber`) |
