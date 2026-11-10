@@ -108,6 +108,24 @@ func (s ToolsCalled) Score(_ context.Context, t *Trace) (Score, error) {
 	return boolScore(s.Name(), ok, details), nil
 }
 
+// NoToolErrors passes iff no tool error fired during the run (Python parity:
+// scorers/tools.py no_tool_errors — zero ToolErrorEvents). A tool that was
+// not found counts as a tool error, as it is-a ToolErrorEvent in Python.
+// Details name the first failing tool and its index into Trace.Events.
+type NoToolErrors struct{}
+
+func (NoToolErrors) Name() string { return "no_tool_errors" }
+
+func (s NoToolErrors) Score(_ context.Context, t *Trace) (Score, error) {
+	details := map[string]any{}
+	i, tool, failed := firstToolError(t)
+	if failed {
+		details["tool"] = tool
+		details["event_index"] = i
+	}
+	return boolScore(s.Name(), !failed, details), nil
+}
+
 // Threshold gates an inner scorer's numeric value at Min: pass iff
 // Value >= Min (Python parity: scorers/threshold.py with at_least; the at_most
 // upper bound is outside the AGo contract and deferred). The gate keeps the

@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Client is a transport-level A2A client: agent-card discovery plus the
-// request/response JSON-RPC methods against one server, the push-notification
+// request/response methods (JSON-RPC, or REST when the card or WithTransport
+// selects it) against one server, the push-notification
 // config surface, and the client-tools / HITL drivers (clienttools.go). Safe
 // for concurrent use.
 //
@@ -30,6 +32,18 @@ type Client struct {
 	headers    map[string]string
 	extensions []string
 	nextID     atomic.Int64
+
+	// Knobs (client_options.go). Zero values keep the plain behavior: post
+	// JSON-RPC to base+"/", no card resolution, no hooks.
+	preset       *AgentCard
+	prefer       string
+	historyLen   int
+	interceptors []CallInterceptor
+
+	// Resolved endpoint (interface selection, clientconn.go); guarded by
+	// connMu and set only after a successful Connect.
+	connMu   sync.Mutex
+	resolved *endpoint
 }
 
 // ClientOption configures a Client.
@@ -88,13 +102,19 @@ func NewClient(baseURL string, opts ...ClientOption) *Client {
 	return c
 }
 
-// AgentCard fetches and decodes the server's agent card.
+// AgentCard fetches and decodes the server's agent card; with WithPresetCard
+// it returns a copy of the injected card without any request.
 func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
+	if c.preset != nil {
+		return cloneCard(c.preset)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+c.cardPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build request: %v", ErrTransport, err)
 	}
-	c.applyHeaders(req)
+	if err := c.intercept(ctx, "agent-card", req); err != nil {
+		return nil, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: fetch agent card: %v", ErrTransport, err)
@@ -121,7 +141,7 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 // turn input-required answers with a Task record, which this method refuses —
 // use SendMessageTask or one of the drivers for extension/HITL exchanges.
 func (c *Client) SendMessage(ctx context.Context, msg *Message) (*Message, error) {
-	result, err := c.call(ctx, MethodMessageSend, map[string]any{"message": msg})
+	result, err := c.sendRaw(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +166,7 @@ func (c *Client) SendMessage(ctx context.Context, msg *Message) (*Message, error
 // TasksGet fetches one task by id; ErrTaskNotFound when the server does not
 // know it.
 func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
-	result, err := c.call(ctx, MethodTasksGet, map[string]any{"id": taskID})
+	result, err := c.getRaw(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +180,7 @@ func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
 // TasksCancel cancels a submitted/working task and returns its record; a
 // terminal task yields ErrTaskNotCancelable.
 func (c *Client) TasksCancel(ctx context.Context, taskID string) (*Task, error) {
-	result, err := c.call(ctx, MethodTasksCancel, map[string]any{"id": taskID})
+	result, err := c.cancelRaw(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +193,19 @@ func (c *Client) TasksCancel(ctx context.Context, taskID string) (*Task, error) 
 
 // call performs one JSON-RPC exchange and returns the raw result on success.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	ep, err := c.endpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ep.binding == bindingREST {
+		// AGO-DEVIATION: the push-notification config methods exist on
+		// JSON-RPC only in this package (rest.go serves no push routes); a
+		// REST-selected client refuses them with ErrBindingUnsupported rather
+		// than silently speaking JSON-RPC to a REST-only server. Python's SDK
+		// client carries push over whatever binding it negotiated.
+		return nil, fmt.Errorf("%w: %s needs the JSON-RPC binding; this client resolved REST",
+			ErrBindingUnsupported, method)
+	}
 	id := c.nextID.Add(1)
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
@@ -187,12 +220,14 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode request: %v", ErrTransport, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+rpcPath, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.rpcURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("%w: build request: %v", ErrTransport, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.applyHeaders(req)
+	if err := c.intercept(ctx, method, req); err != nil {
+		return nil, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrTransport, method, err)
@@ -224,6 +259,18 @@ func (c *Client) applyHeaders(req *http.Request) {
 	if len(c.extensions) > 0 {
 		req.Header.Set(HeaderA2AExtensions, strings.Join(c.extensions, ","))
 	}
+}
+
+// intercept stamps the configured headers, then runs the interceptors in
+// registration order; the first failure aborts the request.
+func (c *Client) intercept(ctx context.Context, method string, req *http.Request) error {
+	c.applyHeaders(req)
+	for _, fn := range c.interceptors {
+		if err := fn(ctx, method, req); err != nil {
+			return fmt.Errorf("%w: interceptor for %s: %w", ErrTransport, method, err)
+		}
+	}
+	return nil
 }
 
 // ValidateExtensions fetches the agent card and reconciles the client's

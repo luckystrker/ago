@@ -10,7 +10,11 @@
 // webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
 // execution drivers, context-variable sync and HITL-over-the-wire on
 // Message.metadata, the REST transport routes, and the declarative security
-// schemes of security.py (D-056). Still deferred: the conversational A2AClient
+// schemes of security.py (D-056). The client also speaks the REST binding,
+// selects the card interface (with the 1.0 protocol-version check), takes a
+// preset card and request interceptors (clientconn.go, clientrest.go), and the
+// server rewrites the served card per request (ServerConfig.CardModifier,
+// CardCacheControl). Still deferred: the conversational A2AClient
 // turn machinery (full history shipping, reconnect/resubscribe), gRPC and
 // card JWS signing/verification (D-056).
 package a2a

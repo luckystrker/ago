@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/internal/uuid"
 )
 
 // Case is one unit of evaluation: a prompt for the agent, an optional Expected
@@ -44,6 +45,12 @@ type CaseResult struct {
 type RunResult struct {
 	Cases    []CaseResult `json:"cases"`
 	PassRate float64      `json:"pass_rate"`
+	// RunID names the run in a result store (store.go); Run stamps a fresh
+	// one. Label is the optional WithLabel tag; CreatedAt the start time.
+	// Results written before these fields existed load with them empty.
+	RunID     string    `json:"run_id,omitempty"`
+	Label     string    `json:"label,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitzero"`
 }
 
 // RunOption tunes a Run.
@@ -51,6 +58,9 @@ type RunOption func(*runOptions)
 
 type runOptions struct {
 	concurrency int
+	label       string
+	storeDir    string
+	reporter    Reporter
 }
 
 // WithConcurrency caps how many cases ask the agent at once (Python parity:
@@ -62,6 +72,27 @@ type runOptions struct {
 // interleaving.
 func WithConcurrency(n int) RunOption {
 	return func(o *runOptions) { o.concurrency = n }
+}
+
+// WithLabel tags the run (RunResult.Label) — a human name for a result store
+// entry, such as the prompt or model variant under test (Python parity:
+// run_agent's label).
+func WithLabel(label string) RunOption {
+	return func(o *runOptions) { o.label = label }
+}
+
+// WithStoreDir persists the finished run to dir as <RunID>.json (StoreRun;
+// Python parity: run_agent's store_dir). A failed write returns the complete
+// RunResult together with the error, so the grading is never lost to a full
+// disk.
+func WithStoreDir(dir string) RunOption {
+	return func(o *runOptions) { o.storeDir = dir }
+}
+
+// WithReporter subscribes a Reporter to the run's progress (see
+// ConsoleReporter).
+func WithReporter(r Reporter) RunOption {
+	return func(o *runOptions) { o.reporter = r }
 }
 
 // DefaultConcurrency is how many cases Run asks at once (Python parity:
@@ -91,14 +122,29 @@ func Run(ctx context.Context, a *agent.Agent, s Suite, opts ...RunOption) (*RunR
 	if limit > len(s) {
 		limit = len(s)
 	}
-	res := &RunResult{Cases: make([]CaseResult, len(s))}
+	res := &RunResult{
+		Cases:     make([]CaseResult, len(s)),
+		RunID:     uuid.New(),
+		Label:     o.label,
+		CreatedAt: time.Now().UTC(),
+	}
+	if o.reporter != nil {
+		o.reporter.RunStarted(len(s), o.label)
+	}
+	// do runs case i and reports it; each slot is written by one goroutine.
+	do := func(i int) {
+		res.Cases[i] = runCase(ctx, a, s[i])
+		if o.reporter != nil {
+			o.reporter.CaseEvaluated(res.Cases[i])
+		}
+	}
 	if len(s) == 0 {
-		return res, nil
+		return finishRun(res, o)
 	}
 	if limit == 1 {
 		// Deterministic mode: suite order, no goroutines (see WithConcurrency).
 		for i := range s {
-			res.Cases[i] = runCase(ctx, a, s[i])
+			do(i)
 		}
 	} else {
 		// The semaphore bounds the in-flight cases; each slot writes
@@ -112,7 +158,7 @@ func Run(ctx context.Context, a *agent.Agent, s Suite, opts ...RunOption) (*RunR
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				res.Cases[i] = runCase(ctx, a, s[i])
+				do(i)
 			}(i)
 		}
 		wg.Wait()
@@ -125,6 +171,20 @@ func Run(ctx context.Context, a *agent.Agent, s Suite, opts ...RunOption) (*RunR
 	}
 	if len(res.Cases) > 0 {
 		res.PassRate = float64(passed) / float64(len(res.Cases))
+	}
+	return finishRun(res, o)
+}
+
+// finishRun notifies the reporter and persists the result to the store
+// directory, if configured.
+func finishRun(res *RunResult, o runOptions) (*RunResult, error) {
+	if o.reporter != nil {
+		o.reporter.RunCompleted(res)
+	}
+	if o.storeDir != "" {
+		if _, err := StoreRun(o.storeDir, res); err != nil {
+			return res, err
+		}
 	}
 	return res, nil
 }

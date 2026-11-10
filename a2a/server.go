@@ -95,6 +95,23 @@ type ServerConfig struct {
 	// deployments, where a rebinding page reaches the server with its own
 	// Host. Nil disables the check.
 	AllowedHosts []string
+	// CardModifier rewrites the card served on the discovery routes per
+	// request (parity: server.py card_modifier — tenant- or caller-specific
+	// cards). It receives a deep copy, so mutate-and-return never leaks into
+	// the long-lived card; returning a nil card serves the (mutated) copy. An
+	// error answers 500 with a fixed message. The modified card is served
+	// verbatim: discovery defaults are not re-applied. Nil serves the static
+	// card. The hook must be safe for concurrent use.
+	//
+	// AGO-DEVIATION: Python's card_modifier takes the card alone; the extra
+	// *http.Request lets a hook vary the card by caller (tenant header,
+	// credentials) without a request-scoped context channel, which the
+	// a2a-sdk provides through ServerCallContext on the extended-card hook.
+	CardModifier func(r *http.Request, card *AgentCard) (*AgentCard, error)
+	// CardCacheControl, when non-empty, is sent as the Cache-Control header
+	// of the discovery routes (parity: build_jsonrpc card_cache_control), for
+	// example "public, max-age=300". Empty sends no header.
+	CardCacheControl string
 	// AllowedOrigins, when non-empty, requires every request carrying an
 	// Origin header (browsers send it cross-origin) to match one entry
 	// exactly (scheme://host[:port], case-insensitive). Requests without
@@ -177,7 +194,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, http.StatusOK, &s.card)
+		s.serveCard(w, r)
 	case r.URL.Path == rpcPath:
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -188,6 +205,46 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// serveCard answers a discovery request: the static card, or the
+// CardModifier's per-request rewrite of a deep copy of it.
+func (s *Server) serveCard(w http.ResponseWriter, r *http.Request) {
+	card := &s.card
+	if s.cfg.CardModifier != nil {
+		clone, err := cloneCard(&s.card)
+		if err != nil {
+			http.Error(w, msgInternalError, http.StatusInternalServerError)
+			return
+		}
+		out, err := s.cfg.CardModifier(r, clone)
+		if err != nil {
+			http.Error(w, msgInternalError, http.StatusInternalServerError)
+			return
+		}
+		card = clone
+		if out != nil {
+			card = out
+		}
+	}
+	if s.cfg.CardCacheControl != "" {
+		w.Header().Set("Cache-Control", s.cfg.CardCacheControl)
+	}
+	writeJSON(w, http.StatusOK, card)
+}
+
+// cloneCard deep-copies a card through its wire form, so a modifier can
+// mutate slices and maps freely.
+func cloneCard(card *AgentCard) (*AgentCard, error) {
+	data, err := json.Marshal(card)
+	if err != nil {
+		return nil, err
+	}
+	var out AgentCard
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // admit applies the request gates — the Authorize hook, then the Host and
