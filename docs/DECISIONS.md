@@ -50,6 +50,8 @@ provider-aware validator appears.
 
 ## D-008 — 2026-10-28 — Provider surface for wave 1
 
+> **Reduced by D-111** — the Z.AI and Mistral vendor knobs of the Provider surface are ported; the xAI/Bedrock/TypeSafe stubs stand.
+
 Full implementations over raw HTTP: **openai** (chat completions + SSE streaming + tools +
 structured output + usage normalization), **anthropic** (messages + SSE + tools + prompt
 caching), **gemini** (generateContent + tools), **ollama** (chat + tools).
@@ -95,6 +97,8 @@ fan out over packages via dynamic workflows, one subagent per package with build
 subtlety. Wave 4 is a whole-repo fix loop to green.
 
 ## D-013 — 2026-10-29 — middleware package: brief-driven simplifications vs Python builtins
+
+> **Reduced by D-106** — `middleware.Metrics` and `middleware.Describe` are ported, so the "no `metrics` builtin" remark no longer holds; the other simplifications stand.
 
 Implemented against the wave-1 brief (events-network.md §2 + the porting ask), which
 simplifies the Python builtins. All marked `// AGO-DEVIATION` in code:
@@ -149,6 +153,8 @@ Deviations marked `// AGO-DEVIATION` in `usage/` and `task/`:
   raising (Python `from_dict` defensiveness parity).
 
 ## D-015 — 2026-10-29 — response: schema envelope and validation semantics in Go
+
+> **Reduced by D-107** — the callable response schema (`response.NewCallableSchema`) and the non-embedded scalar schema (`WithSchemaEmbed(false)`) are ported; the rest of this entry stands.
 
 The `response` package normalizes Python's `make_adapter` embedding rules and adapts
 validation to stdlib `encoding/json`:
@@ -283,6 +289,8 @@ Wave-1 config brief implemented (`config/config.go`, `config/client.go`,
 
 ## D-018 — 2026-10-29 — testing: scripted doubles in Go (TestConfig/TrackingConfig)
 
+> **Reduced by D-107** — `agotest.NewTestScript` now carries the Turn vocabulary (`Text`, `Reply`, `ToolCall`, `Fail`, `Publish`) and `SetRaiseToolErrors`; full-response scripts remain valid.
+
 Package `testing` (package name `agotesting`, import alias `agotest "ago/testing"` —
 avoids clashing with the stdlib testing package). Deviations vs Python
 `ag2/testing.py`, marked `// AGO-DEVIATION` in code:
@@ -354,6 +362,8 @@ provider skin over `config.RunChatCompat`; deviations, marked `// AGO-DEVIATION`
 
 ## D-020 — 2026-10-29 — config/anthropic: Messages API provider on raw HTTP/SSE
 
+> **Reduced by D-110** — Files API refs, the prefix cache breakpoint, `NativeStructuredOutput`, `pause_turn` and server-tool events are ported; the rest of this entry stands.
+
 Wave-1 provider brief implemented (`config/anthropic/`: config.go, mappers.go, client.go).
 Parity with `ag2/config/anthropic/` over `internal/httpx` + `internal/sse` (no SDK).
 Deviations, marked `// AGO-DEVIATION` in code:
@@ -402,6 +412,8 @@ Deviations, marked `// AGO-DEVIATION` in code:
   not a Chat-Completions dialect, so it does not reuse the shared openaicompat engine.
 
 ## D-021 — 2026-10-29 — provider packages zai/mistral/dashscope (chat-compat) and stubs xai/bedrock/typesafe
+
+> **Reduced by D-111** — Z.AI thinking/token-cache/sensitive-word knobs and Mistral guardrails/prediction/`prompt_mode`/logprobs are ported; the Files API clients stay out.
 
 Wave-1 provider brief implemented as `config/zai`, `config/mistral`,
 `config/dashscope`, `config/xai`, `config/bedrock`, `config/typesafe`. The
@@ -453,6 +465,8 @@ stubs exist as configs only. Deviations, marked `// AGO-DEVIATION` in code:
 
 ## D-022 — 2026-10-29 — config/gemini & config/ollama: raw-REST providers, field visibility, usage mapping
 
+> **Reduced by D-111** — Ollama streaming and the Gemini cached-content/modalities/image/thinking/input-metadata knobs are ported; Vertex AI stays deferred.
+
 Wave-1 provider brief for gemini + ollama implemented over raw HTTP (`config/gemini/`,
 `config/ollama/`), on `internal/httpx`. Deviations, marked `// AGO-DEVIATION` in code:
 
@@ -495,6 +509,8 @@ Wave-1 provider brief for gemini + ollama implemented over raw HTTP (`config/gem
 
 ## D-023 — 2026-10-29 — spec: AgentSpec serialization (FromAgent / ToAgent)
 
+> **Reduced by D-107** — `spec.FromAgent` now captures the response schema and `ToAgent` restores it as a `RawSchema`.
+
 Package `spec` (wire copy of Python `ag2/spec.py`). Deviations, marked
 `// AGO-DEVIATION` in code:
 
@@ -519,6 +535,8 @@ Package `spec` (wire copy of Python `ag2/spec.py`). Deviations, marked
   fragments keep their order and re-enter the turn as one static fragment.
 
 ## D-024 — 2026-10-29 — watch: pull-model Wait replaces the push arm/disarm protocol
+
+> **Superseded by D-106** — `CronWatch` and `CadenceWatch` are ported (own cron parser, pull-model, validated at construction); the pull-model decision itself stands.
 
 Package `watch` ports `ag2/watch.py` minus the cron variants (CronWatch and the
 CadenceWatch size-or-time batching are deferred — no consumer needs them yet and
@@ -551,6 +569,8 @@ in `watch/`:
   inside a spawned goroutine.
 
 ## D-025 — 2026-10-29 — observers: direct stream subscription, contract-pinned built-ins
+
+> **Extended by D-106** — `LoopDetector` also detects repeated tool calls, and `BaseObserver` and the `TokenMonitor` thresholds exist.
 
 Package `observers` ports `ag2/observers/` to the brief's AGo contract. Deviations,
 marked `// AGO-DEVIATION` in `observers/`:
@@ -712,6 +732,8 @@ Deviations, marked `// AGO-DEVIATION` in code:
   anonymous types fall back to the full reflect string).
 
 ## D-029 — 2026-10-29 — mcp: minimal client over one persistent session
+
+> **Superseded by D-108 and D-109** — `input_required` answering, protocol-era negotiation, the `Toolkit` discovery cache, connection options and the standalone GET channel are ported; "minimal client" no longer holds.
 
 Wave-3 brief implemented as `mcp/` (config.go, jsonrpc.go, transport.go, http.go,
 stdio.go, client.go, content.go, tools.go). JSON-RPC 2.0 over streamable HTTP
@@ -1158,6 +1180,8 @@ pairs, the uri-before-framework guard order, and the attach helper round trip.
 
 ## D-046 — 2026-10-30 — files: the Files API moves out of deferred — ago/files plus OpenAI and Anthropic clients
 
+> **Reduced by D-110** — a `FileIdInput` is now mapped by Chat Completions (OpenAI dialect) and by Anthropic.
+
 `ag2/ag2/files/` and the two provider `files.py` modules port to `ago/files` and to
 `FilesClient`/`CreateFilesClient` in `ago/config/{openai,anthropic}`. The package direction
 is fixed by the cycle risk: `ago/files` imports no config package; `config/<provider>`
@@ -1204,6 +1228,8 @@ both pagination shapes (0/1/3 pages), delete, non-2xx → `ErrFilesAPI`, and
 `CreateFilesClient` key resolution (explicit → env → `ErrNotProvided`).
 
 ## D-047 — 2026-10-30 — tools: hosted builtin tools become schema carriers; anthropic/gemini mappers map them
+
+> **Reduced by D-112** — per-call `Variable` kwargs (`With<Carrier>Variable`) and the Google Maps carrier with its Gemini mapping are ported; Gemini server-tool replay stays deferred.
 
 The nine builtin tools (`ag2/ag2/tools/builtin/`: web_search, web_fetch,
 code_execution, file_search, image_generation, shell, memory, mcp_server,
@@ -1738,6 +1764,8 @@ appenders. Gates: root suite green with the root `go.mod` untouched, plus
 
 ## D-058 — 2026-10-30 — mcp: the serving side ported as a stateless subset (ago/mcpserver supersedes the D-010 deferral for this slice)
 
+> **Reduced by D-109** — resources, prompts, sessions/`Mcp-Session-Id`, SSE answers with resume, elicitation/sampling back-channel, progress and argument validation are ported; the modern era, pause/resume, MCP Apps and OAuth stay out.
+
 Owner directive, same wave as D-049/D-052/D-053. `ago/mcpserver` ports the serving
 side of `ag2/ag2/mcp/` (server.py, executor.py, tools.py, transport.py) as a
 stateless MCP server exposing one Ask bridge as the conversational `ask` tool,
@@ -1804,6 +1832,8 @@ stream shape, construction refusals, the never-answering-tool guard, and the
 content-mapping branches (unit).
 
 ## D-060 — 2026-10-30 — config/openai: the Responses API and the Decisions API are ported; hosted tools have their OpenAI client
+
+> **Reduced by D-110** — the Decisions instruction parts (`QuestionInstructionParts`) and the shell command/output delta events are ported; the other deferred Responses items stand.
 
 Supersedes the D-008 deferral of `openai_responses_client.py` /
 `openai_decisions_client.py` for this slice (owner directive), and closes the
@@ -1978,6 +2008,8 @@ exclusion, strict gate, scorer rates, summary),
 serialization, clamp, Trace.Err stamping), plus the pre-existing suite.
 
 ## D-062 — 2026-10-30 — toolpacks: the ready-made tool packs port as ago/toolpacks (shell, local code runner, filesystem, search, skills)
+
+> **Reduced by D-112 and D-115** — D-112 ports filesystem `update_file`/`delete_file`/raw read, the Tavily parameters, `run_skill_script`, multi-runtime skills and the execution-backend seam; D-115 ports the Docker and Daytona sandboxes as `contrib/sandboxdocker` and `contrib/sandboxdaytona`. The Tenki sandbox and the TypeScript runner stay deferred.
 
 Owner directive. `ago/toolpacks` builds the ready-made tools of ag2/ag2/tools/ on
 the ago/tools framework; every constructor returns a `tools.Tool` implemented over
@@ -3123,6 +3155,8 @@ Gates `go test -count=1 ./agent/...` green 2026-11-03.
 
 ## D-084 — 2026-11-02 — agent: upstream `assembly=` deprecation has nothing to port; no `HaltCheckMiddleware`
 
+> **Superseded in part by D-107** — `middleware.HaltCheck()` is now a public middleware (the "no `HaltCheckMiddleware`" half is closed); the `assembly=` half and the built-in halt in the turn loop stand.
+
 Upstream deprecates the `Agent(assembly=...)` parameter in favor of explicit middleware and extracts
 the private halt check into a public `HaltCheckMiddleware` (`ag2/middleware/halt.py`, commit
 4d5773e7b, PR #3545).
@@ -4183,3 +4217,543 @@ subprocess: streamed text, tool round trip, usage, session reuse, no process
 after `Close`; crash → typed error) and two DeepSeek review rounds (163 mutants
 over five files, 2 equivalent survivors).
 
+
+## D-106 — 2026-11-10 — watch/observers/middleware/policies: cron and cadence watches, BaseObserver, loop/token thresholds, Metrics and Describe, policy transparency (gap audit 2026-11-09, wave 3, W3-C1)
+
+Closes the D-024 deferral (CronWatch/CadenceWatch), the D-013 "no `metrics`
+builtin" deferral and the observer/policy gaps of the audit. All four
+packages stay backward compatible: every old constructor keeps its behavior.
+
+- **`watch.CronWatch(expression, opts...)` and `watch.CadenceWatch(stream, n,
+  maxWait, opts...)`.** Pull model like the rest of the package (D-024).
+  Python has no cron dependency either; AGo ports its own five-field parser
+  (`*`, `a`, `a-b`, `*/step`, `start/step`, lists, `SUN..SAT`, 7 = Sunday,
+  day-of-month AND day-of-week, a one-year search horizon with a `now+1h`
+  fallback). `WithCronNow` injects the clock. `CadenceWatch` returns a
+  `BatchWatch` that fires on N events or after `maxWait`; the subscription
+  lives for one `Wait`.
+- **Cron fields are validated at construction.** Out-of-range or malformed
+  fields (`60 * * * *`, `* * * * 8`, `0 24`, a reversed range `5-3`) are
+  rejected by `CronWatch`; Python only fails (or silently wraps: `8 % 7`, an
+  empty range) when it searches. The search advances on absolute time, so DST
+  is handled by `time.Time.Add`. The reviewer ran 41 expressions × 6 instants
+  against the Python parser: every difference was one of those invalid inputs.
+- **`observers.NewBaseObserver(name, process, opts...)`.** Python arms a Watch
+  to collect batches; AGo batches inline in the stream subscription
+  (`WithBatchSize`, `WithBatchWindow`, `WithProcessTimeout`,
+  `WithObserverCondition`) because the Watch protocol is pull-model. Errors and
+  timeouts of `process` are logged and never surface in `Stream.Send`.
+- **`LoopDetector`** now also detects repeated `ToolCallEvent`s with the same
+  name and arguments (Python's only mode), with `WithLoopWindowSize`,
+  `WithLoopName`, `WithLoopTimeout`; the earlier model-text detection is kept
+  (D-025) so existing users keep their alerts. Default names are
+  `loop_detector` and `token_monitor` (underscore), not Python's
+  `loop-detector`/`token-monitor`.
+- **`TokenMonitor`** gains `NewTokenMonitorThresholds(warn, alert)` (warning
+  at `>= warn`, critical at `>= alert`, each fired once) beside the single
+  budget constructor. A reported `TotalTokens` wins and prompt+completion is
+  the fallback for hand-assembled usage; Python takes the max of the two.
+- **`middleware.Metrics(registry, opts...)`** ports Python's
+  `MetricsMiddleware`: nine instruments with Python's names and labels, on a
+  stdlib `MetricsRegistry` (`NewMetricsRegistry`, export through `Samples()`;
+  no OpenTelemetry — that stays `contrib/otelx`, D-064). The agent label comes
+  from the `ago:agent` dependency (D-107) or `WithMetricsAgentName`. Two
+  deviations: `error_type` is the Go type name of the error, and a
+  `ToolErrorEvent` answer is labelled `tool_error`, because Go errors are
+  wrapped and the event carries text; the registry reads the agent's
+  `ago:config` through reflection so `middleware` does not import `config`
+  (the import graph stays `middleware → events, context, stream`).
+- **`middleware.Describe`/`DescribeFactory` and `MiddlewareDescription`** for
+  every builtin. Python describes the factory object; a Go `Factory` is a
+  closure with no identity, so `DescribeFactory` builds one per-turn instance
+  and describes that. A custom retry filter reports `retry_on: "custom"` and
+  `Complete: false`.
+- **`policies`.** `WithWindowTransparency`, `WithBudgetTransparency`,
+  `WithEpisodicTransparency` add the "N earlier events omitted" note;
+  `ValidateOrder` returns Python's ordering warnings. Window and budget count
+  the *conversational* subset of the events (D-030), not Python's raw list.
+  **Episodic transparency is off by default**, where Python turns it on:
+  turning it on would change every model input of an existing user; parity is
+  one option away (reviewer-confirmed).
+
+Verified by tables on a fake clock (minute, hour, day, week, month, year
+boundaries), a real agent turn with a tool call and a HITL approval for the
+metric counters, and the repository mutation tool (cron 39/42, loop detector
+12/15, metrics 39/43; every survivor equivalent except the cron horizon
+boundary `1 16 10 11 WED`, which no test pins — recorded in `known-issues.md`).
+
+## D-107 — 2026-11-10 — middleware/response/spec/testing/compact/knowledge/agent: halt middleware, callable and non-embedded response schemas, spec schema round trip, scripted Turns, round-aware compaction, per-path subscriptions, `ago:agent` (gap audit 2026-11-09, wave 3, W3-C2)
+
+- **`middleware.HaltCheck()`** (Python `middleware/halt.py`) is the public
+  halt middleware. **Supersedes the "no `HaltCheckMiddleware`" half of D-084**:
+  place it after the layer that sends `HaltEvent`; its subscription lives for
+  one turn. The built-in halt in `agent/turn.go` stays. `examples/safety_halt`
+  now uses it instead of a local copy.
+- **`response.NewCallableSchema[T](validate, opts...)`** ports the
+  `@response_schema` decorator: the answer is decoded into `T` through
+  `Schema[T]` (same JSON schema and envelope; `WithCallableName`,
+  `WithCallableDescription`, `WithCallableJSONSchema`, `WithCallableEmbed`) and
+  the validator receives the typed value. `response.NewRawCallable` hands over
+  the raw text (Go-only). The validator's dependencies come from the
+  conversation context (`ctx.Dependency`/`Variable`), not `fast_depends`:
+  injection lives in `tools` (`aginject`), which imports `response`, so a port
+  inside `response` would be an import cycle. `SystemPrompt()` is empty (Python
+  keeps `system_prompt=None` and relies on provider-native schemas).
+- **`response.NewSchema[T](name, desc, response.WithSchemaEmbed(false))`**
+  (`embed=False`): a scalar is validated and prompted without the
+  `{"data": …}` envelope. For `T = string` the answer is still a JSON-quoted
+  string — Python's `ResponseSchema(str)` accepts any text, so "no schema" is
+  the equivalent.
+- **`spec.FromAgent` captures the response schema**, `(*AgentSpec).ToAgent`
+  restores it as a `RawSchema` (no validation); an explicit
+  `agent.WithResponseSchema` wins over the spec's. This replaces the earlier
+  "response schema not publicly readable → nil" limit (D-023).
+- **`agotest.NewTestScript(turns...)`** with the Turn vocabulary `Text`,
+  `Reply`, `ToolCall`, `Fail`, `Publish` replaces "full-response scripts only"
+  (D-018). `Text` returns the answer and does not also publish a
+  `ModelMessage` — the Go agent publishes the returned response itself, while
+  Python's `TestClient` also sends it. **`SetRaiseToolErrors` is off by
+  default** (Python: on): it sees the `ToolErrorEvent`/`ToolNotFoundEvent`
+  that really reach the history (not-found, error, panic, timeout) but cannot
+  re-raise the original exception type because the Go event carries text;
+  turning it on by default breaks eight existing scripts.
+- **Compaction cut (`compact.WithKeepRecent(n)`).** The cut is widened to a
+  replayable boundary (`snapCut`, Python `_replay.snap`): a tool result never
+  loses its call and a standalone call never loses the response that declared
+  it. AGo has no provider anchor/turn-item events (D-030), so the pairing
+  reduces to those two rules. Reviewer's 3,000 random transcripts × all keeps:
+  no broken pair.
+- **`knowledge` per-path subscriptions.** `Subscribe(path, fn)
+  *ChangeSubscription` on `MemoryStore`, `DiskStore`, `LockedStore`; the
+  `ChangeSubscriber` interface and `SubscribeTo(store, path, fn)` for any
+  store; `Close` is idempotent and nil-safe; a path matches itself and anything
+  below it; callbacks fire in registration order. `DiskStore.Subscribe` sees
+  only writes of this process (extends D-027); other processes need
+  `PollingWatcher`.
+- **`ago:agent`.** `agent/run.go` publishes the agent under
+  `middleware.AgentDependencyKey` (`ago:agent`) for the run; Python's
+  `__ag2_agent__` key is not used. It is not restored after the turn because
+  each run has its own context. This is what feeds the `Metrics` agent label
+  (D-106; the backlog item of W3-C1's review).
+
+Reviewer found and the executor fixed: callback order was random after the
+subscription registry became a map (117 of 200 runs out of order; now 0/200),
+`CallableSchema` was a raw-string stub, and the `testing` comment denied that
+tool failures reach the history. Mutation tool: `store.go` 17/17,
+`callable.go` 10/10, compact 6 survivors, all equivalent.
+
+## D-108 — 2026-11-10 — mcp: client answers server requests, `input_required` rounds, modern protocol era, connection knobs, `Toolkit`, embedded resources (gap audit 2026-11-09, wave 3, W3-M1)
+
+Closes the audit's MCP-client rows of D-029 (the "minimal client"): "not
+ported: `input_required` answering, discovery cache, protocol-era
+negotiation". The package `mcp` now imports `config` and `stream` (sampling on
+the agent's model); `docs/ARCHITECTURE.md` records the edge. `go list -deps
+./config` does not contain `mcp`, so there is no cycle.
+
+- **Answering server requests.** `mcp.WithAnswering(AnswerPolicy)` and
+  `(*Client).CallToolWith(ctx, cx, name, args)` answer what the server asks
+  mid-call: elicitation through `context.Input` (the HITL channel; form mode
+  only — url mode and multi-field forms are declined), sampling through a
+  handler or the agent's own model, roots, ping. A capability is advertised
+  only when enabled. Without a conversation an elicitation **fails** instead
+  of being declined; an error in the sampling/roots handler fails the call, as
+  in Python. Works on stdio and on streamable-HTTP SSE.
+- **Exchange timer pauses while the client answers.** The HTTP/stdio timeout
+  clock stops during a human answer (it may take minutes) and restarts
+  afterwards; an HTTP exchange timeout now returns `ErrTimeout`.
+  *AGO-DEVIATION:* the `Timeout` caps the whole exchange (including reading an
+  SSE body), where Python's httpx timeout is per phase.
+- **`input_required` rounds and `ProtocolMode`.** `MCPServerConfig.ProtocolMode`
+  / `MCPStdioConfig.ProtocolMode`: `ProtocolLegacy` (zero value, handshake
+  only) or `ProtocolAuto` (probe `server/discover`, fall back to
+  `initialize`, per Python's `negotiate_auto`). A modern request carries the
+  `_meta` stamp (`protocolVersion`, `clientInfo`, `clientCapabilities`) and the
+  `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers; the server identity
+  is read from `_meta["io.modelcontextprotocol/serverInfo"]`. The retry cap is
+  `AnswerPolicy.MaxRounds`; beyond it the call fails with `ErrMaxRounds`.
+  A round with no requests (state only) sends no `inputResponses`, waits
+  50 → 250 ms and returns `requestState` unchanged. Checked against `mcp`
+  2.3.0 from PyPI: the first version of the port invented the discover shape
+  and the reviewer returned it; the test fake now enforces the SDK's
+  `classify_inbound_request` ladder.
+- **Two AGO-DEVIATIONs in the round machinery.** The SDK answers the requests
+  of one round concurrently; AGo answers them one by one in key order so two
+  questions never reach the single human channel at once. `roots` is
+  advertised with `listChanged: true` like the SDK although AGo never sends
+  `notifications/roots/list_changed` (the roots are fixed at construction).
+  The retry after `-32022` is omitted (the client offers one modern version).
+- **Connection options.** `MCPServerConfig.Proxy` (HTTP(S)/SOCKS5 URL),
+  `.Description`, `.ProtocolMode`; `MCPStdioConfig.Description`,
+  `.ProtocolMode`. **AGO-DEVIATION: `InsecureSkipVerify` instead of Python's
+  `verify` (default True)** — the unsafe state must never be a zero value, so
+  a bare `MCPServerConfig{}` stays safe.
+- **`mcp.NewToolkit(config, opts...)` / `mcp.NewToolkitFunc(resolve, opts...)`
+  and `ConfigResolver`.** The discovery cache of Python's `MCPToolkit`: a
+  config change invalidates it, a failed discovery does not evict it.
+  *AGO-DEVIATION:* Python resolves `Variable` fields inside the config
+  dataclass; AGo has one function over the whole config. Python opens a
+  short-lived session per call; a Go `Client` owns a process or connection, so a
+  superseded client lives until the next replacement and is then closed.
+- **Embedded resources** map to `TextInput` (text) / `BinaryInput` (blob)
+  instead of a JSON dump — a parity fix; the old test that pinned the JSON
+  form was corrected.
+- **Not done:** the standalone GET channel of the client was left to W3-M2 (D-109);
+  `Mcp-Param-*` headers from `x-mcp-header` are not set.
+
+Reviewer rounds: round 1 returned the invented envelope (finding score 30);
+round 2 accepted after 24 mutants killed (`client.go` 49/56, `http.go` 68/81,
+`jsonrpc.go` 17/19, `answering.go` 48/58). Risk-4 leftovers are in
+`known-issues.md`.
+
+## D-109 — 2026-11-10 — mcpserver/mcp: resources, prompts, sessions, SSE and resume, elicitation and sampling back-channel, progress, argument validation, client GET channel (gap audit 2026-11-09, wave 3, W3-M2)
+
+Closes the "Not ported" list of D-058 except the modern era, pause/resume, MCP
+Apps and OAuth. The default transport is unchanged: stateless, JSON answers.
+
+- **Default stays stateless+JSON.** *AGO-DEVIATION:* Python defaults to
+  stateful sessions and SSE answers. `TransportConfig{Stateful: true,
+  StreamResponses: true, EventStore: …}` (option `WithTransport`) switches to
+  Python's mode so a running deployment keeps its behavior.
+- **Resources and prompts.** `WithResources`, `WithResourceTemplates`,
+  `WithPrompts`; the capability is advertised only when something is
+  registered; `list_changed` is not sent (Python does not either).
+  *AGO-DEVIATION:* Python lets `Title`, `Description`, `MIMEType` and `_meta`
+  values be `Variable`s resolved per request; AGo fixes them at registration
+  and the `Read` callback sees the request through `cx`.
+- **Sessions and conversations.** `Mcp-Session-Id` (uuid v4), 404 for an
+  unknown or expired id, 400 without one, 503 beyond `MaxSessions`, `DELETE`,
+  idle reaping (`SessionIdleTimeout`). `WithConversations(ConversationConfig)`:
+  a conversation is found by handle, by MCP session, by stdio or created
+  fresh; LRU cap and TTL. *AGO-DEVIATION:* Python binds a conversation to the
+  principal that created it; AGo has no access-token store (D-058), so the
+  handle is the only credential — front a server whose callers must not share
+  conversations with an authenticating proxy.
+- **SSE answers, resume.** `EventStore` (`NewMemoryEventStore`) + `Last-Event-ID`
+  replay for GET and an interrupted POST; a turn with a store lives on the
+  session context and survives a disconnect, without a store the turn is tied
+  to the connection. **`MemoryEventStore` is bounded**: `WithMaxStreams`
+  (default 10,000, oldest-written stream is dropped whole) and the
+  `StreamForgetter` interface — a session's streams are forgotten at `DELETE`,
+  idle reap and `Server.Close`; the stateless transport writes nothing to the
+  store. A custom store that does not implement `StreamForgetter` keeps its
+  session streams. Batches are not supported: an array body is 400 `-32602` on
+  the stateful/streaming path (as in the SDK); the default stateless transport answers
+  `-32600` "batch requests are not supported". The reviewer's B1 fix: a turn that finishes between
+  the replay and the attach is now caught by a second `ReplayEventsAfter`.
+- **Back-channel: elicitation and sampling.** `WithElicitationPolicy`,
+  `WithClientModel`; checked against the client's advertised capabilities; no
+  capability or no back-channel falls back to the agent's own HITL hook /
+  model, sampling without either answers `-32021`. *AGO-DEVIATION:* the channel
+  exists only on a stateful SSE transport; Python also reaches a stdio client,
+  whose loop here cannot read the client's reply while a turn runs.
+- **Progress and log** (`WithoutProgress` disables). *AGO-DEVIATION:* sent on
+  the request's own stream; Python sends them on the standalone channel (no
+  `related_request_id`), so a client without a GET stream never sees them.
+- **Argument validation** by a stdlib JSON-Schema validator with Python
+  `jsonschema` wording; a failure is a tool result with `isError: true` and the
+  text `Input validation error: …` (not a JSON-RPC error — the task text was
+  wrong, the executor read `server._on_call_tool`). *AGO-DEVIATION:* not
+  enforced — `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`,
+  references outside the document, patterns RE2 cannot compile, the draft-07
+  array form of `items` (Python raises `SchemaError`); the unchecked direction
+  is the safe one. `patternProperties` keys are excluded from
+  `additionalProperties`; the work per value is capped (50,000 steps per
+  keyword chain, cycles of `$ref` cut exactly), and a 60,000-element array is
+  still checked to its last item.
+- **Client side (`mcp`).** After `initialized` the client opens a GET channel
+  (a 405 stops the retries), answers server requests made outside a call (ping,
+  roots; elicitation without a conversation errors) and delivers notifications
+  through `mcp.WithNotifications`; resume by `Last-Event-ID`. Calling the
+  client re-entrantly from the notification callback deadlocks (documented).
+- **Import graph.** `mcpserver → agent, config, context, events, hitl, stream,
+  tools` (config through `WithClientModel`); recorded in `ARCHITECTURE.md`.
+
+Verified by end-to-end tests of our client against our server (`e2e_test.go`),
+strict tests that pin every response shape and transport status to the SDK
+(`strict_test.go`; one of them caught a real bug: the MIME of a listed resource
+was not applied on read), 150 loaded resume iterations with 0 failures and the
+mutation tool (`schema.go` 98/101, `eventstore.go` 13/15, `session.go` 45/48,
+`backchannel.go` 27/28, `sseevents.go` 8/8; all survivors equivalent).
+The first 20-second resume timeout seen once under load was never reproduced
+(`known-issues.md`).
+
+## D-110 — 2026-11-10 — config/anthropic, config/openai: Files API refs, prefix cache breakpoint, `output_config`, `pause_turn`, server-tool events, Decisions instruction parts, shell deltas (gap audit 2026-11-09, wave 3, W3-P1)
+
+Reduces D-020 (Anthropic), D-046 (Files) and D-060 (Responses/Decisions).
+
+- **`FileIdInput`.** Chat Completions (OpenAI dialect only) maps it to
+  `{"type":"file","file":{"file_id"}}`; Anthropic maps it to an
+  `image`/`document` block with `source.type = "file"` (an image is told by the
+  file extension) and sets the `files-api-2025-04-14` beta header, merged with
+  the caller's. *AGO-DEVIATION:* Python refuses a file uploaded through another
+  provider; `UploadedFile` carries no provider tag here, so a foreign id is
+  rejected by the API itself. The other Chat-engine dialects still refuse the
+  part (D-017).
+- **Prefix cache breakpoint.** With `PromptCaching` on, the last block of the
+  last user turn also gets `cache_control` (beside the last system block and
+  last tool). *AGO-DEVIATION:* a block that already carries a caller-set
+  `cache_control` keeps it; Python overwrites it with a 5-minute `ephemeral`,
+  which drops a caller's `ttl: "1h"`.
+- **`AnthropicConfig.NativeStructuredOutput` is opt-in.** *AGO-DEVIATION:*
+  Python always sends `output_config`; older models answer 400 and the bodies
+  of existing callers must not change. The API version header stays
+  `2023-06-01`.
+- **`pause_turn`.** The paused content is sent back as an assistant turn, up to
+  5 continuations; the answer is the last hop's, usage is summed, the cache
+  diagnostics chain continues. *AGO-DEVIATION:* `extra_body["messages"]` does
+  not override the continuation (in Python/SDK `extra_body` wins on every hop
+  and the paused turn would never resume); a paused answer without content is
+  returned as is (Python would send an empty assistant turn, which the API
+  rejects).
+- **Server-tool blocks** become builtin call/result events; the block is kept
+  as is (`VendorMetadata["block"]` on the call, `Result.Metadata["block"]` on
+  the result) and replayed in the next request with null fields stripped
+  (Python's `exclude_none`), except that a pause continuation keeps an explicit
+  null as the SDK's `exclude_unset` does. *AGO-DEVIATION:* Python keeps the SDK
+  block object on provider event subtypes, AGo has none (D-030); `title` /
+  `page_age` of a web-search result go to the result's metadata because
+  `UrlInput` has none; MCP connector blocks (`mcp_tool_use`/`mcp_tool_result`)
+  are mapped, where Python drops them; `container_upload` is still dropped.
+- **Decisions: `OpenAIDecisionsConfig.QuestionInstructionParts []any`** (a
+  string, an `events.Input` or a ready map); the schema message closes the
+  sequence with its own `input_text`.
+- **Shell deltas.** New transient events `openai.ShellCommandChunk` and
+  `openai.ShellOutputChunk` (`OpenAIShellCommandChunk`/`OpenAIShellOutputChunk`
+  on the wire). Found on the way: a real Responses stream with
+  `shell_call_output_content.delta` failed to decode because that delta is an
+  object `{stdout, stderr}`, not a string; fixed.
+
+Reviewer rounds: round 1 found the null-field replay (risk 24; fixed by
+`withoutNulls`), six uncovered branches in `servertool.go` and the
+`extra_body` clobbering; round 2 accepted (`servertool.go` 28/28, `client.go`
+100/118 with every survivor old code or equivalent).
+
+## D-111 — 2026-11-10 — config/ollama, gemini, zai, mistral: Ollama streaming, Gemini request and input knobs, Z.AI and Mistral vendor extras (gap audit 2026-11-09, wave 3, W3-P2)
+
+Closes **Ollama streaming of D-022** and the Z.AI/Mistral knobs deferred in
+D-008/D-021 and D-035. Every added field is zero-value compatible: the old
+request body does not change.
+
+- **Ollama streaming** reads NDJSON directly with a stdlib `bufio.Scanner`
+  (8 MiB line cap): `internal/httpx` streams SSE frames only and Ollama answers
+  NDJSON. `ModelReasoning`/`ModelMessageChunk` arrive in order, tool calls are
+  accumulated, usage/finish reason/model come from the `done` chunk; a
+  `{"error": …}` inside a 200 stream fails the call; HTTP errors are
+  `*config.APIError`; cancellation is honored before the request and mid-stream.
+  *AGO-DEVIATION:* the Python client reads the stream through the ollama SDK.
+  Transport retries are absent, as in Python.
+- **Gemini.** `WithCachedContent`, `WithResponseModalities`, `WithImageConfig`
+  (`ImageConfig`; generated `inlineData` → `ModelResponse.Files`),
+  `WithThinkingConfig` (a raw object that overrides level/budget), and per-input
+  `vendor_metadata`: `media_resolution`, `video_metadata`
+  (`startOffset`/`endOffset`/`fps`), `display_name`. All in `Clone`.
+- **Z.AI.** `ZAIConfig.Thinking *bool`, `ReasoningEffort`, `SensitiveWordCheck`,
+  `WatermarkEnabled *bool` (an explicit false is sent), `ToolStream`, `Extra`,
+  `DisableTokenCache *bool`, `SourceChannel`. `DisableTokenCache == nil` is
+  Python's default (true: the raw key is the bearer, the old body is
+  unchanged); `false` mints an HS256 token (`<id>.<secret>`, 210 s lifetime).
+  *AGO-DEVIATION:* the SDK caches that token for 180 s; AGo signs a fresh token
+  **on every request** (in `chatClient.Call`) because `Create` runs once per
+  turn and a tool loop longer than 210 s would otherwise send an expired
+  bearer; the cost is one HMAC per call. A key not of the form `<id>.<secret>`
+  fails in `Create` with `config.ErrNotProvided`.
+- **`x-source-channel`.** The SDK always sends it, default `python-sdk`.
+  *AGO-DEVIATION:* AGo's default is `"ago"` (`zai.DefaultSourceChannel`);
+  `SourceChannel` overrides it and an `ExtraHeaders` entry of that name wins
+  over both (case-insensitive).
+- **Mistral.** `Guardrails []map[string]any`, `Prediction map[string]any`,
+  `PromptMode` (`"reasoning"`), `Logprobs *bool` (an explicit false is sent).
+- Still out: Files API clients (D-021), Vertex AI (D-022).
+
+Reviewer found the Z.AI token minted once per `Create` (risk 9, fixed), missing
+tests for half keys and mid-stream cancellation (added; `ollama/stream.go`
+19/19, `zai/token.go` 9/9, `zai/client.go` 5/5 killed).
+
+## D-112 — 2026-11-10 — tools/toolpacks/config/gemini: filesystem update/delete/raw, Tavily and DDG parameters, `run_skill_script`, multi-runtime skills, per-call `Variable` kwargs, Google Maps, the code-execution backend seam (gap audit 2026-11-09, wave 3, W3-T1)
+
+Reduces D-062/D-063/D-099 (toolpacks) and D-047 (hosted carriers). The
+execution seam is what the Docker/Daytona modules (D-115) plug into.
+
+- **Filesystem.** `update_file`, `delete_file` and `read_file(raw=true)`
+  (base64) are default members, so `TestFilesystemToolkitShape` went from 5 to
+  7 members; `WithFilesystemReadOnly` drops every mutating member. `delete_file`
+  unlinks a symlink itself and never follows it.
+- **Search.** `NewTavilySearch` takes the nine request parameters it lacked
+  (among them `WithTavilyTopic`, `WithTavilyTimeRange`, `WithTavilyDays`,
+  `WithTavilyCountry`, `WithTavilyAutoParameters`, `WithTavilyIncludeFavicon`,
+  `WithTavilyIncludeAnswerMode`), the `fast`/`ultra-fast` depths, and the
+  per-call `Variable` bindings `WithTavilyVariable` / `WithDDGVariable`
+  (Tavily binds any request parameter; DDG binds `max_results`, `region`,
+  `safesearch`; a nil value drops the parameter). Perplexity per-call kwargs
+  were not touched.
+- **Skills.** `NewSkillsToolkitFromRuntime(rts...)` is variadic (existing calls
+  compile unchanged; the last runtime wins on a name clash),
+  `NewSkillsToolkitFromDirs`. `run_skill_script` follows Python's rules (the
+  script must be listed under `scripts/`, a symlink out of the skill is
+  refused, object arguments refused, a blocklist, shebang/`.py`/`.sh`).
+  *AGO-DEVIATION:* **it is opt-in** (`WithSkillScripts()` or any
+  `WithSkillScript*`: `Timeout`, `MaxOutput`, `Blocked`, `Sandbox`); Python
+  always offers it, and every existing skills toolkit would otherwise start
+  exposing script execution. A second deviation comment records that Python's
+  `_resolve_within` already resolves symlinks (an earlier text said it was
+  lexical only).
+- **Per-call `Variable` kwargs on the hosted carriers** —
+  `WithWebSearchVariable`, `WithWebFetchVariable`, `WithFileSearchVariable`,
+  `WithImageGenerationVariable`, `WithShellVariable`, `WithMCPServerVariable`,
+  `WithRetrievalVariable`, `WithGoogleMapsVariable` (all
+  `(param string, v Variable)`). *AGO-DEVIATION:* Python types each kwarg as
+  `value | Variable`; Go option functions take concrete values, so the binding
+  is a separate option keyed by the schema's JSON field name; an unknown name
+  or a mistyped value is a `Schemas` error; a Variable's default is its
+  `HasDefault` value (no `default_factory`). Supersedes the "per-turn
+  `Variable` resolution" deferral of D-047.
+- **`tools.NewGoogleMaps`** (`GoogleMapsTool`; `WithGoogleMapsLocation`,
+  `WithGoogleMapsLanguageCode`, `WithGoogleMapsWidget`). Gemini maps it to
+  `{"googleMaps": {}}` (`enableWidget: true` with the widget flag) and, only
+  when both latitude and longitude are set, `toolConfig.retrievalConfig`
+  (`latLng`, `languageCode`). *AGO-DEVIATION:* that is the only `ToolConfig`
+  AGo builds; `include_server_side_tool_invocations` is still not sent and
+  Gemini server-tool replay stays deferred (D-047).
+- **Execution seam (`toolpacks/sandbox.go`, `localsandbox.go`).** `Sandbox`
+  (`Exec` with timeout, `PutFile`, `GetFile`, `Close`), `SandboxFactory`
+  (`Open` returns `(sandbox, release, err)`), `SingletonFactory`,
+  `CodeEnvironment`, `CodeAdapter`, exported `LocalSandbox`; options
+  `WithShellSandbox`, `NewSandboxCodeTool`, `NewSandboxCodeToolFromFactory`,
+  `WithSkillScriptSandbox`. `GetFile` goes beyond Python (a downloading code
+  tool needs it); local-only options are refused next to a backend. The
+  existing local shell and code runner stay a fast path beside the seam and
+  are not rerouted through `LocalSandbox`.
+
+Reviewer round 1 returned the work for untested new logic (`chainRuntime`
+script routing, the `.py` branch, one-sided Maps coordinates, release errors);
+round 2 accepted: 2 new survivors, both equivalent; the 26 others are older
+code.
+
+## D-113 — 2026-11-10 — contrib/searchtools: the Exa, Firecrawl, Glasser, Keenable, Serply, TinyFish and Xquik toolkits as an optional module (gap audit 2026-11-09, wave 3, W3-X1)
+
+First slice of the `extensions/tools/search` gap. A new optional module
+`github.com/luckystrker/ago/contrib/searchtools` (own `go.mod`, stdlib only,
+`replace` to the root) so the core keeps its zero-dependency rule (D-048).
+Seven toolkits, 20 tools: `NewExaToolkit` (4), `NewFirecrawlToolkit` (2),
+`NewGlasserToolkit` (6), `NewKeenableSearchToolkit` (2),
+`NewSerplySearchToolkit` (3), `NewTinyFishSearchToolkit` (2),
+`NewXquikSearchToolkit` (1). Tool names, parameter schemas, paths, JSON keys,
+auth headers and env names (`EXA_API_KEY`, `FIRECRAWL_API_KEY`,
+`TINYFISH_API_KEY`, `KEENABLE_API_KEY`) follow Python; the key comes from the
+constructor, the environment or a conversation variable
+(`With<Provider>APIKeyVariable`), and defaults can be bound to conversation
+variables with `With<Provider>Variable(param, variable)`; every toolkit takes
+`With<Provider>Middleware`.
+
+- **AGO-DEVIATION — absent optional fields are omitted** (`omitempty`). Python's
+  dataclasses print `null`; the Go structs drop the key (the same approach as
+  the Tavily tool in `toolpacks`). Applies to Exa, Firecrawl, Serply, TinyFish.
+- **AGO-DEVIATION — typed HTTP errors.** One `*searchtools.HTTPError` with the
+  sentinels `ErrHTTPStatus`, `ErrAPIResponse`, `ErrMissingKey`, `ErrRejected`
+  (provider, method, URL, status, body, provider message) replaces
+  `httpx.HTTPStatusError`.
+- **AGO-DEVIATION — own User-Agent.** exa-py and tinyfish send their SDK
+  names; the port sends `ago-searchtools`. Serply keeps
+  `ag2-serply-extension` because Cloudflare blocks other values.
+- **AGO-DEVIATION — Glasser `charge_usd`** is typed as a string; a numeric
+  value is rendered (Python keeps the raw value).
+- **Not carried over:** Python's dead kwargs (`exa_search(user_location=,
+  moderation=)`, `exa_find_similar(category=)`) are not exposed. Keenable has
+  no missing-key error by design (the keyless `/v1/search/public` path).
+- **Round 2 fixes.** Glasser accepts a relative `result_url` (resolved like
+  `httpx.URL.join`; a foreign host is refused, as Python does) — before the fix
+  a paid call could be repeated; truncation counts runes, not bytes (Python
+  slices code points).
+
+Reviewer accepted after the full mutation tool run (`-max 0`): `common.go` 44/44,
+`glasser.go` 118 killed of 127 (9 do not compile), `firecrawl.go` 76/77 (1 does not
+compile), 0 survivors; 93 tests, no network.
+
+## D-114 — 2026-11-10 — contrib/searchtools: wire check against the exa-py, firecrawl-py and tinyfish SDKs, request timeouts, SDK retries and scrape auto-resume (gap audit 2026-11-09, wave 3, W3-X1b)
+
+A verify-only task that found real differences. The reference SDKs
+(`exa-py 2.25.0`, `firecrawl-py 4.53.2`, `tinyfish 0.5.0`, the versions in
+`ag2/uv.lock`) were downloaded from PyPI and read as data.
+
+- **Wire fixes.** Exa `/answer` now sends `stream:false`; Firecrawl reads the
+  camelCase `metadata.sourceURL`/`statusCode` the API really sends (the snake
+  spellings are still accepted; `"503"` → 503); a Firecrawl body without
+  `"success": true` is now an error (`ErrAPIResponse`, **a behavior change** — a
+  200 used to pass); an empty query in Firecrawl or TinyFish is `ErrRejected`
+  without a network call; Firecrawl `scrape` trims the URL.
+- **Timeouts.** Exa and TinyFish default to **600 s** per request (the SDKs'
+  default; was 60 s). *AGO-DEVIATION:* Firecrawl's SDK passes `timeout=None`;
+  AGo caps it at 600 s so a stuck connection cannot hold a turn forever.
+  The deadline is a per-attempt `context.WithTimeout` (visible in
+  `req.Context()`); a caller-supplied `*http.Client` gets no extra deadline.
+  *AGO-DEVIATION:* an attempt that times out is not retried (the SDKs retry an
+  httpx timeout like any transport error); 3 × 10 minutes would hold a turn for
+  half an hour.
+- **User-Agent.** *AGO-DEVIATION:* Firecrawl's SDK sends `python-httpx/<ver>`,
+  Exa/TinyFish their own names; AGo sends `ago-searchtools` (extends D-113).
+- **Retries as in the SDKs.** `WithTinyFishMaxRetries(n)` = **retries**
+  (1 + n attempts, default 2): 408, 429, any 5xx, network errors and body-read
+  failures; `WithFirecrawlMaxRetries(n)` = **total attempts** (default 3): only
+  502 and network errors. Back-off 0.5 s × 2^(n−1), capped at 8 s for TinyFish.
+  *AGO-DEVIATION:* the SDK's Firecrawl back-off has no cap; AGo caps one wait at
+  60 s. A cancelled context stops the retries at once, a retried POST resends
+  the same body.
+- **Scrape auto-resume.** On `408 SCRAPE_TIMEOUT` with `details.state =
+  "processing_continues"` Firecrawl `scrape` repeats up to 5 times, waiting
+  `retryAfterSeconds` (else the `Retry-After` header, else 60 s; clamped 5 s …
+  10 min; at most 20 minutes in total). Without it a large PDF fails with 408.
+
+Reviewer: both timeout and retry tests fail if the corresponding line is
+removed; full mutation run (`-max 0`): `common.go` 57/57, `tinyfish.go` 49/51 (2 do not
+compile), `firecrawl.go` 102/104 (1 does not compile, 1 survivor judged equivalent). Risk-3 leftover: two of the knobs share a name but not a meaning —
+`MIGRATION.md` says so.
+
+## D-115 — 2026-11-10 — contrib/sandboxdocker, contrib/sandboxdaytona and the remote path guard: Docker and Daytona execution backends on the toolpacks seam (gap audit 2026-11-09, wave 3, W3-X2)
+
+Closes the Docker/Daytona half of the D-062 deferral. Two optional modules
+(stdlib only, own `go.mod`): `contrib/sandboxdocker` and `contrib/sandboxdaytona`.
+Each has `NewEnvironment(opts...)`, a `toolpacks.SandboxFactory` for
+`toolpacks.WithShellSandbox` and `toolpacks.NewSandboxCodeToolFromFactory`
+(D-112), plus the lower-level `NewSandbox(Config)`. Tenki is still not ported.
+
+- **Docker (Engine API).** The daemon is driven over the unix socket
+  (`DOCKER_HOST`, default `/var/run/docker.sock`) or plain `tcp://`; the
+  container is created with image (pulled when missing — `containers.run` does
+  the same in docker-py), env, workdir, user, network mode (default `none`),
+  memory limit (default `512m`), CPU quota, auto-remove, host bind mount; exec
+  with a timeout (on timeout the container is restarted and the result is 124,
+  as in Python); files through the archive API; stop and remove on `Close`.
+  The factory keeps one container per set of resolved parameters
+  (`WithImageVariable`, `WithEnvVarsVariable`, `WithNetworkModeVariable`).
+  *AGO-DEVIATION:* TLS (`DOCKER_TLS_VERIFY`, `https://`) and `ssh://` daemon
+  endpoints are not supported.
+- **Daytona (REST).** `POST /sandbox`, wait for `started`, exec, upload,
+  download, delete on `Close`; a half-created sandbox is deleted, never
+  leaked; the toolbox base comes from `toolboxProxyUrl` or
+  `GET /sandbox/{id}/toolbox-proxy-url`, as in the SDK. Key and URL from options
+  or `DAYTONA_API_KEY`/`DAYTONA_API_URL`/`DAYTONA_TARGET`; `WithVariable(param,
+  v)` for the six parameters Python allows. A create that outlives its
+  timeout or is cancelled is always the typed "did not start" error wrapping
+  the context error. **The toolbox paths come from Daytona's published OpenAPI
+  and the SDK source, not from a live account** — check against a real account
+  before relying on them in production.
+- **AGO-DEVIATIONs shared by both.** Exec output is capped (`WithMaxOutput`,
+  default 100k characters) where Python returns it unbounded; Python refuses
+  only absolute paths, AGo also refuses a `..` that climbs out of the workdir.
+  Daytona only: Python passes no working directory and drops the per-call env,
+  AGo sends `cwd` and `envs`, and creates the workdir through `files/folder`
+  (Python never creates it).
+- **The remote path guard (core `toolpacks`).** `checkIgnore` resolved paths on
+  the *host* filesystem even when the workdir lives in a container (the risk-6
+  note of W3-T1's review). `ShellTool` with a non-host factory now uses
+  `checkIgnorePosix`, lexical on POSIX paths and touching no host files;
+  `hostBacked(f)` is true only for a `SingletonFactory` over a sandbox with a
+  host view. A test pins that a host symlink inside a remote workdir is not
+  followed.
+
+Reviewer round 1 found a flaky `TestCreateFailureDeletesTheSandbox` (5 of 17
+runs; the deadline landed inside a poll), a false "docker-py does not pull"
+claim (the executor was right: `docker/models/containers.py`), an invented
+toolbox fallback URL and untested boundaries; all fixed, 400 loaded runs clean.
+Mutation tool: `docker.go` 61/62, `engine.go` 49/59, `daytona.go` 119/129;
+every survivor equivalent or a status-300 boundary.
