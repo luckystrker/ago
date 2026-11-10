@@ -41,22 +41,61 @@ type Schema[T any] struct {
 	description  string
 	schema       map[string]any
 	systemPrompt string
-	embedded     bool // T is a bare scalar: responses travel in the {"data": ...} envelope
+	embedded     bool // T is a bare scalar and the envelope is on: responses travel in {"data": ...}
+}
+
+// SchemaOption customizes a Schema.
+type SchemaOption func(*schemaOptions)
+
+// schemaOptions collects the options NewSchema applies before the schema is
+// generated; embed defaults to true (Python parity).
+type schemaOptions struct {
+	embed bool
+}
+
+// WithSchemaEmbed controls the {"data": ...} envelope bare scalar responses
+// travel in (Python parity: ResponseSchema(embed=...)). The default, true, wraps
+// every scalar so the wire shape is always a JSON object; false prompts for and
+// validates the bare value ("42", `"hi"`), for providers or models that answer
+// with a scalar directly. It changes nothing for non-scalar types.
+//
+// AGO-DEVIATION: for T = string the envelope is off but the answer is still a
+// JSON string ("hi", quotes included). Python's ResponseSchema(str) accepts any
+// text at all; use no schema (free text) for that.
+func WithSchemaEmbed(embed bool) SchemaOption {
+	return func(o *schemaOptions) { o.embed = embed }
 }
 
 // NewSchema builds a schema for T. An empty name defaults to "ResponseSchema" (Python
-// parity); the description is used as given.
-func NewSchema[T any](name, description string) *Schema[T] {
+// parity); the description is used as given. Options tune the envelope (see
+// WithSchemaEmbed).
+func NewSchema[T any](name, description string, opts ...SchemaOption) *Schema[T] {
+	o := schemaOptions{embed: true}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	rt := reflect.TypeOf((*T)(nil)).Elem()
+	scalar := isScalarKind(deref(rt).Kind())
 	s := &Schema[T]{
 		name:        name,
 		description: description,
-		embedded:    isScalarKind(deref(rt).Kind()),
+		embedded:    o.embed && scalar,
 	}
 	if s.name == "" {
 		s.name = "ResponseSchema"
 	}
-	if sch, err := SchemaOf(rt); err == nil {
+	var (
+		sch map[string]any
+		err error
+	)
+	if scalar && !s.embedded {
+		// The bare scalar schema, without the wrapper SchemaOf applies at the top
+		// level: the model must answer "42", not {"data": 42}.
+		sch, err = typeSchema(deref(rt), map[reflect.Type]bool{})
+	} else {
+		sch, err = SchemaOf(rt)
+	}
+	if err == nil {
 		s.schema = sch
 		s.systemPrompt = renderSystemPrompt(sch)
 	}
@@ -88,9 +127,10 @@ func (s *Schema[T]) JSONSchema() map[string]any { return copySchema(s.schema) }
 func (s *Schema[T]) SystemPrompt() string { return s.systemPrompt }
 
 // Validate parses response into T. Bare scalar types (strings, integers, floats, bools)
-// travel in the {"data": ...} envelope and are unwrapped here; every other type is
-// parsed directly. Structural constraints the JSON unmarshal cannot see (required
-// members, enum membership) are checked against the generated schema.
+// travel in the {"data": ...} envelope and are unwrapped here unless the schema was
+// built with WithSchemaEmbed(false), in which case the bare value is parsed; every
+// other type is parsed directly. Structural constraints the JSON unmarshal cannot see
+// (required members, enum membership) are checked against the generated schema.
 //
 // AGO-DEVIATION: pydantic coerces loosely ("5" → 5); encoding/json is strict, so type
 // mismatches are validation errors. See docs/DECISIONS.md D-013.

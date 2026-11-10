@@ -1,6 +1,7 @@
 // Package agotesting provides scripted model doubles for tests: TestConfig
-// replays a queue of ModelResponses and records what history every call saw;
-// TrackingConfig wraps any real config and records its calls the same way.
+// replays a queue of Turns (ModelResponses or the Text/ToolCall/Fail/Publish
+// vocabulary) and records what history every call saw; TrackingConfig wraps any
+// real config and records its calls the same way.
 //
 // The directory is named "testing" but the package is agotesting so it can
 // never clash with the standard library "testing" package. Import it as
@@ -32,26 +33,29 @@ const ProviderTest config.Provider = "test"
 var ErrScriptedExhausted = errors.New("agotesting: scripted responses exhausted")
 
 // TestConfig is a scripted model double implementing both config.ModelConfig
-// and config.LLMClient. Every Call hands out the next scripted
-// *events.ModelResponse; once the script is exhausted the error wraps
-// ErrScriptedExhausted. Each invocation — including one that finds the script
-// exhausted — is recorded as a deep-copied snapshot of the history it was
-// handed (see Calls). Safe for concurrent use.
+// and config.LLMClient. Every Call hands out the next scripted turn; once the
+// script is exhausted the error wraps ErrScriptedExhausted. Each invocation —
+// including one that finds the script exhausted — is recorded as a deep-copied
+// snapshot of the history it was handed (see Calls). Safe for concurrent use.
 //
-// AGO-DEVIATION: the Python Turn vocabulary (plain strings, raised exceptions,
-// mid-turn published events, tool-call shortcuts) collapses to full
-// ModelResponse scripts, and the raise_tool_errors history inspection is not
-// ported; recording the call history, which Python keeps on TrackingClient,
-// lives here per the porting brief.
+// A script is built either from full ModelResponses (NewTestConfig) or from the
+// Turn vocabulary (NewTestScript: text, tool calls, failures, mid-turn
+// published events). SetRaiseToolErrors mirrors Python's raise_tool_errors: on,
+// a tool failure found in the history fails the call (the convenient way to
+// assert that a tool blew up); off, the double behaves like a real provider
+// handed a failed call as an ordinary result and carries on.
 type TestConfig struct {
 	// script is immutable after construction and shared with clones.
-	script []*events.ModelResponse
+	script []Turn
 	// model is immutable after construction ("test" unless Clone overrode it).
 	model string
 
 	mu    sync.Mutex
 	next  int
 	calls [][]events.Event
+	// raiseToolErrors is guarded by mu (SetRaiseToolErrors may run while a test
+	// is setting up).
+	raiseToolErrors bool
 }
 
 var (
@@ -61,7 +65,40 @@ var (
 
 // NewTestConfig scripts one ModelResponse per LLM call, handed out in order.
 func NewTestConfig(responses ...*events.ModelResponse) *TestConfig {
-	return &TestConfig{script: responses, model: "test"}
+	turns := make([]Turn, len(responses))
+	for i, resp := range responses {
+		turns[i] = Reply(resp)
+	}
+	return newTestConfig(turns)
+}
+
+// NewTestScript scripts the Turn vocabulary handed out in order: Text, Reply,
+// ToolCall, Fail and Publish (Python parity: TestConfig(*turns)).
+func NewTestScript(turns ...Turn) *TestConfig { return newTestConfig(turns) }
+
+func newTestConfig(turns []Turn) *TestConfig {
+	// Off by default: the pre-existing behaviour of the double is to hand a
+	// failed tool call to the agent as an ordinary result.
+	return &TestConfig{script: turns, model: "test"}
+}
+
+// SetRaiseToolErrors toggles the tool-failure re-raise (Python parity:
+// raise_tool_errors). Call it before the config is handed to an agent. On, the
+// first ToolErrorEvent or ToolNotFoundEvent in the history fails the call; that
+// is the convenient way to assert that a tool blew up. Off (the default), the
+// double behaves like a real provider handed a failed call as an ordinary
+// result: a test asserting that something *ends the turn* needs that, or it is
+// asserting this double's behavior rather than the agent's.
+//
+// AGO-DEVIATION: Python's raise_tool_errors defaults to True. AGo keeps it off
+// by default: turning it on would change the behaviour of every existing script,
+// which the port's backward-compatibility rule forbids. The check itself does see
+// agent-run failures — the executor sends ToolErrorEvent/ToolNotFoundEvent on the
+// stream before the batch is settled.
+func (t *TestConfig) SetRaiseToolErrors(enabled bool) {
+	t.mu.Lock()
+	t.raiseToolErrors = enabled
+	t.mu.Unlock()
 }
 
 // Provider returns ProviderTest.
@@ -105,28 +142,49 @@ func (t *TestConfig) Clone(overrides map[string]any) (config.ModelConfig, error)
 		}
 		model = s
 	}
-	return &TestConfig{script: t.script, model: model}, nil
+	t.mu.Lock()
+	raise := t.raiseToolErrors
+	t.mu.Unlock()
+	return &TestConfig{script: t.script, model: model, raiseToolErrors: raise}, nil
 }
 
-// Call records the history it was handed, then returns the next scripted
-// response verbatim (not copied — Python parity; the agent is expected to treat
-// a response as immutable once produced). When the script is exhausted it
-// returns an error wrapping ErrScriptedExhausted and records the call all the
-// same, so Calls still shows that the call happened. conv and opts are accepted
-// for the LLMClient contract and left untouched: scripted responses are
-// complete ModelResponses, and publishing them to the stream is the agent's job.
+// Call records the history it was handed, then plays the next scripted turn.
+// When the script is exhausted it returns an error wrapping
+// ErrScriptedExhausted and records the call all the same, so Calls still shows
+// that the call happened. conv is where a Publish turn sends its events; a
+// scripted response is otherwise complete as handed over, and publishing it to
+// the stream is the agent's job.
 func (t *TestConfig) Call(ctx context.Context, messages []events.Event, conv *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
 	t.mu.Lock()
 	t.calls = append(t.calls, snapshotEvents(messages))
-	if t.next >= len(t.script) {
-		n := t.next + 1
-		t.mu.Unlock()
-		return nil, fmt.Errorf("%w: no scripted response for call %d", ErrScriptedExhausted, n)
-	}
-	resp := t.script[t.next]
-	t.next++
+	raiseToolErrors := t.raiseToolErrors
 	t.mu.Unlock()
-	return resp, nil
+
+	if raiseToolErrors {
+		if err := toolErrorInHistory(messages); err != nil {
+			return nil, err
+		}
+	}
+
+	for {
+		t.mu.Lock()
+		if t.next >= len(t.script) {
+			n := t.next + 1
+			t.mu.Unlock()
+			return nil, fmt.Errorf("%w: no scripted response for call %d", ErrScriptedExhausted, n)
+		}
+		turn := t.script[t.next]
+		t.next++
+		t.mu.Unlock()
+
+		resp, done, err := turn.turn(conv)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return resp, nil
+		}
+	}
 }
 
 // Calls returns the history snapshot of every call so far, oldest first. The

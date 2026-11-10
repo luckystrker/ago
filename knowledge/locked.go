@@ -80,3 +80,21 @@ func (l *LockedStore) OnChange(fn func(path string)) {
 	defer l.mu.RUnlock()
 	l.inner.OnChange(fn)
 }
+
+// Subscribe subscribes to changes at path or under it on the inner store. The
+// callback carries the same lock caveat as OnChange. A store that cannot scope
+// notifications gets the store-wide callback filtered to path, so the handle's
+// Close stops delivery but the inner registration stays until that store is
+// dropped.
+func (l *LockedStore) Subscribe(path string, fn func(path string)) *ChangeSubscription {
+	if cs, ok := l.inner.(ChangeSubscriber); ok {
+		l.mu.RLock()
+		defer l.mu.RUnlock()
+		return cs.Subscribe(path, fn)
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return SubscribeTo(l.inner, path, fn)
+}
+
+var _ ChangeSubscriber = (*LockedStore)(nil)

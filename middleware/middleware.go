@@ -5,7 +5,8 @@
 // Parity with Python AG2 ag2/middleware/base.py: a Factory builds one Middleware
 // instance per turn; Base supplies pass-through defaults for every hook, so
 // implementations embed it and override only the hooks they need. Builtins live in
-// this package too (history/limiters, retry, logging, approval).
+// this package too (history/limiters, retry, logging, approval, metrics, halt
+// check).
 package middleware
 
 import (

@@ -13,9 +13,10 @@
 //     no assembly agent option: policies compose through the middleware chain
 //     (policies doc: "composed left-to-right inside AssemblerMiddleware
 //     .on_llm_call"), so the example builds the same pair by hand — an
-//     assembler that runs AlertPolicy in OnLLMCall, and HaltCheck, a direct
-//     port of _HaltCheckMiddleware — ordered assembler-first so the halt fires
-//     inside the same model call it is meant to stop.
+//     assembler that runs AlertPolicy in OnLLMCall, then
+//     middleware.HaltCheck() (the port of _HaltCheckMiddleware) — ordered
+//     assembler-first so the halt fires inside the same model call it is meant
+//     to stop.
 //   - There is no observers=[...] agent option (docs/DECISIONS.md D-025): the
 //     observer registers itself on the conversation stream, so the example owns
 //     the stream and points the agent at it with WithStreamBase.
@@ -112,13 +113,14 @@ func main() {
 
 	// The assembly pair, Python parity order (assembler first, halt check
 	// second): AlertPolicy.Apply runs before each model call and sends the
-	// HaltEvent; HaltCheck — armed during the same call's OnTurn — sees it and
-	// answers "HALTED: <reason>" without reaching the model. One AlertPolicy
-	// for the whole session: its dedup makes every alert deliver exactly once.
+	// HaltEvent; middleware.HaltCheck — armed during the same call's OnTurn —
+	// sees it and answers "HALTED: <reason>" without reaching the model. One
+	// AlertPolicy for the whole session: its dedup makes every alert deliver
+	// exactly once.
 	alerts := policies.NewAlertPolicy()
 	assembly := []middleware.Factory{
 		func() middleware.Middleware { return &assembler{policy: alerts} },
-		func() middleware.Middleware { return &HaltCheck{} },
+		middleware.HaltCheck(),
 	}
 
 	operator := agent.New("safe-shell",
@@ -217,56 +219,6 @@ var _ middleware.Middleware = (*assembler)(nil)
 func (a *assembler) OnLLMCall(next middleware.LLMCallFunc, evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
 	if _, _, err := a.policy.Apply(nil, evs, ctx); err != nil {
 		return nil, err
-	}
-	return next(evs, ctx)
-}
-
-// HaltCheck is the direct port of Python's _HaltCheckMiddleware: it subscribes
-// to HaltEvent for the length of one turn (OnTurn) and short-circuits every
-// model call after a halt with a synthetic "HALTED: <reason>" response. The
-// agent's own halt guard only covers calls that start after the halt; this
-// middleware stops the very call during which the halt event was sent.
-type HaltCheck struct {
-	middleware.Base
-	mu     sync.Mutex
-	halted bool
-	reason string
-}
-
-var _ middleware.Middleware = (*HaltCheck)(nil)
-
-// OnTurn scopes the halt subscription to this turn and unregisters it when the
-// turn body returns (Python parity: subscribe in on_turn, unsubscribe in the
-// finally block).
-func (h *HaltCheck) OnTurn(next middleware.TurnFunc, ev *events.ModelRequest, ctx *agocontext.Context) (*events.ModelResponse, error) {
-	if ctx == nil || ctx.Stream == nil {
-		return next(ev, ctx)
-	}
-	sub := ctx.Stream.Subscribe(func(e events.Event) error {
-		halt, ok := events.AsValue(e).(events.HaltEvent)
-		if !ok {
-			return nil
-		}
-		h.mu.Lock()
-		h.halted, h.reason = true, halt.Reason
-		h.mu.Unlock()
-		return nil
-	}, stream.SubscribeOptions{Condition: events.TypeOf[events.HaltEvent]()})
-	defer ctx.Stream.Unsubscribe(sub)
-	return next(ev, ctx)
-}
-
-// OnLLMCall short-circuits once a halt is on the stream (Python parity: the
-// synthetic HALTED ModelResponse).
-func (h *HaltCheck) OnLLMCall(next middleware.LLMCallFunc, evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
-	h.mu.Lock()
-	halted, reason := h.halted, h.reason
-	h.mu.Unlock()
-	if halted {
-		fmt.Printf("  [halt] model call short-circuited: HALTED: %s\n", reason)
-		return &events.ModelResponse{
-			Message: &events.ModelMessage{Content: "HALTED: " + reason},
-		}, nil
 	}
 	return next(evs, ctx)
 }
