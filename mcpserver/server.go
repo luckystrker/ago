@@ -163,6 +163,26 @@ type ServerConfig struct {
 	//
 	// AGO-DEVIATION: as AllowedHosts.
 	AllowedOrigins []string
+
+	// ToolMeta is the presentation metadata advertised per served tool, keyed
+	// by tool name (the conversational tool's included): title, annotations,
+	// outputSchema, _meta (Python parity: mcp_tool(title=, annotations=,
+	// output_schema=, meta=)). A key naming no served tool, or an output
+	// schema that is not an object schema, fails construction with
+	// ErrInvalidToolMeta. A tool whose metadata carries an output schema
+	// answers a result that is one JSON object as structuredContent as well.
+	// Nil advertises nothing extra.
+	//
+	// AGO-DEVIATION: Python carries this metadata on the tool (mcp_tool
+	// arguments); see ToolMeta.
+	ToolMeta map[string]ToolMeta
+
+	// Variables and Dependencies are what each request's tools resolve
+	// tools.Variable and tools.Inject slots against, and ToolMeta.Resolve
+	// reads (Python parity: the variables and dependencies of the request's
+	// MCPExecutionContext). Every request works on its own copy of the maps.
+	Variables    map[string]any
+	Dependencies map[string]any
 }
 
 // ServerOption overrides ServerConfig fields for NewServerForAgent.
@@ -228,6 +248,7 @@ type toolEntry struct {
 	name        string
 	description string
 	inputSchema map[string]any
+	meta        ToolMeta
 	// call runs one tools/call. The outcome is a tool result even on failure:
 	// an agent/tool failure is isError content (Python parity: the executor's
 	// tool_error arm), while unknown names are refused before dispatch as a
@@ -254,6 +275,8 @@ type Server struct {
 	callTimeout    time.Duration                                  // stdio exchange bound; < 0 = off
 	allowedHosts   []string
 	allowedOrigins []string
+	variables      map[string]any
+	dependencies   map[string]any
 
 	initialized atomic.Bool
 }
@@ -305,6 +328,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		callTimeout:    callTimeout,
 		allowedHosts:   cfg.AllowedHosts,
 		allowedOrigins: cfg.AllowedOrigins,
+		variables:      cfg.Variables,
+		dependencies:   cfg.Dependencies,
 	}
 	seen := map[string]bool{toolName: true}
 	// The scratch context exists because the Tool contract hands Schemas a
@@ -336,10 +361,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 				description: schema.Description,
 				inputSchema: normalizeInputSchema(schema.Parameters),
 				call: func(ctx context.Context, args map[string]any) toolCallOutcome {
-					return registeredToolOutcome(t, served.Name, args)
+					return s.registeredToolOutcome(ctx, t, served.Name, args)
 				},
 			})
 		}
+	}
+	if err := validateToolMeta(cfg.ToolMeta, seen); err != nil {
+		return nil, err
+	}
+	s.ask.meta = cfg.ToolMeta[toolName]
+	for _, e := range s.extras {
+		e.meta = cfg.ToolMeta[e.name]
 	}
 	return s, nil
 }
@@ -504,7 +536,7 @@ func (s *Server) handle(ctx context.Context, req *rpcRequest) *rpcResponse {
 			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
 				Error: rpcErr(codeInvalidRequest, "Call initialize before listing or calling tools.")}
 		}
-		return reply(s.listTools())
+		return reply(s.listTools(ctx))
 	case "tools/call":
 		if !s.initialized.Load() {
 			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
@@ -569,15 +601,11 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]any {
 // listTools serves the registry in construction order: the conversational
 // tool first (Python parity: executor.list_tools plus the provider's
 // entries). The set is small and fixed, so there is no cursor to hand back.
-func (s *Server) listTools() map[string]any {
+func (s *Server) listTools(ctx context.Context) map[string]any {
 	all := append([]*toolEntry{s.ask}, s.extras...)
 	out := make([]map[string]any, 0, len(all))
 	for _, t := range all {
-		out = append(out, map[string]any{
-			"name":        t.name,
-			"description": t.description,
-			"inputSchema": t.inputSchema,
-		})
+		out = append(out, s.advertise(ctx, t))
 	}
 	return map[string]any{"tools": out}
 }
@@ -613,6 +641,10 @@ func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.R
 	result := map[string]any{"content": outcome.content}
 	if outcome.isError {
 		result["isError"] = true
+	} else if outcome.structured != nil && s.declaresOutputSchema(ctx, entry) {
+		// AGO-DEVIATION: only a tool advertising an output schema answers
+		// structuredContent (Python: any Mapping result); see structuredOf.
+		result["structuredContent"] = outcome.structured
 	}
 	return &rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
 }
@@ -637,6 +669,10 @@ func (s *Server) entry(name string) *toolEntry {
 type toolCallOutcome struct {
 	content []contentBlock
 	isError bool
+	// structured is the result as one JSON object when it has that form; it is
+	// answered as structuredContent only for a tool advertising an output
+	// schema.
+	structured map[string]any
 }
 
 // contentBlock is one tools/call content block. The MCP block variants share
@@ -699,7 +735,11 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 	}
 	// MCP requires at least one content block; an empty reply maps to ""
 	// (Python parity: reply_to_content).
-	return toolCallOutcome{content: []contentBlock{textBlock(reply)}}
+	var structured map[string]any
+	if strings.HasPrefix(strings.TrimSpace(reply), "{") {
+		_ = json.Unmarshal([]byte(reply), &structured)
+	}
+	return toolCallOutcome{content: []contentBlock{textBlock(reply)}, structured: structured}
 }
 
 // registeredToolOutcome runs one deterministic tool through the tools.Tool
@@ -711,9 +751,12 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 // interface has no direct call, and the scratch-stream round trip is the
 // machinery every Tool implementation (function tools included) already
 // answers through (D-056).
-func registeredToolOutcome(t tools.Tool, name string, args map[string]any) toolCallOutcome {
-	ms := stream.NewMemoryStream()
-	cx := agocontext.New(ms)
+func (s *Server) registeredToolOutcome(ctx context.Context, t tools.Tool, name string, args map[string]any) toolCallOutcome {
+	cx, err := s.requestContext(ctx, "tools/call", name)
+	if err != nil {
+		return toolErrorOutcome(err.Error())
+	}
+	ms := cx.Stream
 	subs, err := t.Register(cx, nil)
 	if err != nil {
 		return toolErrorOutcome(err.Error())
@@ -765,8 +808,20 @@ func registeredToolOutcome(t tools.Tool, name string, args map[string]any) toolC
 		// on an empty reply.
 		return toolErrorOutcome(fmt.Sprintf("tool %q returned no result", name))
 	default:
-		return toolCallOutcome{content: resultContent(result.Parts, name)}
+		return toolCallOutcome{content: resultContent(result.Parts, name), structured: structuredOf(result.Parts)}
 	}
+}
+
+// declaresOutputSchema reports whether the entry advertises an output schema
+// for this request, its per-request resolution included.
+func (s *Server) declaresOutputSchema(ctx context.Context, t *toolEntry) bool {
+	meta := t.meta
+	if meta.Resolve != nil {
+		if cx, err := s.requestContext(ctx, "tools/call", t.name); err == nil {
+			meta = meta.merged(cx)
+		}
+	}
+	return meta.OutputSchema != nil
 }
 
 // resultContent maps tool result parts onto MCP content blocks (Python parity:
