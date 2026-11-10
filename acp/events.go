@@ -25,9 +25,23 @@ func (AvailableCommandsEvent) EventType() string    { return "ACPAvailableComman
 func (AvailableCommandsEvent) Transient() bool      { return false }
 func (AvailableCommandsEvent) Conversational() bool { return false }
 
+// PlanEvent is the event a peer's plan update becomes when an agent runs as
+// a model (Python parity: ACPPlan): the agent's current execution plan.
+// EventOf does not produce it — plan updates reach Bridge.OnUpdate as
+// Updates — the provider (provider.go) publishes it on the run's stream.
+type PlanEvent struct {
+	events.Base
+	Entries []PlanEntry `json:"entries"`
+}
+
+func (PlanEvent) EventType() string    { return "ACPPlan" }
+func (PlanEvent) Transient() bool      { return false }
+func (PlanEvent) Conversational() bool { return false }
+
 func init() {
 	events.RegisterEvent(ModeChange{})
 	events.RegisterEvent(AvailableCommandsEvent{})
+	events.RegisterEvent(PlanEvent{})
 }
 
 // EventOf maps a session/update a Bridge received onto the typed event that

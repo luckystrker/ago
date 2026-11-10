@@ -7,10 +7,16 @@
 //   - Serve (the agent role) exposes a handler over stdin/stdout so any ACP
 //     client can drive it: initialize / session/new / session/prompt, with the
 //     handler's output pushed out as session/update notifications.
+//
 //   - Bridge (the client role) drives an external ACP agent running as a
 //     subprocess (a CLI coding agent in ACP mode): it performs the initialize
 //     handshake, opens sessions and collects the agent_message_chunk text of
 //     each prompt.
+//
+//   - Config (the provider) is the Bridge role wrapped as a model: an
+//     external ACP agent as an AGo agent's config.ModelConfig, with the run's
+//     tools exposed to it over an in-process HTTP MCP server. Presets:
+//     ClaudeCodeConfig, CodexConfig, OpenCodeConfig, KiloCodeConfig.
 //
 // Python parity: the serving half is ag2/ag2/acp/agent.py + executor.py +
 // session.py + mappers.py; the consuming half is ag2/acp/bridge.py +
@@ -20,10 +26,12 @@
 package acp
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -68,6 +76,9 @@ var (
 	// Bridge.ExchangeTimeout; the agent subprocess was killed to unblock the
 	// wait, so the Bridge is no longer usable for further exchanges.
 	ErrTimeout = errors.New("acp: exchange timed out")
+	// ErrAgentExited reports an agent subprocess that ended while a reply was
+	// still owed (it also wraps ErrProtocol, which it always did).
+	ErrAgentExited = errors.New("acp: agent exited")
 )
 
 // killAfter bounds a subprocess shutdown: closing stdin lets a well-behaved
@@ -146,6 +157,10 @@ func writeLine(w io.Writer, msg any) error {
 type contentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
+	// Data (base64) and MimeType carry an image or audio block; only the
+	// message-chunk updates an agent streams back use them.
+	Data     string `json:"data,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
 }
 
 func textBlock(s string) contentBlock { return contentBlock{Type: "text", Text: s} }
@@ -228,6 +243,10 @@ type Update struct {
 	// chunk kinds: user_message_chunk / agent_message_chunk / agent_thought_chunk
 	MessageID string `json:"messageId,omitempty"`
 	Text      string `json:"-"`
+	// Data and MimeType replace Text when the chunk carries an image or audio
+	// block (MimeType "image/..." or "audio/...").
+	Data     []byte `json:"-"`
+	MimeType string `json:"-"`
 
 	// tool_call / tool_call_update
 	ToolCallID  string          `json:"-"`
@@ -268,6 +287,13 @@ func (u Update) MarshalJSON() ([]byte, error) {
 	switch {
 	case u.isChunk():
 		blk := textBlock(u.Text)
+		if len(u.Data) > 0 {
+			kind := "image"
+			if strings.HasPrefix(u.MimeType, "audio/") {
+				kind = "audio"
+			}
+			blk = contentBlock{Type: kind, Data: base64.StdEncoding.EncodeToString(u.Data), MimeType: u.MimeType}
+		}
 		m["content"] = blk
 		if u.MessageID != "" {
 			m["messageId"] = u.MessageID
@@ -361,6 +387,13 @@ func (u *Update) UnmarshalJSON(data []byte) error {
 		}
 		if blk != nil {
 			u.Text = blk.Text
+			if blk.Type == "image" || blk.Type == "audio" {
+				// An undecodable payload is dropped, not fatal: the update's
+				// kind and any siblings still reach the caller.
+				if data, err := base64.StdEncoding.DecodeString(blk.Data); err == nil && len(data) > 0 {
+					u.Data, u.MimeType = data, blk.MimeType
+				}
+			}
 		}
 	case u.Kind == "tool_call" || u.Kind == "tool_call_update":
 		u.ToolCallID, u.Title, u.ToolKind, u.Status = w.ToolCallID, w.Title, w.ToolKind, w.Status
