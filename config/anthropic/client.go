@@ -39,6 +39,7 @@ type Client struct {
 	timeout       time.Duration // caps non-streaming requests; 0 = no cap
 	maxRetries    int
 	promptCaching bool
+	nativeOutput  bool // send the response schema as output_config
 
 	defaultHeaders   map[string]string
 	metadata         map[string]string
@@ -64,11 +65,14 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	if conv != nil { // a nil conv is a headless call
 		prompt = conv.PromptLines()
 	}
+	var structured map[string]any
 	if opts.ResponseSchema != nil {
-		// Structured output is prompt-driven on this provider (Python sends a
-		// native output_config; the brief scopes the port to the prompt): the
-		// schema's own system prompt carries the JSON requirement, validation
-		// happens above via response.Proto.
+		// The schema's own system prompt carries the JSON requirement and
+		// validation happens above via response.Proto; with NativeStructuredOutput
+		// the API also constrains the answer to the schema (output_config).
+		if c.nativeOutput {
+			structured = outputConfig(opts.ResponseSchema.JSONSchema())
+		}
 		if sp := opts.ResponseSchema.SystemPrompt(); sp != "" {
 			prompt = append(prompt, sp)
 		}
@@ -77,6 +81,12 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	turns, err := ConvertMessages(messages)
 	if err != nil {
 		return nil, err
+	}
+
+	if c.promptCaching {
+		// The breakpoint on the last user turn extends the cached prefix over
+		// the whole history (system and the last tool carry the other two).
+		injectCacheBreakpoint(turns)
 	}
 
 	body := map[string]any{
@@ -117,6 +127,12 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 		// flag, so the body field and the header travel together.
 		betas = append(betas, mcpClientBeta)
 	}
+	if structured != nil {
+		body["output_config"] = structured
+	}
+	if hasFileReferences(messages) {
+		betas = append(betas, filesBeta)
+	}
 	if len(c.stopSequences) > 0 {
 		body["stop_sequences"] = c.stopSequences
 	}
@@ -148,24 +164,6 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	if c.streaming {
 		body["stream"] = true
 	}
-	// The diagnostics chain names the message this request is compared against;
-	// null on the first call (Python parity: AnthropicCacheDiagnostics chaining).
-	var previousMessageID string
-	if c.cacheDiagnostics {
-		previousMessageID = c.previousMessageID()
-		var previous any
-		if previousMessageID != "" {
-			previous = previousMessageID
-		}
-		body["diagnostics"] = map[string]any{"previous_message_id": previous}
-	}
-	// extra_body merges last, as the SDK does: an unmapped field (thinking,
-	// a vendor flag) reaches the wire without a typed config slot, and a key
-	// it repeats replaces the derived value.
-	for k, v := range c.extraBody {
-		body[k] = v
-	}
-
 	headers := make(map[string]string, len(c.defaultHeaders)+2)
 	for name, value := range c.defaultHeaders {
 		headers[name] = value
@@ -189,10 +187,82 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	client := &httpx.Client{HTTP: c.httpClient, MaxRetries: c.maxRetries, Timeout: c.timeout}
 	url := c.baseURL + messagesPath
 
-	if c.streaming {
-		return c.stream(ctx, client, url, headers, body, conv, previousMessageID)
+	// A turn paused mid-way by a server-side tool (stop_reason pause_turn) is
+	// resumed by sending its content back as an assistant turn, up to
+	// maxPauseContinuations times; the answer is the last hop's, with every
+	// hop's usage summed (Python parity).
+	var carried events.Usage
+	for hop := 0; ; hop++ {
+		// The diagnostics chain names the message this request is compared
+		// against; null on the first call (Python parity: AnthropicCacheDiagnostics
+		// chaining). Every hop re-chains to the message the previous one answered.
+		var previousMessageID string
+		if c.cacheDiagnostics {
+			previousMessageID = c.previousMessageID()
+			var previous any
+			if previousMessageID != "" {
+				previous = previousMessageID
+			}
+			body["diagnostics"] = map[string]any{"previous_message_id": previous}
+		}
+		// extra_body merges last, as the SDK does: an unmapped field (thinking,
+		// a vendor flag) reaches the wire without a typed config slot, and a key
+		// it repeats replaces the derived value.
+		// AGO-DEVIATION: on a continuation hop `messages` is not replaced again.
+		// Python's SDK merge would overwrite it, so a caller's extra_body
+		// messages would resend the paused request unchanged and the turn
+		// could never resume.
+		for k, v := range c.extraBody {
+			if k == "messages" && hop > 0 {
+				continue
+			}
+			body[k] = v
+		}
+
+		var (
+			res *roundResult
+			err error
+		)
+		if c.streaming {
+			res, err = c.stream(ctx, client, url, headers, body, conv, previousMessageID)
+		} else {
+			res, err = c.once(ctx, client, url, headers, body, conv, previousMessageID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// AGO-DEVIATION: a paused answer without content is returned as is;
+		// Python would resend an empty assistant turn, which the API refuses.
+		if res.stopReason != "pause_turn" || hop >= maxPauseContinuations || len(res.content) == 0 {
+			res.resp.Usage = carried.Add(res.resp.Usage)
+			return res.resp, nil
+		}
+		// The paused content joins the messages the hop actually sent (an
+		// extra_body override included).
+		paused := turn("assistant", res.content)
+		switch sent := body["messages"].(type) {
+		case []map[string]any:
+			body["messages"] = append(sent, paused)
+		case []any:
+			body["messages"] = append(sent, paused)
+		default:
+			res.resp.Usage = carried.Add(res.resp.Usage)
+			return res.resp, nil
+		}
+		carried = carried.Add(res.resp.Usage)
 	}
-	return c.once(ctx, client, url, headers, body, conv, previousMessageID)
+}
+
+// maxPauseContinuations bounds the follow-up calls a pause_turn answer may
+// trigger (Python parity: max_continuations).
+const maxPauseContinuations = 5
+
+// roundResult is one Messages-API round: the durable response plus what a
+// pause_turn continuation needs to resume the turn.
+type roundResult struct {
+	resp       *events.ModelResponse
+	content    []map[string]any // the response's content blocks, verbatim
+	stopReason string           // the raw stop_reason
 }
 
 // defaultBetas collects the anthropic-beta values a caller set as defaults.
@@ -263,6 +333,31 @@ type wireBlock struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
+
+	// raw is the block exactly as the API sent it: server-tool blocks are
+	// replayed from it, and a paused turn is resumed with it.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON decodes the typed fields and keeps the verbatim block.
+func (b *wireBlock) UnmarshalJSON(data []byte) error {
+	type plain wireBlock // no methods: avoids recursing into this one
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*b = wireBlock(p)
+	b.raw = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+// object decodes the verbatim block into a generic JSON object.
+func (b wireBlock) object() (map[string]any, error) {
+	var m map[string]any
+	if err := json.Unmarshal(b.raw, &m); err != nil {
+		return nil, fmt.Errorf("anthropic: decoding %s block: %w", b.Type, err)
+	}
+	return m, nil
 }
 
 type wireMessage struct {
@@ -286,7 +381,7 @@ type wireCacheMissReason struct {
 	CacheMissedInputTokens *int64 `json:"cache_missed_input_tokens"`
 }
 
-func (c *Client) once(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*events.ModelResponse, error) {
+func (c *Client) once(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*roundResult, error) {
 	status, data, err := client.PostJSON(ctx, url, headers, body)
 	if err != nil {
 		return nil, err
@@ -305,7 +400,13 @@ func (c *Client) once(ctx context.Context, client *httpx.Client, url string, hea
 		FinishReason: MapStopReason(raw.StopReason),
 		ResponseID:   raw.ID,
 	}
+	content := make([]map[string]any, 0, len(raw.Content))
 	for _, block := range raw.Content {
+		obj, err := block.object()
+		if err != nil {
+			return nil, err
+		}
+		content = append(content, obj)
 		switch block.Type {
 		case "thinking":
 			if block.Thinking != "" {
@@ -342,11 +443,22 @@ func (c *Client) once(ctx context.Context, client *httpx.Client, url string, hea
 				Name:      block.Name,
 				Arguments: args,
 			})
+		case "server_tool_use", "mcp_tool_use":
+			if ev := serverToolCallEvent(obj); ev != nil {
+				if err := sendEvent(conv, ev); err != nil {
+					return nil, err
+				}
+			}
 		default:
-			// Unknown block kinds (server_tool_use, container_upload, ...) have
-			// no AGo replay event yet: dropped.
-			// AGO-DEVIATION: Python re-emits them as provider-specific replay
-			// events; the AGo vocabulary has no carrier for those kinds.
+			if ev := serverToolResultEvent(obj); ev != nil {
+				if err := sendEvent(conv, ev); err != nil {
+					return nil, err
+				}
+			}
+			// Other unknown block kinds (container_upload, ...) have no AGo
+			// replay event yet: dropped.
+			// AGO-DEVIATION: Python re-emits container_upload as a
+			// provider-specific event; AGo records only the server-tool kinds.
 		}
 	}
 	if raw.Usage != nil {
@@ -356,7 +468,7 @@ func (c *Client) once(ctx context.Context, client *httpx.Client, url string, hea
 		return nil, err
 	}
 	c.setLastMessageID(raw.ID)
-	return resp, nil
+	return &roundResult{resp: resp, content: content, stopReason: raw.StopReason}, nil
 }
 
 // --- streaming ---------------------------------------------------------------------
@@ -377,6 +489,8 @@ type streamEvent struct {
 		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
+		// Citation is one citations_delta entry, kept verbatim.
+		Citation json.RawMessage `json:"citation"`
 	} `json:"delta"`
 
 	// message_delta
@@ -402,8 +516,24 @@ type thinkingAcc struct {
 	text, signature string
 }
 
-func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*events.ModelResponse, error) {
+// streamBlock rebuilds one streamed content block as the API would have sent
+// it whole: the start block, with deltas folded in and tool input assembled at
+// the stop.
+type streamBlock struct {
+	obj     map[string]any
+	partial strings.Builder // input_json_delta fragments
+}
+
+// appendString folds a text-like delta into the block's string field.
+func (b *streamBlock) appendString(field, delta string) {
+	cur, _ := b.obj[field].(string)
+	b.obj[field] = cur + delta
+}
+
+func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*roundResult, error) {
 	var (
+		blocks       = map[int]*streamBlock{}
+		rawStop      string
 		content      strings.Builder
 		calls        []events.ToolCallEvent
 		accs         = map[int]*toolAcc{}
@@ -434,6 +564,15 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				}
 			}
 		case "content_block_start":
+			var started *streamBlock
+			if len(ev.ContentBlock.raw) > 0 {
+				obj, err := ev.ContentBlock.object()
+				if err != nil {
+					return err
+				}
+				started = &streamBlock{obj: obj}
+				blocks[ev.Index] = started
+			}
 			switch ev.ContentBlock.Type {
 			case "tool_use":
 				accs[ev.Index] = &toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
@@ -445,8 +584,38 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				if err := sendEvent(conv, &RedactedThinkingEvent{Data: ev.ContentBlock.Data}); err != nil {
 					return err
 				}
+			case "server_tool_use", "mcp_tool_use":
+				// The input arrives as input_json_delta; the event is built at
+				// content_block_stop so it carries the whole of it.
+			default:
+				// A server-tool result arrives whole in its start block.
+				if started != nil {
+					if rev := serverToolResultEvent(started.obj); rev != nil {
+						if err := sendEvent(conv, rev); err != nil {
+							return err
+						}
+					}
+				}
 			}
 		case "content_block_delta":
+			if b, ok := blocks[ev.Index]; ok {
+				switch ev.Delta.Type {
+				case "text_delta":
+					b.appendString("text", ev.Delta.Text)
+				case "thinking_delta":
+					b.appendString("thinking", ev.Delta.Thinking)
+				case "signature_delta":
+					b.obj["signature"] = ev.Delta.Signature
+				case "input_json_delta":
+					b.partial.WriteString(ev.Delta.PartialJSON)
+				case "citations_delta":
+					var cite any
+					if err := json.Unmarshal(ev.Delta.Citation, &cite); err == nil {
+						list, _ := b.obj["citations"].([]any)
+						b.obj["citations"] = append(list, cite)
+					}
+				}
+			}
 			switch ev.Delta.Type {
 			case "text_delta":
 				content.WriteString(ev.Delta.Text)
@@ -470,6 +639,23 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				}
 			}
 		case "content_block_stop":
+			if b, ok := blocks[ev.Index]; ok && b.partial.Len() > 0 {
+				// max_tokens can cut a block mid-JSON: the block is kept with
+				// its start input rather than failing the turn.
+				var input any
+				if err := json.Unmarshal([]byte(b.partial.String()), &input); err == nil {
+					b.obj["input"] = input
+				}
+			}
+			if b, ok := blocks[ev.Index]; ok {
+				if t, _ := b.obj["type"].(string); t == "server_tool_use" || t == "mcp_tool_use" {
+					if cev := serverToolCallEvent(b.obj); cev != nil {
+						if err := sendEvent(conv, cev); err != nil {
+							return err
+						}
+					}
+				}
+			}
 			if acc, ok := accs[ev.Index]; ok {
 				args := acc.arguments
 				if strings.TrimSpace(args) == "" {
@@ -492,6 +678,7 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 			}
 		case "message_delta":
 			if ev.Delta.StopReason != "" {
+				rawStop = ev.Delta.StopReason
 				finishReason = MapStopReason(ev.Delta.StopReason)
 			}
 			if ev.Usage != nil {
@@ -543,7 +730,17 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 		return nil, err
 	}
 	c.setLastMessageID(responseID)
-	return resp, nil
+
+	indexes := make([]int, 0, len(blocks))
+	for i := range blocks {
+		indexes = append(indexes, i)
+	}
+	slices.Sort(indexes)
+	assembled := make([]map[string]any, 0, len(indexes))
+	for _, i := range indexes {
+		assembled = append(assembled, blocks[i].obj)
+	}
+	return &roundResult{resp: resp, content: assembled, stopReason: rawStop}, nil
 }
 
 // mergeStreamUsage assembles the call's usage the way the final message of a

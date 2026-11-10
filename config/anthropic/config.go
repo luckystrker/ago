@@ -135,6 +135,14 @@ type AnthropicConfig struct {
 	// PromptCaching injects cache_control {"type":"ephemeral"} onto the last
 	// system block and the last tool.
 	PromptCaching bool
+	// NativeStructuredOutput sends the call's response schema as the API's
+	// output_config (a json_schema format the model is constrained to), on top
+	// of the schema's prompt text. Off keeps the prompt-driven path, where an
+	// off-schema answer is caught by the retry above the client.
+	// AGO-DEVIATION: Python always sends output_config; AGo makes it opt-in
+	// because older models answer it with a 400 and the request body of an
+	// existing caller must not change under it.
+	NativeStructuredOutput bool
 	// DefaultHeaders travel on every request (Python parity: default_headers).
 	// A case-insensitive `anthropic-beta` value is folded into the request's
 	// beta header together with the framework's own flags.
@@ -222,6 +230,7 @@ func (c *AnthropicConfig) Create() (config.LLMClient, error) {
 		timeout:          c.Timeout,
 		maxRetries:       c.MaxRetries,
 		promptCaching:    c.PromptCaching,
+		nativeOutput:     c.NativeStructuredOutput,
 		defaultHeaders:   copyMap(c.DefaultHeaders),
 		metadata:         copyMap(c.Metadata),
 		serviceTier:      c.ServiceTier,

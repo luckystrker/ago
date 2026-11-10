@@ -147,7 +147,6 @@ func TestBuildMessagesUnsupportedInputs(t *testing.T) {
 		part events.Input
 	}{
 		{"url video", &events.UrlInput{URL: "https://x/v.mp4", Kind: events.BinaryVideo}},
-		{"file id", &events.FileIdInput{FileID: "file-1"}},
 		// The Input interface is sealed to the events package, so an unmapped
 		// foreign part cannot exist; an unclassified binary input hits the
 		// same fallthrough.
@@ -161,6 +160,53 @@ func TestBuildMessagesUnsupportedInputs(t *testing.T) {
 				t.Fatalf("want ErrUnsupportedInput, got %v", err)
 			}
 		})
+	}
+}
+
+// A Files-API upload is referenced by id in the OpenAI dialect; the other
+// tenants of the shared engine (own Python mappers) still refuse it.
+func TestBuildMessagesFileReference(t *testing.T) {
+	req := events.ModelRequest{Parts: []events.Input{
+		&events.TextInput{Content: "summarize"},
+		&events.FileIdInput{FileID: "file-abc", Filename: "report.pdf"},
+	}}
+	msgs, err := BuildMessages(nil, []events.Event{&req})
+	if err != nil {
+		t.Fatalf("openai dialect: %v", err)
+	}
+	parts := msgs[len(msgs)-1]["content"].([]map[string]any)
+	want := map[string]any{"type": "file", "file": map[string]any{"file_id": "file-abc"}}
+	if !reflect.DeepEqual(parts[1], want) {
+		t.Fatalf("file part: got %#v, want %#v", parts[1], want)
+	}
+	for _, provider := range []Provider{ProviderMistral, ProviderZAI, ProviderDashScope, ProviderXAI} {
+		if _, err := BuildMessagesFor(provider, nil, []events.Event{&req}); !errors.Is(err, ErrUnsupportedInput) {
+			t.Errorf("%s: want ErrUnsupportedInput, got %v", provider, err)
+		}
+	}
+}
+
+func TestRunChatCompatSendsFileReference(t *testing.T) {
+	srv, captured := captureServer(t, 200, completionBody)
+	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m"}
+	req := events.ModelRequest{Parts: []events.Input{&events.FileIdInput{FileID: "file-abc"}}}
+	if _, err := RunChatCompat(context.Background(), p, []events.Event{&req}, nil, CallOptions{}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var body struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(*captured, &body); err != nil {
+		t.Fatal(err)
+	}
+	last := body.Messages[len(body.Messages)-1]
+	want := map[string]any{"type": "file", "file": map[string]any{"file_id": "file-abc"}}
+	content, _ := last.Content.([]any)
+	if last.Role != "user" || len(content) != 1 || !reflect.DeepEqual(content[0], want) {
+		t.Fatalf("wire message: %+v", last)
 	}
 }
 
@@ -427,7 +473,7 @@ func TestRunChatCompatNotProvided(t *testing.T) {
 func TestRunChatCompatUnsupportedInputFailsFast(t *testing.T) {
 	srv, captured := captureServer(t, 200, `{}`)
 	p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m"}
-	req := events.ModelRequest{Parts: []events.Input{&events.FileIdInput{FileID: "f-1"}}}
+	req := events.ModelRequest{Parts: []events.Input{&events.UrlInput{URL: "https://x/v.mp4", Kind: events.BinaryVideo}}}
 	_, err := RunChatCompat(context.Background(), p, []events.Event{&req}, nil, CallOptions{})
 	if !errors.Is(err, ErrUnsupportedInput) {
 		t.Fatalf("want ErrUnsupportedInput, got %v", err)

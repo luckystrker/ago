@@ -507,8 +507,18 @@ func inputPart(dialect inputDialect, part events.Input) (map[string]any, error) 
 			"image_url": map[string]any{"url": p.URL},
 		}, nil
 	case events.FileIdInput:
-		// AGO-DEVIATION: Python's OpenAI client accepts file references; the
-		// shared engine has no Files API, so they fail fast per the brief.
+		// An uploaded file travels by reference, in the OpenAI dialect only
+		// (Python parity: the openai mapper's file part). The other tenants of
+		// the shared engine have their own mappers in Python and fail fast.
+		// AGO-DEVIATION: Python refuses a file uploaded through another
+		// vendor's Files API; AGo's UploadedFile carries no provider tag, so
+		// that check does not exist and the API answers a foreign file id.
+		if dialect == inputDialectOpenAI {
+			return map[string]any{
+				"type": "file",
+				"file": map[string]any{"file_id": p.FileID},
+			}, nil
+		}
 		return nil, fmt.Errorf("%w: FileIdInput for the chat-completions API", ErrUnsupportedInput)
 	default:
 		return nil, fmt.Errorf("%w: %T for the chat-completions API", ErrUnsupportedInput, part)

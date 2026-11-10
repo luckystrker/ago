@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -117,7 +118,12 @@ func TestCallText(t *testing.T) {
 		t.Fatalf("messages = %v", msgs)
 	}
 	m := msgs[0].(map[string]any)
-	if m["role"] != "user" || m["content"] != "hello" {
+	// Prompt caching is on by default, so the lone user turn carries the
+	// conversation-prefix breakpoint.
+	wantTurn := map[string]any{"role": "user", "content": []any{
+		map[string]any{"type": "text", "text": "hello", "cache_control": map[string]any{"type": "ephemeral"}},
+	}}
+	if !reflect.DeepEqual(m, wantTurn) {
 		t.Fatalf("user turn = %v", m)
 	}
 
@@ -425,7 +431,6 @@ func TestConvertMessagesUnsupportedInputs(t *testing.T) {
 		{"binary document without pdf media type", &events.BinaryInput{Data: []byte{1}, MediaType: "text/html", Kind: events.BinaryDocument}},
 		{"image with unsupported media type", &events.BinaryInput{Data: []byte{1}, MediaType: "image/bmp", Kind: events.BinaryImage}},
 		{"url video", &events.UrlInput{URL: "https://x/v.mp4", Kind: events.BinaryVideo}},
-		{"file id", &events.FileIdInput{FileID: "file-1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
