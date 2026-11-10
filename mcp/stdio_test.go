@@ -65,6 +65,14 @@ func runStdioServer(in io.Reader, out io.Writer) {
 	// ask sends one server-to-client request (string id, like a real server
 	// might use) and reads stdin until its reply shows up.
 	ask := func(method string, params any) (json.RawMessage, *rpcError) {
+		if strings.HasPrefix(method, notifyPrefix) {
+			msg := map[string]any{"jsonrpc": "2.0", "method": strings.TrimPrefix(method, notifyPrefix)}
+			if params != nil {
+				msg["params"] = params
+			}
+			writeStub(w, msg)
+			return json.RawMessage(`{}`), nil
+		}
 		reqSeq++
 		id := fmt.Sprintf("srv-%d", reqSeq)
 		msg := map[string]any{"jsonrpc": "2.0", "id": id, "method": method}
@@ -136,7 +144,7 @@ func runStdioServer(in io.Reader, out io.Writer) {
 				writeStub(w, map[string]any{"jsonrpc": "2.0", "id": "idle-1", "method": "ping"})
 			case "idle_report":
 				writeStub(w, stubReply(req.ID, textResult(fmt.Sprint(idleAnswered)), nil))
-			case "caps", "elicit", "sample", "sample_media", "roots", "ping", "needs_input", "state_only", "resource":
+			case "notify", "caps", "elicit", "sample", "sample_media", "roots", "ping", "needs_input", "state_only", "resource":
 				result, rpcErr := b.handle("tools/call", req.Params, nil, ask)
 				writeStub(w, stubReply(req.ID, result, rpcErr))
 			default:

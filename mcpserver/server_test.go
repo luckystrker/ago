@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/luckystrker/ago/agent"
 	agocontext "github.com/luckystrker/ago/context"
@@ -192,8 +193,14 @@ func TestHTTPRoundTrip(t *testing.T) {
 		t.Errorf("CallTool nope = %v, want ErrProtocol naming Unknown tool", err)
 	}
 
-	// The empty-message guard.
+	// A call missing the required argument fails schema validation before the
+	// agent runs (Python parity: a tool-level "Input validation error").
 	if _, err := cl.CallTool("ask", nil); !errors.Is(err, mcp.ErrToolCall) ||
+		!strings.Contains(err.Error(), "Input validation error: 'message' is a required property") {
+		t.Errorf("CallTool ask/missing = %v, want the validation error", err)
+	}
+	// The empty-message guard still stands for a present-but-empty message.
+	if _, err := cl.CallTool("ask", map[string]any{"message": ""}); !errors.Is(err, mcp.ErrToolCall) ||
 		!strings.Contains(err.Error(), "Missing required 'message' argument.") {
 		t.Errorf("CallTool ask/empty = %v, want the message guard", err)
 	}
@@ -236,9 +243,10 @@ func TestNewServerForAgent(t *testing.T) {
 
 func TestInitializeNegotiation(t *testing.T) {
 	s, _ := newTestServer(t, nil)
-	// A revision this subset does not speak is answered with its own latest.
+	// A revision the server does not speak is answered with its own latest (the
+	// SDK's negotiation over the handshake revisions).
 	resp := rawPost(t, s, `{"jsonrpc":"2.0","id":1,"method":"initialize",
-		"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}`)
+		"params":{"protocolVersion":"1999-01-01","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}`)
 	if resp.Error != nil {
 		t.Fatalf("initialize newer: %v", resp.Error)
 	}
@@ -248,8 +256,17 @@ func TestInitializeNegotiation(t *testing.T) {
 	if err := json.Unmarshal(mustRaw(t, resp.Result), &got); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if got.ProtocolVersion != protocolVersion {
-		t.Errorf("negotiated to %q, want %q", got.ProtocolVersion, protocolVersion)
+	if got.ProtocolVersion != latestHandshakeVersion {
+		t.Errorf("negotiated to %q, want %q", got.ProtocolVersion, latestHandshakeVersion)
+	}
+
+	// Every handshake revision is echoed verbatim, not only the oldest.
+	for _, v := range handshakeVersions {
+		resp = rawPost(t, s, `{"jsonrpc":"2.0","id":3,"method":"initialize",
+			"params":{"protocolVersion":"`+v+`","capabilities":{}}}`)
+		if err := json.Unmarshal(mustRaw(t, resp.Result), &got); err != nil || got.ProtocolVersion != v {
+			t.Errorf("requested %q, negotiated %q (%v)", v, got.ProtocolVersion, err)
+		}
 	}
 
 	// The supported revision is echoed verbatim.
@@ -532,4 +549,15 @@ func errText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func TestConversationConfigRefusals(t *testing.T) {
+	// Python raises ValueError for a bound below one and for a non-positive TTL;
+	// zero is "use the default" here, so only a negative value is refused.
+	for _, cc := range []ConversationConfig{{MaxConversations: -1}, {TTL: -time.Second}} {
+		_, err := NewServerForAgent(agent.New("a", ""), WithConversations(cc))
+		if !errors.Is(err, ErrNotProvided) {
+			t.Errorf("%+v = %v, want ErrNotProvided", cc, err)
+		}
+	}
 }

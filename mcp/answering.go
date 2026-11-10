@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
@@ -144,13 +145,43 @@ type SamplingResult struct {
 type SamplingHandler func(ctx context.Context, cx *agocontext.Context, req SamplingRequest) (SamplingResult, error)
 
 // callScope is what a server's request is answered against: the conversation of
-// the tool call in flight. Set and read only while the Client's lock is held (the
-// transports invoke the handler on the goroutine waiting for its call's reply).
+// the tool call in flight. Requests are answered on the goroutine waiting for the
+// call's reply, but the standalone HTTP stream answers on its own goroutine, so
+// the scope is guarded.
 type callScope struct {
 	cx *agocontext.Context
+
+	mu sync.Mutex
 	// failure records the first request that could not be answered; the call
 	// fails with it however the server then replies.
 	failure error
+}
+
+func (s *callScope) fail(err error) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.failure == nil {
+		s.failure = err
+	}
+	s.mu.Unlock()
+}
+
+func (s *callScope) failed() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failure
+}
+
+// activeScope is the tool call in flight, nil between calls.
+func (c *Client) activeScope() *callScope {
+	c.scopeMu.Lock()
+	defer c.scopeMu.Unlock()
+	return c.scope
 }
 
 // handleServerRequest answers one server-initiated request: ping, elicitation,
@@ -178,9 +209,7 @@ func (c *Client) answer(result any, err error) (any, *rpcError) {
 	if err == nil {
 		return result, nil
 	}
-	if c.scope != nil && c.scope.failure == nil {
-		c.scope.failure = fmt.Errorf("%w: %w", ErrAnswering, err)
-	}
+	c.activeScope().fail(fmt.Errorf("%w: %w", ErrAnswering, err))
 	code := codeInternalError
 	var pe *paramsError
 	if errors.As(err, &pe) {
@@ -230,14 +259,15 @@ func (c *Client) elicit(ctx context.Context, raw json.RawMessage) (any, error) {
 		// Splitting one free-text answer across fields is fabricating data.
 		return declined(), nil
 	}
-	if c.scope == nil || c.scope.cx == nil {
+	scope := c.activeScope()
+	if scope == nil || scope.cx == nil {
 		// An absent channel is not a refusal: declining would hand the server
 		// a decision the operator never made, so the call fails instead.
 		return nil, errors.New("elicitation needs a conversation (use CallToolWith or Tools) to reach a human")
 	}
 	// A hitl error (no hook, hook failure, timeout) is deliberately not turned
 	// into a decline, for the same reason.
-	answer, err := c.scope.cx.Input(ctx, p.Message, 0)
+	answer, err := scope.cx.Input(ctx, p.Message, 0)
 	if err != nil {
 		return nil, fmt.Errorf("human input: %w", err)
 	}
@@ -287,8 +317,8 @@ func (c *Client) sample(ctx context.Context, raw json.RawMessage) (any, error) {
 		req.Messages = append(req.Messages, SamplingMessage{Role: m.Role, Parts: parts})
 	}
 	var cx *agocontext.Context
-	if c.scope != nil {
-		cx = c.scope.cx
+	if scope := c.activeScope(); scope != nil {
+		cx = scope.cx
 	}
 	handler := c.policy.SamplingHandler
 	if handler == nil {
@@ -426,8 +456,8 @@ func (c *Client) answerInputRequests(ctx context.Context, ir inputRequired) (map
 		}
 		result, rpcErr := c.handleServerRequest(ctx, req.Method, req.Params)
 		if rpcErr != nil {
-			if c.scope != nil && c.scope.failure != nil {
-				return nil, c.scope.failure
+			if failure := c.activeScope().failed(); failure != nil {
+				return nil, failure
 			}
 			return nil, fmt.Errorf("%w: input request %q (%s): %s", ErrAnswering, key, req.Method, rpcErr.Message)
 		}

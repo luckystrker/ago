@@ -78,10 +78,29 @@ type Client struct {
 	// modern is set when the session settled on the modern era (server/discover
 	// answered): requests then carry per-request metadata and no initialize
 	// handshake happened.
-	modern bool
+	modern         bool
+	onNotification func(Notification)
 	// scope is the tool call in flight, against which the server's own requests
 	// are answered; nil between calls.
-	scope *callScope
+	scope   *callScope
+	scopeMu sync.Mutex
+}
+
+// Notification is a server-to-client notification: progress on a call, a log
+// message, a list that changed. It carries no id and expects no reply.
+type Notification struct {
+	Method string
+	Params json.RawMessage
+}
+
+// WithNotifications delivers the server's notifications to fn. fn runs on a
+// transport goroutine (the stdio reader, an HTTP stream reader, or the goroutine
+// waiting on a call's reply) and must return quickly; hand heavy work to another
+// goroutine. It must not call back into this Client: a notification can arrive
+// while a call holds the Client's lock, so a re-entrant call would deadlock.
+// Without it notifications are dropped.
+func WithNotifications(fn func(Notification)) Option {
+	return func(c *Client) { c.onNotification = fn }
 }
 
 // Option configures a Client built by New.
@@ -258,6 +277,7 @@ func (c *Client) startSession(ctx context.Context) (ServerInfo, error) {
 		return ServerInfo{}, fmt.Errorf("%w: no transport", ErrUnsupportedConfig)
 	}
 	tr.setHandler(c.handleServerRequest)
+	tr.setNotifier(c.onNotification)
 	c.modern = false
 
 	if c.mode == ProtocolAuto {
@@ -291,6 +311,8 @@ func (c *Client) startSession(ctx context.Context) (ServerInfo, error) {
 		tr.close()
 		return ServerInfo{}, err
 	}
+	// The standalone stream opens once the session is confirmed, as in the SDK.
+	tr.startListener()
 	// AGO-DEVIATION: the server's protocol version is recorded but never
 	// negotiated further — the minimum client accepts whatever a server that
 	// answered the 2024-11-05 offer speaks.
@@ -430,8 +452,27 @@ func (c *Client) withMeta(params map[string]any) map[string]any {
 	for k, v := range params {
 		out[k] = v
 	}
-	out["_meta"] = c.envelope(c.session.ProtocolVersion)
+	env := c.envelope(c.session.ProtocolVersion)
+	if own, ok := params["_meta"].(map[string]any); ok {
+		for k, v := range own { // the caller's keys (progressToken) ride beside the envelope
+			if _, reserved := env[k]; !reserved {
+				env[k] = v
+			}
+		}
+	}
+	out["_meta"] = env
 	return out
+}
+
+// Request sends one JSON-RPC request the typed helpers do not cover —
+// resources/list, resources/read, prompts/get and the like — and returns the raw
+// result. A JSON-RPC error object is an error wrapping ErrProtocol whose text
+// carries the code and message.
+func (c *Client) Request(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.request(ctx, method, params)
 }
 
 // ListTools lists the server's tools, following the cursor pagination to the end
@@ -494,6 +535,13 @@ func (c *Client) CallTool(name string, args map[string]any) (ToolOutcome, error)
 // server request that cannot be answered fails the call with ErrAnswering; a
 // server that keeps replying input_required fails it with ErrMaxRounds.
 func (c *Client) CallToolWith(ctx context.Context, cx *agocontext.Context, name string, args map[string]any) (ToolOutcome, error) {
+	return c.CallToolMeta(ctx, cx, name, args, nil)
+}
+
+// CallToolMeta is CallToolWith with request metadata: meta travels as the call's
+// params._meta, which is where a progressToken goes to ask the server for
+// progress notifications on this call (delivered through WithNotifications).
+func (c *Client) CallToolMeta(ctx context.Context, cx *agocontext.Context, name string, args map[string]any, meta map[string]any) (ToolOutcome, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -502,19 +550,29 @@ func (c *Client) CallToolWith(ctx context.Context, cx *agocontext.Context, name 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.scope = &callScope{cx: cx}
-	defer func() { c.scope = nil }()
+	scope := &callScope{cx: cx}
+	c.scopeMu.Lock()
+	c.scope = scope
+	c.scopeMu.Unlock()
+	defer func() {
+		c.scopeMu.Lock()
+		c.scope = nil
+		c.scopeMu.Unlock()
+	}()
 
 	params := map[string]any{"name": name, "arguments": args}
+	if len(meta) > 0 {
+		params["_meta"] = meta
+	}
 	rounds := 0
 	backoff := stateOnlyBackoffInitial
 	for {
 		res, err := c.requestLocked(ctx, "tools/call", params)
-		if c.scope.failure != nil {
+		if scope.failed() != nil {
 			// A request the server made could not be answered; however the
 			// server went on, the call is lost (Python parity: the ErrorData
 			// aborts the call).
-			return ToolOutcome{}, c.scope.failure
+			return ToolOutcome{}, scope.failed()
 		}
 		if err != nil {
 			return ToolOutcome{}, err
@@ -534,6 +592,9 @@ func (c *Client) CallToolWith(ctx context.Context, cx *agocontext.Context, name 
 		// state token has nothing to answer: back off (50ms doubling to 250ms)
 		// and retry without inputResponses, as the SDK does.
 		params = map[string]any{"name": name, "arguments": args}
+		if len(meta) > 0 {
+			params["_meta"] = meta
+		}
 		if len(ir.InputRequests) > 0 {
 			backoff = stateOnlyBackoffInitial
 			responses, err := c.answerInputRequests(ctx, ir)
