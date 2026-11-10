@@ -37,7 +37,8 @@ type FilesystemOption func(*filesystemConfig) error
 
 // filesystemConfig is the resolved option set.
 type filesystemConfig struct {
-	readOnly bool
+	readOnly   bool
+	middleware []middleware.Middleware
 }
 
 // WithFilesystemReadOnly omits every mutating tool (write_file,
@@ -46,6 +47,22 @@ type filesystemConfig struct {
 // delete_file).
 func WithFilesystemReadOnly() FilesystemOption {
 	return func(c *filesystemConfig) error { c.readOnly = true; return nil }
+}
+
+// WithFilesystemMiddleware adds tool-scoped middleware to every member, the Go
+// spelling of the Python toolkit's middleware= kwarg. The first entry is the
+// outermost layer of each tool's own chain; agent middleware still wraps it
+// from outside.
+func WithFilesystemMiddleware(mw ...middleware.Middleware) FilesystemOption {
+	return func(c *filesystemConfig) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: filesystem middleware must not be nil")
+			}
+		}
+		c.middleware = append(c.middleware, mw...)
+		return nil
+	}
 }
 
 // NewFilesystemToolkit builds the tools rooted at dir. The root must be an
@@ -87,7 +104,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 		return string(b), nil
 	}
 	readFile, err := tools.NewFunctionTool("read_file",
-		"Read the contents of a file (UTF-8 text).", readFn)
+		"Read the contents of a file (UTF-8 text).", readFn, tools.WithMiddleware(cfg.middleware...))
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +132,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 		}
 		writeFile, err := tools.NewFunctionTool("write_file",
 			"Create or overwrite a file with the given content. Parent directories are created automatically.",
-			writeFn)
+			writeFn, tools.WithMiddleware(cfg.middleware...))
 		if err != nil {
 			return nil, err
 		}
@@ -149,7 +166,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 		return out, nil
 	}
 	listDir, err := tools.NewFunctionTool("list_directory",
-		"List a directory's entries. Directories carry a trailing slash.", listFn)
+		"List a directory's entries. Directories carry a trailing slash.", listFn, tools.WithMiddleware(cfg.middleware...))
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +186,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 			return fmt.Sprintf("Successfully created directory %s", args.Path), nil
 		}
 		mkdir, err := tools.NewFunctionTool("make_directory",
-			"Create a directory (and any missing parents) inside the workspace.", mkdirFn)
+			"Create a directory (and any missing parents) inside the workspace.", mkdirFn, tools.WithMiddleware(cfg.middleware...))
 		if err != nil {
 			return nil, err
 		}
@@ -208,7 +225,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 	}
 	findFiles, err := tools.NewFunctionTool("find_files",
 		"Search for files matching a glob pattern. Use recursive patterns like '**/*.py' to search subdirectories.",
-		globFn)
+		globFn, tools.WithMiddleware(cfg.middleware...))
 	if err != nil {
 		return nil, err
 	}

@@ -47,6 +47,7 @@ type ShellTool struct {
 	ignore      []string
 	restricted  bool
 	readonly    bool
+	middleware  []middleware.Middleware
 	tool        *tools.FunctionTool
 	sandbox     localSandbox
 }
@@ -217,6 +218,23 @@ func WithShellIgnore(patterns ...string) ShellOption {
 	}
 }
 
+// WithShellMiddleware adds tool-scoped middleware, the Go spelling of the
+// Python tool's middleware= kwarg: the first entry is the outermost layer of
+// the tool's own chain, and agent middleware still wraps it from outside. Use
+// it for per-tool approval, telemetry or argument rewriting without wrapping
+// every tool the agent has.
+func WithShellMiddleware(mw ...middleware.Middleware) ShellOption {
+	return func(s *ShellTool) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: shell middleware must not be nil")
+			}
+		}
+		s.middleware = append(s.middleware, mw...)
+		return nil
+	}
+}
+
 // NewShellTool builds the run_shell_command tool: local execution through the
 // platform shell (cmd /c on Windows, sh -c elsewhere). The result carries stdout
 // and stderr; a non-zero exit appends an "[exit code: N]" line, a timeout is
@@ -273,7 +291,7 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 		Command string `json:"command" agschema:"description=The shell command to run,required"`
 	}
 	fn := func(args shellArgs, cx *agocontext.Context) (string, error) { return s.run(cx, args.Command) }
-	ft, err := tools.NewFunctionTool(s.toolName, description, fn)
+	ft, err := tools.NewFunctionTool(s.toolName, description, fn, tools.WithMiddleware(s.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: shell tool: %w", err)
 	}

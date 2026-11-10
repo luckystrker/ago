@@ -3,6 +3,7 @@ package toolpacks
 import (
 	stdcontext "context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -292,6 +293,12 @@ func TestRunLocalCommandOutputBufferCap(t *testing.T) {
 // to list matching processes on the platform ("" lines = none running).
 // No `start /b` on windows: it does not spawn reliably on headless CI runners;
 // the foreground pair keeps the same cmd→ping grandchild shape.
+//
+// The Unix sleep duration is unique per call: a plain "sleep 60" listing is
+// matched by pgrep -f across every concurrent test binary (a parallel
+// `go test ./...` against `-count=N ./toolpacks/` sees the other process's
+// probes), which makes the alive/dead verdicts order-dependent. A unique
+// fractional duration keeps each probe's listing to its own process tree.
 func grandchildProbe() (start []string, listCmd []string, ok bool) {
 	if runtime.GOOS == "windows" {
 		return []string{"cmd", "/c", "ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul"},
@@ -300,7 +307,16 @@ func grandchildProbe() (start []string, listCmd []string, ok bool) {
 	if _, err := exec.LookPath("pgrep"); err != nil {
 		return nil, nil, false
 	}
-	return []string{"sh", "-c", "sleep 60 & sleep 60"}, []string{"pgrep", "-f", "sleep 60"}, true
+	duration := uniqueSleepDuration()
+	return []string{"sh", "-c", "sleep " + duration + " & sleep " + duration},
+		[]string{"pgrep", "-f", "sleep " + duration}, true
+}
+
+// uniqueSleepDuration formats a fractional sleep long enough for the probe and
+// unique to this test process and call.
+func uniqueSleepDuration() string {
+	n := (time.Now().UnixNano() + int64(os.Getpid())*1_000_003) % 1_000_000_000
+	return fmt.Sprintf("59.%09d", n)
 }
 
 // listMatching runs the probe listing. pgrep exits 1 when nothing matches —
@@ -346,6 +362,23 @@ func waitProbeRunning(t *testing.T, listCmd []string, name string, timeout time.
 	return false
 }
 
+// waitProbeGone polls until the probe listing no longer shows a live matching
+// process, or returns false at the deadline. A killed process can take a moment
+// to leave the process table, so a fixed sleep is a race.
+func waitProbeGone(t *testing.T, listCmd []string, name string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if !probeAlive(t, listCmd, name) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	start, listCmd, ok := grandchildProbe()
 	if !ok {
@@ -362,10 +395,9 @@ func TestRunLocalCommandTimeoutKillsTree(t *testing.T) {
 	if res.ExitCode != 124 {
 		t.Fatalf("exit code = %d, want 124 (timeout), output = %q", res.ExitCode, res.Output)
 	}
-	// The kill runs inside the context cancel; give the table a moment to
-	// settle before listing.
-	time.Sleep(500 * time.Millisecond)
-	if probeAlive(t, listCmd, nameOf(start)) {
+	// The kill runs inside the context cancel; the process table may take a
+	// moment to settle.
+	if !waitProbeGone(t, listCmd, nameOf(start), 5*time.Second) {
 		t.Fatalf("a grandchild survived the timeout kill:\n%s", listMatching(t, listCmd))
 	}
 }
@@ -404,7 +436,7 @@ func TestRunLocalCommandCancelKillsTree(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("runLocalCommand did not return after the parent cancel")
 	}
-	if probeAlive(t, listCmd, nameOf(start)) {
+	if !waitProbeGone(t, listCmd, nameOf(start), 5*time.Second) {
 		t.Fatalf("a grandchild survived the cancel kill:\n%s", listMatching(t, listCmd))
 	}
 }

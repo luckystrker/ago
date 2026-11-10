@@ -78,15 +78,16 @@ func serveTurn(ctx context.Context, a *agent.Agent, input RunAgentInput, emit fu
 	mapped := mapRunInputMessages(input)
 
 	// The turn runs on its own stream: the mapped history is its transcript and
-	// the current turn's parts are its first model request.
-	run, err := a.Run(ctx)
+	// the current turn's parts are its first model request. The client's tools
+	// are that run's tools only (agent.RunOptions.Tools), so a concurrent or
+	// later turn cannot see them and a failed run leaves nothing behind.
+	run, err := a.RunWith(ctx, agent.RunOptions{Tools: clientToolsForRun(a, input.Tools)})
 	if err != nil {
 		emit(runErrorEvent(err))
 		return nil
 	}
 	defer run.Close()
 	s := run.Stream()
-	defer declareClientTools(a, s.ID(), input.Tools)()
 	if err := s.History().Replace(mapped.history); err != nil {
 		emit(runErrorEvent(fmt.Errorf("seed history: %w", err)))
 		return nil

@@ -394,7 +394,26 @@ func NewServerForAgent(a *agent.Agent, opts ...ServerOption) (*Server, error) {
 		o(&cfg)
 	}
 	cfg.Ask = func(ctx context.Context, userText string) (string, error) {
-		run, err := a.Run(ctx, userText)
+		// Python parity: executor.py:344-347 hands ask() the request's
+		// variables and dependencies (and, there, tools/prompt). The request
+		// context travels too, under RequestDependency, so a served agent's
+		// tool resolves the same Inject slot a deterministic tool does. Each
+		// request gets its own copies; the maps are never shared or mutated.
+		toolName := cfg.ToolName
+		if toolName == "" {
+			toolName = defaultToolName
+		}
+		deps := copyAnyMap(cfg.Dependencies)
+		deps[RequestDependency] = &RequestContext{
+			Method: "tools/call",
+			Tool:   toolName,
+			HTTP:   RequestFromContext(ctx),
+		}
+		opts := agent.RunOptions{
+			Variables:    copyAnyMap(cfg.Variables),
+			Dependencies: deps,
+		}
+		run, err := a.RunWith(ctx, opts, userText)
 		if err != nil {
 			return "", fmt.Errorf("mcpserver: start turn: %w", err)
 		}
@@ -409,6 +428,15 @@ func NewServerForAgent(a *agent.Agent, opts ...ServerOption) (*Server, error) {
 		return reply.Body(), nil
 	}
 	return NewServer(cfg)
+}
+
+// copyAnyMap copies a string-keyed map, treating nil as empty.
+func copyAnyMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // normalizeInputSchema guarantees the object schema MCP requires (Python
@@ -735,6 +763,12 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 	}
 	// MCP requires at least one content block; an empty reply maps to ""
 	// (Python parity: reply_to_content).
+	//
+	// AGO-DEVIATION: Python validates the reply against the agent's response
+	// schema and answers the validated object as structuredContent
+	// (mcp/executor.py:370-384). AGo has no response-schema binding on the
+	// Ask bridge, so a reply that looks like one JSON object is parsed and
+	// carried as structuredContent; a non-object or invalid reply stays text.
 	var structured map[string]any
 	if strings.HasPrefix(strings.TrimSpace(reply), "{") {
 		_ = json.Unmarshal([]byte(reply), &structured)

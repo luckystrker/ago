@@ -258,7 +258,7 @@ func TestShellToolTurnCancelKillsCommand(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the tool call did not return after the turn cancel")
 	}
-	if probeAlive(t, listCmd, nameOf(start)) {
+	if !waitProbeGone(t, listCmd, nameOf(start), 5*time.Second) {
 		t.Fatalf("a command survived the turn cancel:\n%s", listMatching(t, listCmd))
 	}
 }
@@ -289,7 +289,7 @@ func TestShellToolCloseStopsRunningCommand(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if probeAlive(t, listCmd, nameOf(start)) {
+	if !waitProbeGone(t, listCmd, nameOf(start), 5*time.Second) {
 		t.Fatalf("a command survived Close:\n%s", listMatching(t, listCmd))
 	}
 	if _, err := os.Stat(s.Workdir()); !os.IsNotExist(err) {
