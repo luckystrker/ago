@@ -83,42 +83,6 @@ func TestSamplingKnobsOnWire(t *testing.T) {
 	}
 }
 
-// TestExtraBodyReachesWireAndWins: extra_body carries a field the config has
-// no slot for, and a colliding key replaces the derived one (SDK merge).
-func TestExtraBodyReachesWireAndWins(t *testing.T) {
-	srv, _, _, _, captured := captureServer(t, http.StatusOK, mistralCompletionBody)
-	cl := mistralClient(t, srv.URL, func(c *MistralConfig) {
-		c.TopK = i64ptr(10)
-		c.ExtraBody = map[string]any{"top_k": 40, "vendor_flag": true}
-	})
-	if _, err := cl.Call(context.Background(), nil, nil, config.CallOptions{}); err != nil {
-		t.Fatalf("call: %v", err)
-	}
-	body := requestJSON(t, *captured)
-	if body["top_k"] != float64(40) || body["vendor_flag"] != true {
-		t.Fatalf("extra_body not merged last: %+v", body)
-	}
-}
-
-// TestExtraBodyCloned: Clone copies the map, so mutating the copy leaves the
-// original untouched.
-func TestExtraBodyCloned(t *testing.T) {
-	cfg := NewMistral("m")
-	cfg.ExtraBody = map[string]any{"a": 1}
-	cp, err := cfg.Clone(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := cp.(*MistralConfig)
-	got.ExtraBody["a"] = 2
-	if cfg.ExtraBody["a"] != 1 {
-		t.Fatal("Clone shared the extra_body map")
-	}
-	if cp2, err := cfg.Clone(map[string]any{"extra_body": map[string]any{"b": 1}}); err != nil || cp2.(*MistralConfig).ExtraBody["b"] != 1 {
-		t.Fatalf("extra_body override: %v", err)
-	}
-}
-
 func TestHTTPHeadersOnWire(t *testing.T) {
 	srv, _, _, header, _ := captureServer(t, http.StatusOK, mistralCompletionBody)
 	cl := mistralClient(t, srv.URL, func(c *MistralConfig) { c.HTTPHeaders = map[string]string{"X-Trace": "t-1"} })

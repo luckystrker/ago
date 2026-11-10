@@ -158,6 +158,7 @@ type AnthropicConfig struct {
 	// has no typed slot for (Python parity: extra_body — in Python it is the
 	// only way to enable thinking, for one). A key that collides with a
 	// derived body field replaces it, as the SDK's merge does.
+	// It overrides `stream` too: "stream" here without Streaming = SSE reply on the non-streaming path (as in the SDK).
 	ExtraBody map[string]any
 	// HTTPClient performs the requests of Create and CreateFilesClient when
 	// non-nil (proxy, custom root CAs, mTLS). It owns its own Timeout and

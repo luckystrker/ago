@@ -68,6 +68,9 @@ type MistralConfig struct {
 
 	// The knobs below are not sent when unset (Python parity: the
 	// MistralConfig fields of the same names).
+	// Stop sequences. AGO-DEVIATION: Python accepts `str | list[str]`; AGo takes
+	// a list, and a single sequence is a one-element slice (the wire value is
+	// always a JSON array, which every provider accepts).
 	Stop              []string
 	RandomSeed        *int64
 	PresencePenalty   *float64
@@ -89,9 +92,6 @@ type MistralConfig struct {
 	// ReasoningEffort is "none", "minimal", "low", "medium", "high" or "xhigh".
 	ReasoningEffort string
 	PromptCacheKey  string
-	// ExtraBody merges into the request body last (Python parity: extra_body).
-	// A key that collides with a derived field replaces it.
-	ExtraBody map[string]any
 
 	// SafePrompt asks Mistral to prepend its safety prompt to the messages.
 	// AGO-DEVIATION: Python's field is tri-state (None = omit, True/False =
@@ -193,11 +193,6 @@ func (c *MistralConfig) params() (config.CompatParams, error) {
 	if c.Metadata != nil {
 		extra["metadata"] = c.Metadata
 	}
-	// extra_body merges last, as the SDK does: a key it repeats replaces the
-	// derived value.
-	for k, v := range c.ExtraBody {
-		extra[k] = v
-	}
 	if len(extra) > 0 {
 		p.Extra = extra
 	}
@@ -211,12 +206,6 @@ func (c *MistralConfig) params() (config.CompatParams, error) {
 // also accepts its value type (wrapped) and nil (cleared).
 func (c *MistralConfig) Clone(overrides map[string]any) (config.ModelConfig, error) {
 	out := *c
-	if c.ExtraBody != nil {
-		out.ExtraBody = make(map[string]any, len(c.ExtraBody))
-		for k, v := range c.ExtraBody {
-			out.ExtraBody[k] = v
-		}
-	}
 	for k, v := range overrides {
 		var err error
 		switch strings.ToLower(k) {
@@ -272,8 +261,6 @@ func (c *MistralConfig) Clone(overrides map[string]any) (config.ModelConfig, err
 			err = setString(&out.ReasoningEffort, k, v)
 		case "promptcachekey", "prompt_cache_key":
 			err = setString(&out.PromptCacheKey, k, v)
-		case "extrabody", "extra_body":
-			err = setAnyMap(&out.ExtraBody, k, v)
 		default:
 			err = fmt.Errorf("config/mistral: unknown config field %q", k)
 		}

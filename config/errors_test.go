@@ -20,6 +20,11 @@ func TestNewAPIErrorParsesEnvelopes(t *testing.T) {
 		"ollama":    {`{"error":"model not found"}`, "", "model not found", "op returned 400: model not found"},
 		"mistral":   {`{"message":"Unauthorized"}`, "", "Unauthorized", "op returned 400: Unauthorized"},
 		"plaintext": {`gateway exploded`, "", "", "op returned 400: gateway exploded"},
+		// An empty error value falls through to the next envelope shape
+		// instead of ending the parse.
+		"empty error string": {`{"error":"","message":"fallback"}`, "", "fallback", "op returned 400: fallback"},
+		"error without message": {`{"error":{"type":"t"},"message":"fallback"}`, "", "fallback",
+			"op returned 400: fallback"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := NewAPIError(ProviderOpenAI, "op", 400, nil, []byte(tc.body))

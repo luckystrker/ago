@@ -183,6 +183,56 @@ func TestPostJSONRetriesOnNetworkError(t *testing.T) {
 	}
 }
 
+// TestPostJSONRetriesOnTruncatedBody: a body that ends before its
+// Content-Length is a read failure, and the attempt is retried (the read path
+// is separate from the transport path).
+func TestPostJSONRetriesOnTruncatedBody(t *testing.T) {
+	shortBackoff(t)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			fmt.Fprint(buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"partial\":")
+			_ = buf.Flush()
+			_ = conn.Close()
+			return
+		}
+		fmt.Fprint(w, `{}`)
+	}))
+	defer srv.Close()
+
+	c := &Client{MaxRetries: 1}
+	status, body, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{})
+	if err != nil || status != http.StatusOK || string(body) != "{}" || calls != 2 {
+		t.Fatalf("a truncated body must be retried: status=%d body=%q calls=%d err=%v", status, body, calls, err)
+	}
+}
+
+// TestPostJSONTransportFailureCountsAttempts: the exhausted-retries error
+// names the real number of attempts (MaxRetries+1) and stops there.
+func TestPostJSONTransportFailureCountsAttempts(t *testing.T) {
+	shortBackoff(t)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	c := &Client{MaxRetries: 1}
+	if _, _, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{}); err == nil ||
+		!strings.Contains(err.Error(), "after 2 attempt(s)") {
+		t.Fatalf("want the attempt count in the message, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 attempts (1 + 1 retry), got %d", calls)
+	}
+}
+
 func TestPostJSONContextCanceled(t *testing.T) {
 	shortBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

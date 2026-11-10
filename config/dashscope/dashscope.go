@@ -62,6 +62,9 @@ type DashScopeConfig struct {
 
 	// The knobs below are not sent when unset (Python parity: the
 	// DashScopeConfig fields of the same names).
+	// Stop sequences. AGO-DEVIATION: Python accepts `str | list[str]`; AGo takes
+	// a list, and a single sequence is a one-element slice (the wire value is
+	// always a JSON array, which every provider accepts).
 	Stop             []string
 	Seed             *int64
 	FrequencyPenalty *float64
