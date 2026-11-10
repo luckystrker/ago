@@ -55,7 +55,9 @@ type Envelope struct {
 	EventType      string    `json:"event_type"`
 	Payload        []byte    `json:"payload,omitempty"` // JSON event data, shaped per event type
 	CausationID    string    `json:"causation_id,omitempty"`
-	Depth          int       `json:"depth,omitempty"` // delegation hop count
+	TaskID         string    `json:"task_id,omitempty"`  // task this envelope concerns (cancel requests); "" = none
+	TraceID        string    `json:"trace_id,omitempty"` // W3C traceparent of the sender's span; "" = none
+	Depth          int       `json:"depth,omitempty"`    // delegation hop count
 	TTLSecs        int       `json:"ttl_secs,omitempty"`
 	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	Priority       int       `json:"priority,omitempty"`
@@ -72,6 +74,8 @@ type envelopeWire struct {
 	EventType      string          `json:"event_type"`
 	Payload        json.RawMessage `json:"payload,omitempty"`
 	CausationID    string          `json:"causation_id,omitempty"`
+	TaskID         string          `json:"task_id,omitempty"`
+	TraceID        string          `json:"trace_id,omitempty"`
 	Depth          int             `json:"depth,omitempty"`
 	TTLSecs        int             `json:"ttl_secs,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
@@ -85,7 +89,8 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 	return json.Marshal(envelopeWire{
 		ID: e.ID, ChannelID: e.ChannelID, SenderID: e.SenderID,
 		Audience: e.Audience, EventType: e.EventType, Payload: e.Payload,
-		CausationID: e.CausationID, Depth: e.Depth, TTLSecs: e.TTLSecs,
+		CausationID: e.CausationID, TaskID: e.TaskID, TraceID: e.TraceID,
+		Depth: e.Depth, TTLSecs: e.TTLSecs,
 		IdempotencyKey: e.IdempotencyKey, Priority: e.Priority, CreatedAt: e.CreatedAt,
 	})
 }
@@ -99,7 +104,8 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 	e.ID, e.ChannelID, e.SenderID = w.ID, w.ChannelID, w.SenderID
 	e.Audience, e.EventType = w.Audience, w.EventType
 	e.Payload = []byte(w.Payload)
-	e.CausationID, e.Depth, e.TTLSecs = w.CausationID, w.Depth, w.TTLSecs
+	e.CausationID, e.TaskID, e.TraceID = w.CausationID, w.TaskID, w.TraceID
+	e.Depth, e.TTLSecs = w.Depth, w.TTLSecs
 	e.IdempotencyKey, e.Priority, e.CreatedAt = w.IdempotencyKey, w.Priority, w.CreatedAt
 	return nil
 }

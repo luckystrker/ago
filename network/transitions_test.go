@@ -2,6 +2,7 @@ package network
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -208,4 +209,121 @@ func TestGraphFromDictErrors(t *testing.T) {
 	}); err == nil {
 		t.Fatal("unknown target must error")
 	}
+}
+
+func TestNewRoundRobinGraph(t *testing.T) {
+	if _, err := NewRoundRobinGraph(nil, 0); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("empty participants: %v", err)
+	}
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob", "carol")
+	graph, err := NewRoundRobinGraph(ids, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Initial != ids[0] || graph.MaxTurns != 5 {
+		t.Fatalf("graph: %+v", graph)
+	}
+	// The builder output must survive the knob round trip.
+	if _, err := GraphFromDict(graph.ToDict()); err != nil {
+		t.Fatalf("ToDict/GraphFromDict: %v", err)
+	}
+
+	ch := openWorkflow(t, h, graph, ids)
+	// Speaking order follows the join order, wrapping around, until MaxTurns.
+	for turn, speaker := range []string{ids[0], ids[1], ids[2], ids[0], ids[1]} {
+		if _, err := h.Send(NewTextEnvelope(ch, speaker, "", "turn")); err != nil {
+			t.Fatalf("turn %d by %s: %v", turn, speaker, err)
+		}
+	}
+	got, _ := h.Channel(ch)
+	if got.State != ChannelClosed || got.CloseReason != "max_turns" {
+		t.Fatalf("after 5 turns: %s %q", got.State, got.CloseReason)
+	}
+}
+
+func TestNewRoundRobinGraphRejectsOutOfTurn(t *testing.T) {
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob")
+	graph, _ := NewRoundRobinGraph(ids, 0)
+	ch := openWorkflow(t, h, graph, ids)
+	if _, err := h.Send(NewTextEnvelope(ch, ids[1], "", "jumping the queue")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("only the initial speaker may open: %v", err)
+	}
+}
+
+func TestNewSequenceGraph(t *testing.T) {
+	if _, err := NewSequenceGraph(nil); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("empty steps: %v", err)
+	}
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob", "carol")
+	graph, err := NewSequenceGraph(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Initial != ids[0] || graph.MaxTurns != 3 {
+		t.Fatalf("graph: %+v", graph)
+	}
+	if _, err := GraphFromDict(graph.ToDict()); err != nil {
+		t.Fatalf("ToDict/GraphFromDict: %v", err)
+	}
+
+	ch := openWorkflow(t, h, graph, ids)
+	// The pipeline runs strictly in step order...
+	if _, err := h.Send(NewTextEnvelope(ch, ids[2], "", "skip ahead")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("step 3 before step 1: %v", err)
+	}
+	for _, speaker := range ids {
+		if got, _ := h.Channel(ch); got.State != ChannelActive {
+			t.Fatalf("closed before %s spoke: %s", speaker, got.State)
+		}
+		if _, err := h.Send(NewTextEnvelope(ch, speaker, "", "done")); err != nil {
+			t.Fatalf("%s: %v", speaker, err)
+		}
+	}
+	// ...and ends with its own close reason after the last step.
+	got, _ := h.Channel(ch)
+	if got.State != ChannelClosed || got.CloseReason != "sequence_complete" {
+		t.Fatalf("after the last step: %s %q", got.State, got.CloseReason)
+	}
+}
+
+func TestNewSequenceGraphSingleStep(t *testing.T) {
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob")
+	graph, _ := NewSequenceGraph(ids[:1])
+	ch := openWorkflow(t, h, graph, ids)
+	if _, err := h.Send(NewTextEnvelope(ch, ids[0], "", "only step")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.Channel(ch); got.State != ChannelClosed || got.CloseReason != "sequence_complete" {
+		t.Fatalf("single step: %s %q", got.State, got.CloseReason)
+	}
+}
+
+// registerAgents registers one auto-acking raw-notifier agent per name and
+// returns their ids in order.
+func registerAgents(t *testing.T, h *Hub, names ...string) []string {
+	t.Helper()
+	rec := newRecorder()
+	ids := make([]string, len(names))
+	for i, name := range names {
+		p, err := h.Register(Passport{Name: name}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.attach(h, p.AgentID, true)
+		ids[i] = p.AgentID
+	}
+	return ids
+}
+
+func openWorkflow(t *testing.T, h *Hub, graph TransitionGraph, ids []string) string {
+	t.Helper()
+	ch, err := h.CreateChannel(ChannelManifest{Type: TypeWorkflow, Knobs: map[string]any{"graph": graph.ToDict()}}, ids)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	return ch.ID
 }

@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -160,8 +161,10 @@ func cloneTaskMetadata(m task.Metadata) task.Metadata {
 // channel they ran in (the tasks tool's cancel action needs it to route a
 // cancel request).
 //
-// Forwarding failures are swallowed — the mirror must never crash the
-// agent's turn.
+// Forwarding failures never crash the agent's turn: they are logged at
+// ERROR and reported through the hub's task-event hook as "mirror_failed"
+// (WithTaskEventHook). A terminal task whose spec carries a Capability also
+// updates the owner's Resume.Observed (Hub.RecordObservation).
 type TaskMirror struct {
 	hub       *Hub
 	ownerID   string
@@ -216,7 +219,7 @@ func (m *TaskMirror) onStarted(ev events.Event) {
 	if !ok {
 		return
 	}
-	now := time.Now()
+	now := m.hub.now()
 	md := task.Metadata{
 		TaskID:    started.TaskID,
 		OwnerID:   m.ownerID,
@@ -240,18 +243,53 @@ func (m *TaskMirror) onStarted(ev events.Event) {
 			md.ExpiresAt = t
 		}
 	}
-	_ = m.hub.ObserveTask(md)
+	if err := m.hub.ObserveTask(md); err != nil {
+		m.escalate(started.TaskID, "started", err)
+	}
+}
+
+// escalate reports a forwarding failure without disturbing the agent's turn:
+// an ERROR log line plus a "mirror_failed" task event.
+func (m *TaskMirror) escalate(taskID, op string, err error) {
+	slog.Error("task mirror failed", "op", op, "task_id", taskID, "owner_id", m.ownerID, "error", err)
+	m.hub.FireTaskEvent(taskID, TaskEventMirrorFailed, map[string]any{
+		"op":          op,
+		"owner_id":    m.ownerID,
+		"channel_id":  m.channelID,
+		"exc_type":    fmt.Sprintf("%T", err),
+		"exc_message": err.Error(),
+	})
 }
 
 // updateSwallowingMissing runs UpdateTask; ErrTaskNotFound is expected
-// (progress/completion for a task the hub never observed) and dropped like
-// any other forwarding failure.
-func (m *TaskMirror) updateSwallowingMissing(taskID string, state task.State, progress map[string]any, result any, errMsg string) {
+// (progress/completion for a task the hub never observed) and dropped, any
+// other failure escalates.
+func (m *TaskMirror) updateSwallowingMissing(taskID, op string, state task.State, progress map[string]any, result any, errMsg string) {
 	if err := m.hub.UpdateTask(taskID, state, progress, result, errMsg); err != nil && !errors.Is(err, ErrTaskNotFound) {
-		// Forwarding failures are swallowed (the mirror never crashes the
-		// agent's turn); nothing else is recorded in this subset.
-		_ = err
+		m.escalate(taskID, op, err)
 	}
+}
+
+// recordObservationIfTagged pushes a terminal task's outcome into the
+// owner's track record when the spec carried a Capability. The accepted
+// state wins over the proposed outcome and latency is measured on the hub
+// clock from the observed start. An unregistered owner has no resume to
+// update, so the failure is dropped (Python parity: the call is suppressed).
+func (m *TaskMirror) recordObservationIfTagged(taskID string, outcome task.State) {
+	md, err := m.hub.Task(taskID)
+	if err != nil || md.Spec.Capability == "" {
+		return
+	}
+	if md.State.Terminal() {
+		outcome = md.State
+	}
+	latency := time.Duration(-1)
+	if !md.StartedAt.IsZero() {
+		if latency = m.hub.now().Sub(md.StartedAt); latency < 0 {
+			latency = 0
+		}
+	}
+	_ = m.hub.RecordObservation(md.OwnerID, md.Spec.Capability, outcome, latency, taskID)
 }
 
 func (m *TaskMirror) onProgress(ev events.Event) {
@@ -259,7 +297,7 @@ func (m *TaskMirror) onProgress(ev events.Event) {
 	if !ok {
 		return
 	}
-	m.updateSwallowingMissing(p.TaskID, "", p.Payload, nil, "")
+	m.updateSwallowingMissing(p.TaskID, "progress", "", p.Payload, nil, "")
 }
 
 func (m *TaskMirror) onCompleted(ev events.Event) {
@@ -271,7 +309,8 @@ func (m *TaskMirror) onCompleted(ev events.Event) {
 	if c.Result != "" {
 		result = c.Result
 	}
-	m.updateSwallowingMissing(c.TaskID, task.StateCompleted, nil, result, "")
+	m.updateSwallowingMissing(c.TaskID, "completed", task.StateCompleted, nil, result, "")
+	m.recordObservationIfTagged(c.TaskID, task.StateCompleted)
 }
 
 func (m *TaskMirror) onFailed(ev events.Event) {
@@ -279,7 +318,8 @@ func (m *TaskMirror) onFailed(ev events.Event) {
 	if !ok {
 		return
 	}
-	m.updateSwallowingMissing(f.TaskID, task.StateFailed, nil, nil, f.Error)
+	m.updateSwallowingMissing(f.TaskID, "failed", task.StateFailed, nil, nil, f.Error)
+	m.recordObservationIfTagged(f.TaskID, task.StateFailed)
 }
 
 func (m *TaskMirror) onExpired(ev events.Event) {
@@ -287,7 +327,8 @@ func (m *TaskMirror) onExpired(ev events.Event) {
 	if !ok {
 		return
 	}
-	m.updateSwallowingMissing(e.TaskID, task.StateExpired, nil, nil, "")
+	m.updateSwallowingMissing(e.TaskID, "expired", task.StateExpired, nil, nil, "")
+	m.recordObservationIfTagged(e.TaskID, task.StateExpired)
 }
 
 func (m *TaskMirror) onCancelled(ev events.Event) {
@@ -295,5 +336,6 @@ func (m *TaskMirror) onCancelled(ev events.Event) {
 	if !ok {
 		return
 	}
-	m.updateSwallowingMissing(c.TaskID, task.StateCancelled, nil, nil, c.Reason)
+	m.updateSwallowingMissing(c.TaskID, "cancelled", task.StateCancelled, nil, nil, c.Reason)
+	m.recordObservationIfTagged(c.TaskID, task.StateCancelled)
 }

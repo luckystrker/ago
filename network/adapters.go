@@ -421,3 +421,65 @@ func applyContextSet(vars map[string]any, env Envelope) {
 		vars[k] = v
 	}
 }
+
+// --- default manifests -------------------------------------------------------
+
+// DefaultManifest implements ManifestProvider: exactly two participants
+// (initiator + respondent), full transcript view, and auto-close when the
+// invite is unanswered for 30s or the question for 600s.
+func (ConsultingAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeConsulting,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Max: 2, Roles: []string{string(RoleInitiator), string(RoleRespondent)}},
+		DefaultViewPolicy: ViewFullTranscript,
+		Expectations: []Expectation{
+			{Kind: "acks_within", OnViolation: "auto_close", Params: map[string]any{"seconds": 30}},
+			{Kind: "reply_within", OnViolation: "auto_close", Params: map[string]any{"seconds": 600}},
+		},
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two participants, windowed
+// summary view, and an audit entry after an hour of silence.
+func (ConversationAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeConversation,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Max: 2, Roles: []string{string(RoleInitiator), string(RoleRespondent)}},
+		DefaultViewPolicy: ViewWindowedSummary,
+		Expectations: []Expectation{
+			{Kind: "max_silence", OnViolation: "audit", Params: map[string]any{"seconds": 3600}},
+		},
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two or more participants,
+// named windowed summary view. AGO-DEVIATION: Python also declares two
+// turn_within expectations; no evaluator exists for that kind (in Python
+// either), so they are not carried.
+func (DiscussionAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeDiscussion,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
+		KnobsSchema:       map[string]string{"ordering": "str"},
+		DefaultViewPolicy: ViewNamedWindowedSummary,
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two or more participants and
+// a required transition graph in knobs["graph"]. AGO-DEVIATION: Python's
+// turn_within expectations are not carried (see DiscussionAdapter).
+func (WorkflowAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeWorkflow,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
+		KnobsSchema:       map[string]string{"graph": "TransitionGraph"},
+		DefaultViewPolicy: ViewNamedWindowedSummary,
+	}
+}
+
+var (
+	_ ManifestProvider = ConsultingAdapter{}
+	_ ManifestProvider = ConversationAdapter{}
+	_ ManifestProvider = DiscussionAdapter{}
+	_ ManifestProvider = WorkflowAdapter{}
+)

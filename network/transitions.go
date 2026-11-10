@@ -81,6 +81,44 @@ func nonEmpty(s, fallback string) string {
 	return fallback
 }
 
+// --- convenience builders ----------------------------------------------------
+
+// NewRoundRobinGraph cycles through the channel's participants in join order
+// starting with participants[0], ending after maxTurns substantive turns
+// (0 = unlimited). It needs at least one participant.
+func NewRoundRobinGraph(participants []string, maxTurns int) (TransitionGraph, error) {
+	if len(participants) == 0 {
+		return TransitionGraph{}, fmt.Errorf("%w: round robin requires at least 1 participant", ErrProtocol)
+	}
+	return TransitionGraph{
+		Initial:     participants[0],
+		Transitions: []Transition{{When: Always{}, To: &RoundRobinTarget{}}},
+		MaxTurns:    maxTurns,
+	}, nil
+}
+
+// NewSequenceGraph is a pipeline: steps[0] → steps[1] → … then the channel
+// terminates with reason "sequence_complete". Any speaker outside the
+// sequence terminates it the same way. MaxTurns is len(steps).
+//
+// AGO-DEVIATION: Python reaches the terminate through the graph's
+// default_target; AGo has none, so the builder appends a catch-all
+// Always → TerminateTarget transition with the same close reason.
+func NewSequenceGraph(steps []string) (TransitionGraph, error) {
+	if len(steps) == 0 {
+		return TransitionGraph{}, fmt.Errorf("%w: sequence requires at least 1 step", ErrProtocol)
+	}
+	transitions := make([]Transition, 0, len(steps))
+	for i := 0; i < len(steps)-1; i++ {
+		transitions = append(transitions, Transition{
+			When: FromSpeaker{AgentID: steps[i]},
+			To:   AgentTarget{AgentID: steps[i+1]},
+		})
+	}
+	transitions = append(transitions, Transition{When: Always{}, To: TerminateTarget{Reason: "sequence_complete"}})
+	return TransitionGraph{Initial: steps[0], Transitions: transitions, MaxTurns: len(steps)}, nil
+}
+
 // --- built-in targets --------------------------------------------------------
 
 // AgentTarget resolves to a named participant.

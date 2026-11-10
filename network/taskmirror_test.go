@@ -2,6 +2,7 @@ package network
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -141,4 +142,122 @@ func TestDetachStopsForwarding(t *testing.T) {
 	if _, err := h.Task("t-99"); !errors.Is(err, ErrTaskNotFound) {
 		t.Fatal("detached mirror must not forward")
 	}
+}
+
+// observingMirror registers a real agent so the mirror's owner has a resume
+// to update, with a fake hub clock for latency.
+func observingMirror(t *testing.T) (*Hub, *fakeClock, stream.Stream, string) {
+	t.Helper()
+	clock := newFakeClock()
+	h := newTestHub(t, WithHubClock(clock.Now))
+	p, err := h.Register(Passport{Name: "worker"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stream.NewMemoryStream()
+	NewTaskMirror(h, p.AgentID, "ch-1").Attach(s)
+	return h, clock, s, p.AgentID
+}
+
+func TestTaskMirrorRecordsCapabilityObservation(t *testing.T) {
+	h, clock, s, owner := observingMirror(t)
+
+	s.Send(events.TaskStarted{TaskID: "t-1", Spec: &events.TaskSpec{Title: "g", Capability: "grinding"}})
+	clock.Advance(2500 * time.Millisecond)
+	s.Send(events.TaskCompleted{TaskID: "t-1", Result: "ok"})
+
+	r, _ := h.ResumeOf(owner)
+	stat := r.Observed["grinding"]
+	if stat.N != 1 || stat.Completed != 1 || stat.P50LatencyMS == nil || *stat.P50LatencyMS != 2500 {
+		t.Fatalf("completed task: %+v", stat)
+	}
+	if got := h.AgentsWithCapability("grinding"); !reflect.DeepEqual(got, []string{owner}) {
+		t.Fatalf("capability index: %v", got)
+	}
+
+	s.Send(events.TaskStarted{TaskID: "t-2", Spec: &events.TaskSpec{Capability: "grinding"}})
+	s.Send(events.TaskFailed{TaskID: "t-2", Error: "boom"})
+	s.Send(events.TaskStarted{TaskID: "t-3", Spec: &events.TaskSpec{Capability: "grinding"}})
+	s.Send(events.TaskExpired{TaskID: "t-3"})
+	s.Send(events.TaskStarted{TaskID: "t-4", Spec: &events.TaskSpec{Capability: "grinding"}})
+	s.Send(events.TaskCancelled{TaskID: "t-4", Reason: "no longer needed"})
+	r, _ = h.ResumeOf(owner)
+	stat = r.Observed["grinding"]
+	if stat.N != 4 || stat.Completed != 1 || stat.Failed != 1 || stat.Expired != 1 {
+		t.Fatalf("all four terminal states: %+v", stat)
+	}
+}
+
+func TestTaskMirrorIgnoresUntaggedAndNonTerminalTasks(t *testing.T) {
+	h, _, s, owner := observingMirror(t)
+
+	s.Send(events.TaskStarted{TaskID: "plain", Spec: &events.TaskSpec{Title: "no capability"}})
+	s.Send(events.TaskCompleted{TaskID: "plain"})
+	s.Send(events.TaskStarted{TaskID: "tagged", Spec: &events.TaskSpec{Capability: "grinding"}})
+	s.Send(events.TaskProgress{TaskID: "tagged", Payload: map[string]any{"step": 1}})
+
+	r, _ := h.ResumeOf(owner)
+	if len(r.Observed) != 0 {
+		t.Fatalf("observations without a terminal capability task: %+v", r.Observed)
+	}
+	// A task completed twice (cascade) is counted once.
+	s.Send(events.TaskCompleted{TaskID: "tagged"})
+	s.Send(events.TaskCompleted{TaskID: "tagged"})
+	r, _ = h.ResumeOf(owner)
+	if r.Observed["grinding"].N != 1 {
+		t.Fatalf("duplicate terminal events: %+v", r.Observed["grinding"])
+	}
+}
+
+func TestTaskMirrorUnregisteredOwnerIsQuiet(t *testing.T) {
+	fired := 0
+	h := newTestHub(t, WithTaskEventHook(func(string, string, map[string]any) { fired++ }))
+	s := stream.NewMemoryStream()
+	NewTaskMirror(h, "not-registered", "").Attach(s)
+	s.Send(events.TaskStarted{TaskID: "t", Spec: &events.TaskSpec{Capability: "x"}})
+	s.Send(events.TaskCompleted{TaskID: "t"})
+	if fired != 0 {
+		t.Fatalf("an owner without a registration is not a mirror failure: %d events", fired)
+	}
+	if got, err := h.Task("t"); err != nil || got.State != task.StateCompleted {
+		t.Fatalf("task store must still update: %+v %v", got, err)
+	}
+}
+
+func TestTaskMirrorEscalatesForwardingFailure(t *testing.T) {
+	type fire struct {
+		taskID, kind string
+		payload      map[string]any
+	}
+	var fires []fire
+	h := newTestHub(t, WithTaskEventHook(func(taskID, kind string, payload map[string]any) {
+		fires = append(fires, fire{taskID, kind, payload})
+	}))
+	s := stream.NewMemoryStream()
+	NewTaskMirror(h, "owner-1", "ch-9").Attach(s)
+
+	// A TaskStarted with no id cannot be observed: the hub refuses it.
+	s.Send(events.TaskStarted{TaskID: "", Spec: &events.TaskSpec{Title: "x"}})
+	if len(fires) != 1 {
+		t.Fatalf("want one mirror_failed event, got %d", len(fires))
+	}
+	got := fires[0]
+	if got.kind != TaskEventMirrorFailed || got.payload["op"] != "started" ||
+		got.payload["owner_id"] != "owner-1" || got.payload["channel_id"] != "ch-9" {
+		t.Fatalf("payload: %+v", got)
+	}
+	if msg, _ := got.payload["exc_message"].(string); msg == "" {
+		t.Fatalf("exc_message missing: %+v", got.payload)
+	}
+
+	// Progress for an unknown task is the expected swallowed case, not a failure.
+	s.Send(events.TaskProgress{TaskID: "never-started", Payload: map[string]any{"a": 1}})
+	if len(fires) != 1 {
+		t.Fatalf("ErrTaskNotFound must not escalate: %d events", len(fires))
+	}
+}
+
+func TestFireTaskEventWithoutHookIsNoop(t *testing.T) {
+	h := newTestHub(t)
+	h.FireTaskEvent("t", TaskEventMirrorFailed, nil) // must not panic
 }
