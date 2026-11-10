@@ -3645,3 +3645,96 @@ Regression: the T8 suite, including the order-sensitive delegation tests
 (`-count=200`) and `go test ./agent/ -count=20`. Gates (2026-11-09):
 `go build ./...`, `go vet ./...`, `go test ./...` (three consecutive green
 runs). `go test -race` still cannot run in this container (no cgo/gcc).
+
+## D-094 — 2026-11-10 — config plumbing: typed API errors, the SDK retry set, injectable HTTP clients, request knobs and the Z.AI retrieval tool (gap audit 2026-11-09, wave 1b-I)
+
+Closes the config-plumbing slice of the gap audit. The provider clients keep
+their wire behavior; what changes is the surface a caller can reach: errors it
+can branch on, a transport it can supply, and request fields that were
+previously unreachable outside OpenAI.
+
+- **One typed API error (`config/errors.go`).** A non-2xx answer is now
+  `*config.APIError{Provider, Op, StatusCode, Type, Message, Body, Retryable,
+  Header}`, returned bare or wrapped, and matched by `(*APIError).Is` against
+  `ErrAPI` plus eight classification sentinels (`ErrBadRequest`,
+  `ErrAuthentication`, `ErrPermissionDenied`, `ErrNotFound`, `ErrConflict`,
+  `ErrUnprocessable`, `ErrRateLimited`, `ErrServerError`). Every provider
+  client returns it: the shared Chat Completions engine (both paths), Anthropic,
+  Gemini, OpenAI Responses/Decisions, Ollama, and both Files clients. The
+  streaming paths convert the transport's new `httpx.StatusError` through
+  `config.WrapStatusError`; the Files clients keep their `ErrFilesAPI` sentinel
+  and wrap the typed error inside it (double `%w`, so `errors.Is` on either
+  works). AGO-DEVIATION: Python has no shared class — the SDKs' own exception
+  hierarchies do not agree — so the sentinel set is AGo's classification by
+  status, not a port of a Python type.
+- **The SDK retry set (408, 409, 429, 5xx).** `httpx.RetryableStatus` is now
+  the single definition; the two Files clients' `retryableStatus`
+  helpers are now one-line wrappers over it. D-017 recorded "retries with Retry-After" but never the status set.
+- **A caller-supplied `*http.Client`.** `httpx.Client.HTTP` is the seam; every
+  provider config exposes it (OpenAI Completions/Responses/Decisions,
+  Anthropic incl. its Files client, Gemini and Ollama as `WithHTTPClient`, Z.AI,
+  Mistral, DashScope — DashScope's is AGo-only: Python's `DashScopeConfig` has
+  no client field). Python names the field differently per SDK
+  (`http_client`, `async_client`, `http_options.client_args`); AGo uses one name
+  everywhere. The injected client owns its Timeout and CheckRedirect — the
+  config's `Timeout` applies only to the default client — so a caller that
+  needs proxy/CAs/mTLS configures it there, as the Python SDKs expect.
+- **Timeouts for Z.AI and Mistral.** Both configs gain `Timeout` and pass it to
+  the engine's existing `CompatParams.Timeout`; Python's `timeout`/
+  `request_timeout` (Z.AI) and `timeout_ms` (Mistral) had no Go equivalent.
+- **Typed Chat Completions options.** `CompatParams` gains `tool_choice`,
+  `reasoning_effort`, `seed`, `max_completion_tokens`, frequency/presence
+  penalty, `user`, `n`, `logprobs`/`top_logprobs`, `logit_bias`, `metadata`,
+  `modalities`, `prediction`, `prompt_cache_key`/`prompt_cache_options`,
+  `safety_identifier`, `service_tier`, `store`, `verbosity` and
+  `web_search_options`; a zero value is not sent, and `Extra` still merges last
+  for OpenAI. `OpenAICompletionsConfig` exposes all of them (with `Clone`
+  aliases); Mistral, Z.AI and DashScope expose the subset their Python configs
+  declare, and Ollama gains its `frequency_penalty`/`presence_penalty`
+  CreateOptions. `n > 1` keeps AGo's documented behavior: the first choice is
+  read, the rest dropped (Python reads `choices[0]` too).
+- **`extra_body` outside OpenAI.** Anthropic and Z.AI gain `ExtraBody` — the
+  providers besides OpenAI whose Python config has the field. Python's
+  `MistralConfig` has none, so Mistral gets none either.
+  Merge order follows the SDK: an `extra_body` key replaces the derived body
+  field for OpenAI and Anthropic (including `stream`); Z.AI keeps its documented inverse
+  (Python's `_merge_extra_body` lets the typed fields win, so `ExtraBody` is the
+  base and the typed knobs overwrite it). Mistral, Gemini, Ollama and DashScope get
+  no escape hatch: their Python configs have none, and adding one would be an
+  AGo-only surface rather than parity — their unmapped knobs stay unported.
+- **`default_query`.** `OpenAICompletionsConfig.DefaultQuery` /
+  `OpenAIResponsesConfig.DefaultQuery` append to every request URL (chat,
+  responses and the Files clients) through `httpx.WithQuery`, which keeps a key
+  the URL already carries. `default_query` was the last OpenAI config field
+  with no Go slot.
+- **AG-UI acceptance filter.** The server paths now map content parts against
+  the served agent's own model config (`config.AcceptsInput`, the W1-B table)
+  and drop an unaccepted part with a warning naming kind, media type, provider
+  and position — never the URL or payload. Python parity: `ag_ui/stream.py`
+  `_accepted_parts`. Before this, one unsupported attachment failed the whole
+  turn inside the model client. `mapRunInputMessages(input)` keeps its
+  unfiltered behavior for callers without a config.
+- **Z.AI retrieval tool.** `tools.NewRetrieval(knowledgeID, opts...)` plus
+  `tools.RetrievalToolSchema` carry the knowledge-base retrieval capability,
+  and `CompatParams.MapTool` lets a provider map a hosted schema the Chat
+  Completions dialect cannot express before the engine's fail-fast
+  `ToolToAPI`. Z.AI maps `{"type":"retrieval","retrieval":{...}}`; every other
+  provider still rejects the schema with `config.ErrUnsupportedTool`. One
+  AGO-DEVIATION: Python's `prompt_template` is `str | None`; the Go string
+  cannot tell None from "", and an empty template means nothing to the API, so
+  "" is not sent.
+- **`stop` is a list.** Mistral, Z.AI and DashScope take `Stop []string`.
+  AGO-DEVIATION: Python accepts `str | list[str]`; a single sequence is a
+  one-element slice, and the wire value is always an array.
+- **Anthropic `Clone` key matching** ignores underscores as well as case, so the
+  Python dataclass spellings (`http_client`, `extra_body`, `service_tier`) name
+  the Go fields.
+
+Verified by `config/errors_test.go`, `config/openaicompat_options_test.go`,
+`internal/httpx/httpx_test.go`, the per-provider `plumbing_test.go` files,
+`agui/acceptance_test.go`, `tools/hosted_test.go` and
+`config/input_acceptance_test.go`. Gates (2026-11-10): `gofmt -l .` clean,
+`go build ./...`, `go vet ./...`, `go test -count=1 ./...`, plus
+`go build/vet ./examples/...` and build+vet+test of every `contrib/*` module (run 2026-11-10 against this
+tree through each module's `replace`). The reviewer-authored part of this
+entry's first commit was cross-reviewed separately (see the gap-audit notes).

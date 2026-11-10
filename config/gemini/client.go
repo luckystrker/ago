@@ -138,7 +138,7 @@ func (c *client) generateContent(ctx context.Context, body map[string]any, heade
 			return nil, err
 		}
 		if status < 200 || status >= 300 {
-			return nil, fmt.Errorf("gemini: generateContent returned %d: %s", status, snippet(data))
+			return nil, config.NewAPIError(config.ProviderGemini, "gemini: generateContent", status, nil, data)
 		}
 		var raw genResponse
 		if err := json.Unmarshal(data, &raw); err != nil {
@@ -247,7 +247,7 @@ func (c *client) streamGenerate(ctx context.Context, body map[string]any, header
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, config.WrapStatusError(config.ProviderGemini, "gemini: streamGenerateContent", err)
 		}
 		usage = usage.Add(hopUsage)
 		// The last hop wins even when it carries no finish reason.
@@ -318,14 +318,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// snippet renders the first bytes of an error response body.
-func snippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		return s[:max] + "…"
-	}
-	return s
 }

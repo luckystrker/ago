@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -48,12 +49,70 @@ type CompatParams struct {
 	Streaming  bool
 	MaxRetries int
 	Timeout    time.Duration
+	// HTTPClient performs the requests when non-nil (proxies, custom root
+	// CAs, mTLS, test transports). The client owns its own Timeout and
+	// redirect policy; the Timeout field above applies only to the default
+	// client. Nil keeps the engine's default client.
+	HTTPClient *http.Client
+
+	// Query is appended to every request URL (SDK parity: default_query).
+	Query map[string]string
+
+	// The fields below are the typed Chat Completions options (SDK parity:
+	// the create() keyword arguments). The zero value of each means "not
+	// sent"; Extra still overrides all of them.
+	// ToolChoice is a mode string ("auto", "none", "required") or a map
+	// ({"type":"function","function":{"name":...}}).
+	ToolChoice any
+	// ReasoningEffort travels as reasoning_effort.
+	ReasoningEffort string
+	// Seed travels as seed; providers whose wire name differs (Mistral
+	// random_seed) set Extra instead.
+	Seed *int64
+	// MaxCompletionTokens travels as max_completion_tokens.
+	MaxCompletionTokens               *int64
+	FrequencyPenalty, PresencePenalty *float64
+	// User travels as user.
+	User string
+	// N is the number of completions to request; the engine reads the first
+	// choice only (SDK parity: ag2 reads choices[0]).
+	N *int64
+	// Logprobs and TopLogprobs travel as logprobs / top_logprobs.
+	Logprobs    *bool
+	TopLogprobs *int64
+	// LogitBias maps token ids (as strings) to a bias in [-100, 100].
+	LogitBias map[string]int64
+	// Metadata travels as metadata (string pairs stored with the request).
+	Metadata map[string]string
+	// Modalities travels as modalities ("text", "audio").
+	Modalities []string
+	// Prediction travels as prediction (predicted output content).
+	Prediction map[string]any
+	// PromptCacheKey is the prompt-cache routing hint; PromptCacheOptions the
+	// cache tuning object.
+	PromptCacheKey     string
+	PromptCacheOptions map[string]any
+	// SafetyIdentifier travels as safety_identifier.
+	SafetyIdentifier string
+	// ServiceTier travels as service_tier.
+	ServiceTier string
+	// Store travels as store.
+	Store *bool
+	// Verbosity travels as verbosity ("low", "medium", "high").
+	Verbosity string
+	// WebSearchOptions travels as web_search_options.
+	WebSearchOptions map[string]any
 
 	// ResponseFormat sends an explicit response_format (provider config);
 	// a per-call ResponseSchema in CallOptions takes precedence over it.
 	ResponseFormat map[string]any
 	// Extra merges into the request body last (Python parity: extra_body).
 	Extra map[string]any
+
+	// MapTool lets a provider map hosted tool schemas the Chat Completions
+	// dialect cannot carry (Z.AI retrieval). It is asked first for every tool;
+	// handled == false falls through to ToolToAPI.
+	MapTool func(tool any) (wire map[string]any, handled bool, err error)
 }
 
 // RunChatCompat performs one chat-completions call. messages is the full event
@@ -87,6 +146,16 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 
 	wireTools := make([]map[string]any, 0, len(opts.Tools))
 	for _, t := range opts.Tools {
+		if p.MapTool != nil {
+			wt, handled, err := p.MapTool(t)
+			if err != nil {
+				return nil, err
+			}
+			if handled {
+				wireTools = append(wireTools, wt)
+				continue
+			}
+		}
 		wt, err := ToolToAPI(t)
 		if err != nil {
 			return nil, err
@@ -113,6 +182,7 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 	if p.ParallelToolCalls != nil {
 		body["parallel_tool_calls"] = *p.ParallelToolCalls
 	}
+	p.applyOptions(body)
 	if rf := responseFormat(p, opts.ResponseSchema); rf != nil {
 		body["response_format"] = rf
 	}
@@ -135,13 +205,74 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
-	url := joinURL(p.BaseURL, p.Path)
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	url := httpx.WithQuery(joinURL(p.BaseURL, p.Path), p.Query)
 
 	if p.Streaming {
 		return runChatStream(ctx, client, url, headers, body, conv, p.provider())
 	}
 	return runChatOnce(ctx, client, url, headers, body, conv, p.provider())
+}
+
+// applyOptions writes the typed Chat Completions options onto body; a zero
+// value is not sent.
+func (p CompatParams) applyOptions(body map[string]any) {
+	if p.ToolChoice != nil {
+		body["tool_choice"] = p.ToolChoice
+	}
+	setString := func(key, v string) {
+		if v != "" {
+			body[key] = v
+		}
+	}
+	setString("reasoning_effort", p.ReasoningEffort)
+	setString("user", p.User)
+	setString("prompt_cache_key", p.PromptCacheKey)
+	setString("safety_identifier", p.SafetyIdentifier)
+	setString("service_tier", p.ServiceTier)
+	setString("verbosity", p.Verbosity)
+	if p.Seed != nil {
+		body["seed"] = *p.Seed
+	}
+	if p.MaxCompletionTokens != nil {
+		body["max_completion_tokens"] = *p.MaxCompletionTokens
+	}
+	if p.FrequencyPenalty != nil {
+		body["frequency_penalty"] = *p.FrequencyPenalty
+	}
+	if p.PresencePenalty != nil {
+		body["presence_penalty"] = *p.PresencePenalty
+	}
+	if p.N != nil {
+		body["n"] = *p.N
+	}
+	if p.Logprobs != nil {
+		body["logprobs"] = *p.Logprobs
+	}
+	if p.TopLogprobs != nil {
+		body["top_logprobs"] = *p.TopLogprobs
+	}
+	if p.Store != nil {
+		body["store"] = *p.Store
+	}
+	if p.LogitBias != nil {
+		body["logit_bias"] = p.LogitBias
+	}
+	if p.Metadata != nil {
+		body["metadata"] = p.Metadata
+	}
+	if len(p.Modalities) > 0 {
+		body["modalities"] = p.Modalities
+	}
+	if p.Prediction != nil {
+		body["prediction"] = p.Prediction
+	}
+	if len(p.PromptCacheOptions) > 0 { // an empty object is not a setting (SDK parity)
+		body["prompt_cache_options"] = p.PromptCacheOptions
+	}
+	if p.WebSearchOptions != nil {
+		body["web_search_options"] = p.WebSearchOptions
+	}
 }
 
 func (p CompatParams) provider() Provider {
@@ -845,7 +976,7 @@ func runChatOnce(ctx context.Context, client *httpx.Client, url string, headers 
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config: chat completions returned %d: %s", status, bodySnippet(data))
+		return nil, NewAPIError(provider, "config: chat completions", status, nil, data)
 	}
 	var raw struct {
 		ID      string          `json:"id"`
@@ -1035,7 +1166,7 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, WrapStatusError(provider, "config: chat completions", err)
 	}
 
 	resp := &events.ModelResponse{
@@ -1070,14 +1201,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// bodySnippet renders the first bytes of an error response body.
-func bodySnippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }

@@ -6,6 +6,7 @@ package gemini
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/luckystrker/ago/config"
@@ -46,6 +47,9 @@ type GeminiConfig struct {
 	// per-request token limit (Python parity: automatic_continuation
 	// bool|None = None; the SDK default is enabled). nil = enabled.
 	automaticContinuation *bool
+	// httpClient carries the requests when non-nil (Python parity:
+	// http_options client args); nil = default client.
+	httpClient *http.Client
 }
 
 // Option sets one field of a GeminiConfig at construction time.
@@ -92,6 +96,11 @@ func WithThinkingLevel(v string) Option { return func(c *GeminiConfig) { c.think
 
 // WithThinkingBudget caps the thinking token budget.
 func WithThinkingBudget(v int64) Option { return func(c *GeminiConfig) { c.thinkingBudget = &v } }
+
+// WithHTTPClient routes every request through c (proxy, custom root CAs,
+// mTLS, test transports). The client owns its own Timeout and redirect
+// policy. Nil keeps the default client.
+func WithHTTPClient(c *http.Client) Option { return func(cfg *GeminiConfig) { cfg.httpClient = c } }
 
 // WithAutomaticContinuation toggles the automatic resumption of answers the
 // server cut off at its per-request token limit. The flag never travels on the
@@ -145,7 +154,7 @@ func (c *GeminiConfig) Create() (config.LLMClient, error) {
 		cfg:     *c,
 		apiKey:  key,
 		baseURL: base,
-		http:    &httpx.Client{},
+		http:    &httpx.Client{HTTP: c.httpClient},
 	}, nil
 }
 
@@ -262,6 +271,15 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 				return nil, err
 			}
 			cc.thinkingBudget = i
+		case "http_client":
+			switch h := v.(type) {
+			case nil:
+				cc.httpClient = nil
+			case *http.Client:
+				cc.httpClient = h
+			default:
+				return nil, overrideErr(k, v)
+			}
 		case "automatic_continuation":
 			b, err := boolPtrOverride(k, v)
 			if err != nil {

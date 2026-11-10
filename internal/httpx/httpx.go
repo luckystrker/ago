@@ -1,6 +1,6 @@
 // Package httpx is the JSON-over-HTTP transport shared by the LLM provider
 // clients: one POST helper for plain JSON endpoints and one for SSE streams,
-// both with transport-level retries (429/5xx and network errors) honoring
+// both with transport-level retries (408/409/429/5xx and network errors) honoring
 // Retry-After. Parity with the retry behavior of the Python provider SDKs
 // (OpenAI max_retries=4, Anthropic 2, Z.AI 3 — configured per provider).
 package httpx
@@ -202,8 +202,58 @@ func retryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
-func retryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code >= 500
+// RetryableStatus reports whether a response status is worth another attempt:
+// 408 (request timeout), 409 (conflict, e.g. a lock the provider holds), 429
+// (rate limit) and every 5xx. Parity with the retry set of the OpenAI and
+// Anthropic SDKs the Python provider clients sit on.
+func RetryableStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests:
+		return true
+	}
+	return code >= 500
+}
+
+func retryableStatus(code int) bool { return RetryableStatus(code) }
+
+// WithQuery appends query pairs to rawURL (SDK parity: default_query). A key
+// the URL already carries keeps its value; an unparsable URL is returned
+// unchanged so the request fails on it with the transport's own error.
+func WithQuery(rawURL string, query map[string]string) string {
+	if len(query) == 0 {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	for k, v := range query {
+		if !q.Has(k) {
+			q.Set(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// StatusError is the failure PostJSONStream reports for a non-2xx answer once
+// its retries are spent. Provider packages convert it into their typed API
+// error; match with errors.As.
+type StatusError struct {
+	// StatusCode is the HTTP status of the final attempt.
+	StatusCode int
+	// Status is the full status line ("429 Too Many Requests").
+	Status string
+	// Header carries the response headers (Retry-After, request ids).
+	Header http.Header
+	// Body is the first bytes of the response body (up to 4 KiB).
+	Body []byte
+}
+
+// Error renders the status and a body snippet.
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("httpx: stream request returned %s: %s", e.Status, snippet(e.Body))
 }
 
 // sleepCtx waits d or until ctx is done.
@@ -302,9 +352,9 @@ func (c *Client) PostJSON(ctx context.Context, url string, headers map[string]st
 
 // PostJSONStream posts body as JSON and reads the response as an SSE stream,
 // passing every data chunk to onEvent (including a "data: [DONE]" sentinel —
-// the caller filters it). Retries cover connection failures and 429/5xx before
+// the caller filters it). Retries cover connection failures and retryable statuses before
 // the stream opens; once events flow, a failure is terminal. A non-2xx final
-// response becomes an error carrying the status and a body snippet. An error
+// response becomes a *StatusError carrying the status and a body snippet. An error
 // returned by onEvent stops the stream and is returned unwrapped.
 func (c *Client) PostJSONStream(ctx context.Context, url string, headers map[string]string, body any, onEvent func(data []byte) error) error {
 	payload, err := json.Marshal(body)
@@ -339,7 +389,7 @@ func (c *Client) PostJSONStream(ctx context.Context, url string, headers map[str
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			return fmt.Errorf("httpx: stream request returned %s: %s", resp.Status, snippet(data))
+			return &StatusError{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data}
 		}
 
 		// The stream is live: no retries past this point (events were delivered).
