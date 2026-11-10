@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/stream"
 )
@@ -75,7 +76,7 @@ func serveTurn(ctx context.Context, a *agent.Agent, input RunAgentInput, emit fu
 		return nil
 	}
 
-	mapped := mapRunInputMessages(input)
+	mapped := mapRunInputMessagesFor(input, a.Config())
 
 	// The turn runs on its own stream: the mapped history is its transcript and
 	// the current turn's parts are its first model request.
@@ -182,7 +183,18 @@ type mappedMessages struct {
 // Content-part metadata is dropped (ago inputs have no metadata field), and
 // provider-tagged file handles are always skipped: which provider the served
 // agent talks to is not readable here, so only untagged handles are accepted.
+//
+// mapRunInputMessages applies no acceptance filter (a nil model config accepts
+// every part); the server paths use mapRunInputMessagesFor with the agent's own
+// config.
 func mapRunInputMessages(input RunAgentInput) mappedMessages {
+	return mapRunInputMessagesFor(input, nil)
+}
+
+// mapRunInputMessagesFor is mapRunInputMessages with the served agent's model
+// config: a media part the config's mapper does not accept is dropped with a
+// warning instead of failing the turn (Python parity: _accepted_parts).
+func mapRunInputMessagesFor(input RunAgentInput, cfg config.ModelConfig) mappedMessages {
 	var (
 		out    mappedMessages
 		folds  []events.Input
@@ -204,7 +216,7 @@ func mapRunInputMessages(input RunAgentInput) mappedMessages {
 	for _, m := range input.Messages {
 		switch m.Role {
 		case "user":
-			parts, _ := mapContent(m.Content, "")
+			parts, _ := mapContent(m.Content, cfg, config.PositionUser)
 			buf = append(buf, parts...)
 
 		case "system", "developer":
@@ -240,7 +252,7 @@ func mapRunInputMessages(input RunAgentInput) mappedMessages {
 
 		case "tool":
 			flush()
-			parts, _ := mapContent(m.Content, "")
+			parts, _ := mapContent(m.Content, cfg, config.PositionTool)
 			// An error is what the model must hear, and leads; the call is owed
 			// a result even when every part was skipped (Python parity).
 			if m.Error != "" {
@@ -283,8 +295,9 @@ func clientContextPrompt(entries []ContextEntry) string {
 
 // mapContent maps a message body — plain text or content parts — to the ago
 // inputs it carries (Python parity: map_agui_parts_to_inputs). Unmappable parts
-// are skipped with a warning; the run carries on without them.
-func mapContent(raw json.RawMessage, provider string) ([]events.Input, bool) {
+// are skipped with a warning; the run carries on without them. A part cfg's
+// mapper does not accept in this position is skipped the same way.
+func mapContent(raw json.RawMessage, cfg config.ModelConfig, position config.InputPosition) ([]events.Input, bool) {
 	text, parts, err := decodeContent(raw)
 	if err != nil {
 		slog.Warn("agui: dropping a message whose content does not decode", "err", err)
@@ -298,16 +311,22 @@ func mapContent(raw json.RawMessage, provider string) ([]events.Input, bool) {
 	}
 	var out []events.Input
 	for _, part := range parts {
-		if inp, ok := mapPart(part, provider); ok {
-			out = append(out, inp)
+		inp, ok := mapPart(part)
+		if !ok {
+			continue
 		}
+		if !config.AcceptsInput(cfg, position, inp) {
+			warnUnaccepted(inp, cfg, position)
+			continue
+		}
+		out = append(out, inp)
 	}
 	return out, true
 }
 
 // mapPart maps one content part, or reports that it is to be skipped (Python
 // parity: map_agui_content_to_input).
-func mapPart(part ContentPart, provider string) (events.Input, bool) {
+func mapPart(part ContentPart) (events.Input, bool) {
 	switch part.Type {
 	case PartText:
 		return &events.TextInput{Content: part.Text}, true
@@ -344,6 +363,25 @@ func mapPart(part ContentPart, provider string) (events.Input, bool) {
 		slog.Warn("agui: skipping a part whose source is of unrecognised type", "source", src.Type)
 		return nil, false
 	}
+}
+
+// warnUnaccepted logs a part dropped by the acceptance filter (Python parity:
+// _accepted_parts). Only the kind and media type are logged — never a URL,
+// handle or payload.
+func warnUnaccepted(inp events.Input, cfg config.ModelConfig, position config.InputPosition) {
+	kind, mediaType := "file", "unknown"
+	switch p := events.AsValue(inp).(type) {
+	case events.BinaryInput:
+		kind, mediaType = string(p.Kind), p.MediaType
+	case events.UrlInput:
+		kind = string(p.Kind)
+	}
+	provider := "unknown"
+	if cfg != nil {
+		provider = string(cfg.Provider())
+	}
+	slog.Warn("agui: skipping a part the model provider does not accept",
+		"kind", kind, "media_type", mediaType, "provider", provider, "position", string(position))
 }
 
 // binaryKind maps a content part type to the ago binary kind it travels as.

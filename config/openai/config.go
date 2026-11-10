@@ -14,6 +14,7 @@ package openai
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -74,7 +75,7 @@ type OpenAICompletionsConfig struct {
 	// Timeout caps a non-streaming request (0 = no cap; streams rely on the
 	// call's context for cancellation).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures (SDK default, applied by NewOpenAICompletions).
 	MaxRetries int
 
@@ -90,6 +91,43 @@ type OpenAICompletionsConfig struct {
 	// ExtraBody merges into the request body last, overriding any engine or
 	// config field (SDK parity: extra_body).
 	ExtraBody map[string]any
+
+	// HTTPClient performs the requests of Create and CreateFilesClient when
+	// non-nil (proxy, custom root CAs, mTLS). It owns its own Timeout and
+	// redirect policy; Timeout above applies only to the default client.
+	// Nil keeps the default client (SDK parity: http_client).
+	HTTPClient *http.Client
+	// DefaultQuery is appended to every request URL (SDK parity:
+	// default_query).
+	DefaultQuery map[string]string
+
+	// The typed Chat Completions options below travel under their wire names
+	// when set; the zero value is not sent. ExtraBody still wins.
+	// ToolChoice is a mode string ("auto", "none", "required") or a map
+	// ({"type":"function","function":{"name":"f"}}).
+	ToolChoice any
+	// ReasoningEffort is "none", "minimal", "low", "medium", "high" or "xhigh".
+	ReasoningEffort                   string
+	FrequencyPenalty, PresencePenalty *float64
+	// N asks for several completions; the client reads the first only.
+	N              *int64
+	Logprobs       *bool
+	TopLogprobs    *int64
+	LogitBias      map[string]int64
+	Metadata       map[string]string
+	Modalities     []string
+	Prediction     map[string]any
+	PromptCacheKey string
+	// PromptCacheOptions travels only when non-empty (a model without the
+	// feature answers an empty object with a 400).
+	PromptCacheOptions map[string]any
+	SafetyIdentifier   string
+	// ServiceTier is "auto", "default", "flex", "scale", "priority" or "fast".
+	ServiceTier string
+	Store       *bool
+	// Verbosity is "low", "medium" or "high".
+	Verbosity        string
+	WebSearchOptions map[string]any
 
 	model string
 }
@@ -144,23 +182,9 @@ func (c *OpenAICompletionsConfig) Create() (config.LLMClient, error) {
 		headers[k] = v
 	}
 
-	extra := map[string]any{}
-	// Sampling fields the shared engine has no typed slot for travel as plain
-	// body fields (Python parity: regular create options).
-	if c.MaxCompletionTokens != nil {
-		extra["max_completion_tokens"] = *c.MaxCompletionTokens
-	}
-	if c.Seed != nil {
-		extra["seed"] = *c.Seed
-	}
-	if c.User != "" {
-		extra["user"] = c.User
-	}
-	// ExtraBody wins over the derived fields (SDK parity: extra_body merges
-	// last).
-	for k, v := range c.ExtraBody {
-		extra[k] = v
-	}
+	// ExtraBody wins over every derived field (SDK parity: extra_body merges
+	// last); the engine applies it after the typed options.
+	extra := c.ExtraBody
 
 	return &Client{
 		params: config.CompatParams{
@@ -178,10 +202,34 @@ func (c *OpenAICompletionsConfig) Create() (config.LLMClient, error) {
 			Stop:              c.Stop,
 			ParallelToolCalls: c.ParallelToolCalls,
 
+			ToolChoice:          c.ToolChoice,
+			ReasoningEffort:     c.ReasoningEffort,
+			Seed:                c.Seed,
+			MaxCompletionTokens: c.MaxCompletionTokens,
+			FrequencyPenalty:    c.FrequencyPenalty,
+			PresencePenalty:     c.PresencePenalty,
+			User:                c.User,
+			N:                   c.N,
+			Logprobs:            c.Logprobs,
+			TopLogprobs:         c.TopLogprobs,
+			LogitBias:           c.LogitBias,
+			Metadata:            c.Metadata,
+			Modalities:          c.Modalities,
+			Prediction:          c.Prediction,
+			PromptCacheKey:      c.PromptCacheKey,
+			PromptCacheOptions:  c.PromptCacheOptions,
+			SafetyIdentifier:    c.SafetyIdentifier,
+			ServiceTier:         c.ServiceTier,
+			Store:               c.Store,
+			Verbosity:           c.Verbosity,
+			WebSearchOptions:    c.WebSearchOptions,
+
 			ResponseFormat: c.ResponseFormat,
 			Streaming:      c.Streaming,
 			Timeout:        c.Timeout,
 			MaxRetries:     c.MaxRetries,
+			HTTPClient:     c.HTTPClient,
+			Query:          c.DefaultQuery,
 
 			Extra: extra,
 		},
@@ -322,6 +370,66 @@ func (c *OpenAICompletionsConfig) set(key string, v any) error {
 			return overrideTypeErr(key, v, "map[string]any")
 		}
 		c.ExtraBody = m
+	case "HTTPClient", "http_client":
+		if v == nil {
+			c.HTTPClient = nil
+			return nil
+		}
+		h, ok := v.(*http.Client)
+		if !ok {
+			return overrideTypeErr(key, v, "*http.Client")
+		}
+		c.HTTPClient = h
+	case "DefaultQuery", "default_query":
+		m, ok := v.(map[string]string)
+		if !ok {
+			return overrideTypeErr(key, v, "map[string]string")
+		}
+		c.DefaultQuery = m
+	case "ToolChoice", "tool_choice":
+		c.ToolChoice = v
+	case "ReasoningEffort", "reasoning_effort":
+		return setString(key, v, &c.ReasoningEffort)
+	case "PromptCacheKey", "prompt_cache_key":
+		return setString(key, v, &c.PromptCacheKey)
+	case "SafetyIdentifier", "safety_identifier":
+		return setString(key, v, &c.SafetyIdentifier)
+	case "ServiceTier", "service_tier":
+		return setString(key, v, &c.ServiceTier)
+	case "Verbosity", "verbosity":
+		return setString(key, v, &c.Verbosity)
+	case "FrequencyPenalty", "frequency_penalty":
+		return setPtr(key, v, &c.FrequencyPenalty, "*float64")
+	case "PresencePenalty", "presence_penalty":
+		return setPtr(key, v, &c.PresencePenalty, "*float64")
+	case "N", "n":
+		return setPtr(key, v, &c.N, "*int64")
+	case "TopLogprobs", "top_logprobs":
+		return setPtr(key, v, &c.TopLogprobs, "*int64")
+	case "Logprobs", "logprobs":
+		return setPtr(key, v, &c.Logprobs, "*bool")
+	case "Store", "store":
+		return setPtr(key, v, &c.Store, "*bool")
+	case "LogitBias", "logit_bias":
+		return setMap(key, v, &c.LogitBias, "map[string]int64")
+	case "Metadata", "metadata":
+		return setMap(key, v, &c.Metadata, "map[string]string")
+	case "Prediction", "prediction":
+		return setMap(key, v, &c.Prediction, "map[string]any")
+	case "PromptCacheOptions", "prompt_cache_options":
+		return setMap(key, v, &c.PromptCacheOptions, "map[string]any")
+	case "WebSearchOptions", "web_search_options":
+		return setMap(key, v, &c.WebSearchOptions, "map[string]any")
+	case "Modalities", "modalities":
+		if v == nil {
+			c.Modalities = nil
+			return nil
+		}
+		m, ok := v.([]string)
+		if !ok {
+			return overrideTypeErr(key, v, "[]string")
+		}
+		c.Modalities = m
 	default:
 		return fmt.Errorf("config/openai: unknown override key %q", key)
 	}
@@ -330,4 +438,46 @@ func (c *OpenAICompletionsConfig) set(key string, v any) error {
 
 func overrideTypeErr(key string, v any, want string) error {
 	return fmt.Errorf("config/openai: override %q: want %s, got %T", key, want, v)
+}
+
+// setString assigns a string override; nil clears the field.
+func setString(key string, v any, dst *string) error {
+	if v == nil {
+		*dst = ""
+		return nil
+	}
+	str, ok := v.(string)
+	if !ok {
+		return overrideTypeErr(key, v, "string")
+	}
+	*dst = str
+	return nil
+}
+
+// setPtr assigns a pointer-typed override; nil clears the field.
+func setPtr[T any](key string, v any, dst **T, want string) error {
+	if v == nil {
+		*dst = nil
+		return nil
+	}
+	p, ok := v.(*T)
+	if !ok {
+		return overrideTypeErr(key, v, want)
+	}
+	*dst = p
+	return nil
+}
+
+// setMap assigns a map-typed override; nil clears the field.
+func setMap[M ~map[string]V, V any](key string, v any, dst *M, want string) error {
+	if v == nil {
+		*dst = nil
+		return nil
+	}
+	m, ok := v.(M)
+	if !ok {
+		return overrideTypeErr(key, v, want)
+	}
+	*dst = m
+	return nil
 }

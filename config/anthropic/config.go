@@ -11,6 +11,7 @@ package anthropic
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"reflect"
 	"strings"
@@ -128,7 +129,7 @@ type AnthropicConfig struct {
 	// Timeout caps a non-streaming request (0 = no cap; streams rely on the
 	// call's context for cancellation).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures.
 	MaxRetries int
 	// PromptCaching injects cache_control {"type":"ephemeral"} onto the last
@@ -153,6 +154,16 @@ type AnthropicConfig struct {
 	// CacheDiagnostics event for every reported one (Python parity:
 	// cache_diagnostics).
 	CacheDiagnostics bool
+	// ExtraBody merges into the request body last, reaching fields the config
+	// has no typed slot for (Python parity: extra_body — in Python it is the
+	// only way to enable thinking, for one). A key that collides with a
+	// derived body field replaces it, as the SDK's merge does.
+	ExtraBody map[string]any
+	// HTTPClient performs the requests of Create and CreateFilesClient when
+	// non-nil (proxy, custom root CAs, mTLS). It owns its own Timeout and
+	// redirect policy; Timeout above applies only to the default client.
+	// Nil keeps the default client (Python parity: http_client).
+	HTTPClient *http.Client
 }
 
 // NewAnthropic returns a config for one model with the documented defaults
@@ -216,7 +227,22 @@ func (c *AnthropicConfig) Create() (config.LLMClient, error) {
 		speed:            c.Speed,
 		thinking:         c.Thinking,
 		cacheDiagnostics: c.CacheDiagnostics,
+		extraBody:        copyAnyMap(c.ExtraBody),
+		httpClient:       c.HTTPClient,
 	}, nil
+}
+
+// copyAnyMap returns a shallow copy of m (nil stays nil), so a client never
+// shares a map a caller may still mutate.
+func copyAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // copyMap returns a copy of m (nil stays nil), so a client never shares a map a
@@ -244,6 +270,7 @@ func (c *AnthropicConfig) Clone(overrides map[string]any) (config.ModelConfig, e
 	}
 	cp.DefaultHeaders = copyMap(c.DefaultHeaders)
 	cp.Metadata = copyMap(c.Metadata)
+	cp.ExtraBody = copyAnyMap(c.ExtraBody)
 	if c.Thinking != nil {
 		thinking := *c.Thinking
 		cp.Thinking = &thinking
@@ -259,7 +286,7 @@ func (c *AnthropicConfig) Clone(overrides map[string]any) (config.ModelConfig, e
 // applyOverride sets one field by case-insensitive name. The private model
 // field is handled explicitly; the exported fields via reflection.
 func (c *AnthropicConfig) applyOverride(key string, value any) error {
-	if strings.EqualFold(key, "model") {
+	if fieldKey(key) == "model" {
 		s, ok := value.(string)
 		if !ok {
 			return fmt.Errorf("config: override %q: want string, got %T", key, value)
@@ -271,12 +298,12 @@ func (c *AnthropicConfig) applyOverride(key string, value any) error {
 	rt := rv.Type()
 	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
-		if !field.IsExported() || !strings.EqualFold(field.Name, key) {
+		if !field.IsExported() || fieldKey(field.Name) != fieldKey(key) {
 			continue
 		}
 		fv := rv.Field(i)
 		if value == nil {
-			if field.Type.Kind() != reflect.Pointer && field.Type.Kind() != reflect.Slice {
+			if field.Type.Kind() != reflect.Pointer && field.Type.Kind() != reflect.Slice && field.Type.Kind() != reflect.Map {
 				return fmt.Errorf("config: override %q: field does not accept nil", key)
 			}
 			fv.Set(reflect.Zero(field.Type))
@@ -296,6 +323,13 @@ func (c *AnthropicConfig) applyOverride(key string, value any) error {
 		return nil
 	}
 	return fmt.Errorf("config: unknown AnthropicConfig override %q", key)
+}
+
+// fieldKey normalizes an override key for matching: the Python dataclass names
+// are snake_case and the Go fields are CamelCase, so underscores and case are
+// ignored ("http_client" and "HTTPClient" name one field).
+func fieldKey(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, "_", ""))
 }
 
 // Compile-time check of the ModelConfig contract.

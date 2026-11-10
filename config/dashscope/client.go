@@ -3,6 +3,7 @@ package dashscope
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
@@ -76,6 +77,30 @@ func setI64(dst **int64, name string, v any) error {
 		*dst = &n64
 	default:
 		return fmt.Errorf("config/dashscope: override %q: got %T, want int64", name, v)
+	}
+	return nil
+}
+
+func setHTTPClient(dst **http.Client, name string, v any) error {
+	switch h := v.(type) {
+	case nil:
+		*dst = nil
+	case *http.Client:
+		*dst = h
+	default:
+		return fmt.Errorf("config/dashscope: override %q: got %T, want *http.Client", name, v)
+	}
+	return nil
+}
+
+func setStrings(dst *[]string, name string, v any) error {
+	switch s := v.(type) {
+	case nil:
+		*dst = nil
+	case []string:
+		*dst = s
+	default:
+		return fmt.Errorf("config/dashscope: override %q: got %T, want []string", name, v)
 	}
 	return nil
 }

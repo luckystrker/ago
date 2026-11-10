@@ -6,6 +6,7 @@ package ollama
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/luckystrker/ago/config"
@@ -41,6 +42,13 @@ type OllamaConfig struct {
 	stop        []string
 	seed        *int64
 	streaming   bool
+	// frequencyPenalty and presencePenalty travel in the options block under
+	// their wire names (Python parity: CreateOptions).
+	frequencyPenalty *float64
+	presencePenalty  *float64
+	// httpClient carries the requests when non-nil (Python parity:
+	// http_client); nil = default client.
+	httpClient *http.Client
 }
 
 // Option sets one field of an OllamaConfig at construction time.
@@ -69,6 +77,21 @@ func WithStop(v ...string) Option {
 
 // WithSeed pins the sampling seed.
 func WithSeed(v int64) Option { return func(c *OllamaConfig) { c.seed = &v } }
+
+// WithFrequencyPenalty penalizes tokens by how often they already appeared.
+func WithFrequencyPenalty(v float64) Option {
+	return func(c *OllamaConfig) { c.frequencyPenalty = &v }
+}
+
+// WithPresencePenalty penalizes tokens that already appeared at all.
+func WithPresencePenalty(v float64) Option {
+	return func(c *OllamaConfig) { c.presencePenalty = &v }
+}
+
+// WithHTTPClient routes every request through c (proxy, custom root CAs,
+// mTLS, test transports). The client owns its own Timeout and redirect
+// policy. Nil keeps the default client.
+func WithHTTPClient(c *http.Client) Option { return func(cfg *OllamaConfig) { cfg.httpClient = c } }
 
 // WithStreaming toggles streaming. Streaming is not implemented yet in this
 // port: Create fails on a streaming config.
@@ -116,7 +139,7 @@ func (c *OllamaConfig) Create() (config.LLMClient, error) {
 		cfg:    *c,
 		host:   host,
 		apiKey: key,
-		http:   &httpx.Client{},
+		http:   &httpx.Client{HTTP: c.httpClient},
 	}, nil
 }
 
@@ -131,6 +154,8 @@ func (c *OllamaConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 	cc.topP = cloneFloat(c.topP)
 	cc.maxTokens = cloneInt(c.maxTokens)
 	cc.seed = cloneInt(c.seed)
+	cc.frequencyPenalty = cloneFloat(c.frequencyPenalty)
+	cc.presencePenalty = cloneFloat(c.presencePenalty)
 	for k, v := range overrides {
 		switch k {
 		case "model":
@@ -181,6 +206,27 @@ func (c *OllamaConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 				return nil, err
 			}
 			cc.seed = i
+		case "frequency_penalty":
+			f, err := floatOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.frequencyPenalty = f
+		case "presence_penalty":
+			f, err := floatOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.presencePenalty = f
+		case "http_client":
+			switch h := v.(type) {
+			case nil:
+				cc.httpClient = nil
+			case *http.Client:
+				cc.httpClient = h
+			default:
+				return nil, overrideErr(k, v)
+			}
 		case "streaming":
 			b, err := boolOverride(k, v)
 			if err != nil {

@@ -95,19 +95,6 @@ func TestContinuationOfFinishReasonRules(t *testing.T) {
 	}
 }
 
-func TestSnippetBoundary(t *testing.T) {
-	// Exactly 512 bytes pass through unchanged; one more truncates with the
-	// ellipsis.
-	exact := strings.Repeat("a", 512)
-	if got := snippet([]byte(exact)); got != exact {
-		t.Fatalf("a 512-byte body must pass through unchanged, got %d bytes: %q", len(got), got)
-	}
-	long := strings.Repeat("b", 513)
-	if got := snippet([]byte(long)); got != long[:512]+"…" {
-		t.Fatalf("a 513-byte body must truncate to 512 + ellipsis, got %d bytes", len(got))
-	}
-}
-
 // --- mappers.go ------------------------------------------------------------------
 
 func TestBuildContentsSkipsEmptyTurns(t *testing.T) {

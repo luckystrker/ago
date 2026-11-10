@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -86,7 +87,7 @@ type OpenAIDecisionsConfig struct {
 
 	// Timeout caps a request (0 = no cap).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures (SDK default, applied by NewOpenAIDecisions).
 	MaxRetries int
 
@@ -112,6 +113,11 @@ type OpenAIDecisionsConfig struct {
 
 	// ExtraBody merges into the request body last (SDK parity: extra_body).
 	ExtraBody map[string]any
+
+	// HTTPClient performs the requests when non-nil (proxy, custom root CAs,
+	// mTLS). It owns its own Timeout and redirect policy; Timeout above
+	// applies only to the default client.
+	HTTPClient *http.Client
 
 	model string
 }
@@ -207,6 +213,8 @@ func (c *OpenAIDecisionsConfig) set(key string, v any) error {
 		return str(&c.Organization)
 	case "Project", "project":
 		return str(&c.Project)
+	case "HTTPClient", "http_client":
+		return setPtr(key, v, &c.HTTPClient, "*http.Client")
 	case "Timeout", "timeout":
 		d, ok := v.(time.Duration)
 		if !ok {
@@ -326,13 +334,13 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
 	status, data, err := client.PostJSON(ctx, joinURL(c.baseURL, decisionsPath), headers, body)
 	if err != nil {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config/openai: decisions returned %d: %s", status, bodySnippet(data))
+		return nil, config.NewAPIError(config.ProviderOpenAI, "config/openai: decisions", status, nil, data)
 	}
 
 	var raw struct {

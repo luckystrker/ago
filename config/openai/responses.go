@@ -100,7 +100,7 @@ type OpenAIResponsesConfig struct {
 	// Timeout caps a non-streaming request (0 = no cap; streams rely on the
 	// call's context for cancellation).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures (SDK default, applied by NewOpenAIResponses).
 	MaxRetries int
 
@@ -116,6 +116,14 @@ type OpenAIResponsesConfig struct {
 	// ExtraBody merges into the request body last, overriding any field the
 	// config derived (SDK parity: extra_body).
 	ExtraBody map[string]any
+
+	// HTTPClient performs the requests of Create and CreateFilesClient when
+	// non-nil (proxy, custom root CAs, mTLS). It owns its own Timeout and
+	// redirect policy; Timeout above applies only to the default client.
+	HTTPClient *http.Client
+	// DefaultQuery is appended to every request URL (SDK parity:
+	// default_query).
+	DefaultQuery map[string]string
 
 	model string
 }
@@ -203,7 +211,8 @@ func (c *OpenAIResponsesConfig) CreateFilesClient() (files.Client, error) {
 		defaultHeaders: headers,
 		timeout:        c.Timeout,
 		maxRetries:     c.MaxRetries,
-		http:           &http.Client{Timeout: c.Timeout},
+		query:          c.DefaultQuery,
+		http:           httpClientOr(c.HTTPClient, c.Timeout),
 	}, nil
 }
 
@@ -362,6 +371,10 @@ func (c *OpenAIResponsesConfig) set(key string, v any) error {
 			return overrideTypeErr(key, v, "bool")
 		}
 		c.Streaming = bv
+	case "HTTPClient", "http_client":
+		return setPtr(key, v, &c.HTTPClient, "*http.Client")
+	case "DefaultQuery", "default_query":
+		return strMap(&c.DefaultQuery)
 	case "Timeout", "timeout":
 		d, ok := v.(time.Duration)
 		if !ok {
@@ -516,8 +529,8 @@ func (c *ResponsesClient) Call(ctx context.Context, messages []events.Event, con
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
-	url := joinURL(c.baseURL, responsesPath)
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	url := httpx.WithQuery(joinURL(c.baseURL, responsesPath), p.DefaultQuery)
 
 	var resp *events.ModelResponse
 	if p.Streaming {
@@ -540,7 +553,7 @@ func runResponsesOnce(ctx context.Context, client *httpx.Client, url string, hea
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config/openai: responses returned %d: %s", status, bodySnippet(data))
+		return nil, config.NewAPIError(config.ProviderOpenAI, "config/openai: responses", status, nil, data)
 	}
 	var raw struct {
 		ID     string           `json:"id"`
@@ -632,7 +645,7 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, config.WrapStatusError(config.ProviderOpenAI, "config/openai: responses", err)
 	}
 
 	resp := acc.response(acc.model, acc.finish, acc.respID)
@@ -1681,16 +1694,6 @@ func joinURL(base, path string) string {
 		path = "/" + path
 	}
 	return strings.TrimSuffix(base, "/") + path
-}
-
-// bodySnippet renders the first bytes of an error response body.
-func bodySnippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }
 
 // dataURL renders inline bytes as a data: URL.

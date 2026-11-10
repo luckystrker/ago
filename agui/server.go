@@ -328,7 +328,7 @@ func (s *Server) begin(ctx context.Context, a *agent.Agent, input RunAgentInput,
 	t.streamID = run.Stream().ID()
 	s.turns.bind(t.streamID, t)
 
-	mapped := mapRunInputMessages(input)
+	mapped := mapRunInputMessagesFor(input, a.Config())
 	if err := run.Stream().History().Replace(mapped.history); err != nil {
 		ex.emit(runErrorEvent(err))
 		run.Close()

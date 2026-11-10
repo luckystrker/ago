@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -45,6 +46,8 @@ type Client struct {
 	speed            string
 	thinking         *ThinkingConfig
 	cacheDiagnostics bool
+	extraBody        map[string]any // merged into the body last
+	httpClient       *http.Client   // nil = default client
 
 	// mu guards the cache-diagnostics chain: the id of the last answered
 	// message, which the next request names as its comparison.
@@ -156,6 +159,12 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 		}
 		body["diagnostics"] = map[string]any{"previous_message_id": previous}
 	}
+	// extra_body merges last, as the SDK does: an unmapped field (thinking,
+	// a vendor flag) reaches the wire without a typed config slot, and a key
+	// it repeats replaces the derived value.
+	for k, v := range c.extraBody {
+		body[k] = v
+	}
 
 	headers := make(map[string]string, len(c.defaultHeaders)+2)
 	for name, value := range c.defaultHeaders {
@@ -177,7 +186,7 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 		}
 		headers["anthropic-beta"] = strings.Join(betas, ",")
 	}
-	client := &httpx.Client{MaxRetries: c.maxRetries, Timeout: c.timeout}
+	client := &httpx.Client{HTTP: c.httpClient, MaxRetries: c.maxRetries, Timeout: c.timeout}
 	url := c.baseURL + messagesPath
 
 	if c.streaming {
@@ -277,20 +286,13 @@ type wireCacheMissReason struct {
 	CacheMissedInputTokens *int64 `json:"cache_missed_input_tokens"`
 }
 
-type wireError struct {
-	Error struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 func (c *Client) once(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*events.ModelResponse, error) {
 	status, data, err := client.PostJSON(ctx, url, headers, body)
 	if err != nil {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("anthropic: messages API returned %d: %s", status, apiErrorSnippet(data))
+		return nil, config.NewAPIError(config.ProviderAnthropic, "anthropic: messages API", status, nil, data)
 	}
 	var raw wireMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -519,7 +521,7 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, config.WrapStatusError(config.ProviderAnthropic, "anthropic: messages API", err)
 	}
 
 	resp := &events.ModelResponse{
@@ -600,22 +602,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// apiErrorSnippet renders an API error body, preferring the Anthropic error
-// envelope's message over the raw bytes.
-func apiErrorSnippet(data []byte) string {
-	var env wireError
-	if err := json.Unmarshal(data, &env); err == nil && env.Error.Message != "" {
-		if env.Error.Type != "" {
-			return env.Error.Type + ": " + env.Error.Message
-		}
-		return env.Error.Message
-	}
-	const max = 512
-	s := strings.TrimSpace(string(data))
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }

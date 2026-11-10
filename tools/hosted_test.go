@@ -20,6 +20,7 @@ var _ Tool = (*ShellTool)(nil)
 var _ Tool = (*MemoryTool)(nil)
 var _ Tool = (*MCPServerTool)(nil)
 var _ Tool = (*ToolSearchTool)(nil)
+var _ Tool = (*RetrievalTool)(nil)
 
 func newHostedTools() []Tool {
 	mcp, _ := NewMCPServer("https://mcp.example", "docs")
@@ -34,6 +35,7 @@ func newHostedTools() []Tool {
 		NewMemory(),
 		mcp,
 		search,
+		NewRetrieval("kb-1"),
 	}
 }
 
@@ -52,6 +54,7 @@ func TestHostedToolNames(t *testing.T) {
 		{MemoryToolName, "memory", true},
 		{MCPServerToolName, "mcp_server", true},
 		{ToolSearchToolName, "tool_search", true},
+		{RetrievalToolName, "retrieval", true},
 	}
 	for i, tt := range want {
 		tool := newHostedTools()[i]
@@ -218,6 +221,16 @@ func TestHostedSchemaGoldenJSON(t *testing.T) {
 			name: "tool_search bm25",
 			tool: mustToolSearch(t, "bm25", NewMemory()),
 			want: `{"mode":"bm25"}`,
+		},
+		{
+			name: "retrieval id only",
+			tool: NewRetrieval("kb-1"),
+			want: `{"knowledge_id":"kb-1"}`,
+		},
+		{
+			name: "retrieval with template",
+			tool: NewRetrieval("kb-1", WithRetrievalPromptTemplate("Use {{knowledge}} to answer {{question}}")),
+			want: `{"knowledge_id":"kb-1","prompt_template":"Use {{knowledge}} to answer {{question}}"}`,
 		},
 	}
 	for _, tc := range cases {

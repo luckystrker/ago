@@ -36,6 +36,7 @@ const (
 	MemoryToolName          = "memory"
 	MCPServerToolName       = "mcp_server"
 	ToolSearchToolName      = "tool_search"
+	RetrievalToolName       = "retrieval"
 )
 
 // Version literals the schemas default to (Python parity: the Literal defaults).
@@ -939,6 +940,71 @@ func (t *ToolSearchTool) Register(cx *agocontext.Context, mw []middleware.Middle
 		subs = append(subs, ids...)
 	}
 	return subs, nil
+}
+
+// --- retrieval ---------------------------------------------------------------------
+
+// RetrievalToolSchema is the provider-neutral knowledge-base retrieval
+// capability. Only Z.AI executes it server-side (Python parity: the Z.AI
+// mapper); every other provider rejects the schema.
+type RetrievalToolSchema struct {
+	// KnowledgeID names the Z.AI knowledge base to search.
+	KnowledgeID string `json:"knowledge_id"`
+	// PromptTemplate overrides the template that frames the retrieved
+	// passages; empty is not sent and the API's own default applies.
+	// AGO-DEVIATION: Python's field is `str | None`, which distinguishes
+	// None from ""; the Go string cannot, and an empty template is not
+	// meaningful to the API, so "" means unset.
+	PromptTemplate string `json:"prompt_template,omitempty"`
+}
+
+// SchemaType returns the provider-neutral tool type.
+func (RetrievalToolSchema) SchemaType() string { return RetrievalToolName }
+
+// RetrievalOption configures NewRetrieval.
+type RetrievalOption func(*RetrievalTool)
+
+// WithRetrievalPromptTemplate sets the template that frames the retrieved
+// passages in the prompt.
+func WithRetrievalPromptTemplate(template string) RetrievalOption {
+	return func(t *RetrievalTool) { t.promptTemplate = template }
+}
+
+// RetrievalTool is the Z.AI knowledge-base retrieval tool (Python parity:
+// builtin/retrieval.py RetrievalTool; Z.AI-specific, unsupported by other
+// providers).
+type RetrievalTool struct {
+	knowledgeID    string
+	promptTemplate string
+}
+
+// NewRetrieval builds the hosted retrieval tool for one knowledge base.
+func NewRetrieval(knowledgeID string, opts ...RetrievalOption) *RetrievalTool {
+	t := &RetrievalTool{knowledgeID: knowledgeID}
+	for _, o := range opts {
+		o(t)
+	}
+	return t
+}
+
+// Name returns the tool type name.
+func (t *RetrievalTool) Name() string { return RetrievalToolName }
+
+// DeclaredInCode is always true: hosted tools come from the program.
+func (t *RetrievalTool) DeclaredInCode() bool { return true }
+
+// Schemas returns the tool's single schema.
+func (t *RetrievalTool) Schemas(_ *agocontext.Context) ([]any, error) {
+	return []any{RetrievalToolSchema{
+		KnowledgeID:    t.knowledgeID,
+		PromptTemplate: t.promptTemplate,
+	}}, nil
+}
+
+// Register subscribes nothing: the tool runs at the provider (see
+// WebSearchTool.Register).
+func (t *RetrievalTool) Register(_ *agocontext.Context, _ []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
 }
 
 // --- small helpers ----------------------------------------------------------------
