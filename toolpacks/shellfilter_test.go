@@ -574,6 +574,58 @@ func TestShellRestrictedEmptyCommand(t *testing.T) {
 	}
 }
 
+// TestCheckIgnoreSymlinkedWorkdir: a workdir that is itself a symlink resolves
+// its real path before the escape/ignore checks, so a relative token is judged
+// against the directory it really lives in.
+func TestCheckIgnoreSymlinkedWorkdir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation")
+	}
+	real := t.TempDir()
+	if err := os.WriteFile(filepath.Join(real, ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "ok.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "workdir")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if got := checkIgnore("cat .env", link, []string{".env"}); !strings.Contains(got, "Access denied") {
+		t.Fatalf("ignored path through a symlinked workdir = %q, want Access denied", got)
+	}
+	if got := checkIgnore("cat ../outside.txt", link, []string{".env"}); !strings.Contains(got, "Access denied") {
+		t.Fatalf("escape from a symlinked workdir = %q, want Access denied", got)
+	}
+	if got := checkIgnore("cat ok.txt", link, []string{".env"}); got != "" {
+		t.Fatalf("allowed path through a symlinked workdir = %q, want no denial", got)
+	}
+}
+
+// TestShellIgnoreGlobTokenLiteralPattern: a glob token (".en?") expands on the
+// host and every match is checked, even when the ignore pattern is a literal
+// name (".env").
+func TestShellIgnoreGlobTokenLiteralPattern(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the restricted exec path relies on POSIX binaries")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewShellTool(WithShellWorkdir(dir), WithShellAllowed("cat"), WithShellIgnore(".env"))
+	if err != nil {
+		t.Fatalf("NewShellTool: %v", err)
+	}
+	defer s.Close()
+	_, cx := newTestContext()
+	ev := callTool(t, s, cx, s.Name(), `{"command":"cat .en?"}`)
+	if got := resultPartText(t, ev); !strings.Contains(got, "Access denied") {
+		t.Fatalf("glob token output = %q, want Access denied", got)
+	}
+}
+
 // TestShellRestrictedUnbalancedQuotes: a command whose quotes do not balance
 // or ends with a dangling escape is refused instead of being handed to a shell.
 func TestShellRestrictedUnbalancedQuotes(t *testing.T) {

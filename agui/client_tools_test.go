@@ -16,7 +16,6 @@ import (
 	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
-	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/tools"
@@ -99,7 +98,7 @@ func TestClientDeclaredToolsRoundTrip(t *testing.T) {
 		clientToolCall(),
 		&events.ModelResponse{Message: &events.ModelMessage{Content: "Chart drawn."}},
 	)
-	h := ServeAgent(agent.New("served", "You are served.", agent.WithConfig(cfg), ClientTools()))
+	h := ServeAgent(agent.New("served", "You are served.", agent.WithConfig(cfg)))
 
 	evs, raw := postRun(t, h, frontendRunBody(""))
 	want := []EventType{
@@ -157,49 +156,37 @@ func TestClientDeclaredToolsRoundTrip(t *testing.T) {
 	}
 }
 
-// The Server path wires the same: Options() carries the client tools, and the
-// declared tool is withdrawn once the turn ended.
+// The Server path wires the same: the declared tool is that run's, and a later
+// direct turn does not see it.
 func TestClientDeclaredToolsOnServer(t *testing.T) {
 	srv, err := NewServer()
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
-	cfg := newToolSeeingConfig(clientToolCall())
-	h := srv.Handler(agent.New("served", "", append(srv.Options(), agent.WithConfig(cfg))...))
+	cfg := newToolSeeingConfig(
+		clientToolCall(),
+		&events.ModelResponse{Message: &events.ModelMessage{Content: "plain reply"}},
+	)
+	a := agent.New("served", "", append(srv.Options(), agent.WithConfig(cfg))...)
+	h := srv.Handler(a)
 
 	evs, raw := postRun(t, h, frontendRunBody(""))
 	want := []EventType{EventRunStarted, EventToolCallStart, EventToolCallArgs, EventToolCallEnd, EventRunFinished}
 	if got := eventTypes(evs); !equalTypes(got, want) {
 		t.Fatalf("types = %v\nwant  = %v\nraw: %q", got, want, raw)
 	}
-	if offered := cfg.offered(); len(offered) != 1 || len(offered[0]) != 1 || offered[0][0] != "draw_chart" {
+	offered := cfg.offered()
+	if len(offered) != 1 || len(offered[0]) != 1 || offered[0][0] != "draw_chart" {
 		t.Fatalf("the model was offered %v", offered)
 	}
-	waitNoDeclared(t)
-}
-
-// declaredCount is how many turns have client tools declared right now.
-func declaredCount() int {
-	n := 0
-	declaredClientTools.Range(func(_, _ any) bool { n++; return true })
-	return n
-}
-
-// waitNoDeclared fails unless every declared tool set is withdrawn shortly: a
-// served turn withdraws its tools as its driver winds down, just after the
-// response ends.
-func waitNoDeclared(t *testing.T) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for declaredCount() != 0 {
-		if time.Now().After(deadline) {
-			declaredClientTools.Range(func(k, _ any) bool {
-				t.Errorf("client tools of stream %v still declared", k)
-				return true
-			})
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The client tools belong to that run: a later direct turn of the same
+	// agent does not see them.
+	if _, err := a.Ask(context.Background(), "plain turn"); err != nil {
+		t.Fatalf("direct follow-up ask: %v", err)
+	}
+	offered = cfg.offered()
+	if len(offered) != 2 || len(offered[1]) != 0 {
+		t.Fatalf("the direct turn was offered %v, want no client tools", offered)
 	}
 }
 
@@ -212,7 +199,7 @@ func TestClientToolNamedLikeAgentToolIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := newToolSeeingConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "ok"}})
-	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg), agent.WithTools(own), ClientTools()))
+	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg), agent.WithTools(own)))
 
 	body := `{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"hi"}],"tools":[` +
 		frontendToolDecl + `,{"name":"pick_date","description":"Pick a date"}]}`
@@ -230,22 +217,16 @@ func TestClientToolNamedLikeAgentToolIsDropped(t *testing.T) {
 	}
 }
 
-// Tools declared for an agent that was not built with ClientTools() are ignored,
-// not an error.
-func TestClientToolsIgnoredWithoutOption(t *testing.T) {
+// Client tools arrive with the run, so an agent needs no construction-time
+// client-tool option to see them.
+func TestClientToolsWorkWithoutOption(t *testing.T) {
 	cfg := newToolSeeingConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "ok"}})
-	var declaredDuringTurn = -1
-	cfg.hook = func([]events.Event, []string) { declaredDuringTurn = declaredCount() }
-	waitNoDeclared(t)
 	evs, _ := postRun(t, ServeAgent(agent.New("served", "", agent.WithConfig(cfg))), frontendRunBody(""))
-	if declaredDuringTurn != 0 {
-		t.Errorf("tools declared during a turn of an agent without ClientTools() = %d, want 0", declaredDuringTurn)
-	}
 	if got := eventTypes(evs); got[len(got)-1] != EventRunFinished {
 		t.Fatalf("types = %v", got)
 	}
-	if offered := cfg.offered(); len(offered) != 1 || len(offered[0]) != 0 {
-		t.Fatalf("model was offered %v, want no tools", offered)
+	if offered := cfg.offered(); len(offered) != 1 || len(offered[0]) != 1 || offered[0][0] != "draw_chart" {
+		t.Fatalf("model was offered %v, want the declared draw_chart", offered)
 	}
 }
 
@@ -253,7 +234,7 @@ func TestClientToolsIgnoredWithoutOption(t *testing.T) {
 // with neither is offered with neither.
 func TestClientToolSchemaAsModelSees(t *testing.T) {
 	cfg := newToolSeeingConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "ok"}})
-	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg), ClientTools()))
+	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg)))
 	body := `{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"hi"}],"tools":[` +
 		frontendToolDecl + `,{"name":"bare"}]}`
 	postRun(t, h, body)
@@ -284,84 +265,6 @@ func TestClientToolSchemaAsModelSees(t *testing.T) {
 	}
 }
 
-// A tool-set resolved for a context with no turn behind it contributes nothing
-// and does not panic.
-func TestClientToolSetNilGuard(t *testing.T) {
-	set := clientToolSet{}
-	for name, cx := range map[string]*agocontext.Context{
-		"nil context": nil,
-		"nil stream":  {},
-		"unknown":     agocontext.New(stream.NewMemoryStream()),
-	} {
-		schemas, err := set.Schemas(cx)
-		if err != nil || len(schemas) != 0 {
-			t.Errorf("%s: Schemas = %v, %v", name, schemas, err)
-		}
-		if cx != nil && cx.Stream != nil {
-			subs, err := set.Register(cx, nil)
-			if err != nil || len(subs) != 0 {
-				t.Errorf("%s: Register = %v, %v", name, subs, err)
-			}
-		}
-	}
-}
-
-// fakeClientTool subscribes a counter on the stream, or fails to register.
-type fakeClientTool struct {
-	name string
-	fail bool
-	hits *int
-}
-
-func (f fakeClientTool) Name() string         { return f.name }
-func (f fakeClientTool) DeclaredInCode() bool { return false }
-func (f fakeClientTool) Schemas(*agocontext.Context) ([]any, error) {
-	return []any{tools.Schema{Name: f.name}}, nil
-}
-func (f fakeClientTool) Register(cx *agocontext.Context, _ []middleware.Middleware) ([]stream.SubID, error) {
-	if f.fail {
-		return nil, errors.New("register failed")
-	}
-	id := cx.Stream.Subscribe(func(events.Event) error { *f.hits++; return nil }, stream.SubscribeOptions{})
-	return []stream.SubID{id}, nil
-}
-
-// When one tool of the set fails to register, the ones already registered are
-// withdrawn: nothing stays subscribed on the stream.
-func TestClientToolSetRegisterRollsBack(t *testing.T) {
-	var hits int
-	cx := agocontext.New(stream.NewMemoryStream())
-	declaredClientTools.Store(cx.Stream.ID(), []tools.Tool{
-		fakeClientTool{name: "first", hits: &hits},
-		fakeClientTool{name: "second", fail: true},
-	})
-	defer declaredClientTools.Delete(cx.Stream.ID())
-
-	subs, err := clientToolSet{}.Register(cx, nil)
-	if err == nil || len(subs) != 0 {
-		t.Fatalf("Register = %v, %v, want the failure and no subscriptions", subs, err)
-	}
-	if err := cx.Stream.Send(events.NewToolCallEvent("anything")); err != nil {
-		t.Fatal(err)
-	}
-	if hits != 0 {
-		t.Fatalf("the first tool's subscription survived the failed Register (%d events seen)", hits)
-	}
-
-	// Control: with no failing tool the subscription is live.
-	declaredClientTools.Store(cx.Stream.ID(), []tools.Tool{fakeClientTool{name: "first", hits: &hits}})
-	subs, err = clientToolSet{}.Register(cx, nil)
-	if err != nil || len(subs) != 1 {
-		t.Fatalf("Register = %v, %v", subs, err)
-	}
-	if err := cx.Stream.Send(events.NewToolCallEvent("anything")); err != nil {
-		t.Fatal(err)
-	}
-	if hits == 0 {
-		t.Fatal("control subscription never fired")
-	}
-}
-
 func userTextOf(msgs []events.Event) string {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if req, ok := events.AsValue(msgs[i]).(events.ModelRequest); ok {
@@ -378,7 +281,6 @@ func userTextOf(msgs []events.Event) string {
 // Two turns running at once on one server each offer the model only the tools
 // their own client declared, and both are withdrawn afterwards.
 func TestConcurrentTurnsKeepTheirOwnClientTools(t *testing.T) {
-	waitNoDeclared(t)
 	srv, err := NewServer()
 	if err != nil {
 		t.Fatal(err)
@@ -409,11 +311,8 @@ func TestConcurrentTurnsKeepTheirOwnClientTools(t *testing.T) {
 			t.Error("the two turns never overlapped")
 			return
 		}
-		// While both turns are in flight both declarations are held; neither
-		// turn ends before both have looked.
-		if n := declaredCount(); n != 2 {
-			t.Errorf("declared tool sets while both turns run = %d, want 2", n)
-		}
+		// Neither turn may end before both have looked, so the offered sets
+		// below were captured while both runs were in flight.
 		checked.Done()
 		checked.Wait()
 	}
@@ -447,7 +346,6 @@ func TestConcurrentTurnsKeepTheirOwnClientTools(t *testing.T) {
 	if !reflect.DeepEqual(offered["A"], []string{"tool_a"}) || !reflect.DeepEqual(offered["B"], []string{"tool_b"}) {
 		t.Fatalf("offered = %v, want A→[tool_a], B→[tool_b]", offered)
 	}
-	waitNoDeclared(t)
 }
 
 // failingStorage refuses to seed a transcript, which fails a turn before it
@@ -459,7 +357,6 @@ func (failingStorage) SetHistory(string, []events.Event) error { return errors.N
 // A turn that fails while its history is seeded still withdraws the client tools
 // it declared — on the server path and on the plain handler path.
 func TestClientToolsWithdrawnWhenHistorySeedFails(t *testing.T) {
-	waitNoDeclared(t)
 	newAgent := func(opts ...agent.Option) *agent.Agent {
 		base := stream.NewMemoryStream(stream.WithStorage(failingStorage{stream.NewMemoryStorage()}))
 		cfg := newToolSeeingConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "unreached"}})
@@ -471,13 +368,12 @@ func TestClientToolsWithdrawnWhenHistorySeedFails(t *testing.T) {
 	}
 	for name, h := range map[string]http.Handler{
 		"server":  srv.Handler(newAgent(srv.Options()...)),
-		"handler": ServeAgent(newAgent(ClientTools())),
+		"handler": ServeAgent(newAgent()),
 	} {
 		evs, _ := postRun(t, h, frontendRunBody(""))
 		if got := eventTypes(evs); got[len(got)-1] != EventRunError {
 			t.Fatalf("%s: types = %v, want the run to end in RUN_ERROR", name, got)
 		}
-		waitNoDeclared(t)
 	}
 }
 
@@ -494,7 +390,7 @@ func TestClientToolNamedLikeToolkitMemberIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := newToolSeeingConfig(&events.ModelResponse{Message: &events.ModelMessage{Content: "ok"}})
-	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg), agent.WithTools(kit), ClientTools()))
+	h := ServeAgent(agent.New("served", "", agent.WithConfig(cfg), agent.WithTools(kit)))
 	postRun(t, h, `{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"hi"}],"tools":[`+
 		frontendToolDecl+`,{"name":"pick_date"}]}`)
 	offered := cfg.offered()

@@ -106,13 +106,13 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 // client. Spread them into agent.New. A WithHitlHook of the application's own
 // passed after these replaces the fallback — the served questions still reach
 // the client through the middleware, and the application hook answers only
-// what runs outside this server. They also carry ClientTools, so the tools a
-// client declares per run reach the model.
+// what runs outside this server. Client tools need no option: each served run
+// receives the tools its client declared as that run's tools
+// (agent.RunOptions.Tools).
 func (s *Server) Options() []agent.Option {
 	return []agent.Option{
 		agent.WithHitlHook(s.fallbackHook),
 		agent.WithMiddleware(func() middleware.Middleware { return interrupter{srv: s} }),
-		ClientTools(),
 	}
 }
 
@@ -121,11 +121,10 @@ func (s *Server) Options() []agent.Option {
 // and returns the handler serving it. A WithHitlHook among opts is overridden:
 // questions on a served agent go to the AG-UI client.
 func (s *Server) ServeAgent(name, prompt string, opts ...agent.Option) http.Handler {
-	base := make([]agent.Option, 0, len(opts)+3)
+	base := make([]agent.Option, 0, len(opts)+2)
 	base = append(base, opts...)
 	base = append(base, agent.WithHitlHook(s.fallbackHook))
 	base = append(base, agent.WithMiddleware(func() middleware.Middleware { return interrupter{srv: s} }))
-	base = append(base, ClientTools())
 	return s.Handler(agent.New(name, prompt, base...))
 }
 
@@ -217,7 +216,6 @@ func (s *Server) resume(ctx context.Context, input RunAgentInput, ex *exchange, 
 		// Unknown, already answered, or expired: which of them is timing or
 		// routing, and none is the client's error. What it sent answers nothing
 		// this server asked (Python parity: resume_held_turn's None path).
-		t.withdrawTools()
 		s.turns.discard(t)
 		return false
 	}
@@ -322,14 +320,13 @@ func (s *Server) begin(ctx context.Context, a *agent.Agent, input RunAgentInput,
 	// scope). Cancellation travels through release/Close instead, which is why
 	// the run scope is opened on the detached context too.
 	turnCtx := context.WithoutCancel(ctx)
-	run, err := a.Run(turnCtx)
+	run, err := a.RunWith(turnCtx, agent.RunOptions{Tools: clientToolsForRun(a, input.Tools)})
 	if err != nil {
 		ex.emit(runErrorEvent(err))
 		return
 	}
 	t.run = run
 	t.streamID = run.Stream().ID()
-	t.withdrawTools = declareClientTools(a, t.streamID, input.Tools)
 	s.turns.bind(t.streamID, t)
 
 	mapped := mapRunInputMessages(input)
@@ -422,9 +419,6 @@ func (s *Server) endTurn(t *servedTurn) {
 		}
 	}
 	t.subs = nil
-	if t.withdrawTools != nil {
-		t.withdrawTools()
-	}
 	t.out.unbind()
 }
 

@@ -101,6 +101,7 @@ type DuckDuckGoSearch struct {
 	safesearch string
 	baseURL    string
 	client     *http.Client
+	middleware []middleware.Middleware
 }
 
 var _ tools.Tool = (*DuckDuckGoSearch)(nil)
@@ -167,6 +168,21 @@ func WithDDGHTTPClient(c *http.Client) DDGOption {
 	}
 }
 
+// WithDDGMiddleware adds tool-scoped middleware, the Go spelling of the Python
+// search tool's middleware= kwarg. The first entry is the outermost layer of
+// the tool's own chain; agent middleware still wraps it from outside.
+func WithDDGMiddleware(mw ...middleware.Middleware) DDGOption {
+	return func(d *DuckDuckGoSearch) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: ddg middleware must not be nil")
+			}
+		}
+		d.middleware = append(d.middleware, mw...)
+		return nil
+	}
+}
+
 // NewDuckDuckGoSearch builds the duckduckgo_search tool.
 func NewDuckDuckGoSearch(opts ...DDGOption) (*DuckDuckGoSearch, error) {
 	d := &DuckDuckGoSearch{
@@ -188,7 +204,7 @@ func NewDuckDuckGoSearch(opts ...DDGOption) (*DuckDuckGoSearch, error) {
 	}
 	ft, err := tools.NewFunctionTool("duckduckgo_search",
 		"Search the web using DuckDuckGo. Returns titles, URLs, and snippets for each result.",
-		fn)
+		fn, tools.WithMiddleware(d.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: ddg search: %w", err)
 	}
@@ -326,12 +342,13 @@ type TavilySearchResponse struct {
 // "tavily_api_key" overrides it per conversation. The key never appears in the
 // tool schema (Python parity: it is not a model-supplied parameter).
 type TavilySearch struct {
-	tool     *tools.FunctionTool
-	apiKey   string
-	baseURL  string
-	client   *http.Client
-	options  map[string]any
-	variable bool // override the key from the conversation variable
+	tool       *tools.FunctionTool
+	apiKey     string
+	baseURL    string
+	client     *http.Client
+	options    map[string]any
+	variable   bool // override the key from the conversation variable
+	middleware []middleware.Middleware
 }
 
 var _ tools.Tool = (*TavilySearch)(nil)
@@ -440,6 +457,20 @@ func WithTavilyAPIKeyVariable() TavilyOption {
 	return func(t *TavilySearch) error { t.variable = true; return nil }
 }
 
+// WithTavilyMiddleware adds tool-scoped middleware, the Go spelling of the
+// Python search tool's middleware= kwarg.
+func WithTavilyMiddleware(mw ...middleware.Middleware) TavilyOption {
+	return func(t *TavilySearch) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: tavily middleware must not be nil")
+			}
+		}
+		t.middleware = append(t.middleware, mw...)
+		return nil
+	}
+}
+
 // NewTavilySearch builds the tavily_search tool. An empty apiKey is accepted
 // only together with WithTavilyAPIKeyVariable.
 func NewTavilySearch(apiKey string, opts ...TavilyOption) (*TavilySearch, error) {
@@ -478,7 +509,7 @@ func NewTavilySearch(apiKey string, opts ...TavilyOption) (*TavilySearch, error)
 	ft, err := tools.NewFunctionTool("tavily_search",
 		"Search the web using Tavily. Returns titles, URLs, snippets, relevance scores, "+
 			"and optional LLM-generated answer, raw content, and images.",
-		fn)
+		fn, tools.WithMiddleware(t.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: tavily search: %w", err)
 	}
@@ -592,10 +623,11 @@ const PerplexityBaseURL = "https://api.perplexity.ai"
 // perplexityCommon carries the shared client wiring of both tools (Python
 // parity: PerplexitySearchToolkit — one client, two endpoints).
 type perplexityCommon struct {
-	apiKey   string
-	baseURL  string
-	client   *http.Client
-	variable bool
+	apiKey     string
+	baseURL    string
+	client     *http.Client
+	variable   bool
+	middleware []middleware.Middleware
 }
 
 func (p *perplexityCommon) headers(key string) map[string]string {
@@ -665,6 +697,20 @@ func WithPerplexityHTTPClient(c *http.Client) PerplexityOption {
 // "perplexity_api_key" instead of the constructor argument.
 func WithPerplexityAPIKeyVariable() PerplexityOption {
 	return func(p *perplexityCommon) error { p.variable = true; return nil }
+}
+
+// WithPerplexityMiddleware adds tool-scoped middleware to both members, the Go
+// spelling of the Python toolkit's middleware= kwarg.
+func WithPerplexityMiddleware(mw ...middleware.Middleware) PerplexityOption {
+	return func(p *perplexityCommon) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: perplexity middleware must not be nil")
+			}
+		}
+		p.middleware = append(p.middleware, mw...)
+		return nil
+	}
 }
 
 // NewPerplexitySearch builds the perplexity toolkit. An empty apiKey is
@@ -737,7 +783,7 @@ func newPerplexitySearchTool(p *perplexityCommon) (*tools.FunctionTool, error) {
 	return tools.NewFunctionTool("perplexity_search",
 		"Search the web with the Perplexity Search API. Returns ranked results "+
 			"with title, URL, snippet, and date.",
-		fn)
+		fn, tools.WithMiddleware(p.middleware...))
 }
 
 // newPerplexityAnswerTool builds perplexity_answer (Python parity: the answer()
@@ -811,7 +857,7 @@ func newPerplexityAnswerTool(p *perplexityCommon) (*tools.FunctionTool, error) {
 		"Ask Perplexity AI for an LLM-generated answer with web citations. "+
 			"Useful for conversational questions, in-depth research, and analysis. "+
 			"Returns content text plus ranked search results and citations.",
-		fn)
+		fn, tools.WithMiddleware(p.middleware...))
 }
 
 // Name returns the toolkit name.
