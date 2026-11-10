@@ -180,9 +180,27 @@ type ServerConfig struct {
 	// Variables and Dependencies are what each request's tools resolve
 	// tools.Variable and tools.Inject slots against, and ToolMeta.Resolve
 	// reads (Python parity: the variables and dependencies of the request's
-	// MCPExecutionContext). Every request works on its own copy of the maps.
+	// MCPExecutionContext). They are snapshotted at NewServer; every request
+	// works on its own copy.
 	Variables    map[string]any
 	Dependencies map[string]any
+
+	// ContextProvider supplies the per-request scope, with the request in hand
+	// (Python parity: AgentExecutor's context_provider, mcp/executor.py:325-345
+	// and server._request_context). It runs on EVERY request: tools/list, and
+	// every tools/call — the conversational ask and deterministic WithTools
+	// tools alike. The scope feeds the agent's RunOptions (Variables,
+	// Dependencies, Tools, Prompt), the deterministic tools' Variables/Inject
+	// slots, and ToolMeta.Resolve. A returned error becomes a JSON-RPC error
+	// and nothing runs. Nil keeps the defaults (ServerConfig.Variables/
+	// Dependencies). Fields left nil in RequestScope keep those defaults;
+	// non-nil maps are merged over them with the provider's value winning.
+	ContextProvider ContextProvider
+
+	// askWithScope is NewServerForAgent's internal ask path: it needs the
+	// provider's RequestScope and the request context, which the public Ask
+	// signature does not carry. NewServer prefers it over Ask.
+	askWithScope func(ctx context.Context, text string, scope *RequestScope, req *RequestContext) (string, error)
 }
 
 // ServerOption overrides ServerConfig fields for NewServerForAgent.
@@ -253,7 +271,7 @@ type toolEntry struct {
 	// an agent/tool failure is isError content (Python parity: the executor's
 	// tool_error arm), while unknown names are refused before dispatch as a
 	// JSON-RPC invalid-params error.
-	call func(ctx context.Context, args map[string]any) toolCallOutcome
+	call func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome
 }
 
 // Server exposes one Ask bridge as an MCP server. The zero flow: Handler()
@@ -270,20 +288,21 @@ type Server struct {
 	ask    *toolEntry
 	extras []*toolEntry // construction order; the ask tool is always first on the wire
 
-	authorize      func(ctx context.Context, method string) error // nil = surface open
-	streams        chan struct{}                                  // GET listener-stream slots
-	callTimeout    time.Duration                                  // stdio exchange bound; < 0 = off
-	allowedHosts   []string
-	allowedOrigins []string
-	variables      map[string]any
-	dependencies   map[string]any
+	authorize       func(ctx context.Context, method string) error // nil = surface open
+	contextProvider ContextProvider
+	streams         chan struct{} // GET listener-stream slots
+	callTimeout     time.Duration // stdio exchange bound; < 0 = off
+	allowedHosts    []string
+	allowedOrigins  []string
+	variables       map[string]any
+	dependencies    map[string]any
 
 	initialized atomic.Bool
 }
 
 // NewServer builds a Server from cfg.
 func NewServer(cfg ServerConfig) (*Server, error) {
-	if cfg.Ask == nil {
+	if cfg.Ask == nil && cfg.askWithScope == nil {
 		return nil, fmt.Errorf("%w: ServerConfig.Ask is not set", ErrNotProvided)
 	}
 	if cfg.Name == "" {
@@ -313,23 +332,30 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if ask.description == "" {
 		ask.description = fmt.Sprintf("Send a message to the '%s' agent and receive its reply.", cfg.Name)
 	}
-	askCall := cfg.Ask
-	ask.call = func(ctx context.Context, args map[string]any) toolCallOutcome {
-		return askOutcome(ctx, askCall, args)
+	askInvoke := cfg.askWithScope
+	if askInvoke == nil {
+		askCall := cfg.Ask
+		askInvoke = func(ctx context.Context, text string, _ *RequestScope, _ *RequestContext) (string, error) {
+			return askCall(ctx, text)
+		}
+	}
+	ask.call = func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+		return askOutcome(ctx, askInvoke, args, scope, req)
 	}
 
 	s := &Server{
-		name:           cfg.Name,
-		version:        cfg.Version,
-		instructions:   cfg.Instructions,
-		ask:            ask,
-		authorize:      cfg.Authorize,
-		streams:        make(chan struct{}, maxStreams),
-		callTimeout:    callTimeout,
-		allowedHosts:   cfg.AllowedHosts,
-		allowedOrigins: cfg.AllowedOrigins,
-		variables:      cfg.Variables,
-		dependencies:   cfg.Dependencies,
+		name:            cfg.Name,
+		version:         cfg.Version,
+		instructions:    cfg.Instructions,
+		ask:             ask,
+		authorize:       cfg.Authorize,
+		contextProvider: cfg.ContextProvider,
+		streams:         make(chan struct{}, maxStreams),
+		callTimeout:     callTimeout,
+		allowedHosts:    cfg.AllowedHosts,
+		allowedOrigins:  cfg.AllowedOrigins,
+		variables:       copyAnyMap(cfg.Variables),
+		dependencies:    copyAnyMap(cfg.Dependencies),
 	}
 	seen := map[string]bool{toolName: true}
 	// The scratch context exists because the Tool contract hands Schemas a
@@ -360,8 +386,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 				name:        schema.Name,
 				description: schema.Description,
 				inputSchema: normalizeInputSchema(schema.Parameters),
-				call: func(ctx context.Context, args map[string]any) toolCallOutcome {
-					return s.registeredToolOutcome(ctx, t, served.Name, args)
+				call: func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+					return s.registeredToolOutcome(ctx, t, served.Name, args, scope, req)
 				},
 			})
 		}
@@ -393,25 +419,44 @@ func NewServerForAgent(a *agent.Agent, opts ...ServerOption) (*Server, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	cfg.Ask = func(ctx context.Context, userText string) (string, error) {
-		// Python parity: executor.py:344-347 hands ask() the request's
-		// variables and dependencies (and, there, tools/prompt). The request
-		// context travels too, under RequestDependency, so a served agent's
-		// tool resolves the same Inject slot a deterministic tool does. Each
-		// request gets its own copies; the maps are never shared or mutated.
-		toolName := cfg.ToolName
-		if toolName == "" {
-			toolName = defaultToolName
-		}
+	// Snapshot the configured maps: the server's per-request copies must not
+	// follow later writes to the caller's map (Python parity: the provider, not
+	// a live map, is the per-request seam).
+	cfg.Variables = copyAnyMap(cfg.Variables)
+	cfg.Dependencies = copyAnyMap(cfg.Dependencies)
+	cfg.askWithScope = func(ctx context.Context, userText string, scope *RequestScope, req *RequestContext) (string, error) {
+		// Python parity: executor.py:325-345 hands ask() the provider's
+		// variables, dependencies, tools and prompt; nil fields keep the ask
+		// defaults. The request context travels too, under RequestDependency,
+		// so a served agent's tool resolves the same Inject slot a
+		// deterministic tool does.
+		vars := copyAnyMap(cfg.Variables)
 		deps := copyAnyMap(cfg.Dependencies)
-		deps[RequestDependency] = &RequestContext{
-			Method: "tools/call",
-			Tool:   toolName,
-			HTTP:   RequestFromContext(ctx),
+		var extraTools []tools.Tool
+		var prompt []string
+		if scope != nil {
+			for k, v := range scope.Variables {
+				vars[k] = v
+			}
+			for k, v := range scope.Dependencies {
+				deps[k] = v
+			}
+			extraTools = scope.Tools
+			prompt = scope.Prompt
 		}
+		if req == nil {
+			toolName := cfg.ToolName
+			if toolName == "" {
+				toolName = defaultToolName
+			}
+			req = &RequestContext{Method: "tools/call", Tool: toolName, HTTP: RequestFromContext(ctx)}
+		}
+		deps[RequestDependency] = req
 		opts := agent.RunOptions{
-			Variables:    copyAnyMap(cfg.Variables),
+			Variables:    vars,
 			Dependencies: deps,
+			Tools:        extraTools,
+			Prompt:       prompt,
 		}
 		run, err := a.RunWith(ctx, opts, userText)
 		if err != nil {
@@ -564,7 +609,12 @@ func (s *Server) handle(ctx context.Context, req *rpcRequest) *rpcResponse {
 			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
 				Error: rpcErr(codeInvalidRequest, "Call initialize before listing or calling tools.")}
 		}
-		return reply(s.listTools(ctx))
+		reqCtx, scope, err := s.resolveRequestScope(ctx, "tools/list", "")
+		if err != nil {
+			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
+				Error: rpcErr(codeInternalError, "context provider: %v", err)}
+		}
+		return reply(s.listTools(ctx, reqCtx, scope))
 	case "tools/call":
 		if !s.initialized.Load() {
 			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
@@ -628,12 +678,17 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]any {
 
 // listTools serves the registry in construction order: the conversational
 // tool first (Python parity: executor.list_tools plus the provider's
-// entries). The set is small and fixed, so there is no cursor to hand back.
-func (s *Server) listTools(ctx context.Context) map[string]any {
+// entries). The request's scope is resolved once by the caller and supplies
+// ToolMeta.Resolve with its variables/dependencies.
+func (s *Server) listTools(ctx context.Context, req *RequestContext, scope *RequestScope) map[string]any {
 	all := append([]*toolEntry{s.ask}, s.extras...)
 	out := make([]map[string]any, 0, len(all))
+	cx, err := s.requestContextFor(ctx, req, scope)
+	if err != nil {
+		cx = nil // static metadata is still truthful
+	}
 	for _, t := range all {
-		out = append(out, s.advertise(ctx, t))
+		out = append(out, s.advertise(ctx, t, cx))
 	}
 	return map[string]any{"tools": out}
 }
@@ -654,6 +709,14 @@ func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.R
 		return &rpcResponse{JSONRPC: "2.0", ID: id,
 			Error: rpcErr(codeInvalidParams, "tools/call params.name is required")}
 	}
+	req, scope, err := s.resolveRequestScope(ctx, "tools/call", p.Name)
+	if err != nil {
+		// Python parity: the provider runs per request before dispatch; a
+		// failure refuses the call and nothing (agent or deterministic tool)
+		// runs.
+		return &rpcResponse{JSONRPC: "2.0", ID: id,
+			Error: rpcErr(codeInternalError, "context provider: %v", err)}
+	}
 	entry := s.entry(p.Name)
 	if entry == nil {
 		// Python parity: executor.call raises MCPError(INVALID_PARAMS,
@@ -665,11 +728,11 @@ func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.R
 	if p.Arguments == nil {
 		p.Arguments = map[string]any{}
 	}
-	outcome := entry.call(ctx, p.Arguments)
+	outcome := entry.call(ctx, p.Arguments, scope, req)
 	result := map[string]any{"content": outcome.content}
 	if outcome.isError {
 		result["isError"] = true
-	} else if outcome.structured != nil && s.declaresOutputSchema(ctx, entry) {
+	} else if outcome.structured != nil && s.declaresOutputSchema(ctx, entry, req, scope) {
 		// AGO-DEVIATION: only a tool advertising an output schema answers
 		// structuredContent (Python: any Mapping result); see structuredOf.
 		result["structuredContent"] = outcome.structured
@@ -737,7 +800,7 @@ func textBlock(text string) contentBlock { return contentBlock{Type: "text", Tex
 // _build_inputs — a "Context:\n…" input ahead of the message; the two inputs
 // collapse into the one string the bridge takes, joined with a newline), the
 // reply body as text content.
-func askOutcome(ctx context.Context, ask func(context.Context, string) (string, error), args map[string]any) toolCallOutcome {
+func askOutcome(ctx context.Context, ask func(context.Context, string, *RequestScope, *RequestContext) (string, error), args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
 	message, _ := args["message"].(string)
 	if message == "" {
 		// Argument validation against the advertised schema is deferred
@@ -755,7 +818,7 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 	if context, _ := args["context"].(string); context != "" {
 		userText = "Context:\n" + context + "\n" + message
 	}
-	reply, err := ask(ctx, userText)
+	reply, err := ask(ctx, userText, scope, req)
 	if err != nil {
 		// The wire carries the message only (Python parity: the executor's
 		// exception arm flattening a failure into a tool result).
@@ -785,8 +848,8 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 // interface has no direct call, and the scratch-stream round trip is the
 // machinery every Tool implementation (function tools included) already
 // answers through (D-056).
-func (s *Server) registeredToolOutcome(ctx context.Context, t tools.Tool, name string, args map[string]any) toolCallOutcome {
-	cx, err := s.requestContext(ctx, "tools/call", name)
+func (s *Server) registeredToolOutcome(ctx context.Context, t tools.Tool, name string, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+	cx, err := s.requestContextFor(ctx, req, scope)
 	if err != nil {
 		return toolErrorOutcome(err.Error())
 	}
@@ -848,10 +911,10 @@ func (s *Server) registeredToolOutcome(ctx context.Context, t tools.Tool, name s
 
 // declaresOutputSchema reports whether the entry advertises an output schema
 // for this request, its per-request resolution included.
-func (s *Server) declaresOutputSchema(ctx context.Context, t *toolEntry) bool {
+func (s *Server) declaresOutputSchema(ctx context.Context, t *toolEntry, req *RequestContext, scope *RequestScope) bool {
 	meta := t.meta
 	if meta.Resolve != nil {
-		if cx, err := s.requestContext(ctx, "tools/call", t.name); err == nil {
+		if cx, err := s.requestContextFor(ctx, req, scope); err == nil {
 			meta = meta.merged(cx)
 		}
 	}

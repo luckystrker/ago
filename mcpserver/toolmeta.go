@@ -10,6 +10,7 @@ import (
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/stream"
+	"github.com/luckystrker/ago/tools"
 )
 
 // ErrInvalidToolMeta reports a ServerConfig.ToolMeta entry that names no served
@@ -102,14 +103,49 @@ func WithToolMeta(name string, meta ToolMeta) ServerOption {
 	}
 }
 
+// RequestScope is what a ContextProvider returns for one request: the values
+// that go into the agent's ask through agent.RunOptions (Python parity:
+// mcp.executor.AskContext). A nil field keeps the ask default; non-nil
+// Variables and Dependencies are merged over ServerConfig's maps with the
+// provider's value winning.
+type RequestScope struct {
+	Variables    map[string]any
+	Dependencies map[string]any
+	Tools        []tools.Tool
+	Prompt       []string
+}
+
+// ContextProvider resolves the per-request scope, with the request in hand
+// (Python parity: AgentExecutor's context_provider, which receives the
+// request's AccessToken or nil, called through server._request_context on every
+// request). It runs once for tools/list and once for every tools/call —
+// deterministic WithTools tools included, not only the conversational ask. The
+// scope feeds the agent's RunOptions, the deterministic tools' Variable/Inject
+// slots, and ToolMeta.Resolve; request is the same *RequestContext those see,
+// including the HTTP request.
+//
+// AGO-DEVIATION: the Go server has no OAuth access-token store (OAuth routes
+// are deferred with D-058), so token is always ""; the HTTP Authorization
+// header remains reachable through request.HTTP. An error refuses the request
+// as a JSON-RPC error without running anything.
+type ContextProvider func(ctx context.Context, token string, request *RequestContext) (RequestScope, error)
+
+// WithContextProvider sets the per-request context provider; see
+// ServerConfig.ContextProvider.
+func WithContextProvider(fn ContextProvider) ServerOption {
+	return func(c *ServerConfig) { c.ContextProvider = fn }
+}
+
 // WithVariables sets the variables each request's tools and ToolMeta.Resolve
-// read; every request gets its own copy.
+// read. The map is snapshotted when the server is constructed; later writes to
+// the caller's map do not reach requests.
 func WithVariables(vars map[string]any) ServerOption {
 	return func(c *ServerConfig) { c.Variables = vars }
 }
 
 // WithDependencies sets the dependencies each request's tools resolve
-// tools.Inject slots against; every request gets its own copy.
+// tools.Inject slots against. The map is snapshotted when the server is
+// constructed; later writes to the caller's map do not reach requests.
 func WithDependencies(deps map[string]any) ServerOption {
 	return func(c *ServerConfig) { c.Dependencies = deps }
 }
@@ -129,21 +165,51 @@ func validateToolMeta(metas map[string]ToolMeta, served map[string]bool) error {
 	return nil
 }
 
-// requestContext builds the conversation context one request's tools run
-// against: a copy of the server's variables and dependencies, the
-// RequestContext under RequestDependency, and the request's std context as the
-// turn context (so RequestFromContext(cx.TurnContext()) reaches the HTTP
-// request). Each request gets its own stream; nothing is shared between them.
-func (s *Server) requestContext(ctx context.Context, method, tool string) (*agocontext.Context, error) {
+// resolveRequestScope builds the per-request context and asks the host's
+// provider for the scope (Python parity: server._request_context, called on
+// every request — tools/list and every tools/call, deterministic tools
+// included). A provider error refuses the request before anything runs.
+func (s *Server) resolveRequestScope(ctx context.Context, method, tool string) (*RequestContext, *RequestScope, error) {
+	req := &RequestContext{Method: method, Tool: tool, HTTP: RequestFromContext(ctx)}
+	if s.contextProvider == nil {
+		return req, nil, nil
+	}
+	// AGO-DEVIATION: no OAuth access-token store exists yet (D-058); the
+	// provider still receives the request context.
+	scope, err := s.contextProvider(ctx, "", req)
+	if err != nil {
+		return req, nil, err
+	}
+	return req, &scope, nil
+}
+
+// requestContextFor builds the conversation context one request's tools run
+// against: a copy of the server's variables and dependencies with the
+// provider's scope laid over, the RequestContext under RequestDependency, and
+// the request's std context as the turn context (so
+// RequestFromContext(cx.TurnContext()) reaches the HTTP request). Each request
+// gets its own stream; nothing is shared between them.
+func (s *Server) requestContextFor(ctx context.Context, req *RequestContext, scope *RequestScope) (*agocontext.Context, error) {
 	deps := make(map[string]any, len(s.dependencies)+1)
 	for k, v := range s.dependencies {
 		deps[k] = v
 	}
-	deps[RequestDependency] = &RequestContext{Method: method, Tool: tool, HTTP: RequestFromContext(ctx)}
 	vars := make(map[string]any, len(s.variables))
 	for k, v := range s.variables {
 		vars[k] = v
 	}
+	if scope != nil {
+		for k, v := range scope.Variables {
+			vars[k] = v
+		}
+		for k, v := range scope.Dependencies {
+			deps[k] = v
+		}
+	}
+	if req == nil {
+		req = &RequestContext{Method: "tools/call", Tool: "", HTTP: RequestFromContext(ctx)}
+	}
+	deps[RequestDependency] = req
 	cx, err := agocontext.NewWithDeps(stream.NewMemoryStream(), deps, vars)
 	if err != nil {
 		return nil, fmt.Errorf("mcpserver: request context: %w", err)
@@ -152,19 +218,17 @@ func (s *Server) requestContext(ctx context.Context, method, tool string) (*agoc
 	return cx, nil
 }
 
-// advertise is the entry's tools/list object. A Resolve that cannot get its
-// request context is skipped: the static metadata still describes the tool.
-func (s *Server) advertise(ctx context.Context, t *toolEntry) map[string]any {
+// advertise is the entry's tools/list object, with ToolMeta.Resolve run
+// against the request's already-built context.
+func (s *Server) advertise(_ context.Context, t *toolEntry, cx *agocontext.Context) map[string]any {
 	out := map[string]any{
 		"name":        t.name,
 		"description": t.description,
 		"inputSchema": t.inputSchema,
 	}
 	meta := t.meta
-	if meta.Resolve != nil {
-		if cx, err := s.requestContext(ctx, "tools/list", ""); err == nil {
-			meta = meta.merged(cx)
-		}
+	if meta.Resolve != nil && cx != nil {
+		meta = meta.merged(cx)
 	}
 	if meta.Title != "" {
 		out["title"] = meta.Title

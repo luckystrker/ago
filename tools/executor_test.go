@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,6 +292,112 @@ func TestExecutorHitlFailureAbandonsBatchAndPropagates(t *testing.T) {
 	}
 	if sawCalls != 2 {
 		t.Fatalf("call events sent = %d, want 2", sawCalls)
+	}
+}
+
+// TestExecutorHitlClosesAbandoned: on a hitl failure the closed abandoned
+// channel is what stops waiting for siblings. A sibling blocked in its tool
+// function must not keep Send waiting: Send returns while the sibling is still
+// running, and its late result is not part of a batch result.
+func TestExecutorHitlClosesAbandoned(t *testing.T) {
+	s, cx := newTestContext()
+	rec := newCollector(s)
+	siblingStarted := make(chan struct{})
+	release := make(chan struct{})
+	var (
+		once   sync.Once
+		exited atomic.Bool
+	)
+	ftAsk := mustFunctionTool(t, "ask", "", func(a struct{}, cx *agocontext.Context) (string, error) {
+		<-siblingStarted
+		return cx.Input(stdcontext.Background(), "question?", 0)
+	})
+	ftSibling := mustFunctionTool(t, "sibling", "", func() string {
+		once.Do(func() { close(siblingStarted) })
+		<-release
+		exited.Store(true)
+		return "late"
+	})
+	ex := NewExecutor() // the default timeout is far above this test
+	if _, err := ex.Register(cx, []Tool{ftAsk, ftSibling}, map[string]bool{"ask": true, "sibling": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "1", Name: "ask", Arguments: "{}"},
+			{ID: "2", Name: "sibling", Arguments: "{}"},
+		}})
+	}()
+
+	select {
+	case err := <-sendDone:
+		if !errors.Is(err, hitl.ErrNotProvided) {
+			t.Fatalf("err = %v, want hitl.ErrNotProvided", err)
+		}
+		// abandoned was closed: the blocked sibling no longer holds the batch.
+		if exited.Load() {
+			t.Fatal("the sibling exited before Send returned; Send waited for it instead of abandoning")
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("Send did not return while the sibling was blocked: abandoned was not closed")
+	}
+
+	// Let the abandoned sibling finish; its result must not become a batch
+	// result after the failure.
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for !exited.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the sibling never exited after release")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, ev := range rec.snapshot() {
+		if events.AsValue(ev).EventType() == "ToolResultsEvent" {
+			t.Fatal("ToolResultsEvent sent after a hitl failure")
+		}
+	}
+}
+
+// TestExecutorHitlWaitsForSiblings: Send returns only after wg.Wait, so no
+// batch goroutine is still running when it returns. The sibling sets a flag on
+// exit; the flag must already be set right after Send.
+func TestExecutorHitlWaitsForSiblings(t *testing.T) {
+	s, cx := newTestContext()
+	siblingStarted := make(chan struct{})
+	var (
+		once   sync.Once
+		exited atomic.Bool
+	)
+	ftAsk := mustFunctionTool(t, "ask", "", func(a struct{}, cx *agocontext.Context) (string, error) {
+		<-siblingStarted
+		return cx.Input(stdcontext.Background(), "question?", 0)
+	})
+	ftSibling := mustFunctionTool(t, "sibling", "", func() string {
+		once.Do(func() { close(siblingStarted) })
+		// Long enough that a missing wg.Wait is observed rather than raced with.
+		time.Sleep(50 * time.Millisecond)
+		exited.Store(true)
+		return "ok"
+	})
+	// With the executor timeout disabled, the wg-tracked goroutine owns the
+	// whole await, so "sibling exited" is precisely "the goroutine returned".
+	ex := NewExecutor(WithDefaultToolTimeout(0))
+	if _, err := ex.Register(cx, []Tool{ftAsk, ftSibling}, map[string]bool{"ask": true, "sibling": true}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	err := s.Send(events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+		{ID: "1", Name: "ask", Arguments: "{}"},
+		{ID: "2", Name: "sibling", Arguments: "{}"},
+	}})
+	if !errors.Is(err, hitl.ErrNotProvided) {
+		t.Fatalf("err = %v, want hitl.ErrNotProvided", err)
+	}
+	if !exited.Load() {
+		t.Fatal("Send returned before the sibling exited: wg.Wait was skipped")
 	}
 }
 
