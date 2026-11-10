@@ -20,9 +20,8 @@ const memoryResourceReadCap = 100_000
 // values.
 //
 // AGO-DEVIATION: Python's MemorySkill also carries in-process scripts; AGo does
-// not, because run_skill_script is deferred with the rest of the skills script
-// runner (docs/DECISIONS.md D-062). Instructions and resources are the parts
-// SkillPlugin activates.
+// not (run_skill_script runs the file-based scripts of a LocalSkillRuntime).
+// Instructions and resources are the parts SkillPlugin activates.
 //
 // A skill is owned by a MemoryRuntime; pass one (or several) to
 // NewMemoryRuntime and serve the runtime through NewSkillsToolkitFromRuntime or
@@ -149,7 +148,7 @@ func (rt *MemoryRuntime) find(name string) (*MemorySkill, error) {
 			return s, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: skill %q not found", tools.ErrNotFound, name)
+	return nil, skillNotFound(name)
 }
 
 // Load renders the skill body with its resource list, the same envelope the

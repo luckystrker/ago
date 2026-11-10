@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,8 +22,9 @@ import (
 
 // CodeRunner executes code snippets as local subprocesses (Python parity:
 // ag2/tools/code/tool.py SandboxCodeTool over sandbox/local.py LocalSandbox +
-// adapter CodeAdapter DEFAULT_RUNNERS — the local backend only; Docker/Daytona
-// sandboxes are deferred, see docs/DECISIONS.md).
+// adapter CodeAdapter DEFAULT_RUNNERS). NewLocalCodeRunner runs snippets as
+// local subprocesses; NewSandboxCodeTool and NewSandboxCodeToolFromFactory run
+// them in any other backend on the Sandbox seam (sandbox.go).
 //
 // Like Python's SandboxCodeTool requires its backend to be passed explicitly, the
 // Go constructor is named LocalCodeRunner so nobody wires model-written code to a
@@ -56,6 +58,13 @@ type CodeRunner struct {
 	middleware []middleware.Middleware
 	tool       *tools.FunctionTool
 	sandbox    localSandbox
+	// backend, when set (NewSandboxCodeTool*), runs every snippet through a
+	// pluggable CodeEnvironment instead of a local subprocess; localOnly names
+	// the options that only configure the local path.
+	backend    CodeEnvironment
+	localOnly  []string
+	adapter    []string // options that configure a CodeAdapter, not a ready CodeEnvironment
+	timeoutSet bool
 }
 
 var _ tools.Tool = (*CodeRunner)(nil)
@@ -134,6 +143,7 @@ func WithCodeRunners(runners map[string]LanguageRunner) CodeRunnerOption {
 			}
 			r.runners[normalizeCodeLanguage(lang)] = runner
 		}
+		r.adapter = append(r.adapter, "WithCodeRunners")
 		return nil
 	}
 }
@@ -159,6 +169,7 @@ func WithCodeWorkdir(dir string) CodeRunnerOption {
 			return err
 		}
 		r.workdir, r.autoDir = abs, false
+		r.localOnly = append(r.localOnly, "WithCodeWorkdir")
 		return nil
 	}
 }
@@ -170,7 +181,8 @@ func WithCodeTimeout(d time.Duration) CodeRunnerOption {
 		if d <= 0 {
 			return errors.New("toolpacks: code runner timeout must be > 0")
 		}
-		r.timeout = d
+		r.timeout, r.timeoutSet = d, true
+		r.adapter = append(r.adapter, "WithCodeTimeout")
 		return nil
 	}
 }
@@ -187,6 +199,7 @@ func WithCodeEnv(env map[string]string) CodeRunnerOption {
 			}
 			r.env[k] = v
 		}
+		r.localOnly = append(r.localOnly, "WithCodeEnv")
 		return nil
 	}
 }
@@ -197,7 +210,11 @@ func WithCodeEnv(env map[string]string) CodeRunnerOption {
 // process (API keys included). Without this option the child sees just the
 // whitelisted non-secret variables plus whatever WithCodeEnv passed.
 func WithCodeInheritEnv() CodeRunnerOption {
-	return func(r *CodeRunner) error { r.inheritEnv = true; return nil }
+	return func(r *CodeRunner) error {
+		r.inheritEnv = true
+		r.localOnly = append(r.localOnly, "WithCodeInheritEnv")
+		return nil
+	}
 }
 
 // WithCodeMaxOutput caps the reported output in characters (Python parity:
@@ -208,6 +225,7 @@ func WithCodeMaxOutput(n int) CodeRunnerOption {
 			return errors.New("toolpacks: code runner max_output must be > 0")
 		}
 		r.maxOutput = n
+		r.localOnly = append(r.localOnly, "WithCodeMaxOutput")
 		return nil
 	}
 }
@@ -223,6 +241,7 @@ func WithCodeLanguages(langs ...string) CodeRunnerOption {
 			return errors.New("toolpacks: code runner languages must not be empty")
 		}
 		r.languages = langs
+		r.adapter = append(r.adapter, "WithCodeLanguages")
 		return nil
 	}
 }
@@ -235,6 +254,7 @@ func WithCodePythonBin(bin string) CodeRunnerOption {
 			return errors.New("toolpacks: code runner python binary must not be empty")
 		}
 		r.pythonBin = bin
+		r.localOnly = append(r.localOnly, "WithCodePythonBin")
 		return nil
 	}
 }
@@ -309,6 +329,93 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 	return r, nil
 }
 
+// NewSandboxCodeTool builds the run_code tool over any CodeEnvironment (Python
+// parity: SandboxCodeTool(environment)): the environment decides where code
+// runs and carries all backend configuration; the tool contributes the schema,
+// the exit-code formatting and the middleware. There is deliberately no default
+// backend — the tool executes whatever the model writes, so it must be wired to
+// a backend on purpose. WithCodeName and WithCodeRunnerMiddleware apply;
+// language, runner and timeout configuration belong to the environment (see
+// CodeAdapter), and every other option makes the constructor fail. Close closes
+// the environment when it owns resources (io.Closer).
+func NewSandboxCodeTool(env CodeEnvironment, opts ...CodeRunnerOption) (*CodeRunner, error) {
+	if env == nil {
+		return nil, errors.New("toolpacks: sandbox code tool: environment must not be nil")
+	}
+	r := &CodeRunner{
+		toolName: "run_code",
+		env:      map[string]string{},
+		backend:  env,
+		runners:  cloneLanguageRunners(defaultLanguageRunners),
+	}
+	r.languages = env.SupportedLanguages()
+	for _, opt := range opts {
+		if err := opt(r); err != nil {
+			return nil, err
+		}
+	}
+	if len(r.localOnly) > 0 {
+		return nil, fmt.Errorf("toolpacks: sandbox code tool: %s configure the local subprocess and cannot be combined with a CodeEnvironment", strings.Join(r.localOnly, ", "))
+	}
+	if len(r.adapter) > 0 {
+		return nil, fmt.Errorf("toolpacks: sandbox code tool: %s configure a CodeAdapter; set them on the environment or use NewSandboxCodeToolFromFactory", strings.Join(r.adapter, ", "))
+	}
+	description := "Execute code in a sandboxed environment. Supported languages: " + strings.Join(r.languages, ", ") + "."
+	return r.finish(description)
+}
+
+// NewSandboxCodeToolFromFactory builds the run_code tool over a SandboxFactory,
+// wrapped in a CodeAdapter (Python parity: SandboxCodeTool given a backend).
+// WithCodeLanguages, WithCodeRunners and WithCodeTimeout configure the adapter;
+// the local-only options make the constructor fail.
+func NewSandboxCodeToolFromFactory(factory SandboxFactory, opts ...CodeRunnerOption) (*CodeRunner, error) {
+	if factory == nil {
+		return nil, errors.New("toolpacks: sandbox code tool: sandbox factory must not be nil")
+	}
+	// Collect the adapter-relevant options on a scratch runner first.
+	scratch := &CodeRunner{
+		toolName:  "run_code",
+		env:       map[string]string{},
+		languages: []string{"python", "bash"},
+		runners:   cloneLanguageRunners(defaultLanguageRunners),
+		timeout:   0,
+	}
+	for _, opt := range opts {
+		if err := opt(scratch); err != nil {
+			return nil, err
+		}
+	}
+	if len(scratch.localOnly) > 0 {
+		return nil, fmt.Errorf("toolpacks: sandbox code tool: %s configure the local subprocess and cannot be combined with a SandboxFactory", strings.Join(scratch.localOnly, ", "))
+	}
+	adapterOpts := []CodeAdapterOption{WithAdapterLanguages(scratch.languages...), WithAdapterRunners(scratch.runners)}
+	if scratch.timeoutSet {
+		adapterOpts = append(adapterOpts, WithAdapterTimeout(scratch.timeout))
+	}
+	adapter, err := NewCodeAdapter(factory, adapterOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return NewSandboxCodeTool(adapter, WithCodeName(scratch.toolName), WithCodeRunnerMiddleware(scratch.middleware...))
+}
+
+// finish builds the function tool of a backend-run CodeRunner.
+func (r *CodeRunner) finish(description string) (*CodeRunner, error) {
+	type codeArgs struct {
+		Code     string `json:"code" agschema:"description=The code to execute,required"`
+		Language string `json:"language" agschema:"description=The language of the snippet,required"`
+	}
+	fn := func(args codeArgs, cx *agocontext.Context) (string, error) {
+		return r.run(cx, args.Code, args.Language)
+	}
+	ft, err := tools.NewFunctionTool(r.toolName, description, fn, tools.WithMiddleware(r.middleware...))
+	if err != nil {
+		return nil, fmt.Errorf("toolpacks: code runner: %w", err)
+	}
+	r.tool = ft
+	return r, nil
+}
+
 // normalizeCodeLanguage canonicalizes a language name; "" stays "". Aliases:
 // py→python, sh→bash, js→javascript, ts→typescript.
 func normalizeCodeLanguage(lang string) string {
@@ -334,6 +441,13 @@ func normalizeCodeLanguage(lang string) string {
 func (r *CodeRunner) run(cx *agocontext.Context, code, language string) (string, error) {
 	if r.sandbox.isClosed() {
 		return "", ErrSandboxClosed
+	}
+	if r.backend != nil {
+		res, err := r.backend.Run(cx.TurnContext(), cx, code, language)
+		if err != nil {
+			return "", err
+		}
+		return formatExit(execResult(res)), nil
 	}
 	lang := normalizeCodeLanguage(language)
 	runner, ok := r.runners[lang]
@@ -510,6 +624,12 @@ func (r *CodeRunner) Workdir() string { return r.workdir }
 // ErrSandboxClosed.
 func (r *CodeRunner) Close() error {
 	r.sandbox.shutdown()
+	if r.backend != nil {
+		if c, ok := r.backend.(io.Closer); ok {
+			return c.Close()
+		}
+		return nil
+	}
 	if !r.autoDir || r.workdir == "" {
 		return nil
 	}

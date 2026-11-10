@@ -58,6 +58,9 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	if len(wireTools) > 0 {
 		body["tools"] = wireTools
 	}
+	if tc := buildToolConfig(opts.Tools); tc != nil {
+		body["toolConfig"] = tc
+	}
 	if gen := c.generationConfig(opts.ResponseSchema); len(gen) > 0 {
 		body["generationConfig"] = gen
 	}

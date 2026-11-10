@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -19,9 +20,8 @@ import (
 // FilesystemToolkit exposes local file operations as function tools, every path
 // confined to one root directory (Python parity: ag2/tools/toolkits/
 // filesystem.py FilesystemToolkit — base_path, the traversal guard, the UTF-8
-// pinning). The member set is the porting brief's read/write/list/mkdir/glob;
-// WithFilesystemReadOnly drops the mutating members; Python's update_file and
-// delete_file are deferred (docs/DECISIONS.md).
+// pinning). The member set is read/write/update/delete/list/mkdir/glob;
+// WithFilesystemReadOnly drops the mutating members.
 //
 // All tools read the filesystem per call, so the toolkit is safe for concurrent
 // use; concurrent writers race the way concurrent writers to one file do.
@@ -41,8 +41,8 @@ type filesystemConfig struct {
 	middleware []middleware.Middleware
 }
 
-// WithFilesystemReadOnly omits every mutating tool (write_file,
-// make_directory), leaving the read-only members (Python parity:
+// WithFilesystemReadOnly omits every mutating tool (write_file, update_file,
+// delete_file, make_directory), leaving the read-only members (Python parity:
 // FilesystemToolkit(read_only=True), which drops write_file/update_file/
 // delete_file).
 func WithFilesystemReadOnly() FilesystemOption {
@@ -68,8 +68,9 @@ func WithFilesystemMiddleware(mw ...middleware.Middleware) FilesystemOption {
 // NewFilesystemToolkit builds the tools rooted at dir. The root must be an
 // existing directory (Python parity: _resolve_dir). Model paths are relative to
 // the root; absolute paths and any path resolving outside the root are refused.
-// The default member set is read, write, list, mkdir and glob;
-// WithFilesystemReadOnly leaves out write_file and make_directory.
+// The default member set is read, write, update, delete, list, mkdir and glob;
+// WithFilesystemReadOnly leaves out write_file, update_file, delete_file and
+// make_directory.
 func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToolkit, error) {
 	var cfg filesystemConfig
 	for _, opt := range opts {
@@ -90,6 +91,7 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 
 	readFn := func(args struct {
 		Path string `json:"path" agschema:"description=Relative path to the file to read,required"`
+		Raw  bool   `json:"raw" agschema:"description=If true read the file as binary and return base64-encoded content"`
 	}) (string, error) {
 		target, err := f.resolve(args.Path)
 		if err != nil {
@@ -99,12 +101,13 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 		if err != nil {
 			return "", err
 		}
-		// Text only: the porting brief's read is the UTF-8 read (Python also
-		// offers raw=true base64 for binary files — deferred).
+		if args.Raw {
+			return base64.StdEncoding.EncodeToString(b), nil
+		}
 		return string(b), nil
 	}
 	readFile, err := tools.NewFunctionTool("read_file",
-		"Read the contents of a file (UTF-8 text).", readFn, tools.WithMiddleware(cfg.middleware...))
+		"Read the contents of a file. Returns UTF-8 text by default. Set raw=true to read binary content as base64.", readFn, tools.WithMiddleware(cfg.middleware...))
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +140,59 @@ func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToo
 			return nil, err
 		}
 		members = append(members, writeFile)
+
+		updateFn := func(args struct {
+			Path       string `json:"path" agschema:"description=Relative path to the file to update,required"`
+			OldContent string `json:"old_content" agschema:"description=The exact text to find and replace,required"`
+			NewContent string `json:"new_content" agschema:"description=The text to replace old_content with,required"`
+		}) (string, error) {
+			target, err := f.resolve(args.Path)
+			if err != nil {
+				return "", err
+			}
+			b, err := os.ReadFile(target)
+			if err != nil {
+				return "", err
+			}
+			text := string(b)
+			// An empty needle matches at index 0 of any text, so on a non-empty
+			// file it would silently prepend new_content; on an empty file it is
+			// the valid way to fill a freshly created file.
+			if args.OldContent == "" && text != "" {
+				return "", errors.New("old_content must not be empty unless the file is empty")
+			}
+			if !strings.Contains(text, args.OldContent) {
+				return "", fmt.Errorf("old_content not found in %s", args.Path)
+			}
+			text = strings.Replace(text, args.OldContent, args.NewContent, 1)
+			if err := os.WriteFile(target, []byte(text), 0o644); err != nil {
+				return "", err
+			}
+			return "Successfully updated " + args.Path, nil
+		}
+		updateFile, err := tools.NewFunctionTool("update_file",
+			"Update a file by replacing the first occurrence of old_content with new_content.",
+			updateFn, tools.WithMiddleware(cfg.middleware...))
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, updateFile)
+
+		deleteFn := func(args struct {
+			Path string `json:"path" agschema:"description=Relative path to the file or directory to delete,required"`
+		}) (string, error) {
+			if err := f.remove(args.Path); err != nil {
+				return "", err
+			}
+			return "Successfully deleted " + args.Path, nil
+		}
+		deleteFile, err := tools.NewFunctionTool("delete_file",
+			"Delete a file or directory. A symlink is removed itself; its target is left untouched.",
+			deleteFn, tools.WithMiddleware(cfg.middleware...))
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, deleteFile)
 	}
 
 	listFn := func(args struct {
@@ -265,6 +321,61 @@ func (f *FilesystemToolkit) Register(cx *agocontext.Context, mw []middleware.Mid
 // a link pointing outside the root is caught, non-existent paths are checked
 // lexically.
 func (f *FilesystemToolkit) resolve(rel string) (string, error) {
+	joined, err := f.lexical(rel)
+	if err != nil {
+		return "", err
+	}
+	// Symlink guard: resolve the deepest existing prefix and re-check
+	// containment (a symlink inside the root can still point outside it).
+	resolved, err := resolveExisting(joined)
+	if err != nil {
+		return "", err
+	}
+	if !withinRoot(f.root, resolved) {
+		return "", fmt.Errorf("path %q escapes the workspace root", rel)
+	}
+	return resolved, nil
+}
+
+// remove deletes the file or directory at the model-supplied relative path. A
+// symlink is unlinked itself (its target is untouched), so it is the link's
+// location that must stay inside the root, not its target (Python parity:
+// delete_file). The root itself is never deletable.
+func (f *FilesystemToolkit) remove(rel string) error {
+	joined, err := f.lexical(rel)
+	if err != nil {
+		return err
+	}
+	if info, lerr := os.Lstat(joined); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+		parent, err := resolveExisting(filepath.Dir(joined))
+		if err != nil {
+			return err
+		}
+		if !withinRoot(f.root, parent) {
+			return fmt.Errorf("path %q escapes the workspace root", rel)
+		}
+		return os.Remove(joined)
+	}
+	target, err := f.resolve(rel)
+	if err != nil {
+		return err
+	}
+	if target == f.root {
+		return fmt.Errorf("path %q refers to the workspace root itself", rel)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return os.RemoveAll(target)
+	}
+	return os.Remove(target)
+}
+
+// lexical validates a model path syntactically (non-empty, relative, no ".."
+// escape) and joins it onto the root without touching the filesystem.
+func (f *FilesystemToolkit) lexical(rel string) (string, error) {
 	if rel == "" {
 		return "", errors.New("path must not be empty")
 	}
@@ -276,17 +387,7 @@ func (f *FilesystemToolkit) resolve(rel string) (string, error) {
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes the workspace root", rel)
 	}
-	joined := filepath.Join(f.root, clean)
-	// Symlink guard: resolve the deepest existing prefix and re-check
-	// containment (a symlink inside the root can still point outside it).
-	resolved, err := resolveExisting(joined)
-	if err != nil {
-		return "", err
-	}
-	if !withinRoot(f.root, resolved) {
-		return "", fmt.Errorf("path %q escapes the workspace root", rel)
-	}
-	return resolved, nil
+	return filepath.Join(f.root, clean), nil
 }
 
 // resolveExisting evaluates symlinks along the existing prefix of p and appends
