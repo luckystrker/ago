@@ -86,6 +86,7 @@ func serveTurn(ctx context.Context, a *agent.Agent, input RunAgentInput, emit fu
 	}
 	defer run.Close()
 	s := run.Stream()
+	defer declareClientTools(a, s.ID(), input.Tools)()
 	if err := s.History().Replace(mapped.history); err != nil {
 		emit(runErrorEvent(fmt.Errorf("seed history: %w", err)))
 		return nil

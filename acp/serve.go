@@ -271,6 +271,20 @@ func (e *Emitter) Plan(entries []PlanEntry) {
 	e.push(Update{Kind: "plan", Entries: entries})
 }
 
+// Mode tells the client the session is now in the mode modeID (Python parity:
+// acp.update_current_mode). The ids a client may expect are the ones the agent
+// advertises; this only reports a change.
+func (e *Emitter) Mode(modeID string) {
+	e.push(Update{Kind: "current_mode_update", ModeID: modeID})
+}
+
+// AvailableCommands replaces the client's list of the agent's slash commands
+// wholesale (Python parity: acp.update_available_commands); nil or empty
+// clears it.
+func (e *Emitter) AvailableCommands(commands []AvailableCommand) {
+	e.push(Update{Kind: "available_commands_update", Commands: commands})
+}
+
 // ToolCall announces a tool call: id, a title, the kind (KindOther unless the
 // deployment knows better) and the in_progress status, with rawInput as the
 // call's raw JSON arguments (Python parity: mappers._tool_call_start).

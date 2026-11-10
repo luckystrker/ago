@@ -20,18 +20,19 @@ import (
 // client's session/request_permission answer on the wire (nested shape,
 // selected option id) and reports what it saw as chunks.
 const (
-	roleEnv      = "AGO_ACP_TEST_ROLE"
-	roleAgent    = "acp-fake-agent"
-	roleDenyProb = "acp-deny-probe-agent"
-	roleCancel   = "acp-cancel-agent"
-	roleLoad     = "acp-load-agent"
-	roleFS       = "acp-fs-probe-agent"
-	roleTerm     = "acp-term-probe-agent"
-	roleTermEcho = "acp-term-echo"
-	roleTermSpam = "acp-term-output-spam"
-	roleTermEnv  = "acp-term-env-probe"
-	roleSilent   = "acp-silent-agent"
-	roleMCPServe = "acp-fake-mcp-server"
+	roleEnv       = "AGO_ACP_TEST_ROLE"
+	roleAgent     = "acp-fake-agent"
+	roleDenyProb  = "acp-deny-probe-agent"
+	roleCancel    = "acp-cancel-agent"
+	roleLoad      = "acp-load-agent"
+	roleFS        = "acp-fs-probe-agent"
+	roleTerm      = "acp-term-probe-agent"
+	roleTermEcho  = "acp-term-echo"
+	roleTermSpam  = "acp-term-output-spam"
+	roleTermEnv   = "acp-term-env-probe"
+	roleSilent    = "acp-silent-agent"
+	roleMCPServe  = "acp-fake-mcp-server"
+	roleServeMode = "acp-serve-mode-agent"
 
 	// Child-process env keys the roles read beyond roleEnv: the file the MCP
 	// server stub touches on exit (the gateway-close test's proof), how many
@@ -91,6 +92,8 @@ func TestMain(m *testing.M) {
 		runSilentAgent(os.Stdin, os.Stdout)
 	case roleMCPServe:
 		runFakeMCPServer(os.Stdin, os.Stdout)
+	case roleServeMode:
+		runServeModeAgent()
 	default:
 		os.Exit(m.Run())
 	}

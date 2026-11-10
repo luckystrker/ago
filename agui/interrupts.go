@@ -227,6 +227,9 @@ type servedTurn struct {
 	proj *Stream
 	run  *agent.AgentRun
 	subs []stream.SubID
+	// withdrawTools withdraws the client tools the opening run input declared; set
+	// before the turn starts.
+	withdrawTools func()
 
 	threadID string
 	streamID string

@@ -216,7 +216,9 @@ const (
 //
 // Chunks carry Text (and MessageID on a replay); tool_call / tool_call_update
 // carry ToolCallID, Title, ToolKind, Status, RawInput and ContentText; plan
-// carries Entries; usage_update carries Used, Size and Cost. Marshalling puts
+// carries Entries; usage_update carries Used, Size and Cost;
+// current_mode_update carries ModeID; available_commands_update carries
+// Commands. Marshalling puts
 // each kind's fields under the keys the Python SDK serializes (schema.py
 // aliases: sessionUpdate, messageId, toolCallId, rawInput, used, size, cost),
 // with the earlier revision's "contentBlock" spelling still accepted on input.
@@ -242,6 +244,13 @@ type Update struct {
 	Used int64      `json:"-"`
 	Size int64      `json:"-"`
 	Cost *UsageCost `json:"-"`
+
+	// current_mode_update: the id of the mode the session is now in.
+	ModeID string `json:"-"`
+
+	// available_commands_update: the slash commands the agent advertises. The
+	// slice replaces the client's list wholesale; an empty one clears it.
+	Commands []AvailableCommand `json:"-"`
 }
 
 // chunkKinds are the updates whose payload is one content block.
@@ -291,6 +300,13 @@ func (u Update) MarshalJSON() ([]byte, error) {
 		if u.Cost != nil {
 			m["cost"] = u.Cost
 		}
+	case u.Kind == "current_mode_update":
+		m["currentModeId"] = u.ModeID
+	case u.Kind == "available_commands_update":
+		if u.Commands == nil {
+			u.Commands = []AvailableCommand{}
+		}
+		m["availableCommands"] = u.Commands
 	default:
 		return nil, fmt.Errorf("acp: unknown session/update kind %q", u.Kind)
 	}
@@ -302,19 +318,21 @@ func (u Update) MarshalJSON() ([]byte, error) {
 // package still accepted. "content" is a single block on the chunk kinds and a
 // list on the tool-call kinds, so it arrives raw and is decoded per kind.
 type updateWire struct {
-	SessionUpdate string          `json:"sessionUpdate"`
-	MessageID     string          `json:"messageId"`
-	ContentBlock  *contentBlock   `json:"contentBlock"` // legacy input dialect, never emitted
-	ContentRaw    json.RawMessage `json:"content"`
-	ToolCallID    string          `json:"toolCallId"`
-	Title         string          `json:"title"`
-	ToolKind      string          `json:"kind"`
-	Status        string          `json:"status"`
-	RawInput      json.RawMessage `json:"rawInput"`
-	Entries       []PlanEntry     `json:"entries"`
-	Used          *int64          `json:"used"`
-	Size          *int64          `json:"size"`
-	Cost          *UsageCost      `json:"cost"`
+	SessionUpdate string             `json:"sessionUpdate"`
+	MessageID     string             `json:"messageId"`
+	ContentBlock  *contentBlock      `json:"contentBlock"` // legacy input dialect, never emitted
+	ContentRaw    json.RawMessage    `json:"content"`
+	ToolCallID    string             `json:"toolCallId"`
+	Title         string             `json:"title"`
+	ToolKind      string             `json:"kind"`
+	Status        string             `json:"status"`
+	RawInput      json.RawMessage    `json:"rawInput"`
+	Entries       []PlanEntry        `json:"entries"`
+	Used          *int64             `json:"used"`
+	Size          *int64             `json:"size"`
+	Cost          *UsageCost         `json:"cost"`
+	CurrentModeID string             `json:"currentModeId"`
+	Commands      []AvailableCommand `json:"availableCommands"`
 }
 
 // toolContentItem is one item of a tool call's content list (Python parity:
@@ -365,6 +383,10 @@ func (u *Update) UnmarshalJSON(data []byte) error {
 			u.Size = *w.Size
 		}
 		u.Cost = w.Cost
+	case u.Kind == "current_mode_update":
+		u.ModeID = w.CurrentModeID
+	case u.Kind == "available_commands_update":
+		u.Commands = w.Commands
 	}
 	return nil
 }
@@ -384,6 +406,45 @@ type PlanEntry struct {
 	Content  string `json:"content"`
 	Priority string `json:"priority,omitempty"`
 	Status   string `json:"status"`
+}
+
+// AvailableCommand is one slash command an agent advertises in an
+// available_commands_update (Python parity: the acp schema AvailableCommand —
+// name and description required, input optional).
+type AvailableCommand struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// InputHint is the hint shown for a command taking free-text input; empty
+	// means the command takes none (wire: "input": {"hint": ...}).
+	InputHint string `json:"-"`
+}
+
+// MarshalJSON puts InputHint under the schema's nested "input" object.
+func (c AvailableCommand) MarshalJSON() ([]byte, error) {
+	m := map[string]any{"name": c.Name, "description": c.Description}
+	if c.InputHint != "" {
+		m["input"] = map[string]any{"hint": c.InputHint}
+	}
+	return json.Marshal(m)
+}
+
+// UnmarshalJSON reads the nested "input": {"hint": ...} into InputHint.
+func (c *AvailableCommand) UnmarshalJSON(data []byte) error {
+	var w struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Input       *struct {
+			Hint string `json:"hint"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	c.Name, c.Description, c.InputHint = w.Name, w.Description, ""
+	if w.Input != nil {
+		c.InputHint = w.Input.Hint
+	}
+	return nil
 }
 
 // UsageCost is the optional cost block of a usage_update (Python parity: the
