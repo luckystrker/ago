@@ -120,6 +120,13 @@ type OpenAITranscriber struct {
 	Client *http.Client
 	// Language is the optional ISO-639-1 hint of the input audio.
 	Language string
+	// PCMSampleRate and PCMChannels describe raw PCM clips (mime "audio/pcm"
+	// or "audio/L16") whose media type carries no "rate"/"channels"
+	// parameters; 0 → 24000 Hz mono, the format of OpenAI's "pcm" speech
+	// output. Parameters on the mime ("audio/L16;rate=16000;channels=1")
+	// take precedence.
+	PCMSampleRate int
+	PCMChannels   int
 }
 
 var _ Transcriber = (*OpenAITranscriber)(nil)
@@ -148,10 +155,19 @@ func (t *OpenAITranscriber) client() *http.Client {
 // Transcribe uploads the clip as multipart form data and returns the transcript
 // text. The filename extension is derived from mime (the endpoint infers the
 // container from it), the response_format is fixed to "text" so the body is the
-// plain transcript. Whitespace around the transcript is trimmed.
+// plain transcript. Whitespace around the transcript is trimmed. A raw 16-bit
+// PCM clip (mime "audio/pcm" or "audio/L16") is wrapped as WAV first — the
+// endpoint cannot decode bare samples (Python parity: voice_to_wav_buffer).
 func (t *OpenAITranscriber) Transcribe(ctx stdcontext.Context, audio []byte, mime string) (string, error) {
 	if t == nil {
 		return "", errors.New("live: nil OpenAITranscriber")
+	}
+	if rate, channels, ok := rawPCMFormat(mime, t.PCMSampleRate, t.PCMChannels); ok {
+		wav, err := PCMToWAV(audio, rate, channels)
+		if err != nil {
+			return "", fmt.Errorf("live: openai transcribe: %w", err)
+		}
+		audio, mime = wav, "audio/wav"
 	}
 
 	var body bytes.Buffer
