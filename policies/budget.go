@@ -1,6 +1,8 @@
 package policies
 
 import (
+	"fmt"
+
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
 )
@@ -26,6 +28,16 @@ func WithCharsPerToken(n int) TokenBudgetOption {
 	}
 }
 
+// WithBudgetTransparency injects a note telling the model that history was cut
+// (Python parity: transparent=True): "[token_budget] Showing N of M events
+// (token budget)."
+//
+// AGO-DEVIATION: Python counts the raw event list; AGo counts the conversational
+// subset it reduces (D-030), so telemetry and alerts never inflate M.
+func WithBudgetTransparency(on bool) TokenBudgetOption {
+	return func(p *TokenBudgetPolicy) { p.transparent = on }
+}
+
 // TokenBudgetPolicy keeps the most recent conversational events whose estimated
 // token cost fits the budget (Python parity: token_budget.py, which sizes by
 // character count with the same 4-chars-per-token default, tunable with
@@ -37,6 +49,7 @@ func WithCharsPerToken(n int) TokenBudgetOption {
 type TokenBudgetPolicy struct {
 	budget        int
 	charsPerToken int
+	transparent   bool
 }
 
 // NewTokenBudgetPolicy keeps a suffix of conversational events worth at most
@@ -73,5 +86,9 @@ func (p TokenBudgetPolicy) Apply(prompts []string, evs []events.Event, _ *agocon
 		cost += c
 		kept++
 	}
-	return prompts, convs[widenCut(convs, len(convs)-kept):], nil
+	retained := convs[widenCut(convs, len(convs)-kept):]
+	if p.transparent {
+		prompts = append(prompts, fmt.Sprintf("[token_budget] Showing %d of %d events (token budget).", len(retained), len(convs)))
+	}
+	return prompts, retained, nil
 }
