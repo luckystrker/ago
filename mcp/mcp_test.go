@@ -439,19 +439,8 @@ func TestHTTPCallToolContentMapping(t *testing.T) {
 		t.Errorf("part 3 = %#v, want UrlInput document", out.Parts[3])
 	}
 	embedded, ok := events.AsValue(out.Parts[4]).(events.TextInput)
-	if !ok {
-		t.Fatalf("part 4 = %#v, want TextInput with JSON", out.Parts[4])
-	}
-	var block map[string]any
-	if err := json.Unmarshal([]byte(embedded.Content), &block); err != nil {
-		t.Fatalf("embedded part is not JSON: %v (%q)", err, embedded.Content)
-	}
-	if block["type"] != "resource" {
-		t.Errorf("embedded block type = %v", block["type"])
-	}
-	res, _ := block["resource"].(map[string]any)
-	if res == nil || res["uri"] != "file:///srv/data.json" {
-		t.Errorf("embedded resource = %v", block["resource"])
+	if !ok || embedded.Content != "{}" {
+		t.Errorf("part 4 = %#v, want the embedded resource's text as TextInput", out.Parts[4])
 	}
 }
 

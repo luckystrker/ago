@@ -49,7 +49,7 @@ plugin  → tools, middleware, context — Plugin contributions (tools/middlewar
 agent   → everything above           — Agent, AgentRun, AgentReply, turn loop, subtasks
 spec    → agent, tools               — AgentSpec from/to agent
 network → agent, events, stream, knowledge, task — hub, channels, envelope, links, adapters
-mcp     → tools, context             — MCP client (stdio+HTTP JSON-RPC), MCPToolkit
+mcp     → tools, context, config, stream — MCP client (stdio+HTTP JSON-RPC), Toolkit; config: sampling on the agent's model; stream: the sampling conversation
 mcpui   → events                     — MCP UI resources/actions (data constructors)
 agui    → agent, events, stream      — AG-UI serving (HTTP SSE endpoint, event projection)
 testing → config, events, stream     — TestConfig, TrackingConfig, fake clients
