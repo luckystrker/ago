@@ -9,20 +9,45 @@ import (
 // events/sizing.py).
 const charsPerToken = 4
 
+// TokenBudgetOption configures NewTokenBudgetPolicy.
+type TokenBudgetOption func(*TokenBudgetPolicy)
+
+// WithCharsPerToken sets the chars-per-token estimate used to size events
+// (Python parity: TokenBudgetPolicy(max_tokens, chars_per_token=4)). Lower
+// values estimate more tokens for the same text; n <= 0 keeps the default.
+//
+// AGO-DEVIATION: Python raises ValueError for chars_per_token < 1; the
+// constructor has no error return, so a non-positive value is ignored.
+func WithCharsPerToken(n int) TokenBudgetOption {
+	return func(p *TokenBudgetPolicy) {
+		if n > 0 {
+			p.charsPerToken = n
+		}
+	}
+}
+
 // TokenBudgetPolicy keeps the most recent conversational events whose estimated
 // token cost fits the budget (Python parity: token_budget.py, which sizes by
-// character count with the same 4-chars-per-token default).
+// character count with the same 4-chars-per-token default, tunable with
+// WithCharsPerToken).
 //
 // The budget is a target, not a guarantee: the newest event is always retained
 // even when it alone overshoots, and a cut that would orphan a tool result
 // widens back until the retained span contains the whole tool round.
 type TokenBudgetPolicy struct {
-	budget int
+	budget        int
+	charsPerToken int
 }
 
 // NewTokenBudgetPolicy keeps a suffix of conversational events worth at most
 // budget estimated tokens.
-func NewTokenBudgetPolicy(budget int) TokenBudgetPolicy { return TokenBudgetPolicy{budget: budget} }
+func NewTokenBudgetPolicy(budget int, opts ...TokenBudgetOption) TokenBudgetPolicy {
+	p := TokenBudgetPolicy{budget: budget, charsPerToken: charsPerToken}
+	for _, opt := range opts {
+		opt(&p)
+	}
+	return p
+}
 
 // Apply returns the conversational suffix that fits the budget. When the whole
 // transcript fits, the input passes through unchanged.
@@ -33,15 +58,15 @@ func (p TokenBudgetPolicy) Apply(prompts []string, evs []events.Event, _ *agocon
 	}
 	total := 0
 	for _, ev := range convs {
-		total += events.EstimatedTokens(ev, charsPerToken)
+		total += events.EstimatedTokens(ev, p.charsPerToken)
 	}
 	if total <= p.budget {
 		return prompts, evs, nil
 	}
-	cost := events.EstimatedTokens(convs[len(convs)-1], charsPerToken)
+	cost := events.EstimatedTokens(convs[len(convs)-1], p.charsPerToken)
 	kept := 1 // the newest event is retained even when it alone breaks the budget
 	for i := len(convs) - 2; i >= 0; i-- {
-		c := events.EstimatedTokens(convs[i], charsPerToken)
+		c := events.EstimatedTokens(convs[i], p.charsPerToken)
 		if cost+c > p.budget {
 			break
 		}
