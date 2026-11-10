@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -316,6 +317,7 @@ type Hub struct {
 	now              func() time.Time
 	ids              *idMinter
 	ackWait          time.Duration
+	ext              hubExt // auth, capability index, inbox/rate accounting, hooks (hubext.go)
 }
 
 // HubOption configures a Hub.
@@ -369,6 +371,7 @@ func NewHub(opts ...HubOption) *Hub {
 		ids:              &idMinter{},
 		ackWait:          30 * time.Second,
 	}
+	h.ext.init()
 	for _, e := range DefaultExpectationEvaluators() {
 		h.expectEvaluators[e.Name()] = e
 	}
@@ -412,15 +415,33 @@ func (h *Hub) Register(p Passport, r *Rule) (Passport, error) {
 		def := DefaultRule()
 		r = &def
 	}
+	if err := r.Inbox.Validate(); err != nil {
+		return Passport{}, err
+	}
+	// The claim proves the identity once, at registration; the hub keeps only
+	// the scheme (a remote agent's claim is routing data for its proxy).
+	// AGO-DEVIATION: the returned passport is the stored, claim-free one;
+	// Python's register returns the stamped original with its claim.
+	_, claim := authSchemeAndClaim(p)
+	if err := h.Authenticate(context.Background(), p, claim); err != nil {
+		return Passport{}, err
+	}
 	stamped := p
+	if p.Kind != KindRemoteAgent {
+		stamped = withoutClaim(p)
+	}
 	stamped.Kind = p.Kind.Effective()
 	stamped.AgentID = uuid.New()
+	if stamped.Version == 0 {
+		stamped.Version = 1
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, taken := h.byName[stamped.Name]; taken {
 		return Passport{}, fmt.Errorf("%w: %q", ErrNameTaken, stamped.Name)
 	}
+	stamped.CreatedAt = h.now()
 	h.passports[stamped.AgentID] = stamped
 	h.byName[stamped.Name] = stamped.AgentID
 	h.rules[stamped.AgentID] = r.Clone()
@@ -436,6 +457,7 @@ func (h *Hub) Unregister(agentID string) error {
 	if !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
+	h.forgetLocked(agentID, h.resumes[agentID])
 	delete(h.passports, agentID)
 	delete(h.byName, p.Name)
 	delete(h.rules, agentID)
@@ -500,14 +522,28 @@ func (h *Hub) RuleOf(agentID string) (Rule, error) {
 	return h.rules[agentID].Clone(), nil
 }
 
-// SetResume stores or replaces the capability claim for an agent.
+// SetResume stores or replaces the capability claim for an agent. The hub
+// stamps LastUpdated and bumps Version past the stored resume's (a first
+// resume keeps the caller's Version, 1 when unset) and re-indexes the
+// capabilities. The whole resume is replaced, Observed included (Python
+// parity): start from ResumeOf to keep the track record.
 func (h *Hub) SetResume(r Resume) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.passports[r.AgentID]; !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, r.AgentID)
 	}
-	h.resumes[r.AgentID] = r
+	old, had := h.resumes[r.AgentID]
+	cur := r.Clone()
+	cur.LastUpdated = h.now()
+	switch {
+	case had:
+		cur.Version = old.Version + 1
+	case cur.Version == 0:
+		cur.Version = 1
+	}
+	h.resumes[r.AgentID] = cur
+	h.reindexLocked(r.AgentID, old, cur)
 	return nil
 }
 
@@ -518,7 +554,7 @@ func (h *Hub) ResumeOf(agentID string) (Resume, error) {
 	if _, ok := h.passports[agentID]; !ok {
 		return Resume{}, fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
-	return h.resumes[agentID], nil
+	return h.resumes[agentID].Clone(), nil
 }
 
 // agentNameLocked resolves a participant id to its passport name ("" when
@@ -565,6 +601,9 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 	if adapter == nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("%w: no adapter registered for manifest %q@%s", ErrNotFound, manifest.Type, manifest.Version)
+	}
+	if mp, ok := adapter.(ManifestProvider); ok {
+		manifest = manifest.applyDefaults(mp.DefaultManifest())
 	}
 
 	// Pre-flight gate (arbiter): concurrency cap on the creator plus the
@@ -711,6 +750,7 @@ func (h *Hub) activate(channelID string) error {
 	if w, ok := h.waiters[channelID]; ok {
 		delete(h.waiters, channelID)
 		snapshot := *ch
+		snapshot.Manifest.cloneExtras()
 		w <- &snapshot
 	}
 	h.mu.Unlock()
@@ -777,6 +817,8 @@ type postAction struct {
 	// closeReason is set when the adapter requested a channel close; it
 	// runs after dispatch, outside the lock.
 	closeReason string
+	// pressure lists inbox high-water crossings to report before dispatch.
+	pressure []pressureEvent
 }
 
 // dispatchTarget is one resolved recipient (captured under the lock so
@@ -808,6 +850,7 @@ func (h *Hub) post(env Envelope) (Envelope, error) {
 	// handshake follow-ups (activate posts the opened envelope; a reject
 	// closes the channel and fails the create waiter).
 	if action.kind == "dispatch" {
+		h.firePressure(action.pressure)
 		h.dispatch(action.env, action.targets)
 	}
 	if action.closeReason != "" {
@@ -890,6 +933,10 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	if d := h.arbiter.AuthorizeSend(env, sender, senderRule, recipients); !d.Allowed {
 		return Envelope{}, denyErr(d)
 	}
+	// Rate limit and inbox capacity (substantive envelopes only).
+	if err := h.admitLocked(env, ch, sender, senderRule); err != nil {
+		return Envelope{}, err
+	}
 
 	// Adapter validate+fold. On error the state stays untouched and the
 	// envelope never reaches the WAL.
@@ -929,6 +976,7 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	action.kind = "dispatch"
 	action.env = env
 	action.targets = h.resolveTargetsLocked(ch, env)
+	action.pressure = h.countDispatchLocked(env, action.targets)
 
 	// Adapter-requested close runs after dispatch (Python parity): the
 	// closing envelope itself is appended directly by closeChannel.
@@ -1071,6 +1119,7 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 		delete(h.waiters, channelID)
 		if waiterErr == nil {
 			snapshot := *ch
+			snapshot.Manifest.cloneExtras()
 			w <- &snapshot
 		} else {
 			w <- nil
@@ -1099,6 +1148,7 @@ func (h *Hub) Channel(channelID string) (*ChannelHandle, error) {
 	if ch.Manifest.Knobs != nil {
 		out.Manifest.Knobs = cloneKnobs(ch.Manifest.Knobs)
 	}
+	out.Manifest.cloneExtras()
 	return &out, nil
 }
 
@@ -1112,6 +1162,7 @@ func (h *Hub) ListChannels() []*ChannelHandle {
 		cp.Participants = append([]Participant(nil), ch.Participants...)
 		cp.PendingAcks = append([]string(nil), ch.PendingAcks...)
 		cp.RejectedBy = append([]string(nil), ch.RejectedBy...)
+		cp.Manifest.cloneExtras()
 		out = append(out, &cp)
 	}
 	return out

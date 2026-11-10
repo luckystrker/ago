@@ -45,12 +45,10 @@ type HubArbiter interface {
 	// plus delegation depth over the explicit audience (broadcasts skip —
 	// protocol broadcasts address the creator too).
 	AuthorizeSend(env Envelope, sender Passport, senderRule Rule, recipients []Passport) Decision
-	// AuthorizeInbox gates a send per-recipient against inbox capacity.
-	// AGO-DEVIATION: the hub never consults this gate in the current
-	// subset — delivery inboxes live client-side (a bounded channel whose
-	// overflow drops) and the hub keeps no pending counter, so there is no
-	// count to consult with; the AGo Rule carries no inbox block either.
-	// The method exists so tenant arbiters keep the Python surface.
+	// AuthorizeInbox gates a substantive send per recipient against inbox
+	// capacity; currentPending is the hub's count of that recipient's
+	// unacknowledged envelopes (Hub.AckInbox). A Deny fails the whole send,
+	// before anything is recorded — build it with ErrInboxFull.
 	AuthorizeInbox(env Envelope, recipient Passport, recipientRule Rule, currentPending int) Decision
 	// AuthorizeDispatch gates per-recipient dispatch (inbound access). A
 	// Deny silently skips this recipient — the rest of the audience still
@@ -117,10 +115,20 @@ func (RuleBasedArbiter) AuthorizeSend(env Envelope, sender Passport, senderRule 
 	return Allow()
 }
 
-// AuthorizeInbox implements HubArbiter. The AGo Rule shape has no inbox
-// block, so the rule-based gate has nothing to compare against and always
-// allows (see the interface's AGO-DEVIATION note).
-func (RuleBasedArbiter) AuthorizeInbox(Envelope, Passport, Rule, int) Decision { return Allow() }
+// AuthorizeInbox implements HubArbiter: under the reject policy a recipient
+// at Rule.Inbox.MaxPending refuses further envelopes. The drop policies pass
+// — the recipient's queue applies them (see InboxBlock).
+func (RuleBasedArbiter) AuthorizeInbox(_ Envelope, recipient Passport, recipientRule Rule, currentPending int) Decision {
+	inbox := recipientRule.Inbox
+	if inbox.MaxPending <= 0 || inbox.EffectiveOverflow() != OverflowReject {
+		return Allow()
+	}
+	if currentPending >= inbox.MaxPending {
+		return Deny(fmt.Sprintf("recipient %q inbox full (%d/%d pending)",
+			recipient.Name, currentPending, inbox.MaxPending), ErrInboxFull)
+	}
+	return Allow()
+}
 
 // AuthorizeDispatch implements HubArbiter: the recipient's inbound globs
 // over the sender's name.
