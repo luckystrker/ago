@@ -4136,3 +4136,50 @@ Ports W1b-J's hub operations and client surface.
 
 Evidence: `network/{listener,lifecycle,query,checkpoint,client_ext,turns}_test.go`;
 the channel-feed drop counter is covered by `TestChannelFeedIsBoundedAndCountsDrops`.
+
+## D-105 — 2026-11-10 — acp: an ACP agent as an LLM provider (gap audit 2026-11-09, wave 2 — owner's choice)
+
+Python's `ACPConfig`/`ACPClient` (`ag2/acp/config.py`, `client.py`) let an agent
+use an external ACP agent (Claude Code, Codex, OpenCode, KiloCode) as its model.
+AGo had both ACP roles but no model provider on them; `docs/MIGRATION.md`
+wrongly implied `ACPClient` was ported. `acp.Config` closes that gap on top of
+the existing `Bridge` (no second client).
+
+- **Shape.** `acp.Config` is a `config.ModelConfig`; the subprocess starts
+  lazily, one ACP session per conversation stream; `session/prompt` per turn;
+  updates map to message chunks, reasoning, builtin tool call/result events,
+  `PlanEvent` and the mode/commands events; `PromptResponse.usage` becomes
+  `ModelResponse.Usage`; returned image/audio blocks become
+  `ModelResponse.Files` (Python `turn_files`); model selection uses
+  `session/set_config_option`. Presets mirror Python's argv/env exactly.
+- **Tools.** AGo tools reach the external agent through an in-process MCP host
+  bound to loopback, on an unguessable path, behind a Host/Origin check; calls
+  run through the run's event stream, so middleware and observers apply; the
+  host stops on `Close`. An agent without HTTP MCP capability yields
+  `ErrMCPCapability`.
+- **AGO-DEVIATION — local subprocess only.** Remote ACP configs
+  (`ACPRemoteConfig`, a non-loopback gateway) stay deferred (D-070).
+  `Config.Close` is required; Python's finalizer-based cleanup has no Go
+  counterpart.
+- **AGO-DEVIATION — text-only prompts and elicitation.** `Bridge` sends one text
+  block, so a non-text part fails with `ErrUnsupportedInput`; elicitation
+  reaches the human as plain text and the structured capability is not
+  advertised (extends D-052). A malformed base64 file block is dropped, where
+  Python yields a file with empty data.
+- **AGO-DEVIATION — switch names.** `DisableTerminal`/`DisableTools` replace
+  `allow_terminal`/`expose_tools` (default True) so the zero value is the useful
+  config; `Clone` still accepts the Python spellings.
+- **AGO-DEVIATION — `StartupTimeout`** bounds the handshake and `session/new`
+  (where a hang happens); in Python it bounds only the gateway start.
+- **Wire fix.** `MCPServer` now marshals in the real ACP shape (`type: "http"`,
+  headers/env as name/value lists) and still decodes the old map form;
+  `ServeConfig.MCPHTTP` is opt-in.
+- **Flake fix.** `ServeAgent` attaches its projection before the continuation
+  turn starts; `TestServeAgentStreamsAndContinues` failed ~1/600 under load
+  before, 2000 clean runs after.
+
+Verified by `acp/provider_test.go` (end-to-end against an `acp.Serve` fake
+subprocess: streamed text, tool round trip, usage, session reuse, no process
+after `Close`; crash → typed error) and two DeepSeek review rounds (163 mutants
+over five files, 2 equivalent survivors).
+
