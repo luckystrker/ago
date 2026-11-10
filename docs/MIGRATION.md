@@ -548,3 +548,27 @@ add them with `go get github.com/luckystrker/ago/contrib/<name>`.
 | `DockerSandbox` (`extensions/docker`) | `sandboxdocker.NewEnvironment(opts ...)` → `toolpacks.SandboxFactory`; `sandboxdocker.NewSandbox(cfg)`; options `WithHost`, `WithImage`, `WithEnvVars`, `WithTimeout`, `WithNetworkMode`, `WithMemLimit`, `WithCPUQuota`, `WithUser`, `WithAutoRemove`, `WithHostPath`, `WithWorkdir`, `WithMaxOutput`, `WithImageVariable`, `WithEnvVarsVariable`, `WithNetworkModeVariable` | Docker Engine API over the unix socket (`DOCKER_HOST`) or plain `tcp://` — no TLS/ssh; defaults network `none`, memory `512m`; output capped (default 100k characters); a `..` escape is refused |
 | `DaytonaSandbox` (`extensions/daytona`) | `sandboxdaytona.NewEnvironment(opts ...)` → `toolpacks.SandboxFactory`; `sandboxdaytona.NewSandbox(cfg)`; options `WithAPIKey`, `WithAPIURL`, `WithTarget`, `WithSnapshot`, `WithImage`, `WithEnvVars`, `WithResources(Resources)`, `WithTimeout`, `WithCreateTimeout`, `WithWorkdir`, `WithMaxOutput`, `WithPollInterval`, `WithHTTPClient`, `WithVariable(param, v)` | Key/URL from options or `DAYTONA_API_KEY`/`DAYTONA_API_URL`/`DAYTONA_TARGET`; sends `cwd` and per-call `envs` (Python sends neither); toolbox paths unverified against a live account |
 | `extensions/tenki`, NLIP, mi4afa, `compaction_verifier`, `tealtiger` | — | Not ported; the owner has not chosen them |
+
+### Protocols and network (D-116)
+
+| Python | Go | Differences |
+|---|---|---|
+| `list_tasks(config, context_id=, status=, page_size=, page_token=, history_length=)` → `ListedTasks` | `Client.TasksList(ctx, a2a.ListTasksParams{...}) (*ListTasksResult, error)` | JSON-RPC `tasks/list` or REST `GET /tasks`; the page token is an offset; `tasks`/`nextPageToken`/`pageSize`/`totalSize` |
+| `A2AServer(extended_card=, extended_card_modifier=)` | `ServerConfig.ExtendedCard`, `ServerConfig.ExtendedCardModifier(func(r *http.Request, card *AgentCard) (*AgentCard, error))` | The modifier receives the request (like `CardModifier`); JSON-RPC `agent/getAuthenticatedExtendedCard` + `GET /extendedAgentCard`; `Client.ExtendedCard(ctx)` |
+| `A2AServer(validate_input_modes=True)` | `ServerConfig.ValidateInputModes` + `ServerConfig.InputModesError()` | `NewServer` returns no error, so the card check is a separate method; media-type refusal on every message surface |
+| `A2ATaskAuthRequiredError` / `A2ATaskRejectedError` | `a2a.ErrTaskAuthRequired` / `a2a.ErrTaskRejected` (wrapped in the handler's error) | `auth-required` (non-terminal) and `rejected` (terminal); the answer is the Task record |
+| `guard.serve(agent, reader, writer)` / `guard_router` | built into `acp.Serve` (`acp/guard.go`) | No separate wrapper: a `_meta` collision → `-32602`, a notification is dropped |
+| `AuthMethodAgent` / `EnvVarAuthMethod` / `TerminalAuthMethod` | `acp.NewAgentAuthMethod` / `NewEnvVarAuthMethod` / `NewTerminalAuthMethod`, `acp.DeclaredAuth` | env-var/terminal validation is the application's (`Validate`); `StaticTokenAuth` is the `agent` kind |
+| `encrypted_signature_of` / `signature_event` / `restore_tool_call` | `agui.EncryptedSignatureOf` / `agui.SignatureEvent` / `agui.RestoreToolCall` | The signature lives in `ToolCallEvent.VendorMetadata[agui.ThoughtSignatureKey]` |
+| `is_same_provider` / `provider_of` | internal to `agui` (`agui/provider.go`) | The vendor tag (`google`) and the API name (`gemini`/`vertexai`) count as the same provider |
+| `STTTranslationConfig(model, api_key=)` | `live.OpenAITranslator{APIKey, Model, BaseURL, Client, PCMSampleRate, PCMChannels}` | `POST /audio/translations`, `response_format=text`; implements `Transcriber` |
+| `BudgetThresholds(max_tokens_per_task=, max_seconds_per_task=)` | `eval.BudgetThresholds{MaxTokensPerTask, MaxSecondsPerTask}` + `eval.WithBudgets` | Observational: `RunResult.BudgetViolations`; cases are not aborted |
+| `Suite(name=, source=)`, `Task(tags=, metadata=)` | `eval.WithSuiteName` / `WithSuiteSource`, `eval.Case.Tags` / `Metadata` | `Suite` is a slice of cases, so name/source travel as run options into `RunResult`; tags reach `CaseResult.Tags` |
+| `agent_judge(retries=, response_schema=Verdict)` | `eval.LLMJudge{StructuredOutput: true, Retries: n}` | Both opt-in (zero value = the old single plain call) |
+| `pairwise_judge(swap=False)` | `eval.Pairwise{SingleOrder: true}` | One judge call, no swap and no position-bias guard |
+| `parse_hub_urn(s)` | `network.ParseHubURN(s) (hubID, agentID string)`, `network.HubURN(hubID, agentID)` | A malformed URN → `("", s)` |
+| `AccessBlock.channel_types` | `network.Rule.ChannelTypes` (`Initiate`/`Accept`) | Enforced at `AuthorizeChannelOpen` (Python only declares it); empty = any type |
+| `LimitsBlock.max_concurrent_tasks` | `network.Rule.MaxConcurrentTasks` | Enforced on the first `ObserveTask` (`ErrAccessDenied`) |
+| `ContextEquals(key=, value=)` | `network.ContextEquals{Key, Value}` | Deep comparison; a missing key = nil |
+| `Transition(priority=)`, `TransitionGraph(default_target=)` | `network.Transition.Priority`, `network.TransitionGraph.DefaultTarget` | Lower priority first, ties in list order; a nil default → the old `no_transition` |
+| `peers(action="find", sort_by="name"\|"cost"\|"track_record")` | the same tool, `sort_by` argument | Peer summaries now carry `cost` and `observed_success_rate`; without `sort_by`, the hub order |

@@ -143,6 +143,7 @@ infrastructure rows in the table above.
 - **OpenAI Responses specifics** (D-060) — prompt-cache diagnostics events, reasoning-item
   replay, skills-into-shell merge, `websocket_base_url`. (Shell command/output delta chunks
   and the Decisions question-instruction parts were ported in wave 3 — D-110.)
+- **Closed in gap-audit wave 3, protocols and network (D-116):** a2a `tasks/list`, the authenticated extended card + `ExtendedCardModifier`, task states `auth-required`/`rejected`/`unknown`, `validate_input_modes` (`ServerConfig.ValidateInputModes`); acp `guard.py` (`_meta` collision guard) and the agent/env_var/terminal auth kinds (`DeclaredAuth`); agui Gemini thought-signature round trip (`REASONING_ENCRYPTED_VALUE`) and same-provider file handles; eval `BudgetThresholds`, suite name/source, case tags/metadata, judge `StructuredOutput`/`Retries`, pairwise `SingleOrder`; live `OpenAITranslator` (`STTTranslationConfig`); network `ParseHubURN`, `Rule.ChannelTypes`, `Rule.MaxConcurrentTasks`, `ContextEquals`, `Transition.Priority` + `DefaultTarget`, peers `sort_by`. File-id acceptance fixed: `AcceptsInput` now accepts a `FileIdInput` where Python's `_MEDIA` does. The table rows above may still list these as deferred; this line supersedes them.
 - **Closed in gap-audit wave 3:** Ollama streaming (D-022 → D-111), cron/cadence watches
   (D-024 → D-106), the middleware `metrics` builtin (D-013 → D-106), the MCP client rows of
   D-029 and the serving rows of D-058 (→ D-108/D-109), the Docker/Daytona sandboxes and the
