@@ -101,11 +101,6 @@ func acceptanceSet(rows ...[]mediaKey) map[mediaKey]bool {
 
 // acceptanceTable is _MEDIA transcribed from Python. File sources carry the ""
 // kind because a file id names content the provider resolves itself.
-//
-// AGO-DEVIATION: the openai-completions file row has no Go counterpart yet —
-// the shared chat engine rejects FileIdInput until the Files API is ported
-// (existing deviation on the mapper). The table keeps Python's row so the
-// framework side can be ported against the reference behavior.
 var acceptanceTable = map[InputDialect]map[mediaKey]bool{
 	DialectOpenAICompletions: acceptanceSet(
 		mediaKeys([]InputPosition{PositionUser}, []InputSource{SourceData, SourceURL}, events.BinaryImage),

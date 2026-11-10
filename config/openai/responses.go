@@ -592,23 +592,54 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 	acc := newTurnAcc()
 	err := client.PostJSONStream(ctx, url, headers, body, func(data []byte) error {
 		var ev struct {
-			Type    string          `json:"type"`
-			Delta   string          `json:"delta"`
-			Item    map[string]any  `json:"item"`
-			Resp    *streamResponse `json:"response"`
-			Message string          `json:"message"`
+			Type string `json:"type"`
+			// Delta is a string for text and command deltas but an object
+			// for shell output deltas, so it decodes per event type.
+			Delta        json.RawMessage `json:"delta"`
+			CommandIndex int             `json:"command_index"`
+			OutputIndex  int             `json:"output_index"`
+			ItemID       string          `json:"item_id"`
+			Item         map[string]any  `json:"item"`
+			Resp         *streamResponse `json:"response"`
+			Message      string          `json:"message"`
 		}
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("config/openai: decoding stream event: %w", err)
 		}
 		switch ev.Type {
 		case "response.output_text.delta":
-			if ev.Delta != "" {
-				acc.content.WriteString(ev.Delta)
-				if err := sendEvent(conv, &events.ModelMessageChunk{Content: ev.Delta}); err != nil {
+			delta, err := stringDelta(ev.Delta)
+			if err != nil {
+				return fmt.Errorf("config/openai: decoding text delta: %w", err)
+			}
+			if delta != "" {
+				acc.content.WriteString(delta)
+				if err := sendEvent(conv, &events.ModelMessageChunk{Content: delta}); err != nil {
 					return err
 				}
 			}
+		case "response.shell_call_command.delta":
+			delta, err := stringDelta(ev.Delta)
+			if err != nil {
+				return fmt.Errorf("config/openai: decoding shell command delta: %w", err)
+			}
+			return sendEvent(conv, &ShellCommandChunk{
+				Content: delta, CommandIndex: ev.CommandIndex, OutputIndex: ev.OutputIndex,
+			})
+		case "response.shell_call_output_content.delta":
+			var delta struct {
+				Stdout *string `json:"stdout"`
+				Stderr *string `json:"stderr"`
+			}
+			if len(ev.Delta) > 0 {
+				if err := json.Unmarshal(ev.Delta, &delta); err != nil {
+					return fmt.Errorf("config/openai: decoding shell output delta: %w", err)
+				}
+			}
+			return sendEvent(conv, &ShellOutputChunk{
+				CommandIndex: ev.CommandIndex, OutputIndex: ev.OutputIndex, ItemID: ev.ItemID,
+				Stdout: delta.Stdout, Stderr: delta.Stderr,
+			})
 		case "response.output_item.done":
 			// Builtin and reasoning events are emitted on Done so the item is
 			// fully populated (Added fires before a server-side tool ran).
@@ -657,6 +688,16 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 		resp.Message = msg
 	}
 	return resp, nil
+}
+
+// stringDelta decodes a string-valued delta; an absent delta is empty.
+func stringDelta(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var s string
+	err := json.Unmarshal(raw, &s)
+	return s, err
 }
 
 type streamResponse struct {
