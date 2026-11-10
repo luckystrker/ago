@@ -161,7 +161,7 @@ func TestExaAnswer(t *testing.T) {
 	}
 	_, cx := newTestContext()
 	ev := callTool(t, tk, cx, "exa_answer", `{"query":"capital of France?"}`)
-	if gotPath != "/answer" || gotBody != `{"query":"capital of France?","text":true}` {
+	if gotPath != "/answer" || gotBody != `{"query":"capital of France?","stream":false,"text":true}` {
 		t.Fatalf("request = %s %s", gotPath, gotBody)
 	}
 	want := `{"answer":"Paris","citations":[` +

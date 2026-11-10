@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/middleware"
@@ -23,6 +24,10 @@ const (
 	tinyfishIntegration = "ag2"
 	// tinyfishMaxURLs bounds one fetch call (Python parity: the SDK's 1-10 range).
 	tinyfishMaxURLs = 10
+	// tinyfishMaxRetries is the SDK's default retry count (_DEFAULT_MAX_RETRIES).
+	tinyfishMaxRetries = 2
+	// tinyfishTimeout is the SDK's default request bound (_DEFAULT_TIMEOUT, 600 s).
+	tinyfishTimeout = 600 * time.Second
 )
 
 // TinyFishSearchResult is one hit (Python parity:
@@ -90,6 +95,8 @@ type TinyFishSearchToolkit struct {
 	client  *http.Client
 	mw      []middleware.Middleware
 	params  *paramSet
+	// maxRetries is how many times a failed request is repeated after the first try.
+	maxRetries int
 }
 
 var _ tools.Tool = (*TinyFishSearchToolkit)(nil)
@@ -117,6 +124,20 @@ func WithTinyFishHTTPClient(c *http.Client) TinyFishOption {
 			return errNilOption("tinyfish", "http client")
 		}
 		t.client = c
+		return nil
+	}
+}
+
+// WithTinyFishMaxRetries sets how often a failed request is repeated after the
+// first try (Python parity: the SDK max_retries kwarg, default 2). Retried
+// failures are HTTP 408, 429 and 5xx plus connection and timeout errors, with
+// the SDK's exponential backoff (0.5 s doubling, capped at 8 s).
+func WithTinyFishMaxRetries(n int) TinyFishOption {
+	return func(t *TinyFishSearchToolkit) error {
+		if n < 0 {
+			return errOptionValue("tinyfish", "max_retries", "must not be negative")
+		}
+		t.maxRetries = n
 		return nil
 	}
 }
@@ -190,8 +211,9 @@ func WithTinyFishVariable(param, variable string) TinyFishOption {
 // is accepted: the key is then read from TINYFISH_API_KEY or the key variable.
 func NewTinyFishSearchToolkit(apiKey string, opts ...TinyFishOption) (*TinyFishSearchToolkit, error) {
 	t := &TinyFishSearchToolkit{
-		key:    apiCredential{key: apiKey, envVar: "TINYFISH_API_KEY"},
-		params: newParamSet(),
+		key:        apiCredential{key: apiKey, envVar: "TINYFISH_API_KEY"},
+		params:     newParamSet(),
+		maxRetries: tinyfishMaxRetries,
 	}
 	for _, opt := range opts {
 		if err := opt(t); err != nil {
@@ -292,6 +314,10 @@ func (t *TinyFishSearchToolkit) headers(key string) map[string]string {
 
 // search runs one Search request.
 func (t *TinyFishSearchToolkit) search(ctx context.Context, cx *agocontext.Context, query string) (TinyFishSearchResponse, error) {
+	if strings.TrimSpace(query) == "" {
+		// Python parity: the SDK raises on a blank query before sending anything.
+		return TinyFishSearchResponse{}, fmt.Errorf("%w: tinyfish: query must be a non-empty string", ErrRejected)
+	}
 	key, err := t.key.resolve(cx)
 	if err != nil {
 		return TinyFishSearchResponse{}, err
@@ -309,6 +335,8 @@ func (t *TinyFishSearchToolkit) search(ctx context.Context, cx *agocontext.Conte
 	data, err := httpRequest{
 		provider: "tinyfish",
 		client:   t.client,
+		timeout:  tinyfishTimeout,
+		retry:    t.retryPolicy(),
 		method:   http.MethodGet,
 		url:      t.productURL("search"),
 		query:    params,
@@ -376,6 +404,8 @@ func (t *TinyFishSearchToolkit) fetch(ctx context.Context, cx *agocontext.Contex
 	data, err := httpRequest{
 		provider: "tinyfish",
 		client:   t.client,
+		timeout:  tinyfishTimeout,
+		retry:    t.retryPolicy(),
 		method:   http.MethodPost,
 		url:      t.productURL("fetch"),
 		header:   t.headers(key),
@@ -418,4 +448,21 @@ func safeURL(raw string) bool {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	return scheme == "http" || scheme == "https"
+}
+
+// retryPolicy is the SDK's retry loop (_request in tinyfish async_.py): up to
+// max_retries+1 tries, repeating on 408, 429, any 5xx and transport errors,
+// waiting 0.5 s * 2^(failed-1) capped at 8 s between tries.
+func (t *TinyFishSearchToolkit) retryPolicy() retryPolicy {
+	return retryPolicy{
+		attempts: t.maxRetries + 1,
+		status: func(code int) bool {
+			return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests ||
+				(code >= 500 && code <= 599)
+		},
+		transport: true,
+		backoff: func(failed int) time.Duration {
+			return doublingBackoff(failed, 8*time.Second)
+		},
+	}
 }

@@ -127,6 +127,7 @@ func TestTinyFishFetchRejectsEmptyAndOversizedBatches(t *testing.T) {
 
 // TestTinyFishHTTPError asserts a non-2xx answer becomes the typed HTTP error.
 func TestTinyFishHTTPError(t *testing.T) {
+	fakeSleep(t) // the 502 is retried; do not wait out the SDK backoff
 	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		respondJSON(t, w, `{"error":"upstream"}`)
@@ -165,5 +166,70 @@ func TestTinyFishMembers(t *testing.T) {
 	if tk.Name() != "tinyfish_search_toolkit" || len(tk.Tools()) != 2 ||
 		tk.Tools()[0].Name() != "tinyfish_search" || tk.Tools()[1].Name() != "tinyfish_fetch" {
 		t.Fatalf("toolkit = %s with %v", tk.Name(), tk.Tools())
+	}
+}
+
+// TestTinyFishOptionValidation asserts which option arguments are rejected and
+// which valid ones are accepted, at construction and on the per-tool factories.
+func TestTinyFishOptionValidation(t *testing.T) {
+	bad := map[string]TinyFishOption{
+		"empty base":         WithTinyFishBaseURL(""),
+		"nil client":         WithTinyFishHTTPClient(nil),
+		"empty key variable": WithTinyFishAPIKeyVariable(""),
+		"nil middleware":     WithTinyFishMiddleware(nil),
+		"empty param":        WithTinyFishVariable("", "v"),
+		"empty variable":     WithTinyFishVariable("format", ""),
+		"both empty":         WithTinyFishVariable("", ""),
+		"negative retries":   WithTinyFishMaxRetries(-1),
+	}
+	for name, opt := range bad {
+		if _, err := NewTinyFishSearchToolkit("k", opt); err == nil {
+			t.Errorf("%s: option must be rejected at construction", name)
+		}
+		tk, err := NewTinyFishSearchToolkit("k")
+		if err != nil {
+			t.Fatalf("NewTinyFishSearchToolkit: %v", err)
+		}
+		if _, err := tk.Search(opt); err == nil {
+			t.Errorf("%s: option must be rejected by the Search factory", name)
+		}
+		if _, err := tk.Fetch(opt); err == nil {
+			t.Errorf("%s: option must be rejected by the Fetch factory", name)
+		}
+	}
+	good := []TinyFishOption{
+		WithTinyFishBaseURL("https://x.example"),
+		WithTinyFishHTTPClient(&http.Client{}),
+		WithTinyFishAPIKeyVariable("key"),
+		WithTinyFishMiddleware(countingMiddleware{}),
+		WithTinyFishVariable("format", "fmt_var"),
+		WithTinyFishMaxRetries(0),
+	}
+	for i, opt := range good {
+		if _, err := NewTinyFishSearchToolkit("k", opt); err != nil {
+			t.Errorf("valid option #%d rejected: %v", i, err)
+		}
+	}
+}
+
+// TestTinyFishFetchAcceptsTenURLs asserts the upper bound of the SDK's 1-10 range
+// is inclusive.
+func TestTinyFishFetchAcceptsTenURLs(t *testing.T) {
+	requests := 0
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		respondJSON(t, w, `{"results":[],"errors":[]}`)
+	})
+	tk, err := NewTinyFishSearchToolkit("k", WithTinyFishBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("NewTinyFishSearchToolkit: %v", err)
+	}
+	_, cx := newTestContext()
+	urls := make([]string, 10)
+	for i := range urls {
+		urls[i] = "https://x.example/"
+	}
+	if _, err := tk.fetch(callContext(cx), cx, urls); err != nil || requests != 1 {
+		t.Fatalf("fetch of 10 urls: err = %v, requests = %d", err, requests)
 	}
 }

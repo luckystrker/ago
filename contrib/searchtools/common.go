@@ -89,31 +89,101 @@ type httpRequest struct {
 	query    url.Values
 	header   map[string]string
 	body     any
+	// timeout bounds each attempt when client is nil; zero means DefaultTimeout.
+	timeout time.Duration
+	// retry is the provider SDK's retry policy; the zero value sends one attempt.
+	retry retryPolicy
 }
 
-// do sends the request and returns the response body. A non-2xx status becomes
-// an *HTTPError; transport and read failures wrap their cause.
+// retryPolicy mirrors the retry loop a provider SDK wraps around its HTTP calls.
+type retryPolicy struct {
+	// attempts is the total number of tries (the first one included); values
+	// below one mean a single try.
+	attempts int
+	// status reports whether an HTTP status is worth another try; nil retries none.
+	status func(code int) bool
+	// transport retries connection, timeout and body-read failures.
+	transport bool
+	// backoff is the wait after the failed-th try (1-based).
+	backoff func(failed int) time.Duration
+}
+
+// doublingBackoff is 0.5 s * 2^(failed-1), never above limit: the wait both
+// SDKs derive from their attempt number.
+func doublingBackoff(failed int, limit time.Duration) time.Duration {
+	// The shift is bounded so a large attempt number cannot overflow a Duration.
+	return min(500*time.Millisecond<<min(failed-1, 20), limit)
+}
+
+// defaultHTTPClient sends requests of a request without its own client; tests
+// replace it to observe the effective per-attempt deadline.
+var defaultHTTPClient = http.DefaultClient
+
+// sleep waits for d or until ctx ends (sleepContext); tests replace it to run
+// backoff instantly.
+var sleep = sleepContext
+
+// do sends the request and returns the response body, retrying as the request's
+// policy allows. A non-2xx status becomes an *HTTPError; transport and read
+// failures wrap their cause. The last failure is returned once the attempts run
+// out, and a cancelled ctx ends the call without further tries.
 func (r httpRequest) do(ctx stdctx.Context) ([]byte, error) {
 	endpoint := r.url
 	if len(r.query) > 0 {
 		endpoint += "?" + r.query.Encode()
 	}
-	var reader io.Reader
+	var payload []byte
 	if r.body != nil {
 		b, err := json.Marshal(r.body)
 		if err != nil {
 			return nil, fmt.Errorf("searchtools: %s: encode request: %w", r.provider, err)
 		}
-		reader = bytes.NewReader(b)
+		payload = b
 	}
 	if ctx == nil {
 		ctx = stdctx.Background()
 	}
+	for failed := 1; ; failed++ {
+		data, retryable, err := r.attempt(ctx, endpoint, payload)
+		if err == nil {
+			return data, nil
+		}
+		if !retryable || failed >= r.retry.attempts {
+			return nil, err
+		}
+		if serr := sleep(ctx, r.retry.backoff(failed)); serr != nil {
+			return nil, fmt.Errorf("searchtools: %s: request failed: %w", r.provider, serr)
+		}
+	}
+}
+
+// attempt sends the request once. retryable says whether the failure is one the
+// retry policy covers.
+func (r httpRequest) attempt(ctx stdctx.Context, endpoint string, payload []byte) (data []byte, retryable bool, err error) {
+	client := r.client
+	if client == nil {
+		client = defaultHTTPClient
+		limit := r.timeout
+		if limit <= 0 {
+			limit = DefaultTimeout
+		}
+		// AGO-DEVIATION: the SDKs retry an httpx timeout like any transport error
+		// (up to 3 tries); here ctx is the per-attempt deadline context, so a timed
+		// out attempt reads as a finished context and is not retried below. One call
+		// is thus bounded by a single timeout instead of up to 3 x 600 s plus backoff.
+		var cancel stdctx.CancelFunc
+		ctx, cancel = stdctx.WithTimeout(ctx, limit)
+		defer cancel()
+	}
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload)
+	}
 	req, err := http.NewRequestWithContext(ctx, r.method, endpoint, reader)
 	if err != nil {
-		return nil, fmt.Errorf("searchtools: %s: build request: %w", r.provider, err)
+		return nil, false, fmt.Errorf("searchtools: %s: build request: %w", r.provider, err)
 	}
-	if r.body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range r.header {
@@ -121,21 +191,19 @@ func (r httpRequest) do(ctx stdctx.Context) ([]byte, error) {
 			req.Header.Set(k, v)
 		}
 	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: DefaultTimeout}
-	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("searchtools: %s: request failed: %w", r.provider, err)
+		return nil, r.retry.transport && ctx.Err() == nil,
+			fmt.Errorf("searchtools: %s: request failed: %w", r.provider, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("searchtools: %s: read response: %w", r.provider, err)
+		return nil, r.retry.transport && ctx.Err() == nil,
+			fmt.Errorf("searchtools: %s: read response: %w", r.provider, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &HTTPError{
+		return nil, r.retry.status != nil && r.retry.status(resp.StatusCode), &HTTPError{
 			Provider:   r.provider,
 			Method:     r.method,
 			URL:        endpoint,
@@ -144,7 +212,7 @@ func (r httpRequest) do(ctx stdctx.Context) ([]byte, error) {
 			RetryAfter: resp.Header.Get("Retry-After"),
 		}
 	}
-	return data, nil
+	return data, false, nil
 }
 
 // decodeJSON unmarshals a response body into out.
