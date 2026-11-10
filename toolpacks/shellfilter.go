@@ -3,6 +3,7 @@ package toolpacks
 import (
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -308,8 +309,12 @@ func deniedPath(resolved, root string, patterns []string) string {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "Access denied: " + resolved
 	}
-	rel = filepath.ToSlash(rel)
-	name := filepath.Base(resolved)
+	return matchIgnore(resolved, filepath.ToSlash(rel), filepath.Base(resolved), patterns)
+}
+
+// matchIgnore applies the ignore patterns to one path inside the workdir: rel is
+// its slash-separated path relative to the workdir, name its base name.
+func matchIgnore(resolved, rel, name string, patterns []string) string {
 	for _, pattern := range patterns {
 		if strings.ContainsAny(pattern, "*?[") {
 			if matchGlob(pattern, rel) || matchGlob(pattern, name) {
@@ -325,6 +330,57 @@ func deniedPath(resolved, root string, patterns []string) string {
 		}
 	}
 	return ""
+}
+
+// checkIgnorePosix is checkIgnore for a workdir that lives inside a remote or
+// container sandbox: workdir is a POSIX path of that sandbox, not a host path,
+// so every token is normalised lexically with the path package — no symlink
+// resolution, no glob expansion, no host filesystem access, and the same result
+// on a Windows host (Python parity: check_ignore with a PurePosixPath, which
+// uses posixpath.normpath). An absolute token replaces the workdir, as
+// posixpath.join does.
+func checkIgnorePosix(command, workdir string, patterns []string) string {
+	if len(patterns) == 0 {
+		return ""
+	}
+	tokens, err := splitCommand(command)
+	if err != nil {
+		tokens = strings.Fields(command)
+	}
+	root := path.Clean(workdir)
+	for _, token := range tokens {
+		for _, candidate := range embeddedPaths(token) {
+			if candidate == "" {
+				continue
+			}
+			var resolved string
+			if path.IsAbs(candidate) {
+				resolved = path.Clean(candidate)
+			} else {
+				resolved = path.Clean(root + "/" + candidate)
+			}
+			if denied := deniedPosix(resolved, root, patterns); denied != "" {
+				return denied
+			}
+		}
+	}
+	return ""
+}
+
+// deniedPosix is deniedPath over POSIX paths.
+func deniedPosix(resolved, root string, patterns []string) string {
+	var rel string
+	switch {
+	case resolved == root:
+		rel = "."
+	case root == "/" && strings.HasPrefix(resolved, "/"):
+		rel = resolved[1:]
+	case strings.HasPrefix(resolved, root+"/"):
+		rel = resolved[len(root)+1:]
+	default:
+		return "Access denied: " + resolved
+	}
+	return matchIgnore(resolved, rel, path.Base(resolved), patterns)
 }
 
 // matchGlob matches s against a shell-style glob where "*" spans path

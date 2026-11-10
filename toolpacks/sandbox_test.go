@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -433,3 +434,103 @@ func TestAdapterTimeoutZeroValues(t *testing.T) {
 		t.Fatal("a negative timeout must be rejected")
 	}
 }
+
+// TestCheckIgnorePosix: the ignore guard over a remote sandbox's POSIX workdir
+// is purely lexical — escapes and patterns are refused, absolute tokens replace
+// the workdir (posixpath.join), and nothing is read from the host filesystem.
+func TestCheckIgnorePosix(t *testing.T) {
+	patterns := []string{".env", "*.pem", "secrets"}
+	for _, tc := range []struct {
+		cmd, workdir string
+		denied       string // "" = allowed
+	}{
+		{"cat notes.txt", "/workspace", ""},
+		{"cat sub/dir/ok.go", "/workspace", ""},
+		{"cat .env", "/workspace", "/workspace/.env"},
+		{"cat sub/.env", "/workspace", "/workspace/sub/.env"},
+		{"cat 'a b/../.env'", "/workspace", "/workspace/.env"},
+		{"cat key.pem", "/workspace", "/workspace/key.pem"},
+		{"cat deep/key.pem", "/workspace", "/workspace/deep/key.pem"},
+		{"ls secrets/x", "/workspace", "/workspace/secrets/x"},
+		{"prog --output=.env", "/workspace", "/workspace/.env"},
+		{"prog -o.env", "/workspace", "/workspace/.env"},
+		{"cat ../outside", "/workspace", "/outside"},
+		{"cat /etc/passwd", "/workspace", "/etc/passwd"},
+		{"cat /workspace/ok.txt", "/workspace", ""},
+		{"cat /workspace/../etc/passwd", "/workspace", "/etc/passwd"},
+		{"cat /workspace2/x", "/workspace", "/workspace2/x"}, // sibling prefix is not inside
+		{"cat ok.txt", "/workspace/", ""},                    // trailing slash normalised
+		{"cat x", "/", ""},
+		{"cat /etc/passwd", "/", ""},
+		{"cat unbalanced 'quote", "/workspace", ""}, // falls back to whitespace split
+	} {
+		got := checkIgnorePosix(tc.cmd, tc.workdir, patterns)
+		want := ""
+		if tc.denied != "" {
+			want = "Access denied: " + tc.denied
+		}
+		if got != want {
+			t.Errorf("checkIgnorePosix(%q, %q) = %q, want %q", tc.cmd, tc.workdir, got, want)
+		}
+	}
+	if got := checkIgnorePosix("cat .env", "/workspace", nil); got != "" {
+		t.Fatalf("no patterns must allow everything, got %q", got)
+	}
+}
+
+// TestShellIgnoreRemoteWorkdirDoesNotTouchHost: for a container-style factory
+// the guard checks the POSIX path lexically. The workdir here also exists on the
+// host with a symlink pointing outside; the host-mode guard would refuse it, the
+// remote one must not look at the host at all.
+func TestShellIgnoreRemoteWorkdirDoesNotTouchHost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses symlinks")
+	}
+	hostDir := t.TempDir()
+	if err := os.Symlink("/etc", filepath.Join(hostDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	f := newMemFactory()
+	remote := &workdirFactory{memFactory: f, dir: hostDir}
+	s, err := NewShellTool(WithShellSandbox(remote), WithShellAllowed("ls"), WithShellIgnore(".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cx := newTestContext()
+	if got := resultPartText(t, callTool(t, s, cx, s.Name(), `{"command":"ls link/passwd"}`)); got != "ls:link/passwd" {
+		t.Fatalf("remote guard = %q: the host symlink must not be resolved", got)
+	}
+	if got := resultPartText(t, callTool(t, s, cx, s.Name(), `{"command":"ls .env"}`)); !strings.HasPrefix(got, "Access denied:") {
+		t.Fatalf("remote guard must still refuse the ignored name, got %q", got)
+	}
+	if got := resultPartText(t, callTool(t, s, cx, s.Name(), `{"command":"ls ../x"}`)); !strings.HasPrefix(got, "Access denied:") {
+		t.Fatalf("remote guard must refuse an escape, got %q", got)
+	}
+
+	// A host-backed singleton keeps the physical check: the same symlink is refused.
+	local, err := NewLocalSandbox(WithLocalSandboxDir(hostDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, _ := NewSingletonFactory(local)
+	hs, err := NewShellTool(WithShellSandbox(sf), WithShellAllowed("ls"), WithShellIgnore(".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resultPartText(t, callTool(t, hs, cx, hs.Name(), `{"command":"ls link/passwd"}`)); !strings.HasPrefix(got, "Access denied:") {
+		t.Fatalf("host-backed guard must follow the symlink out of the workdir, got %q", got)
+	}
+	// A singleton over a sandbox without a host view is remote.
+	mem, _ := NewSingletonFactory(&memSandbox{files: map[string][]byte{}})
+	if hostBacked(mem) || !hostBacked(sf) || hostBacked(remote) {
+		t.Fatalf("hostBacked: mem=%v local=%v factory=%v", hostBacked(mem), hostBacked(sf), hostBacked(remote))
+	}
+}
+
+// workdirFactory is a non-singleton factory that reports a chosen workdir.
+type workdirFactory struct {
+	*memFactory
+	dir string
+}
+
+func (w *workdirFactory) Workdir() string { return w.dir }

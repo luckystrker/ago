@@ -53,7 +53,11 @@ type ShellTool struct {
 	// factory, when set by WithShellSandbox, runs every command in a pluggable
 	// backend instead of a local subprocess; localOnly names the options that
 	// only configure the local path and are therefore refused alongside it.
-	factory    SandboxFactory
+	factory SandboxFactory
+	// remoteFS is set when the factory's working directory is a path inside a
+	// remote or container sandbox rather than a host directory: the ignore
+	// filter then checks it lexically as a POSIX path (checkIgnorePosix).
+	remoteFS   bool
 	localOnly  []string
 	timeoutSet bool
 }
@@ -310,6 +314,7 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			_ = os.RemoveAll(s.workdir)
 		}
 		s.workdir, s.autoDir = factoryWorkdir(s.factory), false
+		s.remoteFS = !hostBacked(s.factory)
 	}
 	if s.readonly && s.allowed == nil {
 		s.allowed = ReadonlyCommands()
@@ -446,7 +451,11 @@ func (s *ShellTool) filter(command string, argv []string) string {
 		return fmt.Sprintf("Command not allowed: %q", command)
 	}
 	if s.ignore != nil {
-		if denied := checkIgnore(command, s.workdir, s.ignore); denied != "" {
+		check := checkIgnore
+		if s.remoteFS {
+			check = checkIgnorePosix
+		}
+		if denied := check(command, s.workdir, s.ignore); denied != "" {
 			return denied
 		}
 	}
