@@ -2,9 +2,14 @@ package searchtools
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/middleware"
@@ -23,6 +28,20 @@ const (
 	// firecrawlDefaultMaxAge is the cache age the SDK accepts by default, in
 	// milliseconds (4 hours).
 	firecrawlDefaultMaxAge = 14400000
+	// firecrawlTimeout bounds one request. AGO-DEVIATION: the SDK passes timeout=None
+	// to httpx, which disables the bound entirely; a hung connection would stall
+	// the turn forever, so the port caps it at the 600 s the sibling SDKs use (the
+	// API itself answers within its 300 s search/scrape timeout).
+	firecrawlTimeout = 600 * time.Second
+
+	// The scrape auto-resume bounds (SDK auto_resume.py): a document the server
+	// keeps processing is re-requested up to five times, waiting the server's
+	// hint clamped to 5 s..10 min (60 s without a hint), 20 min in total.
+	firecrawlResumeMaxAttempts  = 5
+	firecrawlResumeMinDelay     = 5 * time.Second
+	firecrawlResumeMaxDelay     = 10 * time.Minute
+	firecrawlResumeDefaultDelay = 60 * time.Second
+	firecrawlResumeMaxTotalWait = 20 * time.Minute
 )
 
 // FirecrawlSearchResult is one web hit (Python parity:
@@ -85,6 +104,8 @@ type FirecrawlToolkit struct {
 	client  *http.Client
 	mw      []middleware.Middleware
 	params  *paramSet
+	// maxRetries is the SDK's max_retries: the total number of tries per request.
+	maxRetries int
 }
 
 var _ tools.Tool = (*FirecrawlToolkit)(nil)
@@ -111,6 +132,20 @@ func WithFirecrawlHTTPClient(c *http.Client) FirecrawlOption {
 			return errNilOption("firecrawl", "http client")
 		}
 		t.client = c
+		return nil
+	}
+}
+
+// WithFirecrawlMaxRetries sets the number of tries per request (Python parity:
+// the SDK max_retries kwarg, default 3; the SDK counts it as total attempts, so
+// 0 and 1 both mean a single try). A try is repeated on HTTP 502 and on
+// connection or timeout errors, waiting 0.5 s doubling between tries.
+func WithFirecrawlMaxRetries(n int) FirecrawlOption {
+	return func(t *FirecrawlToolkit) error {
+		if n < 0 {
+			return errOptionValue("firecrawl", "max_retries", "must not be negative")
+		}
+		t.maxRetries = n
 		return nil
 	}
 }
@@ -421,6 +456,8 @@ func NewFirecrawlToolkit(apiKey string, opts ...FirecrawlOption) (*FirecrawlTool
 		key:     apiCredential{key: apiKey, envVar: "FIRECRAWL_API_KEY"},
 		baseURL: "https://api.firecrawl.dev",
 		params:  newParamSet(),
+		// Python parity: SDK max_retries default.
+		maxRetries: 3,
 	}
 	for _, opt := range opts {
 		if err := opt(t); err != nil {
@@ -501,26 +538,32 @@ func (t *FirecrawlToolkit) post(ctx context.Context, cx *agocontext.Context, pat
 		return nil, err
 	}
 	body["origin"] = firecrawlOrigin
+	// AGO-DEVIATION: the SDK's httpx client sends python-httpx/<ver> as the
+	// User-Agent; this port identifies itself as ago.
+	header := map[string]string{"Authorization": "Bearer " + key, "User-Agent": "ago-searchtools"}
 	data, err := httpRequest{
 		provider: "firecrawl",
 		client:   t.client,
+		timeout:  firecrawlTimeout,
+		retry:    t.retryPolicy(),
 		method:   http.MethodPost,
 		url:      t.baseURL + path,
-		header:   map[string]string{"Authorization": "Bearer " + key},
+		header:   header,
 		body:     body,
 	}.do(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// A 200 with success=false is a failed call (Python parity: handle_response_error).
+	// A 200 whose success flag is false or absent is a failed call (Python parity:
+	// `if not body.get("success")` -> handle_response_error).
 	var envelope struct {
-		Success *bool  `json:"success"`
+		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
 	if err := decodeJSON("firecrawl", data, &envelope); err != nil {
 		return nil, err
 	}
-	if envelope.Success != nil && !*envelope.Success {
+	if !envelope.Success {
 		return nil, fmt.Errorf("%w: firecrawl: %s", ErrAPIResponse, strings.TrimSpace(envelope.Error))
 	}
 	return data, nil
@@ -605,6 +648,10 @@ func (t *FirecrawlToolkit) searchScrapeOptions(cx *agocontext.Context) (map[stri
 
 // search runs one /v2/search request.
 func (t *FirecrawlToolkit) search(ctx context.Context, cx *agocontext.Context, query string) (FirecrawlSearchResponse, error) {
+	if strings.TrimSpace(query) == "" {
+		// Python parity: the SDK rejects a blank query before sending anything.
+		return FirecrawlSearchResponse{}, fmt.Errorf("%w: firecrawl: query cannot be empty", ErrRejected)
+	}
 	body := map[string]any{"query": query, "limit": firecrawlSearchLimit, "timeout": firecrawlSearchTimeout}
 	if v, ok, err := t.params.intParam(cx, "limit"); err != nil {
 		return FirecrawlSearchResponse{}, err
@@ -807,7 +854,7 @@ func firecrawlPage(item map[string]any, maxChars int) (string, *string, *string,
 	metadata, _ := item["metadata"].(map[string]any)
 	url := rawText(metadata, "url")
 	if url == "" {
-		url = rawText(metadata, "source_url")
+		url = metadataText(metadata, "sourceURL", "source_url")
 	}
 	var title, description, markdown *string
 	if v, ok := metadata["title"].(string); ok {
@@ -842,7 +889,8 @@ func (t *FirecrawlToolkit) scrape(ctx context.Context, cx *agocontext.Context, t
 	if err != nil {
 		return nil, err
 	}
-	body := map[string]any{"url": target}
+	// Python parity: the SDK sends url.strip().
+	body := map[string]any{"url": strings.TrimSpace(target)}
 	for k, v := range opts {
 		body[k] = v
 	}
@@ -852,7 +900,7 @@ func (t *FirecrawlToolkit) scrape(ctx context.Context, cx *agocontext.Context, t
 	} else if ok {
 		limitChars = v
 	}
-	data, err := t.post(ctx, cx, "/v2/scrape", body)
+	data, err := t.postScrape(ctx, cx, body)
 	if err != nil {
 		return nil, err
 	}
@@ -868,7 +916,7 @@ func (t *FirecrawlToolkit) scrape(ctx context.Context, cx *agocontext.Context, t
 		Links: []string{},
 	}
 	if out.URL == "" {
-		out.URL = rawText(metadata, "source_url")
+		out.URL = metadataText(metadata, "sourceURL", "source_url")
 	}
 	if out.URL == "" {
 		out.URL = target
@@ -882,7 +930,7 @@ func (t *FirecrawlToolkit) scrape(ctx context.Context, cx *agocontext.Context, t
 	if v, ok := metadata["language"].(string); ok {
 		out.Language = &v
 	}
-	if v, ok := rawInt(metadata["status_code"]); ok {
+	if v, ok := metadataStatusCode(metadata); ok {
 		out.StatusCode = &v
 	}
 	if v, ok := raw.Data["markdown"].(string); ok {
@@ -916,4 +964,128 @@ func firecrawlLinks(v any) []string {
 		}
 	}
 	return links
+}
+
+// metadataKey reads one DocumentMetadata field. The API answers in camelCase
+// (sourceURL, statusCode); the SDK maps those keys to snake_case and lets a
+// snake_case key through unchanged, so either spelling lands on the same field
+// and the camelCase one wins when both are present (it is written last).
+func metadataKey(metadata map[string]any, camel, snake string) (any, bool) {
+	if v, ok := metadata[camel]; ok {
+		return v, true
+	}
+	v, ok := metadata[snake]
+	return v, ok
+}
+
+// metadataText is the string value of a metadata field, or "" when absent or not
+// a string.
+func metadataText(metadata map[string]any, camel, snake string) string {
+	v, _ := metadataKey(metadata, camel, snake)
+	s, _ := v.(string)
+	return s
+}
+
+// metadataStatusCode is the scrape's HTTP status. The SDK coerces a numeric
+// string to an int.
+func metadataStatusCode(metadata map[string]any) (int, bool) {
+	v, ok := metadataKey(metadata, "statusCode", "status_code")
+	if !ok {
+		return 0, false
+	}
+	if s, isString := v.(string); isString {
+		n, err := strconv.Atoi(s)
+		return n, err == nil
+	}
+	return rawInt(v)
+}
+
+// retryPolicy is the SDK's POST loop (AsyncHttpClient.post): max_retries tries
+// in total, repeating on HTTP 502 and on transport errors, waiting
+// 0.5 s * 2^(failed-1) between tries. Every other status, including 5xx other
+// than 502, is returned to the caller at once.
+func (t *FirecrawlToolkit) retryPolicy() retryPolicy {
+	return retryPolicy{
+		attempts:  t.maxRetries,
+		status:    func(code int) bool { return code == http.StatusBadGateway },
+		transport: true,
+		backoff: func(failed int) time.Duration {
+			// AGO-DEVIATION: the SDK's backoff is unbounded; the wait is capped at
+			// one minute so a large max_retries cannot park a turn for hours.
+			return doublingBackoff(failed, time.Minute)
+		},
+	}
+}
+
+// postScrape sends the scrape request, re-issuing it while the server reports
+// that the document is still processing (Python parity: the auto-resume loop of
+// async_scrape.scrape). The retry attaches to the in-flight job on the server.
+func (t *FirecrawlToolkit) postScrape(ctx context.Context, cx *agocontext.Context, body map[string]any) ([]byte, error) {
+	resumes := 0
+	var waited time.Duration
+	for {
+		data, err := t.post(ctx, cx, "/v2/scrape", body)
+		if err == nil {
+			return data, nil
+		}
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			return nil, err
+		}
+		delay, ok := firecrawlResumeDelay(httpErr)
+		if !ok || resumes >= firecrawlResumeMaxAttempts || waited+delay > firecrawlResumeMaxTotalWait {
+			return nil, err
+		}
+		resumes++
+		waited += delay
+		if serr := sleep(ctx, delay); serr != nil {
+			return nil, fmt.Errorf("searchtools: firecrawl: request failed: %w", serr)
+		}
+	}
+}
+
+// firecrawlResumeDelay reports how long to wait before re-issuing a scrape that
+// answered 408 SCRAPE_TIMEOUT with details.state "processing_continues" (Python
+// parity: processing_continues_delay_s). The wait is the body's
+// retryAfterSeconds, else the Retry-After header, else 60 s, clamped to 5 s..10 min.
+func firecrawlResumeDelay(e *HTTPError) (time.Duration, bool) {
+	if e.StatusCode != http.StatusRequestTimeout {
+		return 0, false
+	}
+	var body struct {
+		Code    string `json:"code"`
+		Details struct {
+			State             string `json:"state"`
+			RetryAfterSeconds any    `json:"retryAfterSeconds"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal([]byte(e.Body), &body); err != nil {
+		return 0, false
+	}
+	if body.Code != "SCRAPE_TIMEOUT" || body.Details.State != "processing_continues" {
+		return 0, false
+	}
+	seconds := finiteSeconds(body.Details.RetryAfterSeconds)
+	if seconds == nil {
+		if n, err := strconv.ParseFloat(strings.TrimSpace(e.RetryAfter), 64); err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
+			seconds = &n
+		}
+	}
+	wait := firecrawlResumeDefaultDelay.Seconds()
+	if seconds != nil {
+		wait = *seconds
+	}
+	// Clamp in seconds before converting, so a huge hint cannot overflow a Duration.
+	wait = min(firecrawlResumeMaxDelay.Seconds(), max(firecrawlResumeMinDelay.Seconds(), wait))
+	return time.Duration(wait * float64(time.Second)), true
+}
+
+// finiteSeconds is a JSON number as a float, or nil for anything else (a JSON
+// true is not one second).
+func finiteSeconds(v any) *float64 {
+	n, ok := v.(float64)
+	if !ok || math.IsInf(n, 0) || math.IsNaN(n) {
+		return nil
+	}
+	return &n
 }

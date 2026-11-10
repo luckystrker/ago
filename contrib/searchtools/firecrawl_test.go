@@ -111,7 +111,7 @@ func TestFirecrawlScrape(t *testing.T) {
 			"html":"<h1>Page</h1>",
 			"links":["https://a.example/","https://b.example/"],
 			"metadata":{"url":"https://page.example/final","title":"Page","description":"D",
-				"language":"en","status_code":200}
+				"language":"en","statusCode":200}
 		}}`)
 	})
 	tk, err := NewFirecrawlToolkit("k", WithFirecrawlBaseURL(srv.URL),

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/middleware"
@@ -14,6 +15,10 @@ import (
 // exaDefaultChars is the text budget the Exa SDK asks for when the caller names
 // no content options (exa-py DEFAULT_MAX_CHARACTERS).
 const exaDefaultChars = 10000
+
+// exaTimeout is the request bound exa-py gives its async HTTP client (600 s); a
+// deep search can run far past the 60 s DefaultTimeout.
+const exaTimeout = 600 * time.Second
 
 // apiKey is one provider credential: the constructor value, the name of a
 // conversation variable overriding it per call, and the environment fallback the
@@ -511,6 +516,7 @@ func (t *ExaToolkit) search(ctx context.Context, cx *agocontext.Context, query s
 	data, err := httpRequest{
 		provider: "exa",
 		client:   t.client,
+		timeout:  exaTimeout,
 		method:   http.MethodPost,
 		url:      t.baseURL + "/search",
 		header:   t.headers(key),
@@ -611,6 +617,7 @@ func (t *ExaToolkit) findSimilar(ctx context.Context, cx *agocontext.Context, ta
 	data, err := httpRequest{
 		provider: "exa",
 		client:   t.client,
+		timeout:  exaTimeout,
 		method:   http.MethodPost,
 		url:      t.baseURL + "/findSimilar",
 		header:   t.headers(key),
@@ -631,6 +638,7 @@ func (t *ExaToolkit) getContents(ctx context.Context, cx *agocontext.Context, ur
 	data, err := httpRequest{
 		provider: "exa",
 		client:   t.client,
+		timeout:  exaTimeout,
 		method:   http.MethodPost,
 		url:      t.baseURL + "/contents",
 		header:   t.headers(key),
@@ -674,10 +682,13 @@ func (t *ExaToolkit) answer(ctx context.Context, cx *agocontext.Context, query s
 	data, err := httpRequest{
 		provider: "exa",
 		client:   t.client,
+		timeout:  exaTimeout,
 		method:   http.MethodPost,
 		url:      t.baseURL + "/answer",
 		header:   t.headers(key),
-		body:     map[string]any{"query": query, "text": true},
+		// exa-py's answer() keeps its stream=False default in the options dict, so the
+		// SDK body always carries "stream":false next to the query and text flag.
+		body: map[string]any{"query": query, "stream": false, "text": true},
 	}.do(ctx)
 	if err != nil {
 		return ExaAnswerResult{}, err
