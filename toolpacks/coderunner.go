@@ -53,6 +53,7 @@ type CodeRunner struct {
 	languages  []string
 	runners    map[string]LanguageRunner
 	pythonBin  string
+	middleware []middleware.Middleware
 	tool       *tools.FunctionTool
 	sandbox    localSandbox
 }
@@ -238,6 +239,22 @@ func WithCodePythonBin(bin string) CodeRunnerOption {
 	}
 }
 
+// WithCodeRunnerMiddleware adds tool-scoped middleware to the run_code tool,
+// the Go spelling of the Python tool's middleware= kwarg. The first entry is
+// the outermost layer of the tool's own chain; agent middleware still wraps it
+// from outside.
+func WithCodeRunnerMiddleware(mw ...middleware.Middleware) CodeRunnerOption {
+	return func(r *CodeRunner) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: code runner middleware must not be nil")
+			}
+		}
+		r.middleware = append(r.middleware, mw...)
+		return nil
+	}
+}
+
 // NewLocalCodeRunner builds the run_code tool: snippets execute in a
 // (non-isolated) local working directory through the platform interpreter —
 // python -c, bash -c, or a node script file. The result carries stdout and
@@ -284,7 +301,7 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 	fn := func(args codeArgs, cx *agocontext.Context) (string, error) {
 		return r.run(cx, args.Code, args.Language)
 	}
-	ft, err := tools.NewFunctionTool(r.toolName, description, fn)
+	ft, err := tools.NewFunctionTool(r.toolName, description, fn, tools.WithMiddleware(r.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: code runner: %w", err)
 	}

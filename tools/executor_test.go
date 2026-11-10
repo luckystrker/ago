@@ -243,10 +243,25 @@ func TestExecutorToolNotFoundFallback(t *testing.T) {
 func TestExecutorHitlFailureAbandonsBatchAndPropagates(t *testing.T) {
 	s, cx := newTestContext() // no hitl hook: every request fails
 	rec := newCollector(s)
+	// Python's gather cancels the sibling tasks on the first HumanInputError, so
+	// a sibling cancelled before its own send never produces a ToolCallEvent:
+	// "one call event per call in the batch" is not a contract. The batch is
+	// still owed no result. To assert the call events that did happen without a
+	// race, make the failing call wait until the sibling has entered its
+	// execution; then both call events are sent before the hitl failure, and
+	// the sibling is still in flight when the batch is abandoned.
+	siblingStarted := make(chan struct{})
+	var once sync.Once
 	ftAsk := mustFunctionTool(t, "ask", "", func(a struct{}, cx *agocontext.Context) (string, error) {
+		select {
+		case <-siblingStarted:
+		case <-time.After(5 * time.Second):
+			t.Error("sibling never started")
+		}
 		return cx.Input(stdcontext.Background(), "question?", 0)
 	})
 	ftSibling := mustFunctionTool(t, "sibling", "", func() string {
+		once.Do(func() { close(siblingStarted) })
 		time.Sleep(30 * time.Millisecond)
 		return "ok"
 	})
