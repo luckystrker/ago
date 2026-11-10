@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -15,46 +16,77 @@ import (
 )
 
 // resourceCap bounds how many bundled resources one skill advertises (Python
-// parity: SkillLoader _RESOURCE_CAP).
+// parity: SkillLoader _RESOURCE_CAP). Discovery stops scanning once the cap is
+// reached and flags the skill as truncated.
 const resourceCap = 50
 
-// skill is one discovered skill directory (Python parity:
-// skills.skill_types.Skill, abbreviated to the fields the toolkit surfaces).
-type skill struct {
-	name        string
-	description string
-	dir         string
-	resources   []string // paths relative to the skill directory; SKILL.md excluded
+// skillNamePattern is the agentskills.io name rule: lowercase alphanumeric
+// words joined by single hyphens (Python parity: SkillLoader._SKILL_NAME_RE).
+var skillNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// SkillInfo is one discovered skill: its metadata plus where it lives
+// (Python parity: skills.skill_types.Skill / SkillMetadata, flattened to the
+// fields the toolkit surfaces).
+type SkillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Location    string `json:"location"`
+	// Full frontmatter, retained for Go callers; the list_skills wire shape
+	// stays name + description + location (Python parity: discover_skills).
+	Version       string            `json:"-"`
+	License       string            `json:"-"`
+	Compatibility string            `json:"-"`
+	AllowedTools  string            `json:"-"`
+	Metadata      map[string]string `json:"-"`
+	Resources     []string          `json:"-"`
+	// ResourcesTruncated reports that scanning stopped at resourceCap.
+	ResourcesTruncated bool `json:"-"`
 }
 
-// SkillsToolkit loads agentskills.io-style local skills from one directory and
-// exposes them as tools (Python parity: ag2/tools/skills/toolkit.py
-// SkillsToolkit over a single LocalRuntime — abbreviated: list, load and
-// resource read; the script runner and the multi-runtime delegation chain are
-// deferred, see docs/DECISIONS.md).
+// SkillRuntime serves skills from one backing store (a directory, memory, or a
+// future remote store). The toolkit and the plugin read through this interface.
+type SkillRuntime interface {
+	// Discover returns the skills sorted by name.
+	Discover() []SkillInfo
+	// Load returns the model-ready skill body (frontmatter stripped, the
+	// resource list wrapped around it).
+	Load(ctx *agocontext.Context, name string) (string, error)
+	// ReadResource returns one bundled resource, confined to the skill.
+	ReadResource(ctx *agocontext.Context, name, resource string) (string, error)
+}
+
+// skill is one discovered local skill directory.
+type skill struct {
+	info SkillInfo
+	dir  string
+}
+
+// LocalSkillRuntime loads agentskills.io-style skills from one directory
+// (Python parity: skills.runtime.local.LocalRuntime over SkillLoader in lenient
+// mode).
 //
 // Each skill lives in <dir>/<name>/SKILL.md with a `---` frontmatter block
-// carrying at least name and description (a missing name falls back to the
-// directory name). Discovery happens at construction; the file system is read
-// again per call for bodies and resources, so the toolkit is safe for
-// concurrent use.
-type SkillsToolkit struct {
+// carrying at least name and description. Discovery happens at construction:
+// a skill without a description is skipped, a missing name falls back to the
+// directory name (lenient mode), and the full frontmatter — version, license,
+// compatibility, allowed-tools, metadata — is retained on SkillInfo. The file
+// system is read again per call for bodies and resources, so the runtime is
+// safe for concurrent use.
+type LocalSkillRuntime struct {
 	dir    string
-	skills []skill
-	tk     *tools.Toolkit
+	skills []*skill
 }
 
-var _ tools.Tool = (*SkillsToolkit)(nil)
+var _ SkillRuntime = (*LocalSkillRuntime)(nil)
 
-// NewSkillsToolkit builds the skills_toolkit from the skills directory. The
-// directory must exist; subdirectories without a SKILL.md are skipped (Python
-// parity: lenient discovery).
-func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
+// NewLocalSkillRuntime scans dir for skills. The directory must exist;
+// subdirectories without a SKILL.md are not skills.
+func NewLocalSkillRuntime(dir string) (*LocalSkillRuntime, error) {
 	abs, err := absDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: skills dir: %w", err)
 	}
-	st := &SkillsToolkit{dir: abs}
+	rt := &LocalSkillRuntime{dir: abs}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: skills dir: %w", err)
@@ -68,24 +100,165 @@ func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
 		if err != nil {
 			continue // not a skill directory
 		}
-		meta := parseFrontmatter(string(raw))
-		name := meta["name"]
+		text := string(raw)
+		fm := parseFrontmatterDocument(text)
+		// Lenient discovery: only a missing/empty description is a reason to
+		// skip. A name mismatch or an unexpected charset is tolerated so skills
+		// authored for other clients still load (Python parity:
+		// SkillLoader._validate_lenient).
+		if strings.TrimSpace(fm.values["description"]) == "" {
+			continue
+		}
+		name := fm.values["name"]
 		if name == "" {
-			// AGO-DEVIATION: Python's lenient loader skips a skill whose
-			// frontmatter name is missing or malformed; AGo falls back to the
-			// directory name so a hand-authored skill still loads (the
-			// agentskills.io name rules are not enforced).
 			name = e.Name()
 		}
-		s := skill{name: name, description: meta["description"], dir: skillDir}
-		s.resources = listResources(skillDir)
-		st.skills = append(st.skills, s)
+		resources, truncated := listResources(skillDir)
+		info := SkillInfo{
+			Name:               name,
+			Description:        fm.values["description"],
+			Location:           skillDir,
+			Version:            fm.values["version"],
+			License:            fm.values["license"],
+			Compatibility:      fm.values["compatibility"],
+			AllowedTools:       fm.values["allowed-tools"],
+			Metadata:           fm.metadata,
+			Resources:          resources,
+			ResourcesTruncated: truncated,
+		}
+		rt.skills = append(rt.skills, &skill{
+			info: info,
+			dir:  skillDir,
+		})
 	}
-	sort.Slice(st.skills, func(i, j int) bool { return st.skills[i].name < st.skills[j].name })
+	sort.Slice(rt.skills, func(i, j int) bool { return rt.skills[i].info.Name < rt.skills[j].info.Name })
+	return rt, nil
+}
+
+// Dir returns the scanned directory.
+func (rt *LocalSkillRuntime) Dir() string { return rt.dir }
+
+// Discover returns the skills sorted by name.
+func (rt *LocalSkillRuntime) Discover() []SkillInfo {
+	out := make([]SkillInfo, 0, len(rt.skills))
+	for _, s := range rt.skills {
+		out = append(out, s.info)
+	}
+	return out
+}
+
+// find returns the named skill.
+func (rt *LocalSkillRuntime) find(name string) (*skill, error) {
+	for _, s := range rt.skills {
+		if s.info.Name == name {
+			return s, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: skill %q not found", tools.ErrNotFound, name)
+}
+
+// Load returns the model-ready SKILL.md body (Python parity:
+// LocalRuntime._read + _wrap_skill_content — identifying tags, the base
+// directory and the resource list around the frontmatter-stripped body).
+func (rt *LocalSkillRuntime) Load(_ *agocontext.Context, name string) (string, error) {
+	s, err := rt.find(name)
+	if err != nil {
+		return "", err
+	}
+	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, "SKILL.md"))
+	if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		return "", err
+	}
+	body := stripFrontmatter(string(raw))
+	lines := []string{
+		fmt.Sprintf("<skill_content name=%q>", s.info.Name),
+		strings.TrimSpace(body),
+		"",
+		"Skill directory: " + s.dir,
+		"Relative paths in this skill are relative to the skill directory.",
+	}
+	if len(s.info.Resources) > 0 {
+		lines = append(lines, "<skill_resources>")
+		for _, r := range s.info.Resources {
+			lines = append(lines, "  <file>"+r+"</file>")
+		}
+		lines = append(lines, "</skill_resources>")
+	}
+	lines = append(lines, "</skill_content>")
+	return strings.Join(lines, "\n"), nil
+}
+
+// ReadResource returns one bundled resource, confined to the skill directory
+// (Python parity: LocalRuntime._read_resource, abbreviated — no size cap beyond
+// the generic output truncation of the tool result).
+func (rt *LocalSkillRuntime) ReadResource(_ *agocontext.Context, name, resource string) (string, error) {
+	s, err := rt.find(name)
+	if err != nil {
+		return "", err
+	}
+	if resource == "" {
+		return "", errors.New("resource path must not be empty")
+	}
+	clean := filepath.Clean(filepath.FromSlash(resource))
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("resource %q escapes the skill directory", resource)
+	}
+	known := false
+	for _, r := range s.info.Resources {
+		if r == filepath.ToSlash(clean) {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return "", fmt.Errorf("resource %q not found in %s", resource, s.dir)
+	}
+	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, clean))
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(target)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// SkillsToolkit loads skills from one runtime and exposes them as tools
+// (Python parity: ag2/tools/skills/toolkit.py SkillsToolkit over a single
+// SkillRuntime — abbreviated: list, load and resource read; the script runner
+// and the multi-runtime delegation chain are deferred, see docs/DECISIONS.md).
+type SkillsToolkit struct {
+	rt SkillRuntime
+	tk *tools.Toolkit
+}
+
+var _ tools.Tool = (*SkillsToolkit)(nil)
+
+// NewSkillsToolkit builds the skills_toolkit from the skills directory.
+func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
+	rt, err := NewLocalSkillRuntime(dir)
+	if err != nil {
+		return nil, err
+	}
+	return NewSkillsToolkitFromRuntime(rt)
+}
+
+// NewSkillsToolkitFromRuntime builds the skills_toolkit over any SkillRuntime
+// (a LocalSkillRuntime, a MemoryRuntime, or a custom store).
+func NewSkillsToolkitFromRuntime(rt SkillRuntime) (*SkillsToolkit, error) {
+	if rt == nil {
+		return nil, errors.New("toolpacks: skills runtime must not be nil")
+	}
+	st := &SkillsToolkit{rt: rt}
 
 	listSkills, err := tools.NewFunctionTool("list_skills",
 		"List available local skills with name and short description.",
-		func() []skillInfo { return st.catalog() })
+		func() []SkillInfo { return st.rt.Discover() })
 	if err != nil {
 		return nil, err
 	}
@@ -93,8 +266,8 @@ func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
 		"Load the full SKILL.md content for a specific skill.",
 		func(args struct {
 			Name string `json:"name" agschema:"description=Skill name returned by list_skills,required"`
-		}) (string, error) {
-			return st.load(args.Name)
+		}, cx *agocontext.Context) (string, error) {
+			return st.rt.Load(cx, args.Name)
 		},
 		tools.WithToolSchema(stringEnumSchema(
 			"name", "Skill name returned by list_skills.", st.names(), nil)))
@@ -106,8 +279,8 @@ func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
 		func(args struct {
 			Name     string `json:"name" agschema:"description=Skill name returned by list_skills,required"`
 			Resource string `json:"resource" agschema:"description=Resource path relative to the skill directory,required"`
-		}) (string, error) {
-			return st.readResource(args.Name, args.Resource)
+		}, cx *agocontext.Context) (string, error) {
+			return st.rt.ReadResource(cx, args.Name, args.Resource)
 		},
 		tools.WithToolSchema(stringEnumSchema("name", "Skill name returned by list_skills.", st.names(),
 			&enumField{
@@ -126,110 +299,14 @@ func NewSkillsToolkit(dir string) (*SkillsToolkit, error) {
 	return st, nil
 }
 
-// skillInfo is one catalog entry (Python parity: discover_skills rows).
-type skillInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Location    string `json:"location"`
-}
-
-// catalog returns the skill list sorted by name.
-func (st *SkillsToolkit) catalog() []skillInfo {
-	out := make([]skillInfo, 0, len(st.skills))
-	for _, s := range st.skills {
-		out = append(out, skillInfo{Name: s.name, Description: s.description, Location: s.dir})
-	}
-	return out
-}
-
 // names lists the known skill names (the enum constraint of the name argument).
 func (st *SkillsToolkit) names() []string {
-	out := make([]string, 0, len(st.skills))
-	for _, s := range st.skills {
-		out = append(out, s.name)
+	infos := st.rt.Discover()
+	out := make([]string, 0, len(infos))
+	for _, s := range infos {
+		out = append(out, s.Name)
 	}
 	return out
-}
-
-// find returns the named skill.
-func (st *SkillsToolkit) find(name string) (skill, error) {
-	for _, s := range st.skills {
-		if s.name == name {
-			return s, nil
-		}
-	}
-	return skill{}, fmt.Errorf("%w: skill %q not found", tools.ErrNotFound, name)
-}
-
-// load returns the model-ready SKILL.md body (Python parity:
-// LocalRuntime._read + _wrap_skill_content — identifying tags, the base
-// directory and the resource list around the frontmatter-stripped body).
-func (st *SkillsToolkit) load(name string) (string, error) {
-	s, err := st.find(name)
-	if err != nil {
-		return "", err
-	}
-	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, "SKILL.md"))
-	if err != nil {
-		return "", err
-	}
-	raw, err := os.ReadFile(target)
-	if err != nil {
-		return "", err
-	}
-	body := stripFrontmatter(string(raw))
-	lines := []string{
-		fmt.Sprintf("<skill_content name=%q>", s.name),
-		strings.TrimSpace(body),
-		"",
-		"Skill directory: " + s.dir,
-		"Relative paths in this skill are relative to the skill directory.",
-	}
-	if len(s.resources) > 0 {
-		lines = append(lines, "<skill_resources>")
-		for _, r := range s.resources {
-			lines = append(lines, "  <file>"+r+"</file>")
-		}
-		lines = append(lines, "</skill_resources>")
-	}
-	lines = append(lines, "</skill_content>")
-	return strings.Join(lines, "\n"), nil
-}
-
-// readResource returns one bundled resource, confined to the skill directory
-// (Python parity: LocalRuntime._read_resource, abbreviated — no size cap beyond
-// the generic output truncation of the tool result).
-func (st *SkillsToolkit) readResource(name, resource string) (string, error) {
-	s, err := st.find(name)
-	if err != nil {
-		return "", err
-	}
-	if resource == "" {
-		return "", errors.New("resource path must not be empty")
-	}
-	clean := filepath.Clean(filepath.FromSlash(resource))
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
-		return "", fmt.Errorf("resource %q escapes the skill directory", resource)
-	}
-	known := false
-	for _, r := range s.resources {
-		if r == filepath.ToSlash(clean) {
-			known = true
-			break
-		}
-	}
-	if !known {
-		return "", fmt.Errorf("resource %q not found in %s", resource, s.dir)
-	}
-	target, err := resolveWithinDir(s.dir, filepath.Join(s.dir, clean))
-	if err != nil {
-		return "", err
-	}
-	b, err := os.ReadFile(target)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
 // resolveWithinDir resolves path — already lexically confined to dir — to its
@@ -256,12 +333,20 @@ func resolveWithinDir(dir, path string) (string, error) {
 	return real, nil
 }
 
-// parseFrontmatter extracts `key: value` lines from a `---`-fenced block (the
-// YAML subset the toolkit reads: plain scalars; quoting is stripped). An absent
-// or unparsable block yields an empty map — the caller decides what is required.
-func parseFrontmatter(text string) map[string]string {
+// frontmatter is the parsed `---` block of a SKILL.md: plain scalars plus the
+// nested `metadata:` mapping (the YAML subset the loader understands).
+type frontmatter struct {
+	values            map[string]string
+	metadata          map[string]string
+	metadataIsMapping bool
+}
+
+// parseFrontmatterDocument extracts the frontmatter block: `key: value` pairs,
+// with indented lines under `metadata:` collected as a mapping (Python parity:
+// loader.parse_frontmatter for the subset; quoting is stripped).
+func parseFrontmatterDocument(text string) frontmatter {
+	out := frontmatter{values: map[string]string{}, metadata: map[string]string{}}
 	text = strings.TrimPrefix(text, "\uFEFF") // UTF-8 BOM (Python parity)
-	out := map[string]string{}
 	if !strings.HasPrefix(text, "---") {
 		return out
 	}
@@ -270,17 +355,83 @@ func parseFrontmatter(text string) map[string]string {
 		return out
 	}
 	block := text[3 : 3+end]
+	parent := ""
 	for _, line := range strings.Split(block, "\n") {
-		line = strings.TrimSpace(line)
-		key, value, found := strings.Cut(line, ":")
-		if !found || key == "" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, ":") {
 			continue
 		}
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		key, value, _ := strings.Cut(trimmed, ":")
+		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		value = strings.Trim(value, `"'`)
-		out[strings.TrimSpace(key)] = value
+		if key == "" {
+			continue
+		}
+		if indent > 0 && parent == "metadata" {
+			out.metadata[key] = value
+			out.metadataIsMapping = true
+			continue
+		}
+		parent = key
+		out.values[key] = value
+		if key == "metadata" {
+			out.metadataIsMapping = value == ""
+		}
 	}
 	return out
+}
+
+// parseFrontmatter extracts the plain `key: value` fields (the historical
+// helper; nested metadata is available through parseFrontmatterDocument).
+func parseFrontmatter(text string) map[string]string {
+	return parseFrontmatterDocument(text).values
+}
+
+// ValidateSkillMetadata applies the agentskills.io metadata rules to the
+// contents of one SKILL.md file (Python parity:
+// SkillLoader.validate_skill_metadata, used by the install path). The lenient
+// local discovery only requires a description; this is the strict gate for
+// callers that install or ship skills.
+func ValidateSkillMetadata(dirName, text string) error {
+	return validateSkillMetadataStrict(dirName, parseFrontmatterDocument(text))
+}
+
+// validateSkillMetadataStrict applies the agentskills.io metadata rules
+// (Python parity: SkillLoader.validate_skill_metadata). The lenient local
+// runtime only requires a description; this validator is the strict gate an
+// install path would use.
+func validateSkillMetadataStrict(dirName string, fm frontmatter) error {
+	if _, ok := fm.values["name"]; !ok {
+		return fmt.Errorf("skill %q is missing required frontmatter field: name", dirName)
+	}
+	description, ok := fm.values["description"]
+	if !ok {
+		return fmt.Errorf("skill %q is missing required frontmatter field: description", dirName)
+	}
+	name := fm.values["name"]
+	if len(name) < 1 || len(name) > 64 {
+		return fmt.Errorf("invalid skill name %q: expected length 1-64", name)
+	}
+	if !skillNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid skill name %q: expected lowercase alnum and single hyphens", name)
+	}
+	if name != dirName {
+		return fmt.Errorf("skill name %q must match directory name %q", name, dirName)
+	}
+	if len(description) < 1 || len(description) > 1024 {
+		return fmt.Errorf("invalid description for %q: expected length 1-1024", name)
+	}
+	if compatibility, ok := fm.values["compatibility"]; ok && compatibility != "" {
+		if len(compatibility) < 1 || len(compatibility) > 500 {
+			return fmt.Errorf("invalid compatibility for %q: expected length 1-500", name)
+		}
+	}
+	if _, ok := fm.values["metadata"]; ok && !fm.metadataIsMapping {
+		return fmt.Errorf("invalid metadata for %q: expected mapping", name)
+	}
+	return nil
 }
 
 // stripFrontmatter returns the markdown body after the frontmatter block
@@ -303,10 +454,14 @@ func stripFrontmatter(text string) string {
 	return strings.TrimSpace(after)
 }
 
-// listResources collects the files of one skill directory (SKILL.md excluded),
-// relative, sorted, capped at resourceCap.
-func listResources(skillDir string) []string {
+// listResources collects the files of one skill directory (SKILL.md and the
+// scripts/ tree excluded), relative and sorted, stopping at resourceCap. The
+// second result reports that more resources exist beyond the cap (Python
+// parity: loader._list_resources).
+func listResources(skillDir string) ([]string, bool) {
 	var out []string
+	truncated := false
+	scriptsDir := filepath.Join(skillDir, "scripts")
 	_ = filepath.WalkDir(skillDir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil // skip unreadable subtrees; discovery stays lenient
@@ -315,13 +470,18 @@ func listResources(skillDir string) []string {
 		if err != nil || rel == "SKILL.md" {
 			return nil
 		}
-		if len(out) < resourceCap {
-			out = append(out, filepath.ToSlash(rel))
+		if p == scriptsDir || strings.HasPrefix(p, scriptsDir+string(filepath.Separator)) {
+			return nil
 		}
+		if len(out) >= resourceCap {
+			truncated = true
+			return filepath.SkipAll
+		}
+		out = append(out, filepath.ToSlash(rel))
 		return nil
 	})
 	sort.Strings(out)
-	return out
+	return out, truncated
 }
 
 // enumField is an extra property of a hand-built parameters schema.
@@ -361,14 +521,22 @@ func (st *SkillsToolkit) Name() string { return st.tk.Name() }
 // DeclaredInCode reports a program-declared tool (framework contract).
 func (st *SkillsToolkit) DeclaredInCode() bool { return st.tk.DeclaredInCode() }
 
-// Dir returns the skills directory the toolkit scans.
-func (st *SkillsToolkit) Dir() string { return st.dir }
+// Dir returns the local skills directory, or "" for a non-directory runtime.
+func (st *SkillsToolkit) Dir() string {
+	if local, ok := st.rt.(*LocalSkillRuntime); ok {
+		return local.dir
+	}
+	return ""
+}
+
+// Runtime returns the backing runtime.
+func (st *SkillsToolkit) Runtime() SkillRuntime { return st.rt }
 
 // Tools returns the members: list_skills, load_skill, read_skill_resource.
 func (st *SkillsToolkit) Tools() []tools.Tool { return st.tk.Tools() }
 
 // Skills returns the discovered skills sorted by name.
-func (st *SkillsToolkit) Skills() []skillInfo { return st.catalog() }
+func (st *SkillsToolkit) Skills() []SkillInfo { return st.rt.Discover() }
 
 // Schemas concatenates the members' schemas.
 func (st *SkillsToolkit) Schemas(cx *agocontext.Context) ([]any, error) { return st.tk.Schemas(cx) }

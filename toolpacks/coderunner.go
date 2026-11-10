@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ type CodeRunner struct {
 	inheritEnv bool
 	maxOutput  int
 	languages  []string
+	runners    map[string]LanguageRunner
 	pythonBin  string
 	tool       *tools.FunctionTool
 	sandbox    localSandbox
@@ -59,6 +61,81 @@ var _ tools.Tool = (*CodeRunner)(nil)
 
 // CodeRunnerOption configures NewLocalCodeRunner.
 type CodeRunnerOption func(*CodeRunner) error
+
+// LanguageRunner describes how one language maps to a subprocess argv
+// (Python parity: sandbox/adapter/code.py LanguageRunner). Exactly one mode:
+//
+//   - Inline: InlineArgv is set; the snippet is appended as the last argument
+//     (python -c <code>, bash -c <code>).
+//   - File: FileExtension and FileRunnerArgv are set; the snippet is written to
+//     a temp file in the workdir and the file path is appended (node <file>,
+//     ts-node <file>).
+type LanguageRunner struct {
+	InlineArgv     []string
+	FileExtension  string
+	FileRunnerArgv []string
+}
+
+// validate enforces the either-inline-or-file contract (Python parity:
+// LanguageRunner.__post_init__).
+func (r LanguageRunner) validate() error {
+	inline := len(r.InlineArgv) > 0
+	fileMode := r.FileExtension != "" || len(r.FileRunnerArgv) > 0
+	if inline == fileMode {
+		return errors.New("toolpacks: LanguageRunner must be either inline (InlineArgv) or file-based (FileExtension + FileRunnerArgv), not both or neither")
+	}
+	if fileMode && (r.FileExtension == "" || len(r.FileRunnerArgv) == 0) {
+		return errors.New("toolpacks: file-mode LanguageRunner requires both FileExtension and FileRunnerArgv")
+	}
+	return nil
+}
+
+// defaultLanguageRunners is the built-in runner table (Python parity:
+// DEFAULT_RUNNERS). The python and bash entries are the default spellings:
+// their interpreters are resolved on PATH at call time, so a custom runner that
+// names an interpreter explicitly keeps that interpreter.
+var defaultLanguageRunners = map[string]LanguageRunner{
+	"python":     {InlineArgv: []string{"python", "-c"}},
+	"bash":       {InlineArgv: []string{"bash", "-c"}},
+	"javascript": {FileExtension: "js", FileRunnerArgv: []string{"node"}},
+}
+
+// DefaultLanguageRunners returns a copy of the built-in runner table.
+func DefaultLanguageRunners() map[string]LanguageRunner {
+	return cloneLanguageRunners(defaultLanguageRunners)
+}
+
+func cloneLanguageRunners(src map[string]LanguageRunner) map[string]LanguageRunner {
+	out := make(map[string]LanguageRunner, len(src))
+	for lang, runner := range src {
+		runner.InlineArgv = append([]string(nil), runner.InlineArgv...)
+		runner.FileRunnerArgv = append([]string(nil), runner.FileRunnerArgv...)
+		out[lang] = runner
+	}
+	return out
+}
+
+// WithCodeRunners overrides or extends the built-in runner table (Python
+// parity: the runners= kwarg merged over DEFAULT_RUNNERS). Use it to register a
+// new language or to pick a different interpreter (tsx instead of ts-node).
+// A language registered here can then be enabled with WithCodeLanguages.
+func WithCodeRunners(runners map[string]LanguageRunner) CodeRunnerOption {
+	return func(r *CodeRunner) error {
+		if len(runners) == 0 {
+			return errors.New("toolpacks: code runner table must not be empty")
+		}
+		for lang, runner := range runners {
+			if strings.TrimSpace(lang) == "" {
+				return errors.New("toolpacks: code runner language must not be empty")
+			}
+			if err := runner.validate(); err != nil {
+				return fmt.Errorf("toolpacks: code runner %q: %w", lang, err)
+			}
+			r.runners[normalizeCodeLanguage(lang)] = runner
+		}
+		return nil
+	}
+}
 
 // WithCodeName overrides the tool name (Python parity: the name kwarg).
 func WithCodeName(name string) CodeRunnerOption {
@@ -134,19 +211,15 @@ func WithCodeMaxOutput(n int) CodeRunnerOption {
 	}
 }
 
-// WithCodeLanguages restricts the accepted languages. Must be a subset of the
-// built-in runners (python, bash, javascript); "sh" is accepted as an alias of
-// "bash" (Python parity: the languages kwarg — Literal python/bash/javascript/
-// typescript; the TypeScript runner needs ts-node and is deferred).
+// WithCodeLanguages restricts the accepted languages. A language must have a
+// runner in the built-in table or one registered by WithCodeRunners, so the
+// option order does not matter: validation happens when the runner is built.
+// "sh", "py", "js" and "ts" are accepted aliases of their canonical names
+// (Python parity: the languages kwarg).
 func WithCodeLanguages(langs ...string) CodeRunnerOption {
 	return func(r *CodeRunner) error {
 		if len(langs) == 0 {
 			return errors.New("toolpacks: code runner languages must not be empty")
-		}
-		for _, l := range langs {
-			if builtinCodeLanguage(l) == "" {
-				return fmt.Errorf("toolpacks: code runner: unsupported language %q", l)
-			}
 		}
 		r.languages = langs
 		return nil
@@ -182,10 +255,16 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 		env:       map[string]string{},
 		maxOutput: defaultMaxOutput,
 		languages: []string{"python", "bash"},
+		runners:   cloneLanguageRunners(defaultLanguageRunners),
 	}
 	for _, opt := range opts {
 		if err := opt(r); err != nil {
 			return nil, err
+		}
+	}
+	for _, l := range r.languages {
+		if _, ok := r.runners[normalizeCodeLanguage(l)]; !ok {
+			return nil, fmt.Errorf("toolpacks: code runner: unsupported language %q", l)
 		}
 	}
 	// AGO-DEVIATION: Python's default description says "Execute code in a
@@ -213,9 +292,9 @@ func NewLocalCodeRunner(opts ...CodeRunnerOption) (*CodeRunner, error) {
 	return r, nil
 }
 
-// builtinCodeLanguage normalizes a language name to a supported one; "" when
-// unsupported. "sh" is an alias of "bash".
-func builtinCodeLanguage(lang string) string {
+// normalizeCodeLanguage canonicalizes a language name; "" stays "". Aliases:
+// py→python, sh→bash, js→javascript, ts→typescript.
+func normalizeCodeLanguage(lang string) string {
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "python", "py":
 		return "python"
@@ -223,8 +302,10 @@ func builtinCodeLanguage(lang string) string {
 		return "bash"
 	case "javascript", "js":
 		return "javascript"
+	case "typescript", "ts":
+		return "typescript"
 	}
-	return ""
+	return strings.ToLower(strings.TrimSpace(lang))
 }
 
 // run executes one snippet (Python parity: CodeAdapter.run + SandboxCodeTool
@@ -237,14 +318,15 @@ func (r *CodeRunner) run(cx *agocontext.Context, code, language string) (string,
 	if r.sandbox.isClosed() {
 		return "", ErrSandboxClosed
 	}
-	lang := builtinCodeLanguage(language)
-	if lang == "" {
+	lang := normalizeCodeLanguage(language)
+	runner, ok := r.runners[lang]
+	if !ok {
 		return fmt.Sprintf("Unsupported language: %q. Supported languages: %s.",
 			language, strings.Join(r.languages, ", ")), nil
 	}
 	allowed := false
 	for _, l := range r.languages {
-		if builtinCodeLanguage(l) == lang {
+		if normalizeCodeLanguage(l) == lang {
 			allowed = true
 			break
 		}
@@ -253,7 +335,7 @@ func (r *CodeRunner) run(cx *agocontext.Context, code, language string) (string,
 		return fmt.Sprintf("Language %q is not enabled. Supported languages: %s.",
 			language, strings.Join(r.languages, ", ")), nil
 	}
-	argv, err := r.argv(lang, code)
+	argv, err := r.argv(lang, runner, code)
 	if err != nil {
 		return err.Error(), nil
 	}
@@ -265,35 +347,41 @@ func (r *CodeRunner) run(cx *agocontext.Context, code, language string) (string,
 }
 
 // argv builds the subprocess command for one snippet (Python parity:
-// DEFAULT_RUNNERS — python/bash inline, javascript through a file written into
-// the workdir).
-func (r *CodeRunner) argv(lang, code string) ([]string, error) {
-	switch lang {
-	case "python":
-		bin := r.pythonBin
-		if bin == "" {
-			bin = findPython()
+// LanguageRunner resolution in DEFAULT_RUNNERS — inline languages append the
+// snippet, file languages write it into the workdir and append the path).
+func (r *CodeRunner) argv(lang string, runner LanguageRunner, code string) ([]string, error) {
+	if len(runner.InlineArgv) > 0 {
+		switch lang {
+		case "python":
+			// The built-in python runner is resolved through findPython so the
+			// python3/python/py fallback (and the Windows convention) still
+			// applies. A custom runner naming its interpreter is used verbatim.
+			if slices.Equal(runner.InlineArgv, []string{"python", "-c"}) {
+				bin := r.pythonBin
+				if bin == "" {
+					bin = findPython()
+				}
+				if bin == "" {
+					return nil, errors.New("Command not found: python (no python3/python/py on PATH)")
+				}
+				return []string{bin, "-c", code}, nil
+			}
+		case "bash":
+			if slices.Equal(runner.InlineArgv, []string{"bash", "-c"}) {
+				if sh := findShell(); sh != "" {
+					return []string{sh, "-c", code}, nil
+				}
+				return nil, errors.New("Command not found: bash")
+			}
 		}
-		if bin == "" {
-			return nil, errors.New("Command not found: python (no python3/python/py on PATH)")
-		}
-		return []string{bin, "-c", code}, nil
-	case "bash":
-		// bash first (Python parity: inline_argv=("bash", "-c")), sh as the
-		// portable fallback on systems without bash; findShell has verified the
-		// interpreter actually executes.
-		if sh := findShell(); sh != "" {
-			return []string{sh, "-c", code}, nil
-		}
-		return nil, errors.New("Command not found: bash")
-	default: // javascript
-		name := fmt.Sprintf("ago_code_%d.js", time.Now().UnixNano())
-		path := filepath.Join(r.workdir, name)
-		if err := os.WriteFile(path, []byte(code), 0o600); err != nil {
-			return nil, fmt.Errorf("writing snippet: %w", err)
-		}
-		return []string{"node", path}, nil
+		return append(append([]string(nil), runner.InlineArgv...), code), nil
 	}
+	name := fmt.Sprintf("ago_code_%d.%s", time.Now().UnixNano(), runner.FileExtension)
+	path := filepath.Join(r.workdir, name)
+	if err := os.WriteFile(path, []byte(code), 0o600); err != nil {
+		return nil, fmt.Errorf("writing snippet: %w", err)
+	}
+	return append(append([]string(nil), runner.FileRunnerArgv...), path), nil
 }
 
 // findShell reports a POSIX shell able to execute snippets, "" when none works
