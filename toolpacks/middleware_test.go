@@ -130,6 +130,22 @@ func TestToolScopedMiddlewareApplied(t *testing.T) {
 		}
 	})
 
+	t.Run("code runner", func(t *testing.T) {
+		if findShell() == "" {
+			t.Skip("no working bash/sh on PATH")
+		}
+		mw := newCounting()
+		r, err := NewLocalCodeRunner(WithCodeRunnerMiddleware(mw))
+		if err != nil {
+			t.Fatalf("NewLocalCodeRunner: %v", err)
+		}
+		defer r.Close()
+		callTool(t, r, cx, r.Name(), `{"code":"echo code_mw","language":"bash"}`)
+		if got := mw.hits.Load(); got != 1 {
+			t.Fatalf("code runner middleware hits = %d, want 1", got)
+		}
+	})
+
 	t.Run("dynamic", func(t *testing.T) {
 		mw := newCounting()
 		f, err := NewDynamicAgentFactory(agotest.NewTestConfig(textResp("unused")), nil, WithDynamicMiddleware(mw))
@@ -147,6 +163,58 @@ func TestToolScopedMiddlewareApplied(t *testing.T) {
 			t.Fatalf("dynamic middleware hits = %d, want 1", got)
 		}
 	})
+}
+
+// TestFilesystemMiddlewareOrder: the filesystem toolkit passes the same ordered
+// chain to every member.
+func TestFilesystemMiddlewareOrder(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	outer := &countingMiddleware{order: &order, label: "outer", mu: &mu}
+	inner := &countingMiddleware{order: &order, label: "inner", mu: &mu}
+	f, err := NewFilesystemToolkit(root, WithFilesystemMiddleware(outer, inner))
+	if err != nil {
+		t.Fatalf("NewFilesystemToolkit: %v", err)
+	}
+	_, cx := newTestContext()
+	callTool(t, f, cx, "read_file", `{"path":"note.txt"}`)
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(order, ",") != "outer,inner" {
+		t.Fatalf("filesystem middleware order = %v, want outer then inner", order)
+	}
+}
+
+// TestSearchMiddlewareOrder: a search tool applies the option order too.
+func TestSearchMiddlewareOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `<div class="result"><h2><a class="result__a" href="https://x/">X</a></h2>`+
+			`<a class="result__snippet">S</a></div>`)
+	}))
+	defer srv.Close()
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	outer := &countingMiddleware{order: &order, label: "outer", mu: &mu}
+	inner := &countingMiddleware{order: &order, label: "inner", mu: &mu}
+	d, err := NewDuckDuckGoSearch(WithDDGBaseURL(srv.URL), WithDDGMiddleware(outer, inner))
+	if err != nil {
+		t.Fatalf("NewDuckDuckGoSearch: %v", err)
+	}
+	_, cx := newTestContext()
+	callTool(t, d, cx, d.Name(), `{"query":"q"}`)
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(order, ",") != "outer,inner" {
+		t.Fatalf("search middleware order = %v, want outer then inner", order)
+	}
 }
 
 // TestToolScopedMiddlewareOrder: the first middleware given to the tool option

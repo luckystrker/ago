@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,82 @@ import (
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/tools"
 )
+
+// TestOneServerPerRequestVariables: one MCP server serves two requests whose
+// host-supplied variables differ; each agent turn's tool resolves its own value.
+// The tenant comes from the HTTP request (the host resolves it in Ask, the
+// role Python's context provider plays), so nothing is shared between turns.
+func TestOneServerPerRequestVariables(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
+	who, err := tools.NewFunctionTool("who_am_i", "Records the tenant",
+		func(a struct {
+			Tenant tools.Variable `agvariable:"tenant"`
+		}) (string, error) {
+			mu.Lock()
+			seen = append(seen, fmt.Sprint(a.Tenant.Default))
+			mu.Unlock()
+			return "ok", nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelCall := func() *events.ModelResponse {
+		return &events.ModelResponse{ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{
+			{ID: "c1", Name: "who_am_i", Arguments: "{}"},
+		}}}
+	}
+	done := func() *events.ModelResponse {
+		return &events.ModelResponse{Message: &events.ModelMessage{Content: "done"}}
+	}
+	a := agent.New("served", "", agent.WithConfig(agotest.NewTestConfig(modelCall(), done(), modelCall(), done())),
+		agent.WithTools(who))
+	s, err := NewServer(ServerConfig{
+		Ask: func(ctx context.Context, text string) (string, error) {
+			// The host resolves the request's tenant; each call gets its own
+			// Variables map through the per-run seam.
+			tenant := ""
+			if r := RequestFromContext(ctx); r != nil {
+				tenant = r.Header.Get("X-Tenant")
+			}
+			run, err := a.RunWith(ctx, agent.RunOptions{Variables: map[string]any{"tenant": tenant}}, text)
+			if err != nil {
+				return "", err
+			}
+			defer run.Close()
+			if err := run.Start(ctx); err != nil {
+				return "", err
+			}
+			reply, err := run.Result(ctx)
+			if err != nil {
+				return "", err
+			}
+			return reply.Body(), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	rpcOver(t, ts.URL, nil, initMsg)
+
+	for _, tenant := range []string{"alpha", "beta"} {
+		header := http.Header{"X-Tenant": []string{tenant}}
+		out := rpcOver(t, ts.URL, header,
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask","arguments":{"message":"who"}}}`)
+		if out["error"] != nil {
+			t.Fatalf("%s: tools/call ask: %v", tenant, out["error"])
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "alpha" || seen[1] != "beta" {
+		t.Fatalf("tenants seen = %v, want [alpha beta]", seen)
+	}
+}
 
 // TestServerForAgentCarriesRequestContext: NewServerForAgent passes each
 // request's Variables, Dependencies and RequestDependency into the agent's ask
