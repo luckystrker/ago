@@ -4,10 +4,10 @@
 // output, exhausted token budget, ...).
 //
 // Parity with Python AG2 ag2/observers/: the Observer protocol, StreamObserver,
-// CompositeObserver and the built-ins LoopDetector and TokenMonitor. The alert flow
-// is Observer → ObserverAlert on the stream; the assembly AlertPolicy (policies
-// package) dedups alerts, injects non-fatal ones into the prompt and turns fatal
-// ones into HaltEvent.
+// BaseObserver, CompositeObserver and the built-ins LoopDetector and TokenMonitor.
+// The alert flow is Observer → ObserverAlert on the stream; the assembly
+// AlertPolicy (policies package) dedups alerts, injects non-fatal ones into the
+// prompt and turns fatal ones into HaltEvent.
 //
 // AGO-DEVIATION: Python registers observers under a caller-owned ExitStack and
 // buffers events through a Watch before processing; AGo subscribes directly on the
