@@ -6,8 +6,10 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,10 +46,15 @@ type httpTransport struct {
 	// request (the modern era announces its revision per request).
 	protocolVersion string
 	handler         requestHandler
-	// sseOpts are the resolved scanner options for SSE answers; computed once
-	// at construction so a session rebuild (client.go reuses this transport)
-	// keeps the configured event-size policy.
-	sseOpts []sse.Option
+	notifier        func(Notification)
+
+	// listenCancel/listenDone belong to the standalone GET stream (startListener).
+	listenCancel context.CancelFunc
+	listenDone   chan struct{}
+	// maxEvent is the resolved per-event cap for SSE answers; computed once at
+	// construction so a session rebuild (client.go reuses this transport) keeps
+	// the configured event-size policy.
+	maxEvent int
 }
 
 // parseAbsoluteURL validates that raw is an absolute http(s) URL.
@@ -106,14 +113,12 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	// The SSE event-size policy mirrors Timeout's sentinel form: zero is the
 	// default cap, a positive value is the threshold, a negative value removes
 	// it (Python parity: max_sse_event_size int|None = 1_048_576; None = no cap).
-	var sseOpts []sse.Option
+	maxEvent := defaultSSEEventSize
 	switch {
 	case cfg.MaxSSEEventSize > 0:
-		sseOpts = []sse.Option{sse.WithMaxEventSize(cfg.MaxSSEEventSize)}
+		maxEvent = cfg.MaxSSEEventSize
 	case cfg.MaxSSEEventSize < 0:
-		sseOpts = []sse.Option{sse.WithUnlimitedEventSize()}
-	default:
-		sseOpts = []sse.Option{sse.WithMaxEventSize(defaultSSEEventSize)}
+		maxEvent = math.MaxInt
 	}
 	custom, err := buildHTTPTransport(cfg)
 	if err != nil {
@@ -135,7 +140,7 @@ func newHTTPTransport(cfg *MCPServerConfig) (*httpTransport, error) {
 	// boundary; same-host hops keep the headers.
 	check := httpx.RedirectStripCredentials.CheckRedirect()
 	return &httpTransport{
-		url: cfg.URL, headers: headers, sseOpts: sseOpts, custom: custom, timeout: timeout,
+		url: cfg.URL, headers: headers, maxEvent: maxEvent, custom: custom, timeout: timeout,
 		client: &http.Client{Timeout: timeout, Transport: rt, CheckRedirect: check},
 		stream: &http.Client{Transport: rt, CheckRedirect: check},
 	}, nil
@@ -358,39 +363,233 @@ func (t *httpTransport) callWithin(ctx context.Context, dl *exchangeDeadline, id
 	}
 }
 
+// streamCursor is what a client needs to resume an SSE stream after a
+// disconnect: the id of the last event it saw (sent back as Last-Event-ID) and
+// the server's reconnect hint.
+type streamCursor struct {
+	lastID  string
+	retryMs int // -1: the server gave no hint
+}
+
+func (c *streamCursor) note(ev sseEvent) {
+	if ev.ID != "" {
+		c.lastID = ev.ID
+	}
+	if ev.Retry >= 0 {
+		c.retryMs = ev.Retry
+	}
+}
+
+// Reconnection policy for a request stream that ended without its reply
+// (mcp.client.streamable_http: MAX_RECONNECTION_ATTEMPTS, DEFAULT_RECONNECTION_DELAY_MS).
+const (
+	maxReconnectAttempts  = 2
+	defaultReconnectDelay = time.Second
+)
+
 // callOverSSE scans the response stream for the reply with the awaited id,
-// skipping any notification the server interleaves and answering the requests
+// delivering the notifications the server interleaves and answering the requests
 // it sends on this stream (elicitation, sampling, roots, ping): each answer is a
-// POST of the JSON-RPC reply to the same endpoint and session.
+// POST of the JSON-RPC reply to the same endpoint and session. A stream that
+// ends before the reply, after the server handed out event ids, is resumed with
+// a GET carrying Last-Event-ID (the server replays what was missed).
 func (t *httpTransport) callOverSSE(ctx context.Context, dl *exchangeDeadline, r io.Reader, id int64) (json.RawMessage, error) {
-	sc := sse.NewScanner(r, t.sseOpts...)
-	for sc.Next() {
-		_, data := sc.Event()
-		var msg wireMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			return nil, fmt.Errorf("%w: malformed SSE message: %v", ErrProtocol, err)
+	cur := streamCursor{retryMs: -1}
+	body := r
+	for attempt := 0; ; attempt++ {
+		res, done, err := t.readStream(ctx, dl, body, id, &cur)
+		if done || err != nil {
+			return res, err
 		}
-		if msg.isRequest() {
+		// The stream ended without the reply.
+		if cur.lastID == "" || attempt >= maxReconnectAttempts {
+			return nil, fmt.Errorf("%w: SSE stream ended without the reply to request %d", ErrProtocol, id)
+		}
+		delay := defaultReconnectDelay
+		if cur.retryMs >= 0 {
+			delay = time.Duration(cur.retryMs) * time.Millisecond
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		resp, err := t.resume(ctx, cur.lastID)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		body = resp.Body
+	}
+}
+
+// readStream consumes one SSE body. done is true when the awaited reply arrived.
+func (t *httpTransport) readStream(ctx context.Context, dl *exchangeDeadline, r io.Reader, id int64, cur *streamCursor) (json.RawMessage, bool, error) {
+	er := newEventReader(r, t.maxEvent)
+	for er.next() {
+		ev := er.event()
+		cur.note(ev)
+		if !ev.HasData {
+			continue // a priming event: it carries only the cursor
+		}
+		var msg wireMessage
+		if err := json.Unmarshal(ev.Data, &msg); err != nil {
+			return nil, false, fmt.Errorf("%w: malformed SSE message: %v", ErrProtocol, err)
+		}
+		switch {
+		case msg.isRequest():
 			dl.pause()
 			err := t.reply(ctx, msg)
 			dl.resume()
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			continue
+		case msg.Method != "":
+			t.deliver(msg)
+		case msg.replyTo(id):
+			res, err := msg.outcome()
+			return res, true, err
 		}
-		if !msg.replyTo(id) {
-			continue // notification or a reply to another exchange
-		}
-		return msg.outcome()
 	}
-	if err := sc.Err(); err != nil {
+	if err := er.failure(); err != nil {
+		// A broken connection after the server handed out event ids is a
+		// disconnect to resume from, like a clean end; an oversized event is not
+		// a transport fault and stays fatal.
+		if cur.lastID != "" && !errors.Is(err, sse.ErrEventTooLarge) && ctx.Err() == nil {
+			return nil, false, nil
+		}
 		// Double %w: consumers (and the tests) must be able to detect an
 		// oversize event through errors.Is(err, sse.ErrEventTooLarge).
-		return nil, fmt.Errorf("%w: SSE stream: %w", ErrProtocol, err)
+		return nil, false, fmt.Errorf("%w: SSE stream: %w", ErrProtocol, err)
 	}
-	return nil, fmt.Errorf("%w: SSE stream ended without the reply to request %d", ErrProtocol, id)
+	return nil, false, nil
 }
+
+// deliver hands one server notification to the Client's notification handler.
+func (t *httpTransport) deliver(msg wireMessage) {
+	if fn := t.notifier; fn != nil {
+		fn(Notification{Method: msg.Method, Params: msg.Params})
+	}
+}
+
+// openStream issues a GET for the session's SSE stream, optionally resuming after
+// lastID. The caller closes the body.
+func (t *httpTransport) openStream(ctx context.Context, sessionID, lastID string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: build request: %v", ErrProtocol, err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
+	if t.protocolVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
+	}
+	if lastID != "" {
+		req.Header.Set("Last-Event-ID", lastID)
+	}
+	resp, err := t.stream.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("mcp: server %s unreachable: %w", t.url, err)
+	}
+	return resp, nil
+}
+
+// resume reopens a request's stream after a disconnect.
+func (t *httpTransport) resume(ctx context.Context, lastID string) (*http.Response, error) {
+	resp, err := t.openStream(ctx, t.sessionID, lastID)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: resuming the stream after %q was refused with status %d", ErrProtocol, lastID, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// startListener opens the standalone GET stream the server uses for messages
+// outside any request, once the session exists (the SDK opens it right after
+// notifications/initialized). A server that offers none (405, or any non-2xx)
+// ends the listener quietly: the stream is optional. A stream that ends is
+// reopened with Last-Event-ID, up to maxReconnectAttempts consecutive failures.
+func (t *httpTransport) startListener() {
+	if t.sessionID == "" || t.listenDone != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.listenCancel, t.listenDone = cancel, done
+	sessionID := t.sessionID
+	go func() {
+		defer close(done)
+		t.listen(ctx, sessionID)
+	}()
+}
+
+func (t *httpTransport) listen(ctx context.Context, sessionID string) {
+	cur := streamCursor{retryMs: -1}
+	failures := 0
+	for failures < maxReconnectAttempts {
+		resp, err := t.openStream(ctx, sessionID, cur.lastID)
+		if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 299) {
+			resp.Body.Close()
+			// 405 and friends: this server has no listener stream. The SDK retries
+			// such a refusal once more after the reconnect delay; AGo stops at the
+			// first, since a status answer is not a transient fault.
+			return
+		}
+		if err != nil {
+			failures++
+		} else {
+			failures = 0
+			er := newEventReader(resp.Body, t.maxEvent)
+			for er.next() {
+				ev := er.event()
+				cur.note(ev)
+				if !ev.HasData {
+					continue
+				}
+				var msg wireMessage
+				if json.Unmarshal(ev.Data, &msg) != nil {
+					continue
+				}
+				switch {
+				case msg.isRequest():
+					// A request outside any call: answered like one inside.
+					_ = t.reply(ctx, msg)
+				case msg.Method != "":
+					t.deliver(msg)
+				}
+			}
+			resp.Body.Close()
+		}
+		delay := defaultReconnectDelay
+		if cur.retryMs >= 0 {
+			delay = time.Duration(cur.retryMs) * time.Millisecond
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *httpTransport) stopListener() {
+	if t.listenCancel == nil {
+		return
+	}
+	t.listenCancel()
+	<-t.listenDone
+	t.listenCancel, t.listenDone = nil, nil
+}
+
+func (t *httpTransport) setNotifier(fn func(Notification)) { t.notifier = fn }
 
 // reply answers one server-initiated request and delivers the answer.
 func (t *httpTransport) reply(ctx context.Context, msg wireMessage) error {
@@ -431,6 +630,7 @@ const closeBudget = 5 * time.Second
 // close ends the HTTP session (a DELETE is the spec's teardown hint; a server may
 // ignore it) and drops the session id.
 func (t *httpTransport) close() error {
+	t.stopListener()
 	if t.sessionID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), closeBudget)
 		defer cancel()

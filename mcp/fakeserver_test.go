@@ -24,6 +24,10 @@ import (
 // fakeAsk sends one server-to-client request and waits for the client's answer.
 type fakeAsk func(method string, params any) (json.RawMessage, *rpcError)
 
+// notifyPrefix turns an ask into a one-way notification: the scenario tools reach
+// both transports' fakes through the one ask function.
+const notifyPrefix = "notify:"
+
 type brain struct {
 	// modern makes the server speak the 2026-07-28 era: requests are validated
 	// like mcp.shared.inbound.classify_inbound_request (envelope in _meta, then
@@ -46,7 +50,7 @@ type brainCall struct {
 	Meta           map[string]json.RawMessage `json:"_meta"`
 }
 
-var brainTools = []string{"caps", "elicit", "sample", "roots", "ping", "needs_input", "resource", "state_only", "sample_media", "idle_ping", "idle_report", "echo"}
+var brainTools = []string{"rst", "huge", "primed", "notify", "cut", "caps", "elicit", "sample", "roots", "ping", "needs_input", "resource", "state_only", "sample_media", "idle_ping", "idle_report", "echo"}
 
 func textResult(text string) map[string]any {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": false}
@@ -221,6 +225,11 @@ func (b *brain) call(c brainCall, ask fakeAsk) (any, *rpcError) {
 		return textResult(string(b.initCaps)), nil
 	case "echo":
 		return textResult("echo"), nil
+	case "notify":
+		// Two notifications ahead of the result, as a server streaming progress does.
+		ask(notifyPrefix+"notifications/progress", map[string]any{"progressToken": "t", "progress": 1, "message": "first"})
+		ask(notifyPrefix+"notifications/message", map[string]any{"level": "info", "data": "second", "logger": "scenario"})
+		return textResult("notified"), nil
 	case "elicit":
 		shape, _ := c.Arguments["shape"].(string)
 		raw, rpcErr := ask("elicitation/create", elicitationParams(shape))
@@ -330,10 +339,78 @@ type scenarioHTTP struct {
 	log     []loggedRequest
 	pending map[string]chan wireMessage
 	nextReq atomic.Int64
+
+	// getStatus, when non-zero, answers every GET with that status (a server
+	// without a standalone stream: 405).
+	getStatus int
+	// push feeds the standalone GET stream: each value is sent as one event.
+	push chan map[string]any
+	// cutReq is the request id of a "cut" call whose stream was dropped before its
+	// response; resumes counts the GETs that carried a Last-Event-ID.
+	cutReq  json.RawMessage
+	resumes int
+	// resumeEnds makes a resume answer with a stream that ends without the
+	// response (exhausting the client's reconnect attempts).
+	resumeEnds bool
 }
 
 func newScenarioHTTP(modern bool) *scenarioHTTP {
-	return &scenarioHTTP{brain: brain{modern: modern}, pending: map[string]chan wireMessage{}}
+	return &scenarioHTTP{brain: brain{modern: modern}, pending: map[string]chan wireMessage{}, push: make(chan map[string]any, 16)}
+}
+
+// serveGet is the standalone stream of streamable HTTP, held to the SDK's rules:
+// it needs text/event-stream in Accept and the session id, answers anything else
+// with an error status, and streams what the test pushes.
+func (s *scenarioHTTP) serveGet(w http.ResponseWriter, r *http.Request) {
+	entry := loggedRequest{Method: "GET", Host: r.Host, Session: r.Header.Get("Mcp-Session-Id"), Headers: map[string]string{
+		"accept": r.Header.Get("Accept"), "last-event-id": r.Header.Get("Last-Event-ID"), "mcp-protocol-version": r.Header.Get("MCP-Protocol-Version"),
+	}}
+	s.record(entry)
+	if s.getStatus != 0 {
+		w.WriteHeader(s.getStatus)
+		return
+	}
+	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		w.WriteHeader(http.StatusNotAcceptable)
+		return
+	}
+	if r.Header.Get("Mcp-Session-Id") != "sess-1" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	fl := w.(http.Flusher)
+	if last := r.Header.Get("Last-Event-ID"); last != "" {
+		s.mu.Lock()
+		s.resumes++
+		reqID, ends := s.cutReq, s.resumeEnds
+		s.mu.Unlock()
+		if ends {
+			fmt.Fprint(w, "id: e-again\nretry: 5\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":\"still going\"}}\n\n")
+			fl.Flush()
+			return
+		}
+		if last != "e1" || reqID == nil {
+			return
+		}
+		res, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": reqID, "result": textResult("resumed")})
+		fmt.Fprintf(w, "id: e2\nevent: message\ndata: %s\n\n", res)
+		fl.Flush()
+		return
+	}
+	fmt.Fprint(w, ": open\n\n")
+	fl.Flush()
+	for {
+		select {
+		case msg := <-s.push:
+			b, _ := json.Marshal(msg)
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", b)
+			fl.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func (s *scenarioHTTP) record(r loggedRequest) {
@@ -384,6 +461,14 @@ func (x *httpExchange) writeEvent(v any) {
 }
 
 func (x *httpExchange) ask(method string, params any) (json.RawMessage, *rpcError) {
+	if strings.HasPrefix(method, notifyPrefix) {
+		msg := map[string]any{"jsonrpc": "2.0", "method": strings.TrimPrefix(method, notifyPrefix)}
+		if params != nil {
+			msg["params"] = params
+		}
+		x.writeEvent(msg)
+		return json.RawMessage(`{}`), nil
+	}
 	id := fmt.Sprintf("srv-%d", x.s.nextReq.Add(1))
 	ch := make(chan wireMessage, 1)
 	x.s.mu.Lock()
@@ -406,6 +491,10 @@ func (x *httpExchange) ask(method string, params any) (json.RawMessage, *rpcErro
 }
 
 func (s *scenarioHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.serveGet(w, r)
+		return
+	}
 	if r.Method == http.MethodDelete {
 		s.record(loggedRequest{Method: "DELETE", Session: r.Header.Get("Mcp-Session-Id"), Host: r.Host})
 		return
@@ -441,6 +530,49 @@ func (s *scenarioHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.record(entry)
 	if !msg.hasID() {
 		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if msg.Method == "tools/call" && strings.Contains(string(msg.Params), `"name":"rst"`) {
+		// The connection dies mid-stream, with no clean end: a broken read, not EOF.
+		s.mu.Lock()
+		s.cutReq = msg.ID
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "id: e1\nretry: 5\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"t\",\"progress\":1}}\n\n")
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		if conn, _, err := rc.Hijack(); err == nil {
+			conn.Close()
+		}
+		return
+	}
+	if msg.Method == "tools/call" && strings.Contains(string(msg.Params), `"name":"huge"`) {
+		// An identified event, then one past any sane cap.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "id: e1\nretry: 5\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\nevent: message\ndata: %s\n\n", strings.Repeat("x", 4096))
+		return
+	}
+	if msg.Method == "tools/call" && strings.Contains(string(msg.Params), `"name":"primed"`) {
+		// A resumable stream opens with a priming event: an id and an empty data
+		// line, then the real messages.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		res, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": textResult("primed ok")})
+		fmt.Fprintf(w, "id: p0\nretry: 5\ndata: \n\nid: p1\nevent: message\ndata: %s\n\n", res)
+		return
+	}
+	if msg.Method == "tools/call" && strings.Contains(string(msg.Params), `"name":"cut"`) {
+		// A stream that dies after one identified event, before its response: the
+		// client must resume it with Last-Event-ID.
+		s.mu.Lock()
+		s.cutReq = msg.ID
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "id: e1\nretry: 5\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"t\",\"progress\":1}}\n\n")
+		w.(http.Flusher).Flush()
 		return
 	}
 	x := &httpExchange{s: s, w: w}

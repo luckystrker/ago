@@ -41,6 +41,8 @@ type stdioTransport struct {
 
 	// handler answers server-initiated requests (nil: method not found).
 	handler requestHandler
+	// notifier receives server notifications; it runs on the reader goroutine.
+	notifier func(Notification)
 	// waiting is set while a caller awaits a reply; a request that shows up
 	// outside that window has nobody to answer it and is refused.
 	waiting atomic.Bool
@@ -141,7 +143,10 @@ func (t *stdioTransport) read(stdout io.ReadCloser) {
 				continue
 			}
 		case msg.Method != "" || !msg.hasID():
-			continue // notification
+			if msg.Method != "" && t.notifier != nil {
+				t.notifier(Notification{Method: msg.Method, Params: msg.Params})
+			}
+			continue
 		}
 		select {
 		case t.responses <- msg:
@@ -287,6 +292,12 @@ func (t *stdioTransport) awaitReply(ctx context.Context, id int64) (json.RawMess
 }
 
 func (t *stdioTransport) setHandler(h requestHandler) { t.handler = h }
+
+func (t *stdioTransport) setNotifier(fn func(Notification)) { t.notifier = fn }
+
+// startListener is a no-op: stdio has no standalone stream, the one pipe carries
+// everything.
+func (t *stdioTransport) startListener() {}
 
 // setProtocolVersion is a no-op: stdio carries no per-request protocol header.
 func (t *stdioTransport) setProtocolVersion(string) {}
