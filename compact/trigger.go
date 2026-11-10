@@ -37,18 +37,46 @@ func (t eventCountTrigger) ShouldTrigger(evs []events.Event, _ events.Usage) boo
 	return n > t.max
 }
 
+// TokenTriggerOption configures TokenTrigger.
+type TokenTriggerOption func(*tokenTrigger)
+
+// WithCharsPerToken sets the chars-per-token estimate used by TokenTrigger
+// (Python parity: CompactTrigger.chars_per_token=4). Lower values estimate more
+// tokens for the same text, so the trigger fires earlier; n <= 0 keeps the
+// default.
+//
+// AGO-DEVIATION: Python raises ValueError for chars_per_token < 1;
+// TokenTrigger returns a Trigger with no error result, so a non-positive value
+// is ignored.
+func WithCharsPerToken(n int) TokenTriggerOption {
+	return func(t *tokenTrigger) {
+		if n > 0 {
+			t.charsPerToken = n
+		}
+	}
+}
+
 // TokenTrigger fires when the estimated token footprint of the events exceeds
 // budget (Python parity: CompactTrigger.max_tokens with chars_per_token=4 —
-// events.EstimatedTokens' default). The estimate runs over every event, not
-// only conversational ones: a retained status observation never joins the
-// conversational span, yet its projected service view rides every model call,
-// so it must spend budget; telemetry (UsageEvent) weighs zero through
-// EstimatedTokens either way. The reported usage argument is ignored on
-// purpose: the estimate tracks what the transcript itself would cost,
+// events.EstimatedTokens' default, tunable with WithCharsPerToken). The estimate
+// runs over every event, not only conversational ones: a retained status
+// observation never joins the conversational span, yet its projected service view
+// rides every model call, so it must spend budget; telemetry (UsageEvent) weighs
+// zero through EstimatedTokens either way. The reported usage argument is ignored
+// on purpose: the estimate tracks what the transcript itself would cost,
 // independent of how the provider bills it. budget <= 0 disables the trigger.
-func TokenTrigger(budget int) Trigger { return tokenTrigger{budget: budget} }
+func TokenTrigger(budget int, opts ...TokenTriggerOption) Trigger {
+	t := tokenTrigger{budget: budget}
+	for _, opt := range opts {
+		opt(&t)
+	}
+	return t
+}
 
-type tokenTrigger struct{ budget int }
+type tokenTrigger struct {
+	budget        int
+	charsPerToken int
+}
 
 func (t tokenTrigger) ShouldTrigger(evs []events.Event, _ events.Usage) bool {
 	if t.budget <= 0 {
@@ -57,7 +85,7 @@ func (t tokenTrigger) ShouldTrigger(evs []events.Event, _ events.Usage) bool {
 	total := 0
 	for _, ev := range evs {
 		if ev != nil {
-			total += events.EstimatedTokens(ev, 0)
+			total += events.EstimatedTokens(ev, t.charsPerToken)
 		}
 	}
 	return total > t.budget

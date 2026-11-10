@@ -45,26 +45,57 @@ func (h *historyLimiter) OnLLMCall(next LLMCallFunc, evs []events.Event, ctx *ag
 
 var _ Middleware = (*historyLimiter)(nil)
 
+// TokenLimiterOption configures TokenLimiter.
+type TokenLimiterOption func(*tokenLimiterOptions)
+
+type tokenLimiterOptions struct {
+	// charsPerToken overrides the chars-per-token estimate; 0 keeps the
+	// events.EstimatedTokens default (4).
+	charsPerToken int
+}
+
+// WithCharsPerToken sets the chars-per-token estimate used to size events
+// (Python parity: TokenLimiter(max_tokens, chars_per_token=4)). Lower values
+// estimate more tokens for the same text, so the limiter cuts earlier; n <= 0
+// keeps the default.
+//
+// AGO-DEVIATION: Python raises ValueError for chars_per_token < 1; a Factory has
+// no error return, so a non-positive value is ignored instead (same rule as the
+// budget clamp in TokenLimiter).
+func WithCharsPerToken(n int) TokenLimiterOption {
+	return func(o *tokenLimiterOptions) {
+		if n > 0 {
+			o.charsPerToken = n
+		}
+	}
+}
+
 // TokenLimiter truncates the history to fit a token budget, always retaining a
 // suffix of the most recent events (Python parity: token_limiter.py). Events are
-// sized with events.EstimatedTokens (default chars-per-token estimate).
+// sized with events.EstimatedTokens, whose chars-per-token estimate is tunable
+// with WithCharsPerToken.
 //
 // The most recent event is always kept even when it alone exceeds the budget, so a
 // call is never made with empty history. AGO-DEVIATION: as with HistoryLimiter,
 // Python re-attaches a leading ModelRequest anchor and widens via replayable_span;
 // AGo keeps a plain suffix. A budget below 1 behaves as 1.
-func TokenLimiter(budget int) Factory {
+func TokenLimiter(budget int, opts ...TokenLimiterOption) Factory {
 	if budget < 1 {
 		budget = 1
 	}
+	var o tokenLimiterOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return func() Middleware {
-		return &tokenLimiter{budget: budget}
+		return &tokenLimiter{budget: budget, charsPerToken: o.charsPerToken}
 	}
 }
 
 type tokenLimiter struct {
 	Base
-	budget int
+	budget        int
+	charsPerToken int
 }
 
 func (t *tokenLimiter) OnLLMCall(next LLMCallFunc, evs []events.Event, ctx *agocontext.Context) (*events.ModelResponse, error) {
@@ -74,7 +105,7 @@ func (t *tokenLimiter) OnLLMCall(next LLMCallFunc, evs []events.Event, ctx *agoc
 	tokens := make([]int, len(evs))
 	total := 0
 	for i, ev := range evs {
-		tokens[i] = events.EstimatedTokens(ev, 0)
+		tokens[i] = events.EstimatedTokens(ev, t.charsPerToken)
 		total += tokens[i]
 	}
 	if total <= t.budget {
