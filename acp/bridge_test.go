@@ -34,6 +34,11 @@ const (
 	roleMCPServe  = "acp-fake-mcp-server"
 	roleServeMode = "acp-serve-mode-agent"
 
+	// Provider tests (provider_test.go): a Serve-based fake agent whose
+	// behavior the env selects, and a raw agent with a model picker.
+	roleProvider      = "acp-provider-fake"
+	roleProviderModel = "acp-provider-model-agent"
+
 	// Child-process env keys the roles read beyond roleEnv: the file the MCP
 	// server stub touches on exit (the gateway-close test's proof), how many
 	// bytes the output-spam role prints, and the parent-only secret the env
@@ -94,6 +99,10 @@ func TestMain(m *testing.M) {
 		runFakeMCPServer(os.Stdin, os.Stdout)
 	case roleServeMode:
 		runServeModeAgent()
+	case roleProvider:
+		runProviderFake()
+	case roleProviderModel:
+		runProviderModelAgent(os.Stdin, os.Stdout)
 	default:
 		os.Exit(m.Run())
 	}
