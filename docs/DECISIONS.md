@@ -3668,12 +3668,13 @@ previously unreachable outside OpenAI.
   hierarchies do not agree — so the sentinel set is AGo's classification by
   status, not a port of a Python type.
 - **The SDK retry set (408, 409, 429, 5xx).** `httpx.RetryableStatus` is now
-  the single definition; the per-package copies in the two Files clients were
-  deleted. D-017 recorded "retries with Retry-After" but never the status set.
+  the single definition; the two Files clients' `retryableStatus`
+  helpers are now one-line wrappers over it. D-017 recorded "retries with Retry-After" but never the status set.
 - **A caller-supplied `*http.Client`.** `httpx.Client.HTTP` is the seam; every
   provider config exposes it (OpenAI Completions/Responses/Decisions,
   Anthropic incl. its Files client, Gemini and Ollama as `WithHTTPClient`, Z.AI,
-  Mistral, DashScope). Python names the field differently per SDK
+  Mistral, DashScope — DashScope's is AGo-only: Python's `DashScopeConfig` has
+  no client field). Python names the field differently per SDK
   (`http_client`, `async_client`, `http_options.client_args`); AGo uses one name
   everywhere. The injected client owns its Timeout and CheckRedirect — the
   config's `Timeout` applies only to the default client — so a caller that
@@ -3692,13 +3693,14 @@ previously unreachable outside OpenAI.
   declare, and Ollama gains its `frequency_penalty`/`presence_penalty`
   CreateOptions. `n > 1` keeps AGo's documented behavior: the first choice is
   read, the rest dropped (Python reads `choices[0]` too).
-- **`extra_body` outside OpenAI.** Anthropic and Mistral gain `ExtraBody`, the
-  two providers whose Python config has the field (Z.AI already had it).
+- **`extra_body` outside OpenAI.** Anthropic and Z.AI gain `ExtraBody` — the
+  providers besides OpenAI whose Python config has the field. Python's
+  `MistralConfig` has none, so Mistral gets none either.
   Merge order follows the SDK: an `extra_body` key replaces the derived body
-  field for OpenAI, Anthropic and Mistral; Z.AI keeps its documented inverse
+  field for OpenAI and Anthropic (including `stream`); Z.AI keeps its documented inverse
   (Python's `_merge_extra_body` lets the typed fields win, so `ExtraBody` is the
-  base and the typed knobs overwrite it). Gemini, Ollama and DashScope get no
-  escape hatch: their Python configs have none, and adding one would be an
+  base and the typed knobs overwrite it). Mistral, Gemini, Ollama and DashScope get
+  no escape hatch: their Python configs have none, and adding one would be an
   AGo-only surface rather than parity — their unmapped knobs stay unported.
 - **`default_query`.** `OpenAICompletionsConfig.DefaultQuery` /
   `OpenAIResponsesConfig.DefaultQuery` append to every request URL (chat,
@@ -3721,6 +3723,9 @@ previously unreachable outside OpenAI.
   AGO-DEVIATION: Python's `prompt_template` is `str | None`; the Go string
   cannot tell None from "", and an empty template means nothing to the API, so
   "" is not sent.
+- **`stop` is a list.** Mistral, Z.AI and DashScope take `Stop []string`.
+  AGO-DEVIATION: Python accepts `str | list[str]`; a single sequence is a
+  one-element slice, and the wire value is always an array.
 - **Anthropic `Clone` key matching** ignores underscores as well as case, so the
   Python dataclass spellings (`http_client`, `extra_body`, `service_tier`) name
   the Go fields.
@@ -3730,4 +3735,6 @@ Verified by `config/errors_test.go`, `config/openaicompat_options_test.go`,
 `agui/acceptance_test.go`, `tools/hosted_test.go` and
 `config/input_acceptance_test.go`. Gates (2026-11-10): `gofmt -l .` clean,
 `go build ./...`, `go vet ./...`, `go test -count=1 ./...`, plus
-`go build/vet ./examples/...` and build+vet+test of every `contrib/*` module.
+`go build/vet ./examples/...` and build+vet+test of every `contrib/*` module (run 2026-11-10 against this
+tree through each module's `replace`). The reviewer-authored part of this
+entry's first commit was cross-reviewed separately (see the gap-audit notes).
