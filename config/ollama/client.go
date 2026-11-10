@@ -42,7 +42,7 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	body := map[string]any{
 		"model":    c.cfg.model,
 		"messages": wireMessages,
-		"stream":   false,
+		"stream":   c.cfg.streaming,
 	}
 	if o := c.options(); len(o) > 0 {
 		body["options"] = o
@@ -72,6 +72,10 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	}
 
 	url := strings.TrimSuffix(c.host, "/") + "/api/chat"
+	if c.cfg.streaming {
+		return c.callStreaming(ctx, url, headers, body, conv)
+	}
+
 	status, data, err := c.http.PostJSON(ctx, url, headers, body)
 	if err != nil {
 		return nil, err

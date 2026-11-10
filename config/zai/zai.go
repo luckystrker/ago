@@ -2,11 +2,12 @@
 // Z.AI exposes an OpenAI Chat-Completions dialect, so its client is a thin
 // binding of ZAIConfig onto the shared engine config.RunChatCompat.
 //
-// Parity with Python AG2 ag2/config/zai/config.py. The Z.AI-specific extras
-// (thinking flags, token-cache opt-out, sensitive-word check, Files API) are
-// out of the wave-1 scope (D-008); the sampled fields follow the porting brief
-// plus the request knobs (stop, seed, tool_choice, user_id, request_id,
-// do_sample, meta, extra_headers, extra_body) and the retrieval tool.
+// Parity with Python AG2 ag2/config/zai/config.py. The request surface carries
+// the thinking toggle, reasoning_effort, the token-cache opt-out, the vendor
+// extras (sensitive_word_check, watermark_enabled, tool_stream, extra), the
+// sampled fields and the request knobs (stop, seed, tool_choice, user_id,
+// request_id, do_sample, meta, extra_headers, extra_body) plus the retrieval
+// tool. The Files API stays out of scope (D-021).
 // See docs/specs/config-llm.md §1.
 package zai
 
@@ -33,6 +34,12 @@ const (
 	DefaultMaxRetries = 3
 	// chatPath is the Chat-Completions endpoint under BaseURL.
 	chatPath = "/chat/completions"
+	// DefaultSourceChannel is the x-source-channel header value the SDK always
+	// sends (Python parity: the zai SDK's "python-sdk").
+	//
+	// AGO-DEVIATION: AGo identifies itself as "ago" instead of claiming to be
+	// the Python SDK; Z.AI treats the header as telemetry only.
+	DefaultSourceChannel = "ago"
 )
 
 // ZAIConfig configures one Z.AI model (Python parity: the ZAIConfig dataclass).
@@ -90,6 +97,32 @@ type ZAIConfig struct {
 	// above win over a same-named ExtraBody key.
 	ExtraBody map[string]any
 
+	// DisableTokenCache selects how the bearer token is built. nil keeps the
+	// Python default (true): the API key travels as-is. An explicit false mints
+	// a short-lived HS256 token from the key's "<id>.<secret>" form (Python
+	// parity: the zai SDK's disable_token_cache=False).
+	DisableTokenCache *bool
+	// SourceChannel is the x-source-channel header value. Empty sends
+	// DefaultSourceChannel; an ExtraHeaders entry of that name wins over both.
+	SourceChannel string
+	// Thinking toggles GLM reasoning; nil leaves the provider default
+	// (Python parity: thinking={"type": "enabled"|"disabled"}).
+	Thinking *bool
+	// ReasoningEffort is the effort level sent as reasoning_effort ("none",
+	// "minimal", "low", "medium", "high", "xhigh", "max"; models from glm-5.2).
+	ReasoningEffort string
+	// SensitiveWordCheck carries the sensitive-word filter request object
+	// (Python parity: sensitive_word_check, an untyped SDK model).
+	SensitiveWordCheck any
+	// WatermarkEnabled toggles a watermark on generated audio; an explicit
+	// false is sent (nil omits the field).
+	WatermarkEnabled *bool
+	// ToolStream streams tool-call deltas.
+	ToolStream *bool
+	// Extra carries the vendor extra block (Python parity: extra, CodeGeex
+	// parameters).
+	Extra any
+
 	Streaming bool
 
 	model string
@@ -120,7 +153,16 @@ func (c *ZAIConfig) Create() (config.LLMClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &chatClient{params: params}, nil
+	cl := &chatClient{params: params}
+	if c.DisableTokenCache != nil && !*c.DisableTokenCache {
+		// The token is minted per request; validate the key form now so a
+		// malformed key fails here instead of mid-turn.
+		if _, _, err := splitAPIKey(params.APIKey); err != nil {
+			return nil, err
+		}
+		cl.tokenAuth = true
+	}
+	return cl, nil
 }
 
 // params renders the shared-engine parameters for this config.
@@ -139,6 +181,25 @@ func (c *ZAIConfig) params() (config.CompatParams, error) {
 	if base == "" {
 		base = DefaultBaseURL
 	}
+	// The SDK always sends x-source-channel; callers may override it, and an
+	// ExtraHeaders entry of that name wins (net/http canonicalizes header names,
+	// so the comparison is case-insensitive).
+	headers := make(map[string]string, len(c.ExtraHeaders)+1)
+	channelSet := false
+	for k, v := range c.ExtraHeaders {
+		headers[k] = v
+		if strings.EqualFold(k, "x-source-channel") {
+			channelSet = true
+		}
+	}
+	if !channelSet {
+		channel := c.SourceChannel
+		if channel == "" {
+			channel = DefaultSourceChannel
+		}
+		headers["x-source-channel"] = channel
+	}
+
 	return config.CompatParams{
 		APIKey:       key,
 		BaseURL:      base,
@@ -152,7 +213,7 @@ func (c *ZAIConfig) params() (config.CompatParams, error) {
 		MaxRetries:   c.MaxRetries,
 		Timeout:      c.Timeout,
 		HTTPClient:   c.HTTPClient,
-		ExtraHeaders: c.ExtraHeaders,
+		ExtraHeaders: headers,
 		Extra:        c.extraBody(),
 		MapTool:      mapTool,
 	}, nil
@@ -197,6 +258,29 @@ func (c *ZAIConfig) extraBody() map[string]any {
 	}
 	if c.Meta != nil {
 		extra["meta"] = c.Meta
+	}
+	if c.Thinking != nil {
+		// Python parity: the wire object, not a bare bool.
+		kind := "disabled"
+		if *c.Thinking {
+			kind = "enabled"
+		}
+		extra["thinking"] = map[string]any{"type": kind}
+	}
+	if c.ReasoningEffort != "" {
+		extra["reasoning_effort"] = c.ReasoningEffort
+	}
+	if c.SensitiveWordCheck != nil {
+		extra["sensitive_word_check"] = c.SensitiveWordCheck
+	}
+	if c.WatermarkEnabled != nil {
+		extra["watermark_enabled"] = *c.WatermarkEnabled
+	}
+	if c.ToolStream != nil {
+		extra["tool_stream"] = *c.ToolStream
+	}
+	if c.Extra != nil {
+		extra["extra"] = c.Extra
 	}
 	if len(extra) == 0 {
 		return nil
@@ -275,6 +359,22 @@ func (c *ZAIConfig) Clone(overrides map[string]any) (config.ModelConfig, error) 
 			err = setStringMap(&out.ExtraHeaders, k, v)
 		case "extrabody", "extra_body":
 			err = setAnyMap(&out.ExtraBody, k, v)
+		case "disabletokencache", "disable_token_cache":
+			err = setBoolPtr(&out.DisableTokenCache, k, v)
+		case "sourcechannel", "source_channel":
+			err = setString(&out.SourceChannel, k, v)
+		case "thinking":
+			err = setBoolPtr(&out.Thinking, k, v)
+		case "reasoningeffort", "reasoning_effort":
+			err = setString(&out.ReasoningEffort, k, v)
+		case "sensitivewordcheck", "sensitive_word_check":
+			out.SensitiveWordCheck = v
+		case "watermarkenabled", "watermark_enabled":
+			err = setBoolPtr(&out.WatermarkEnabled, k, v)
+		case "toolstream", "tool_stream":
+			err = setBoolPtr(&out.ToolStream, k, v)
+		case "extra":
+			out.Extra = v
 		default:
 			err = fmt.Errorf("config/zai: unknown config field %q", k)
 		}

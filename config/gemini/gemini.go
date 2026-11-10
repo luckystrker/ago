@@ -43,6 +43,17 @@ type GeminiConfig struct {
 	seed             *int64
 	thinkingLevel    *string
 	thinkingBudget   *int64
+	// thinkingConfig is a raw thinkingConfig object; when set it wins over
+	// thinkingLevel/thinkingBudget (Python parity: thinking_config).
+	thinkingConfig map[string]any
+	// cachedContent names a cached content resource made with the Caches API
+	// (Python parity: cached_content; top-level "cachedContent" on the wire).
+	cachedContent string
+	// responseModalities asks for the output kinds ("TEXT", "IMAGE"); the
+	// imageConfig block then tunes image generation (Python parity:
+	// response_modalities + image_config).
+	responseModalities []string
+	imageConfig        *ImageConfig
 	// automaticContinuation resumes answers the server truncated at its
 	// per-request token limit (Python parity: automatic_continuation
 	// bool|None = None; the SDK default is enabled). nil = enabled.
@@ -96,6 +107,78 @@ func WithThinkingLevel(v string) Option { return func(c *GeminiConfig) { c.think
 
 // WithThinkingBudget caps the thinking token budget.
 func WithThinkingBudget(v int64) Option { return func(c *GeminiConfig) { c.thinkingBudget = &v } }
+
+// WithThinkingConfig sets the thinkingConfig object verbatim, for fields the
+// level/budget pair does not cover (includeThoughts, thinkingLevel values of
+// newer models, numTokens). When set it wins over WithThinkingLevel and
+// WithThinkingBudget, exactly as Python resolves thinking_config first.
+// The map is copied.
+func WithThinkingConfig(raw map[string]any) Option {
+	return func(c *GeminiConfig) { c.thinkingConfig = cloneAnyMap(raw) }
+}
+
+// WithCachedContent names a content cache created through the Caches API; the
+// name travels as the top-level cachedContent of generateContent. An empty
+// name keeps the field off the wire.
+func WithCachedContent(name string) Option {
+	return func(c *GeminiConfig) { c.cachedContent = name }
+}
+
+// WithResponseModalities selects the output kinds, e.g. "TEXT" and "IMAGE"
+// (Python parity: response_modalities).
+func WithResponseModalities(modalities ...string) Option {
+	return func(c *GeminiConfig) { c.responseModalities = append([]string(nil), modalities...) }
+}
+
+// WithImageConfig tunes image generation; it only takes effect together with
+// an "IMAGE" response modality.
+func WithImageConfig(cfg ImageConfig) Option {
+	return func(c *GeminiConfig) { c.imageConfig = &cfg }
+}
+
+// ImageConfig is the image-generation block of generationConfig (Python
+// parity: google.genai.types.ImageConfig). Every zero field stays off the
+// wire; the names match Python's snake_case fields, the JSON keys are the
+// REST camelCase ones.
+type ImageConfig struct {
+	// AspectRatio is one of "1:1", "2:3", "3:2", "3:4", "4:3", "9:16",
+	// "16:9", "21:9".
+	AspectRatio string
+	// ImageSize is "1K", "2K" or "4K".
+	ImageSize string
+	// PersonGeneration is ALLOW_ALL, ALLOW_ADULT or ALLOW_NONE.
+	PersonGeneration string
+	// ProminentPeople controls celebrity generation (Vertex AI only).
+	ProminentPeople string
+	// OutputMimeType is the MIME type of the generated images.
+	OutputMimeType string
+	// OutputCompressionQuality is the JPEG/WebP quality (Vertex AI only).
+	OutputCompressionQuality *int64
+	// ImageOutputOptions carries the output image format (Vertex AI only).
+	ImageOutputOptions map[string]any
+}
+
+// wire renders the block under the REST aliases; unset fields are omitted.
+func (i ImageConfig) wire() map[string]any {
+	out := map[string]any{}
+	set := func(key, value string) {
+		if value != "" {
+			out[key] = value
+		}
+	}
+	set("aspectRatio", i.AspectRatio)
+	set("imageSize", i.ImageSize)
+	set("personGeneration", i.PersonGeneration)
+	set("prominentPeople", i.ProminentPeople)
+	set("outputMimeType", i.OutputMimeType)
+	if i.OutputCompressionQuality != nil {
+		out["outputCompressionQuality"] = *i.OutputCompressionQuality
+	}
+	if len(i.ImageOutputOptions) > 0 {
+		out["imageOutputOptions"] = i.ImageOutputOptions
+	}
+	return out
+}
 
 // WithHTTPClient routes every request through c (proxy, custom root CAs,
 // mTLS, test transports). The client owns its own Timeout and redirect
@@ -174,6 +257,13 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 	cc.seed = cloneInt(c.seed)
 	cc.thinkingLevel = cloneString(c.thinkingLevel)
 	cc.thinkingBudget = cloneInt(c.thinkingBudget)
+	cc.thinkingConfig = cloneAnyMap(c.thinkingConfig)
+	cc.responseModalities = append([]string(nil), c.responseModalities...)
+	if c.imageConfig != nil {
+		img := *c.imageConfig
+		img.ImageOutputOptions = cloneAnyMap(c.imageConfig.ImageOutputOptions)
+		cc.imageConfig = &img
+	}
 	cc.automaticContinuation = cloneBool(c.automaticContinuation)
 	for k, v := range overrides {
 		switch k {
@@ -271,6 +361,30 @@ func (c *GeminiConfig) Clone(overrides map[string]any) (config.ModelConfig, erro
 				return nil, err
 			}
 			cc.thinkingBudget = i
+		case "thinking_config":
+			m, err := anyMapOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.thinkingConfig = m
+		case "cached_content":
+			s, err := stringOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.cachedContent = s
+		case "response_modalities":
+			ss, err := stringsOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.responseModalities = ss
+		case "image_config":
+			img, err := imageConfigOverride(k, v)
+			if err != nil {
+				return nil, err
+			}
+			cc.imageConfig = img
 		case "http_client":
 			switch h := v.(type) {
 			case nil:
@@ -345,6 +459,52 @@ func stringsOverride(key string, v any) ([]string, error) {
 	default:
 		return nil, overrideErr(key, v)
 	}
+}
+
+// anyMapOverride accepts an object override and copies it, so a cloned config
+// never shares a mutable map with the caller.
+func anyMapOverride(key string, v any) (map[string]any, error) {
+	switch m := v.(type) {
+	case nil:
+		return nil, nil
+	case map[string]any:
+		return cloneAnyMap(m), nil
+	default:
+		return nil, overrideErr(key, v)
+	}
+}
+
+// imageConfigOverride accepts the typed block or its pointer (Python parity:
+// replace() takes types.ImageConfig); nil clears it.
+func imageConfigOverride(key string, v any) (*ImageConfig, error) {
+	switch img := v.(type) {
+	case nil:
+		return nil, nil
+	case ImageConfig:
+		c := img
+		c.ImageOutputOptions = cloneAnyMap(img.ImageOutputOptions)
+		return &c, nil
+	case *ImageConfig:
+		if img == nil {
+			return nil, nil
+		}
+		c := *img
+		c.ImageOutputOptions = cloneAnyMap(img.ImageOutputOptions)
+		return &c, nil
+	default:
+		return nil, overrideErr(key, v)
+	}
+}
+
+func cloneAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func boolOverride(key string, v any) (bool, error) {

@@ -45,6 +45,11 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	}
 
 	body := map[string]any{"contents": contents}
+	if c.cfg.cachedContent != "" {
+		// A cached content resource replaces the explicit history cost; the
+		// name is a top-level generateContent field (Python parity).
+		body["cachedContent"] = c.cfg.cachedContent
+	}
 	if si := strings.Join(prompt, "\n"); si != "" {
 		body["systemInstruction"] = map[string]any{
 			"parts": []map[string]any{{"text": si}},
@@ -93,9 +98,21 @@ func (c *client) generationConfig(schema response.Proto) map[string]any {
 	if c.cfg.seed != nil {
 		gen["seed"] = *c.cfg.seed
 	}
-	// Both thinking knobs resolve into one thinkingConfig object (Python
-	// parity: _resolve_thinking_config — level, budget or both).
-	if c.cfg.thinkingLevel != nil || c.cfg.thinkingBudget != nil {
+	if len(c.cfg.responseModalities) > 0 {
+		gen["responseModalities"] = c.cfg.responseModalities
+	}
+	if c.cfg.imageConfig != nil {
+		// An all-zero block is not a setting: it stays off the wire.
+		if img := c.cfg.imageConfig.wire(); len(img) > 0 {
+			gen["imageConfig"] = img
+		}
+	}
+	// A raw thinkingConfig object wins over the level/budget pair (Python
+	// parity: _resolve_thinking_config returns thinking_config untouched); the
+	// two rooted knobs then resolve into one object.
+	if c.cfg.thinkingConfig != nil {
+		gen["thinkingConfig"] = c.cfg.thinkingConfig
+	} else if c.cfg.thinkingLevel != nil || c.cfg.thinkingBudget != nil {
 		thinking := map[string]any{}
 		if c.cfg.thinkingLevel != nil {
 			thinking["thinkingLevel"] = *c.cfg.thinkingLevel

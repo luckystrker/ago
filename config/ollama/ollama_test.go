@@ -93,9 +93,9 @@ func TestOllamaCreateValidation(t *testing.T) {
 	if _, err := NewOllama("").Create(); !errors.Is(err, config.ErrNotProvided) {
 		t.Fatalf("missing model: want ErrNotProvided, got %v", err)
 	}
-	// Streaming is not implemented in this port: Create refuses.
-	if _, err := NewOllama("m", WithStreaming(true)).Create(); !errors.Is(err, config.ErrUnsupportedInput) {
-		t.Fatalf("streaming: want ErrUnsupportedInput, got %v", err)
+	// Streaming configs build a client: the streaming path is supported.
+	if _, err := NewOllama("m", WithStreaming(true)).Create(); err != nil {
+		t.Fatalf("streaming: %v", err)
 	}
 	// A missing key is legal (local server): no error, no header.
 	cl, err := NewOllama("m").Create()

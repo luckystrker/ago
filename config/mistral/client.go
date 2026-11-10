@@ -152,3 +152,37 @@ func setAnyMap(dst *map[string]any, name string, v any) error {
 	}
 	return nil
 }
+
+// setAnyMaps accepts a list of objects (the guardrails block); each entry is
+// copied so a cloned config never shares the caller's maps.
+func setAnyMaps(dst *[]map[string]any, name string, v any) error {
+	var src []map[string]any
+	switch m := v.(type) {
+	case nil:
+		*dst = nil
+		return nil
+	case []map[string]any:
+		src = m
+	case []any:
+		src = make([]map[string]any, 0, len(m))
+		for _, entry := range m {
+			obj, ok := entry.(map[string]any)
+			if !ok {
+				return fmt.Errorf("config/mistral: override %q: got element %T, want map[string]any", name, entry)
+			}
+			src = append(src, obj)
+		}
+	default:
+		return fmt.Errorf("config/mistral: override %q: got %T, want []map[string]any", name, v)
+	}
+	out := make([]map[string]any, len(src))
+	for i, obj := range src {
+		cp := make(map[string]any, len(obj))
+		for k, val := range obj {
+			cp[k] = val
+		}
+		out[i] = cp
+	}
+	*dst = out
+	return nil
+}
