@@ -200,7 +200,9 @@ Never bind a default-configured handler to a non-loopback interface.
 `toolpacks.NewLocalCodeRunner` execute LLM-controlled commands and code on the host with
 the full permissions of the process. There is no filesystem, network or memory
 isolation — only a timeout, an output cap, an optional env allowlist and (for code) a
-language allowlist; the Docker/Daytona sandbox backends of Python AG2 are not ported.
+language allowlist. For isolation run them on a sandbox backend through the execution seam
+(`toolpacks.WithShellSandbox`, `toolpacks.NewSandboxCodeToolFromFactory`) with the optional
+`contrib/sandboxdocker` or `contrib/sandboxdaytona` module; the Tenki backend is not ported.
 The shell block-pattern option is advisory filtering, not a security boundary. Treat
 both tools as *executes arbitrary code by design*: wire the approval middleware
 (`middleware.Approval`) or a HITL hook on every agent that carries them, and assume that
@@ -253,14 +255,16 @@ All examples run offline on scripted models — clone and `go run ./examples/<na
   (event-sourced traces instead of OTEL).
 - **Optional modules** under `contrib/` (own go.mod, external deps allowed only there;
   the core stays at zero): `knowledgesqlite`, `knowledgeredis`, `streamredis`, `wslink`
-  (WebSocket network link), `otelx` (OpenTelemetry middleware). CI runs them as a
-  dedicated job.
+  (WebSocket network link), `otelx` (OpenTelemetry middleware), `searchtools` (Exa,
+  Firecrawl, Glasser, Keenable, Serply, TinyFish and Xquik search toolkits),
+  `sandboxdocker` and `sandboxdaytona` (execution backends for the shell and code tools).
+  CI runs them as a dedicated job.
 - **Stubbed:** xAI, Bedrock, TypeSafe configs (client construction returns an explicit
   "not implemented").
 - **Deferred remainders** (honest, each with a decision record): A2UI v0.9/v0.9.1 and its
   Starlette/stream middleware (the v1.0 core is ported); the realtime
-  audio stack and sound devices behind `live`; Docker/Daytona sandboxes behind the code
-  runner; ACP OAuth auth kinds and the cross-process session store — see
+  audio stack and sound devices behind `live`; the Tenki sandbox, NLIP, mi4afa,
+  `compaction_verifier` and `tealtiger` extensions; ACP OAuth auth kinds and the cross-process session store — see
   [docs/PORT_STATUS.md](docs/PORT_STATUS.md).
 - **Reviewed:** an independent port-parity review against the Python sources found and
   fixed 20 confirmed defects; the review trail is in the git history and decision records.

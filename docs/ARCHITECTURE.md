@@ -37,7 +37,7 @@ hitl    → events                     — HumanHook, HITL errors
 response → events, context           — ResponseProto, Schema[T], JSON-schema generation
 tools   → events, context            — Tool, FunctionTool, Toolkit, ToolExecutor, precedence
 config  → events, tools, response    — Provider, ModelConfig, LLMClient, per-provider clients
-middleware → events, context         — 4-hook onion chain, Conditional, builtins
+middleware → events, context, stream — 4-hook onion chain, `If`, builtins (HaltCheck subscribes to the stream)
 usage   → events                     — Report aggregation from UsageEvents
 task    → stream, events             — Task lifecycle, CheckpointStore
 knowledge → events, compact, aggregate — KnowledgeStore protocol, memory/disk backends, EventLog, Config strategy fields
@@ -47,12 +47,13 @@ observers → events, stream, context  — Observer protocol, LoopDetector, Toke
 watch   → events, stream             — Watch protocol, Interval/Event/AllOf/AnyOf/Sequence
 plugin  → tools, middleware, context — Plugin contributions (tools/middleware/prompts), Bundle
 agent   → everything above           — Agent, AgentRun, AgentReply, turn loop, subtasks
-spec    → agent, tools               — AgentSpec from/to agent
+spec    → agent, tools, response     — AgentSpec from/to agent (response schema round trip)
 network → agent, events, stream, knowledge, task — hub, channels, envelope, links, adapters
 mcp     → tools, context, config, stream — MCP client (stdio+HTTP JSON-RPC), Toolkit; config: sampling on the agent's model; stream: the sampling conversation
+mcpserver → agent, config, context, events, hitl, stream, tools — MCP serving side (resources, prompts, sessions, back-channel); config: the client's model for sampling
 mcpui   → events                     — MCP UI resources/actions (data constructors)
 agui    → agent, events, stream      — AG-UI serving (HTTP SSE endpoint, event projection)
-testing → config, events, stream     — TestConfig, TrackingConfig, fake clients
+testing → config, context, events, stream — TestConfig, TrackingConfig, scripted Turns, fake clients
 examples/                            — runnable programs (offline ones use testing pkg)
 ```
 
@@ -404,8 +405,7 @@ type HumanInputFunc func(ev *events.HumanInputRequest, ctx *context.Context) (*e
 
 type Base struct{}  // embed; each hook defaults to `return next(...)`
 type Factory func() Middleware
-type Conditional struct{...}  // wraps Factory with events.Condition; skips inner when false
-func If(c events.Condition, f Factory) Factory
+func If(c events.Condition, f Factory) Factory  // wraps Factory with events.Condition; skips inner when false
 
 // Builtins (middleware/builtin): HistoryLimiter(n), TokenLimiter(budget, charsPerToken),
 // Retry(maxAttempts, isRetryable), Logging(logger), Approval(toolName string, granted map[string]bool)
