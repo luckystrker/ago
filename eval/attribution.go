@@ -166,7 +166,7 @@ func (f FailureAttribution) Score(ctx context.Context, t *Trace) (Score, error) 
 // ScoreWith), and a verdict with no error_mode degrades to "other" (Python:
 // content() returning None) — D-051, D-061.
 func (f FailureAttribution) llmAttribute(ctx context.Context, t *Trace) (*Attribution, error) {
-	resp, err := callHeadless(ctx, f.Client, f.attributePrompt(t))
+	resp, err := callHeadless(ctx, f.Client, f.attributePrompt(t), config.CallOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("eval: attributor call: %w", err)
 	}

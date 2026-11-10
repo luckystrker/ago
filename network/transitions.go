@@ -2,6 +2,8 @@ package network
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
 	"sync"
 )
 
@@ -10,9 +12,11 @@ import (
 // (ToDict / GraphFromDict) and drives the WorkflowAdapter's speaker
 // selection.
 //
-// AGO-DEVIATION vs Python: the brief drops per-transition priorities (list
-// order decides) and the default_target field (fall-through terminates), and
-// the ContextEquals condition is not ported.
+// AGO-DEVIATION vs Python: the graph is serialized under the Go key names
+// ("initial"/"when"/"to" instead of "initial_speaker"/"when"/"then") and
+// carries no TransitionRegistry — custom targets and conditions cannot be
+// stored in channel knobs, because the built-in set is a closed Go type
+// switch.
 
 // TurnContext is what a target/condition sees when the workflow adapter
 // folds one substantive envelope: the envelope itself plus the snapshotted
@@ -39,39 +43,62 @@ type TransitionCondition interface {
 	Match(ctx *TurnContext) bool
 }
 
-// Transition pairs a condition with a target; the first matching transition
-// in list order wins.
+// Transition pairs a condition with a target. Lower Priority is checked
+// first; equal priorities resolve in list order (Python parity:
+// transitions.py Transition.priority, workflow.py _select's stable sort).
 type Transition struct {
-	When TransitionCondition
-	To   TransitionTarget
+	When     TransitionCondition
+	To       TransitionTarget
+	Priority int
 }
 
 // TransitionGraph is the orchestrator script: an initial speaker, ordered
-// transitions, and an optional turn cap (0 = unlimited).
+// transitions, an optional fall-through target and an optional turn cap
+// (0 = unlimited). A nil DefaultTarget terminates with "no_transition", which
+// is the graph behavior before default targets existed.
 type TransitionGraph struct {
-	Initial     string
-	Transitions []Transition
-	MaxTurns    int
+	Initial       string
+	Transitions   []Transition
+	DefaultTarget TransitionTarget
+	MaxTurns      int
 }
 
-// Select runs the graph against ctx: the first matching transition's target
-// decides. No match terminates the channel ("no_transition") — the brief's
-// graph has no default target.
+// Select runs the graph against ctx: the lowest-priority matching
+// transition's target decides (ties in list order); with no match the
+// graph's DefaultTarget decides, or — when it is nil — the channel terminates
+// with "no_transition" (Python parity: workflow.py _select).
 func (g TransitionGraph) Select(ctx *TurnContext) Routing {
-	for _, tr := range g.Transitions {
+	for _, tr := range g.sortedTransitions() {
 		if !tr.When.Match(ctx) {
 			continue
 		}
-		next, err := tr.To.Next(ctx)
-		if err != nil {
-			return Routing{Close: true, CloseReason: fmt.Sprintf("transition_error: %v", err)}
-		}
-		if next == "" {
-			return Routing{Close: true, CloseReason: nonEmpty(ctx.CloseReason, "workflow_terminated")}
-		}
-		return Routing{NextSender: next}
+		return applyTarget(tr.To, ctx)
 	}
-	return Routing{Close: true, CloseReason: "no_transition"}
+	if g.DefaultTarget == nil {
+		return Routing{Close: true, CloseReason: "no_transition"}
+	}
+	return applyTarget(g.DefaultTarget, ctx)
+}
+
+// sortedTransitions returns the transitions in evaluation order: ascending
+// priority, ties in list order (a stable sort of a copy, so Select stays
+// side-effect free).
+func (g TransitionGraph) sortedTransitions() []Transition {
+	out := append([]Transition(nil), g.Transitions...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out
+}
+
+// applyTarget runs one target and turns its answer into a Routing.
+func applyTarget(t TransitionTarget, ctx *TurnContext) Routing {
+	next, err := t.Next(ctx)
+	if err != nil {
+		return Routing{Close: true, CloseReason: fmt.Sprintf("transition_error: %v", err)}
+	}
+	if next == "" {
+		return Routing{Close: true, CloseReason: nonEmpty(ctx.CloseReason, "workflow_terminated")}
+	}
+	return Routing{NextSender: next}
 }
 
 func nonEmpty(s, fallback string) string {
@@ -99,11 +126,8 @@ func NewRoundRobinGraph(participants []string, maxTurns int) (TransitionGraph, e
 
 // NewSequenceGraph is a pipeline: steps[0] → steps[1] → … then the channel
 // terminates with reason "sequence_complete". Any speaker outside the
-// sequence terminates it the same way. MaxTurns is len(steps).
-//
-// AGO-DEVIATION: Python reaches the terminate through the graph's
-// default_target; AGo has none, so the builder appends a catch-all
-// Always → TerminateTarget transition with the same close reason.
+// sequence terminates it the same way (the fall-through target). MaxTurns is
+// len(steps).
 func NewSequenceGraph(steps []string) (TransitionGraph, error) {
 	if len(steps) == 0 {
 		return TransitionGraph{}, fmt.Errorf("%w: sequence requires at least 1 step", ErrProtocol)
@@ -115,8 +139,12 @@ func NewSequenceGraph(steps []string) (TransitionGraph, error) {
 			To:   AgentTarget{AgentID: steps[i+1]},
 		})
 	}
-	transitions = append(transitions, Transition{When: Always{}, To: TerminateTarget{Reason: "sequence_complete"}})
-	return TransitionGraph{Initial: steps[0], Transitions: transitions, MaxTurns: len(steps)}, nil
+	return TransitionGraph{
+		Initial:       steps[0],
+		Transitions:   transitions,
+		DefaultTarget: TerminateTarget{Reason: "sequence_complete"},
+		MaxTurns:      len(steps),
+	}, nil
 }
 
 // --- built-in targets --------------------------------------------------------
@@ -237,21 +265,53 @@ func (c ToolCalled) Match(ctx *TurnContext) bool {
 	return tool == c.Name
 }
 
+// ContextEquals fires when the channel-scoped context variable Key holds
+// Value (Python parity: transitions.py ContextEquals). A key that was never
+// set compares as nil, so ContextEquals{Key: "foo"} fires while foo is unset
+// or deleted. Comparison is deep (maps and slices included), which is what
+// Python's == does.
+//
+// AGO-DEVIATION: a value restored from channel knobs arrives as generic JSON
+// (numbers as float64), so a Value built as an int compares unequal to the
+// same number after a round trip — the same trap Python's == sets for int vs
+// float only where it matters (it compares them equal; AGo does not).
+type ContextEquals struct {
+	Key   string
+	Value any
+}
+
+func (c ContextEquals) Match(ctx *TurnContext) bool {
+	var have any
+	if ctx.ContextVars != nil {
+		have = ctx.ContextVars[c.Key]
+	}
+	return reflect.DeepEqual(have, c.Value)
+}
+
 // --- serialization (channel knobs) -------------------------------------------
 
 // ToDict serialises the graph into a JSON-friendly dict for
-// ChannelManifest.Knobs["graph"].
+// ChannelManifest.Knobs["graph"]. Priority is omitted at its zero value and
+// the default target only when one is set, so a graph built the old way
+// serialises exactly as before.
 func (g TransitionGraph) ToDict() map[string]any {
 	transitions := make([]any, 0, len(g.Transitions))
 	for _, tr := range g.Transitions {
-		transitions = append(transitions, map[string]any{
+		entry := map[string]any{
 			"when": conditionToDict(tr.When),
 			"to":   targetToDict(tr.To),
-		})
+		}
+		if tr.Priority != 0 {
+			entry["priority"] = tr.Priority
+		}
+		transitions = append(transitions, entry)
 	}
 	d := map[string]any{
 		"initial":     g.Initial,
 		"transitions": transitions,
+	}
+	if g.DefaultTarget != nil {
+		d["default_target"] = targetToDict(g.DefaultTarget)
 	}
 	if g.MaxTurns > 0 {
 		d["max_turns"] = g.MaxTurns
@@ -273,6 +333,13 @@ func GraphFromDict(d map[string]any) (TransitionGraph, error) {
 	if mt, ok := toInt(d["max_turns"]); ok {
 		g.MaxTurns = mt
 	}
+	if dt, ok := d["default_target"].(map[string]any); ok {
+		target, err := targetFromDict(dt)
+		if err != nil {
+			return g, err
+		}
+		g.DefaultTarget = target
+	}
 	raw, ok := d["transitions"].([]any)
 	if !ok {
 		return g, nil
@@ -290,7 +357,8 @@ func GraphFromDict(d map[string]any) (TransitionGraph, error) {
 		if err != nil {
 			return g, err
 		}
-		g.Transitions = append(g.Transitions, Transition{When: when, To: to})
+		priority, _ := toInt(tr["priority"])
+		g.Transitions = append(g.Transitions, Transition{When: when, To: to, Priority: priority})
 	}
 	return g, nil
 }
@@ -342,6 +410,8 @@ func conditionToDict(c TransitionCondition) map[string]any {
 		return map[string]any{"name": "from_speaker", "agent_id": c.AgentID}
 	case ToolCalled:
 		return map[string]any{"name": "tool_called", "tool": c.Name}
+	case ContextEquals:
+		return map[string]any{"name": "context_equals", "key": c.Key, "value": c.Value}
 	default:
 		return map[string]any{"name": fmt.Sprintf("%T", c)}
 	}
@@ -358,6 +428,8 @@ func conditionFromDict(d map[string]any) (TransitionCondition, error) {
 		return FromSpeaker{AgentID: toString(d["agent_id"])}, nil
 	case "tool_called":
 		return ToolCalled{Name: toString(d["tool"])}, nil
+	case "context_equals":
+		return ContextEquals{Key: toString(d["key"]), Value: d["value"]}, nil
 	default:
 		return nil, fmt.Errorf("%w: unknown condition %q", ErrProtocol, d["name"])
 	}

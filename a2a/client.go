@@ -297,3 +297,32 @@ func rpcErrToGo(e *RPCError) error {
 		return fmt.Errorf("%w: %s", ErrRPC, e.Error())
 	}
 }
+
+// ExtendedCard fetches the authenticated extended agent card: the JSON-RPC
+// agent/getAuthenticatedExtendedCard method, or GET /extendedAgentCard on the
+// REST binding. ErrRPC wraps the -32004 a server without an extended card
+// answers; the card is served only to a caller that passed the server's
+// request gates (WithHeaders carries whatever credentials they need).
+func (c *Client) ExtendedCard(ctx context.Context) (*AgentCard, error) {
+	result, err := c.extendedCardRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var card AgentCard
+	if err := json.Unmarshal(result, &card); err != nil {
+		return nil, fmt.Errorf("%w: decode extended card: %v", ErrWire, err)
+	}
+	return &card, nil
+}
+
+// extendedCardRaw performs the extended-card fetch on the resolved binding.
+func (c *Client) extendedCardRaw(ctx context.Context) (json.RawMessage, error) {
+	ep, err := c.endpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ep.binding != bindingREST {
+		return c.call(ctx, MethodExtendedCard, struct{}{})
+	}
+	return c.restDo(ctx, MethodExtendedCard, http.MethodGet, ep.restURL+ExtendedCardPath, nil)
+}

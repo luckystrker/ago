@@ -15,8 +15,10 @@ import (
 //
 //	POST /message:send     — one exchange (the 1.x send path)
 //	POST /tasks            — the same exchange under the wave's alias path
+//	GET  /tasks            — tasks/list (filters as query parameters)
 //	GET  /tasks/{id}       — tasks/get (historyLength query parameter)
 //	POST /tasks/{id}:cancel — tasks/cancel
+//	GET  /extendedAgentCard — the authenticated extended card
 //
 // Payloads and errors use application/a2a+json (the a2a-sdk binding media
 // type, src/a2a/utils/constants.py A2A_JSON_MEDIA_TYPE); failures map to HTTP
@@ -37,6 +39,8 @@ func (s *Server) serveREST(w http.ResponseWriter, r *http.Request) bool {
 	switch {
 	case r.Method == http.MethodPost && (path == RESTMessageSendPath || path == RESTTasksPath):
 		s.restMessageSend(w, r)
+	case r.Method == http.MethodGet && path == RESTTasksPath:
+		s.restTasksList(w, r)
 	case r.Method == http.MethodPost && strings.HasSuffix(path, ":cancel") && strings.HasPrefix(path, RESTTasksPath+"/"):
 		s.restTaskCancel(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, RESTTasksPath+"/"):
@@ -61,6 +65,10 @@ func (s *Server) restMessageSend(w http.ResponseWriter, r *http.Request) {
 		writeRESTError(w, http.StatusBadRequest, codeInvalidRequest, "decode message: "+err.Error())
 		return
 	}
+	if rpcErr := s.checkInputModes(&msg); rpcErr != nil {
+		writeREST(w, rpcErr)
+		return
+	}
 	outcome, rpcErr := s.executeSend(r.Context(), &msg)
 	if rpcErr != nil {
 		writeREST(w, rpcErr)
@@ -72,7 +80,8 @@ func (s *Server) restMessageSend(w http.ResponseWriter, r *http.Request) {
 	}
 	// A refused commit answers with the stored Task record: the turn lost
 	// the race to a cancel or an earlier terminal transition.
-	if outcome.state == TaskStateInputRequired || outcome.refused {
+	if outcome.state == TaskStateInputRequired || outcome.state == TaskStateAuthRequired ||
+		outcome.state == TaskStateRejected || outcome.refused {
 		writeRESTJSON(w, http.StatusOK, outcome.task)
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -263,5 +264,75 @@ func TestCascadeOverHTTPFakes(t *testing.T) {
 	}
 	if ttsFake.gotReq.Voice != "nova" {
 		t.Errorf("tts request voice = %q, want the voice forwarded through the cascade", ttsFake.gotReq.Voice)
+	}
+}
+
+// The translator posts to /audio/translations — not the transcription
+// endpoint — with the same multipart shape, no language hint (the endpoint
+// translates to English), and returns the plain-text answer.
+func TestTranslatorPostsToTheTranslationsEndpoint(t *testing.T) {
+	var gotPath, gotModel, gotFormat, gotLang, gotAuth, gotFilename, gotType string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		gotModel = r.FormValue("model")
+		gotFormat = r.FormValue("response_format")
+		gotLang = r.FormValue("language")
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Errorf("file part: %v", err)
+			return
+		}
+		defer file.Close()
+		gotFilename = header.Filename
+		gotType = header.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(file)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "  hello world  \n")
+	}))
+	defer srv.Close()
+
+	tr := &OpenAITranslator{APIKey: "secret", Model: "whisper-2", BaseURL: srv.URL}
+	text, err := tr.Translate(stdcontext.Background(), []byte("CLIP"), "audio/wav")
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if text != "hello world" {
+		t.Fatalf("text = %q, want the trimmed English translation", text)
+	}
+	if gotPath != "/audio/translations" {
+		t.Fatalf("path = %q, want /audio/translations", gotPath)
+	}
+	if gotModel != "whisper-2" || gotFormat != "text" {
+		t.Fatalf("form model=%q response_format=%q", gotModel, gotFormat)
+	}
+	if gotLang != "" {
+		t.Fatalf("translation must not send a language hint, got %q", gotLang)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if gotFilename != "speech.wav" || gotType != "audio/wav" || string(gotBody) != "CLIP" {
+		t.Fatalf("file part: %q %q %q", gotFilename, gotType, gotBody)
+	}
+}
+
+// A translator is usable anywhere a Transcriber is, and an API failure is
+// reported as ErrAPI.
+func TestTranslatorSatisfiesTranscriberAndReportsAPIErrors(t *testing.T) {
+	var _ Transcriber = &OpenAITranslator{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no such model", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	tr := &OpenAITranslator{APIKey: "k", BaseURL: srv.URL}
+	if _, err := tr.Transcribe(stdcontext.Background(), []byte("CLIP"), "audio/wav"); !errors.Is(err, ErrAPI) {
+		t.Fatalf("err = %v, want ErrAPI", err)
 	}
 }

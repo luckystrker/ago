@@ -182,3 +182,100 @@ func TestPairwiseErrors(t *testing.T) {
 func verdictPref(pref, reason string) string {
 	return `{"preferred": "` + pref + `", "reason": "` + reason + `"}`
 }
+
+// StructuredOutput asks the provider to constrain the answer to the verdict
+// schema; off, the call carries no schema (the old wire shape).
+func TestLLMJudgeStructuredOutput(t *testing.T) {
+	sc := &scriptClient{bodies: []string{verdictJSON("0.9", "good")}}
+	if _, err := (LLMJudge{Client: sc, Rubric: "r", StructuredOutput: true}).Score(context.Background(), answeredTrace("x")); err != nil {
+		t.Fatalf("score: %v", err)
+	}
+	if len(sc.opts) != 1 || sc.opts[0].ResponseSchema == nil {
+		t.Fatalf("structured output must send a response schema: %+v", sc.opts)
+	}
+	schema := sc.opts[0].ResponseSchema.JSONSchema()
+	if _, ok := schema["properties"].(map[string]any)["score"]; !ok {
+		t.Fatalf("schema does not describe the verdict: %#v", schema)
+	}
+
+	plain := &scriptClient{bodies: []string{verdictJSON("0.9", "good")}}
+	if _, err := (LLMJudge{Client: plain, Rubric: "r"}).Score(context.Background(), answeredTrace("x")); err != nil {
+		t.Fatalf("score: %v", err)
+	}
+	if plain.opts[0].ResponseSchema != nil {
+		t.Fatal("without StructuredOutput the call must carry no schema")
+	}
+}
+
+// An invalid verdict is re-asked, with the validation error in the re-ask;
+// the retries are spent, it is an error.
+func TestLLMJudgeRetriesInvalidVerdict(t *testing.T) {
+	sc := &scriptClient{bodies: []string{"I think it is great!", verdictJSON("0.7", "after retry")}}
+	got, err := (LLMJudge{Client: sc, Rubric: "r", Retries: 1}).Score(context.Background(), answeredTrace("x"))
+	if err != nil {
+		t.Fatalf("score after a retry: %v", err)
+	}
+	if got.Value != 0.7 || len(sc.prompts) != 2 {
+		t.Fatalf("value=%v calls=%d", got.Value, len(sc.prompts))
+	}
+	if !strings.Contains(sc.prompts[1], "could not be validated") ||
+		!strings.Contains(sc.prompts[1], "no JSON verdict") {
+		t.Fatalf("re-ask must say what failed: %q", sc.prompts[1])
+	}
+
+	exhausted := &scriptClient{bodies: []string{"nope", "still nope"}}
+	if _, err := (LLMJudge{Client: exhausted, Rubric: "r", Retries: 1}).Score(context.Background(), answeredTrace("x")); err == nil {
+		t.Fatal("an invalid verdict past the retries must error")
+	}
+	if len(exhausted.prompts) != 2 {
+		t.Fatalf("retries=1 must make exactly two calls, got %d", len(exhausted.prompts))
+	}
+
+	// A verdict without a score is a validation failure too, so it retries.
+	noScore := &scriptClient{bodies: []string{`{"reason": "no score"}`, verdictJSON("0.4", "ok")}}
+	if _, err := (LLMJudge{Client: noScore, Rubric: "r", Retries: 1}).Score(context.Background(), answeredTrace("x")); err != nil {
+		t.Fatalf("score: %v", err)
+	}
+	if !strings.Contains(noScore.prompts[1], "no score") {
+		t.Fatalf("re-ask must carry the validation error: %q", noScore.prompts[1])
+	}
+}
+
+// SingleOrder makes one judge call and reports that order's preference: no
+// swap, no flip-to-tie defense, and the detail carries one order only.
+func TestPairwiseSingleOrder(t *testing.T) {
+	sc := &scriptClient{bodies: []string{`{"preferred": "first", "reason": "clearer"}`}}
+	out, err := (Pairwise{Client: sc, Rubric: "r", SingleOrder: true}).Compare(
+		context.Background(), answeredTrace("answer a"), answeredTrace("answer b"))
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if out.Winner != WinsA {
+		t.Fatalf("winner = %q, want a (response 1 was preferred)", out.Winner)
+	}
+	if out.Reasoning != "clearer" {
+		t.Fatalf("reasoning = %q", out.Reasoning)
+	}
+	if len(sc.prompts) != 1 {
+		t.Fatalf("single-order mode must make one call, got %d", len(sc.prompts))
+	}
+	if _, ok := out.Detail["order2"]; ok {
+		t.Fatalf("single-order detail must not claim a second order: %+v", out.Detail)
+	}
+	if out.Detail["order1"] != "first" {
+		t.Fatalf("detail = %+v", out.Detail)
+	}
+
+	// The same verdict in dual-order mode is a tie (the swapped call would
+	// prefer the other side), which is what SingleOrder skips.
+	dual := &scriptClient{bodies: []string{
+		`{"preferred": "first", "reason": "clearer"}`,
+		`{"preferred": "first", "reason": "clearer"}`,
+	}}
+	if out, err := (Pairwise{Client: dual, Rubric: "r"}).Compare(
+		context.Background(), answeredTrace("answer a"), answeredTrace("answer b")); err != nil {
+		t.Fatalf("compare: %v", err)
+	} else if out.Winner != WinsTie || len(dual.prompts) != 2 {
+		t.Fatalf("dual order: winner=%q calls=%d", out.Winner, len(dual.prompts))
+	}
+}

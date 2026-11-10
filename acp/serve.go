@@ -462,6 +462,9 @@ func (c *serveConn) readLoop() {
 			continue
 		}
 		if msg.ID == nil {
+			if guardNotification(msg.Method, msg.Params) {
+				continue // a colliding _meta on a notification drops it
+			}
 			if msg.Method == "session/cancel" {
 				c.cancelTurn(msg.Params)
 			}
@@ -509,6 +512,11 @@ func (c *serveConn) write(msg any) error {
 // goroutine's while a nested exchange (permission/elicitation) waits for the
 // client on the replies channel.
 func (c *serveConn) dispatch(method string, params json.RawMessage) (any, *rpcError) {
+	// _meta may not displace a request's own fields (acp/guard.py): refuse
+	// before anything reads the parameters.
+	if collisions := collidingMetaKeys(method, params); len(collisions) > 0 {
+		return nil, metaGuardError(collisions)
+	}
 	switch method {
 	case "initialize":
 		var p struct {

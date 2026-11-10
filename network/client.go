@@ -115,8 +115,14 @@ type AgentClient struct {
 	inbox     chan Envelope
 	done      chan struct{}
 	closeOnce sync.Once
-	busy      int32
-	dropped   int64 // atomic: envelopes discarded by the inbox overflow policy
+	// pending counts envelopes the pump has taken responsibility for and not
+	// finished: incremented before the envelope is queued (so a delivery in
+	// flight is visible), decremented after the handler returns or the
+	// envelope is discarded. It is WaitIdle's signal: the queue length alone
+	// leaves a window in which a pump that has just taken an envelope off the
+	// queue looks idle.
+	pending int64
+	dropped int64 // atomic: envelopes discarded by the inbox overflow policy
 
 	errMu   sync.Mutex
 	lastErr error
@@ -249,11 +255,14 @@ func (a *AgentClient) Ask(channelID string, msg string) (string, error) {
 	return round.Text, nil
 }
 
-// WaitIdle blocks until the pump has drained its inbox and no handler is
-// running (test affordance for asynchronous dispatch).
+// WaitIdle blocks until every envelope delivered to this client has been
+// handled: nothing queued, nothing in flight (test affordance for asynchronous
+// dispatch). An envelope is counted from the moment the hub hands it to the
+// pump until the handler returns, so there is no window in which a delivery is
+// neither queued nor running and the wait would return early.
 func (a *AgentClient) WaitIdle(ctx context.Context) error {
 	for {
-		if len(a.inbox) == 0 && atomic.LoadInt32(&a.busy) == 0 {
+		if atomic.LoadInt64(&a.pending) == 0 {
 			return nil
 		}
 		select {
@@ -300,6 +309,7 @@ func (a *AgentClient) deliver(env Envelope) {
 		a.hub.AckInbox(a.AgentID(), 1) // counted at dispatch, never queued
 		return
 	}
+	atomic.AddInt64(&a.pending, 1)
 	enqueueWithPolicy(a.inbox, env, a.Rule().Inbox.EffectiveOverflow(), a.discard)
 }
 
@@ -307,6 +317,7 @@ func (a *AgentClient) deliver(env Envelope) {
 // inbox slot at the hub.
 func (a *AgentClient) discard(env Envelope) {
 	atomic.AddInt64(&a.dropped, 1)
+	atomic.AddInt64(&a.pending, -1)
 	if a.Rule().Inbox != (InboxBlock{}) { // explicit opt-in; no Inbox rule keeps the old silent drop
 		a.errMu.Lock()
 		a.lastErr = fmt.Errorf("%w: agent %s discarded envelope %s on channel %s",
@@ -351,10 +362,9 @@ func (a *AgentClient) pump() {
 	for {
 		select {
 		case env := <-a.inbox:
-			atomic.AddInt32(&a.busy, 1)
 			a.process(env)
 			a.hub.AckInbox(a.AgentID(), 1)
-			atomic.AddInt32(&a.busy, -1)
+			atomic.AddInt64(&a.pending, -1)
 		case <-a.done:
 			return
 		}

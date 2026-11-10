@@ -180,3 +180,79 @@ func TestRuleJSONOmitsUnsetLimits(t *testing.T) {
 		t.Fatalf("wire names: %s", data)
 	}
 }
+
+// --- channel-type access -----------------------------------------------------
+
+// An agent that may not initiate a channel type is refused at open, before the
+// invite handshake runs; the same rule leaves other types alone.
+func TestRuleChannelTypesRestrictInitiate(t *testing.T) {
+	h := newTestHub(t)
+	hc := NewHubClient(h)
+	alice, err := hc.Register("alice", WithAgentRule(Rule{
+		InboundGlobs:  []string{"*"},
+		OutboundGlobs: []string{"*"},
+		ChannelTypes:  ChannelTypeAccess{Initiate: []string{TypeConversation}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := hc.Register("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = alice.Close(); _ = bob.Close() }()
+
+	if _, err := alice.CreateChannel(ChannelManifest{Type: TypeWorkflow}, bob.AgentID()); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("workflow initiate: %v, want ErrAccessDenied", err)
+	}
+	if _, err := alice.CreateChannel(ChannelManifest{Type: TypeConversation}, bob.AgentID()); err != nil {
+		t.Fatalf("conversation initiate: %v", err)
+	}
+}
+
+// An agent that will not accept a channel type cannot be invited into one; the
+// creator's open fails instead of hanging on an invitee that would refuse.
+func TestRuleChannelTypesRestrictAccept(t *testing.T) {
+	h := newTestHub(t)
+	hc := NewHubClient(h)
+	alice, err := hc.Register("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := hc.Register("bob", WithAgentRule(Rule{
+		InboundGlobs:  []string{"*"},
+		OutboundGlobs: []string{"*"},
+		ChannelTypes:  ChannelTypeAccess{Accept: []string{TypeConversation}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = alice.Close(); _ = bob.Close() }()
+
+	if _, err := alice.CreateChannel(ChannelManifest{Type: TypeDiscussion}, bob.AgentID()); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("discussion invite: %v, want ErrAccessDenied", err)
+	}
+	if _, err := alice.CreateChannel(ChannelManifest{Type: TypeConversation}, bob.AgentID()); err != nil {
+		t.Fatalf("conversation invite: %v", err)
+	}
+}
+
+// A zero ChannelTypeAccess (what every rule built before this field existed
+// carries) allows every type.
+func TestRuleChannelTypesZeroValueIsPermissive(t *testing.T) {
+	var r Rule
+	for _, typ := range []string{TypeConversation, TypeWorkflow, TypeDiscussion, TypeConsulting} {
+		if !r.MayInitiate(typ) || !r.MayAccept(typ) {
+			t.Fatalf("zero rule blocks %q", typ)
+		}
+	}
+}
+
+func TestRuleCloneCopiesChannelTypes(t *testing.T) {
+	r := Rule{ChannelTypes: ChannelTypeAccess{Initiate: []string{"conversation"}, Accept: []string{"workflow"}}}
+	c := r.Clone()
+	c.ChannelTypes.Initiate[0] = "changed"
+	if r.ChannelTypes.Initiate[0] != "conversation" {
+		t.Fatal("Clone must deep-copy the channel-type globs")
+	}
+}

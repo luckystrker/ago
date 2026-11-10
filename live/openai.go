@@ -162,10 +162,99 @@ func (t *OpenAITranscriber) Transcribe(ctx stdcontext.Context, audio []byte, mim
 	if t == nil {
 		return "", errors.New("live: nil OpenAITranscriber")
 	}
-	if rate, channels, ok := rawPCMFormat(mime, t.PCMSampleRate, t.PCMChannels); ok {
+	return uploadSpeech(ctx, speechUpload{
+		apiKey:   t.APIKey,
+		model:    t.model(),
+		baseURL:  t.baseURL(),
+		client:   t.client(),
+		rate:     t.PCMSampleRate,
+		channels: t.PCMChannels,
+	}, "/audio/transcriptions", t.Language, audio, mime)
+}
+
+// OpenAITranslator calls POST /audio/translations over net/http — Python
+// parity: live/openai.py STTTranslationConfig. It takes speech in any language
+// and returns English text: the same multipart upload as the transcriber, with
+// no language hint (the endpoint translates to English by definition). The zero
+// value is unusable without an APIKey; unset fields take their documented
+// defaults. Safe for concurrent use, and usable anywhere a Transcriber is.
+type OpenAITranslator struct {
+	APIKey string
+	// Model is the translation model id; "" → "whisper-1".
+	Model string
+	// BaseURL is the API root; "" → https://api.openai.com/v1.
+	BaseURL string
+	// Client is the HTTP client; nil → the package default client.
+	Client *http.Client
+	// PCMSampleRate and PCMChannels describe raw PCM clips; 0 → 24000 Hz mono.
+	PCMSampleRate int
+	PCMChannels   int
+}
+
+var _ Transcriber = (*OpenAITranslator)(nil)
+
+func (t *OpenAITranslator) model() string {
+	if t.Model != "" {
+		return t.Model
+	}
+	return "whisper-1"
+}
+
+func (t *OpenAITranslator) baseURL() string {
+	if t.BaseURL != "" {
+		return t.BaseURL
+	}
+	return defaultBaseURL
+}
+
+func (t *OpenAITranslator) client() *http.Client {
+	if t.Client != nil {
+		return t.Client
+	}
+	return defaultClient
+}
+
+// Transcribe translates the clip and returns the English text. It satisfies
+// Transcriber so a translation stage drops into a cascade wherever a
+// transcription stage does.
+func (t *OpenAITranslator) Transcribe(ctx stdcontext.Context, audio []byte, mime string) (string, error) {
+	if t == nil {
+		return "", errors.New("live: nil OpenAITranslator")
+	}
+	return uploadSpeech(ctx, speechUpload{
+		apiKey:   t.APIKey,
+		model:    t.model(),
+		baseURL:  t.baseURL(),
+		client:   t.client(),
+		rate:     t.PCMSampleRate,
+		channels: t.PCMChannels,
+	}, "/audio/translations", "", audio, mime)
+}
+
+// Translate is Transcribe under the name the Python config uses.
+func (t *OpenAITranslator) Translate(ctx stdcontext.Context, audio []byte, mime string) (string, error) {
+	return t.Transcribe(ctx, audio, mime)
+}
+
+// speechUpload is the transport half shared by the transcription-style
+// endpoints: where to post, as whom, and how to read a raw PCM clip.
+type speechUpload struct {
+	apiKey   string
+	model    string
+	baseURL  string
+	client   *http.Client
+	rate     int
+	channels int
+}
+
+// uploadSpeech posts audio to one audio endpoint as multipart form data with
+// response_format=text and returns the trimmed body. language is the optional
+// ISO-639-1 input hint; "" omits it.
+func uploadSpeech(ctx stdcontext.Context, u speechUpload, endpoint, language string, audio []byte, mime string) (string, error) {
+	if rate, channels, ok := rawPCMFormat(mime, u.rate, u.channels); ok {
 		wav, err := PCMToWAV(audio, rate, channels)
 		if err != nil {
-			return "", fmt.Errorf("live: openai transcribe: %w", err)
+			return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 		}
 		audio, mime = wav, "audio/wav"
 	}
@@ -180,49 +269,53 @@ func (t *OpenAITranscriber) Transcribe(ctx stdcontext.Context, audio []byte, mim
 	h.Set("Content-Type", mime)
 	fh, err := w.CreatePart(h)
 	if err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
 	if _, err := fh.Write(audio); err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
 	for _, f := range []struct{ k, v string }{
-		{"model", t.model()},
+		{"model", u.model},
 		{"response_format", "text"},
-		{"language", t.Language},
 	} {
 		if f.v == "" {
 			continue
 		}
 		if err := w.WriteField(f.k, f.v); err != nil {
-			return "", fmt.Errorf("live: openai transcribe: %w", err)
+			return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
+		}
+	}
+	if language != "" {
+		if err := w.WriteField("language", language); err != nil {
+			return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 		}
 	}
 	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(t.baseURL(), "/")+"/audio/transcriptions", &body)
+		strings.TrimRight(u.baseURL, "/")+endpoint, &body)
 	if err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+t.APIKey)
+	req.Header.Set("Authorization", "Bearer "+u.apiKey)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
-	resp, err := t.client().Do(req)
+	resp, err := u.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// Only a snippet of an error body is ever reported — never buffer a
 		// giant one whole.
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("live: openai transcribe: %w: status %d: %s", ErrAPI, resp.StatusCode, snippet(data))
+		return "", fmt.Errorf("live: openai %s: %w: status %d: %s", endpoint, ErrAPI, resp.StatusCode, snippet(data))
 	}
 	data, err := readCapped(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("live: openai transcribe: %w", err)
+		return "", fmt.Errorf("live: openai %s: %w", endpoint, err)
 	}
 	return strings.TrimSpace(string(data)), nil
 }

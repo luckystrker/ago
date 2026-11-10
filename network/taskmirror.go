@@ -26,8 +26,9 @@ var ErrTaskNotFound = errors.New("network: task not found")
 // does not create, assign or cancel — it stores the metadata and starts
 // TTL accounting (expires_at rides in from the agent-side TaskStarted).
 // Re-observing an id updates in place (owner re-emitting TaskStarted on a
-// retry). AGO-DEVIATION vs Python: no persistence and no
-// max_concurrent_tasks cap — the AGo Rule carries no task-limits block and
+// retry) and is never capped; a *new* id is refused with ErrAccessDenied when
+// its owner already holds Rule.MaxConcurrentTasks non-terminal tasks (Python
+// parity: core.py observe_task). AGO-DEVIATION vs Python: no persistence —
 // the store is in-memory. Safe for concurrent use.
 func (h *Hub) ObserveTask(md task.Metadata) error {
 	if md.TaskID == "" {
@@ -35,7 +36,8 @@ func (h *Hub) ObserveTask(md task.Metadata) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if existing, ok := h.tasks[md.TaskID]; ok {
+	existing, seen := h.tasks[md.TaskID]
+	if seen {
 		if md.State == "" {
 			md.State = existing.State
 		}
@@ -53,6 +55,17 @@ func (h *Hub) ObserveTask(md task.Metadata) error {
 		}
 		if md.Progress == nil {
 			md.Progress = existing.Progress
+		}
+	} else if cap := h.rules[md.OwnerID].MaxConcurrentTasks; cap > 0 {
+		active := 0
+		for _, t := range h.tasks {
+			if t.OwnerID == md.OwnerID && !t.State.Terminal() {
+				active++
+			}
+		}
+		if active >= cap {
+			return fmt.Errorf("%w: owner %q exceeded max_concurrent_tasks (%d >= %d)",
+				ErrAccessDenied, md.OwnerID, active, cap)
 		}
 	}
 	if md.State == "" {

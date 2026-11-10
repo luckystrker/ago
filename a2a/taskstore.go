@@ -17,6 +17,16 @@ var (
 	// ErrTaskNotCancelable reports a cancel request against a task already in
 	// a terminal state (JSON-RPC -32002 on the wire).
 	ErrTaskNotCancelable = errors.New("a2a: task not cancelable")
+	// ErrTaskAuthRequired parks a task in auth-required: a handler returning
+	// an error that wraps it makes the server store the task auth-required
+	// with the error text as the status message, so the caller can obtain
+	// credentials and continue the task (parity: a2a TASK_STATE_AUTH_REQUIRED,
+	// A2ATaskAuthRequiredError).
+	ErrTaskAuthRequired = errors.New("a2a: task requires authentication")
+	// ErrTaskRejected ends a task as rejected: a handler returning an error
+	// that wraps it refuses the task outright (parity: a2a
+	// TASK_STATE_REJECTED, A2ATaskRejectedError).
+	ErrTaskRejected = errors.New("a2a: task rejected")
 	// ErrWire reports malformed A2A wire data: an unknown part kind, an
 	// undecodable envelope, or a result of an unexpected shape.
 	ErrWire = errors.New("a2a: malformed wire data")
