@@ -37,6 +37,42 @@ func TestTailWindowCompactNoOp(t *testing.T) {
 			t.Fatalf("target %d: kept %d events, want the history unchanged", target, len(got))
 		}
 	}
+
+	// The cut lands exactly on index 0 (the window covers every conversational
+	// event): the history is returned as-is, not as a re-slice that could drift.
+	exact := []events.Event{userReq("one"), userReq("two"), userReq("three")}
+	got := NewTailWindowCompact(3).Compact(exact)
+	if len(got) != len(exact) {
+		t.Fatalf("exact window kept %d events, want %d", len(got), len(exact))
+	}
+	for i := range exact {
+		if got[i] != exact[i] {
+			t.Fatalf("exact window changed event %d", i)
+		}
+	}
+}
+
+// TestTailWindowCompactKeepsAllWhenTailIsUnreplayable pins the retained-range
+// guard: when aligning the cut to a replayable boundary would reach the end of
+// the history, the window keeps everything instead of returning an empty slice.
+func TestTailWindowCompactKeepsAllWhenTailIsUnreplayable(t *testing.T) {
+	call := events.ToolCallEvent{ID: "c1", Name: "t"}
+	evs := []events.Event{
+		userReq("u"),
+		&events.ModelResponse{ToolCalls: events.ToolCallsEvent{Calls: []events.ToolCallEvent{call}}},
+		&events.ToolResultsEvent{Results: []events.ToolResultEvent{{ParentID: "c1"}}},
+	}
+	// target 1 lands on the result, whose call would be dropped: the cut advances
+	// to the end and there is nothing left to keep.
+	got := NewTailWindowCompact(1).Compact(evs)
+	if len(got) != len(evs) {
+		t.Fatalf("kept %d events, want the history unchanged (%d)", len(got), len(evs))
+	}
+	for i := range evs {
+		if got[i] != evs[i] {
+			t.Fatalf("the no-op path changed event %d", i)
+		}
+	}
 }
 
 // TestTailWindowMiddlewareRewritesHistory pins the middleware path: the old

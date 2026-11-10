@@ -196,3 +196,11 @@ func (m *MemoryStore) ReadRange(path string, off, n int) ([]byte, error) {
 func (m *MemoryStore) OnChange(fn func(path string)) {
 	m.ch.add(fn)
 }
+
+// Subscribe notifies fn for changes at path or under it and returns a closable
+// handle (Python parity: MemoryKnowledgeStore.on_change).
+func (m *MemoryStore) Subscribe(path string, fn func(path string)) *ChangeSubscription {
+	return m.ch.subscribe(path, fn)
+}
+
+var _ ChangeSubscriber = (*MemoryStore)(nil)

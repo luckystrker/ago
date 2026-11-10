@@ -2,7 +2,8 @@
 // validates model answers. A Proto describes the contract (name, description, JSON
 // schema, system-prompt fragment) and validates a raw model response against it.
 //
-// Parity with Python AG2 ag2/response/ (proto.py, schema.py, prompted.py, decision.py).
+// Parity with Python AG2 ag2/response/ (proto.py, schema.py, prompted.py,
+// callable.go, decision.py).
 // The reflection-based JSON-schema generator (SchemaOf) is shared with package tools
 // for function-parameter schemas. See docs/specs/core.md §2 ("Response schemas") and
 // docs/DECISIONS.md D-007 (Validate drops the Python provider argument).
@@ -38,6 +39,7 @@ var (
 	_ Proto = (*Schema[int])(nil)
 	_ Proto = (*RawSchemaImpl)(nil)
 	_ Proto = (*PromptedSchema)(nil)
+	_ Proto = (*CallableSchema)(nil)
 )
 
 // ErrInvalidResponse is wrapped by every ValidationError; match with errors.Is when the

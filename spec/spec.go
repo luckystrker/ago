@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/luckystrker/ago/agent"
+	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/tools"
 )
 
@@ -25,6 +26,24 @@ type SchemaSpec struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Schema      map[string]any `json:"json_schema"`
+}
+
+// ResponseProto rebuilds the wire schema as a response.Proto. It is a RawSchema,
+// not the original schema object: a spec carries data, not code, so validation
+// is not restored and the caller checks the content itself (Python parity:
+// ResponseSchemaSpec.to_response_schema).
+func (s *SchemaSpec) ResponseProto() response.Proto {
+	if s == nil {
+		return nil
+	}
+	opts := []response.RawOption{}
+	if s.Name != "" {
+		opts = append(opts, response.WithRawName(s.Name))
+	}
+	if s.Description != "" {
+		opts = append(opts, response.WithRawDescription(s.Description))
+	}
+	return response.RawSchema(s.Schema, opts...)
 }
 
 // AgentSpec captures an Agent's declarative state (Python parity: AgentSpec).
@@ -75,12 +94,11 @@ func (s *AgentSpec) UnmarshalJSON(data []byte) error {
 }
 
 // FromAgent captures the serializable state of a live agent: its name, static
-// prompt fragments and tool names. Dynamic prompts, middleware, callbacks and
-// dependencies are dropped (Python parity: AgentSpec.from_agent).
+// prompt fragments, tool names and response schema. Dynamic prompts, middleware,
+// callbacks and dependencies are dropped (Python parity: AgentSpec.from_agent).
 //
-// AGO-DEVIATION: the agent's response schema has no public getter, so
-// ResponseSchema is always nil here (Python reads the private
-// agent._response_schema); see docs/DECISIONS.md.
+// A schema whose JSONSchema is nil (prompt-driven, or one the type generator
+// could not map) is captured as no schema: a spec carries wire data only.
 func FromAgent(a *agent.Agent) (*AgentSpec, error) {
 	ts := a.Tools()
 	names := make([]string, 0, len(ts))
@@ -90,20 +108,28 @@ func FromAgent(a *agent.Agent) (*AgentSpec, error) {
 		}
 		names = append(names, t.Name())
 	}
-	return &AgentSpec{
+	s := &AgentSpec{
 		Name:      a.Name(),
 		Prompt:    a.PromptFragments(),
 		ToolNames: names,
-	}, nil
+	}
+	if rs := a.ResponseSchema(); rs != nil {
+		if js := rs.JSONSchema(); js != nil {
+			s.ResponseSchema = &SchemaSpec{Name: rs.Name(), Description: rs.Description(), Schema: js}
+		}
+	}
+	return s, nil
 }
 
 // ToAgent rebuilds an Agent from the spec. Tools are resolved by name against
 // available; the pool is already a flat name→tool index, so toolkit members
 // must be listed (or flattened) by the caller (Python flattens a Toolkit while
 // building its index). A spec tool missing from the pool fails the call with
-// an error wrapping tools.ErrResolution. Extra opts are applied as given; pass
-// agent.WithResponseSchema(...) to attach a schema (the spec's ResponseSchema
-// field is wire data only; see docs/DECISIONS.md).
+// an error wrapping tools.ErrResolution.
+//
+// A captured response schema is restored as a RawSchema (validation happens in
+// the caller, Python parity). Extra opts are applied after it, so an explicit
+// agent.WithResponseSchema passed here wins over the spec's schema.
 func (s *AgentSpec) ToAgent(available map[string]tools.Tool, opts ...agent.Option) (*agent.Agent, error) {
 	resolved := make([]tools.Tool, 0, len(s.ToolNames))
 	var missing []string
@@ -120,6 +146,9 @@ func (s *AgentSpec) ToAgent(available map[string]tools.Tool, opts ...agent.Optio
 			missing, sortedNames(available), tools.ErrResolution)
 	}
 	opts = append(opts, agent.WithTools(resolved...))
+	if rs := s.ResponseSchema.ResponseProto(); rs != nil {
+		opts = append([]agent.Option{agent.WithResponseSchema(rs)}, opts...)
+	}
 	return agent.New(s.Name, strings.Join(s.Prompt, "\n"), opts...), nil
 }
 

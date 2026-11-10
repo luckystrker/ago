@@ -102,6 +102,15 @@ func (r *AgentRun) open(ctx stdcontext.Context) (err error) {
 	r.cx.SetTurnContext(r.turnCtx)
 	r.maxToolRounds = opts.maxToolRounds
 
+	// The running agent publishes itself for the duration of the turn (Python
+	// parity: _set_for_turn(..., AGENT_CONTEXT_DEPENDENCY_KEY, self)), so
+	// middleware and knowledge policies can label their records with a real name:
+	// MetricsMiddleware reads this dependency for its "agent" label. The run's
+	// context belongs to this invocation (fresh, or cloned from the previous
+	// turn's and overwritten here), so no restore is needed; per-call dependency
+	// overrides applied below still win, as in Python.
+	r.cx.SetDependency(middleware.AgentDependencyKey, a)
+
 	// Per-stream turn lock: concurrent asks on one stream serialize (Python parity:
 	// the per-stream turn lock in _turn_scope). Acquiring honors ctx: a caller
 	// queued behind another turn returns its deadline error instead of parking.

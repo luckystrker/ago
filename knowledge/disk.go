@@ -372,3 +372,14 @@ func (d *DiskStore) ReadRange(path string, off, n int) ([]byte, error) {
 func (d *DiskStore) OnChange(fn func(path string)) {
 	d.ch.add(fn)
 }
+
+// Subscribe notifies fn for mutations at path or under it and returns a closable
+// handle (Python parity: DiskKnowledgeStore.on_change, minus the external-change
+// watching). AGO-DEVIATION: notifications come from in-process writes only, so a
+// change made by another process is not seen here; use PollingWatcher with a
+// VersionSource for that.
+func (d *DiskStore) Subscribe(path string, fn func(path string)) *ChangeSubscription {
+	return d.ch.subscribe(path, fn)
+}
+
+var _ ChangeSubscriber = (*DiskStore)(nil)

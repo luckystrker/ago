@@ -37,6 +37,9 @@ type CompactionMiddleware struct {
 	// TailWindowCompact rewrite (NewTailWindow).
 	tail  *TailWindowCompact
 	agent string
+	// keep overrides KeepRecent: how many trailing conversational events a
+	// summarizing compaction retains verbatim (0 = KeepRecent).
+	keep int
 }
 
 var _ middleware.Middleware = (*CompactionMiddleware)(nil)
@@ -48,6 +51,14 @@ type Option func(*CompactionMiddleware)
 // parity: CompactionStarted.agent / CompactionCompleted.agent).
 func WithAgent(name string) Option {
 	return func(m *CompactionMiddleware) { m.agent = name }
+}
+
+// WithKeepRecent sets how many trailing conversational events a summarizing
+// compaction retains verbatim (Python parity: SummarizeCompact(target)). The
+// window is aligned to a tool-round boundary afterwards — see snapCut — so the
+// retained range may be shorter than n. n <= 0 keeps KeepRecent.
+func WithKeepRecent(n int) Option {
+	return func(m *CompactionMiddleware) { m.keep = n }
 }
 
 // New builds the middleware Factory: one CompactionMiddleware per turn.
@@ -108,11 +119,16 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 	if m.tail != nil {
 		return m.tailCompact(ctx, evs)
 	}
-	cut := cutIndex(evs, KeepRecent)
-	if cut <= 0 {
-		// Fewer than KeepRecent+1 conversational events, or nothing before the
-		// fresh range: there is no old span worth a summary (Python parity:
-		// _cut_for_target returning 0 is a no-op).
+	keep := m.keep
+	if keep <= 0 {
+		keep = KeepRecent
+	}
+	cut := snapCut(evs, cutIndex(evs, keep))
+	if cut <= 0 || cut >= len(evs) {
+		// Fewer than keep conversational events, nothing before the fresh range,
+		// or no replayable boundary left to cut at: there is no old span worth a
+		// summary (Python parity: _cut_for_target returning 0, or an empty
+		// retained range, is a no-op).
 		return nil
 	}
 	old := conversational(evs[:cut])

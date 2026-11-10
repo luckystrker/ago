@@ -7,6 +7,7 @@ import (
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/middleware"
 	"github.com/luckystrker/ago/stream"
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/usage"
@@ -694,5 +695,49 @@ func TestCompactionKeepsDistinctIdLessStrategySpend(t *testing.T) {
 	}
 	if got := report.ByKind[events.UsageKindCompaction]; got.TotalTokens == nil || *got.TotalTokens != 10 {
 		t.Fatalf("compaction kind = %+v, want both records", got)
+	}
+}
+
+// TestCompactionNilTriggerOrStrategyPassesThrough pins the pass-through cases
+// documented on New/NewTailWindow: a missing trigger, a missing strategy or both
+// leave the history alone (and must not call a nil interface).
+func TestCompactionNilTriggerOrStrategyPassesThrough(t *testing.T) {
+	strategy := strategyFunc(func(*agocontext.Context, []events.Event) (string, error) {
+		t.Error("the strategy must not run without a trigger")
+		return "s", nil
+	})
+	factories := map[string]middleware.Factory{
+		"nil trigger":          New(nil, strategy),
+		"nil strategy":         New(EventCountTrigger(1), nil),
+		"nil trigger and both": New(nil, nil),
+		"nil tail window":      NewTailWindow(nil, 2),
+	}
+	for name, factory := range factories {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := newTestCtx(t)
+			send(t, ctx, userReq("u1"))
+			send(t, ctx, userReq("u2"))
+			before, err := ctx.Stream.History().GetEvents()
+			if err != nil {
+				t.Fatalf("GetEvents: %v", err)
+			}
+			if _, err := factory().OnTurn(func(*events.ModelRequest, *agocontext.Context) (*events.ModelResponse, error) {
+				return &events.ModelResponse{}, nil
+			}, &events.ModelRequest{}, ctx); err != nil {
+				t.Fatalf("OnTurn: %v", err)
+			}
+			after, err := ctx.Stream.History().GetEvents()
+			if err != nil {
+				t.Fatalf("GetEvents: %v", err)
+			}
+			if !equalStrs(fingerprint(before), fingerprint(after)) {
+				t.Fatalf("history changed: %v -> %v", fingerprint(before), fingerprint(after))
+			}
+			for _, e := range *log {
+				if strings.HasPrefix(e, "Compaction") {
+					t.Fatalf("compaction events were published: %v", *log)
+				}
+			}
+		})
 	}
 }
