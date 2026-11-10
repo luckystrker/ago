@@ -76,9 +76,16 @@ type mediaKey struct {
 	kind     events.BinaryType
 }
 
-// mediaKeys expands positions × sources × kinds into rows.
+// mediaKeys expands positions × sources × kinds into rows. With no kinds it
+// emits one kind-less row per (position, source) pair: that is how a provider
+// file id is described — the source names content the provider resolves itself,
+// so it carries no binary kind ("file", None in Python's _MEDIA).
 func mediaKeys(positions []InputPosition, sources []InputSource, kinds ...events.BinaryType) []mediaKey {
-	out := make([]mediaKey, 0, len(positions)*len(sources)*len(kinds))
+	capacity := len(positions) * len(sources) * max(len(kinds), 1)
+	out := make([]mediaKey, 0, capacity)
+	if len(kinds) == 0 {
+		kinds = []events.BinaryType{""}
+	}
 	for _, p := range positions {
 		for _, s := range sources {
 			for _, k := range kinds {

@@ -584,3 +584,82 @@ func TestTasksToolScopeAllParticipantFilter(t *testing.T) {
 		t.Fatalf("scope=all = %v, want exactly tk-own and tk-shared", list)
 	}
 }
+
+// peers find sorts on request: by name, by input cost (cheapest first, a peer
+// with no cost profile last) and by observed track record (best first).
+func TestPeersFindSortBy(t *testing.T) {
+	h := newTestHub(t)
+	hc := NewHubClient(h)
+	caller, err := hc.Register("caller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { caller.Close() })
+
+	// Registered out of order on purpose: the default (hub) order is
+	// carol, dave, erin; every sorted answer must differ from it.
+	if _, err := h.Register(Passport{Name: "carol", Cost: &CostProfile{InputPerMTok: 9}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	dave, err := h.Register(Passport{Name: "dave", Cost: &CostProfile{InputPerMTok: 1}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Register(Passport{Name: "erin"}, nil); err != nil { // no cost profile at all
+		t.Fatal(err)
+	}
+	// dave has the best track record: one completed observation.
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-dave", OwnerID: dave.AgentID, State: task.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.UpdateTask("t-dave", task.StateCompleted, nil, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RecordObservation(dave.AgentID, "grind", task.StateCompleted, 12, "t-dave"); err != nil {
+		t.Fatal(err)
+	}
+
+	set, err := ClientTools(hc, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func(args string) []string {
+		t.Helper()
+		list := toolResultList(t, callTool(t, set, "peers", args))
+		out := make([]string, len(list))
+		for i, peer := range list {
+			out[i], _ = peer["name"].(string)
+		}
+		return out
+	}
+
+	if got, want := names(`{"action":"find","sort_by":"name"}`), []string{"carol", "dave", "erin"}; !equalStrings(got, want) {
+		t.Fatalf("sort_by=name = %v, want %v", got, want)
+	}
+	if got, want := names(`{"action":"find","sort_by":"cost"}`), []string{"dave", "carol", "erin"}; !equalStrings(got, want) {
+		t.Fatalf("sort_by=cost = %v, want %v", got, want)
+	}
+	if got, want := names(`{"action":"find","sort_by":"track_record"}`), []string{"dave", "carol", "erin"}; !equalStrings(got, want) {
+		t.Fatalf("sort_by=track_record = %v, want %v", got, want)
+	}
+	// No sort_by keeps the hub's registration order.
+	if got, want := names(`{"action":"find"}`), []string{"carol", "dave", "erin"}; !equalStrings(got, want) {
+		t.Fatalf("unsorted = %v, want %v", got, want)
+	}
+	// An unknown mode is an error the model can read, not a silent ignore.
+	if got, _ := callTool(t, set, "peers", `{"action":"find","sort_by":"vibes"}`).(string); !strings.Contains(got, "unknown sort_by") {
+		t.Fatalf("unknown sort_by = %v", got)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

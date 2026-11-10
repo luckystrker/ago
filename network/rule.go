@@ -26,10 +26,10 @@ var (
 // rule at registration. Both halves are enforced at the hub, never the
 // client.
 //
-// AGO-DEVIATION vs Python's Rule: the brief pins a flat shape — channel-type
-// access and default TTLs are not ported, and the Python limits.* nesting is
-// flattened (MaxDelegationDepth ≙ limits.delegation_depth, Rate ≙
-// limits.rate, Inbox ≙ limits.inbox).
+// AGO-DEVIATION vs Python's Rule: the brief pins a flat shape — the Python
+// limits.* nesting is flattened (MaxDelegationDepth ≙ limits.delegation_depth,
+// Rate ≙ limits.rate, Inbox ≙ limits.inbox, MaxConcurrentTasks ≙
+// limits.max_concurrent_tasks, ChannelTypes ≙ access.channel_types).
 type Rule struct {
 	// InboundGlobs globs over sender *names*; a recipient accepts envelopes
 	// only from matching senders. Empty = accept nobody (use DefaultRule).
@@ -37,11 +37,22 @@ type Rule struct {
 	// OutboundGlobs globs over recipient *names*; the sender may address
 	// only matching recipients.
 	OutboundGlobs []string `json:"outbound_globs,omitempty"`
+	// ChannelTypes restricts which channel types this agent may initiate and
+	// accept. The zero value allows every type (the permissive default — an
+	// absent block means "any type").
+	//
+	// AGO-DEVIATION: Python declares ChannelTypeAccess but nothing reads it;
+	// the hub enforces it here (the same treatment as Rate).
+	ChannelTypes ChannelTypeAccess `json:"channel_types,omitzero"`
 	// MaxDelegationDepth caps Envelope.Depth on send; 0 disables the cap.
 	MaxDelegationDepth int `json:"max_delegation_depth,omitempty"`
 	// MaxConcurrentChannels caps the channels one creator may keep
 	// non-terminal; 0 disables the cap.
 	MaxConcurrentChannels int `json:"max_concurrent_channels,omitempty"`
+	// MaxConcurrentTasks caps the non-terminal tasks one owner may keep
+	// observed at the hub (Hub.ObserveTask); 0 disables the cap (Python
+	// parity: limits.max_concurrent_tasks, enforced on first observation).
+	MaxConcurrentTasks int `json:"max_concurrent_tasks,omitempty"`
 	// Rate is the sender's token-bucket limit on substantive envelopes; the
 	// zero value disables it.
 	//
@@ -69,6 +80,30 @@ type Rule struct {
 type RateBlock struct {
 	PerMinute int `json:"per_minute,omitempty"`
 	Burst     int `json:"burst,omitempty"`
+}
+
+// ChannelTypeAccess is the channel-type half of a rule: globs over a channel
+// manifest's Type. Initiate is checked against the channels this agent
+// creates, Accept against the channels it is invited to. An empty list allows
+// every type (Python's default is ["*"], and an absent block is permissive).
+type ChannelTypeAccess struct {
+	Initiate []string `json:"initiate,omitempty"`
+	Accept   []string `json:"accept,omitempty"`
+}
+
+// allows reports whether s passes a glob list; an empty list allows anything.
+func allows(globs []string, s string) bool { return len(globs) == 0 || Match(globs, s) }
+
+// MayInitiate reports whether the rule lets its agent create a channel of
+// channelType.
+func (r Rule) MayInitiate(channelType string) bool {
+	return allows(r.ChannelTypes.Initiate, channelType)
+}
+
+// MayAccept reports whether the rule lets its agent join a channel of
+// channelType.
+func (r Rule) MayAccept(channelType string) bool {
+	return allows(r.ChannelTypes.Accept, channelType)
 }
 
 // Inbox overflow policies (InboxBlock.Overflow).
@@ -261,6 +296,12 @@ func (r Rule) Clone() Rule {
 	}
 	if len(r.OutboundGlobs) > 0 {
 		out.OutboundGlobs = append([]string(nil), r.OutboundGlobs...)
+	}
+	if len(r.ChannelTypes.Initiate) > 0 {
+		out.ChannelTypes.Initiate = append([]string(nil), r.ChannelTypes.Initiate...)
+	}
+	if len(r.ChannelTypes.Accept) > 0 {
+		out.ChannelTypes.Accept = append([]string(nil), r.ChannelTypes.Accept...)
 	}
 	return out
 }

@@ -245,6 +245,11 @@ func TestAuditLogRecordsListenerEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return len(kindsOf(sink.Entries(), AuditTurnFailed)) == 1 })
+	// The entry reaches the sink before the audit log notifies its live
+	// subscribers, and the failure is reported from alice's pump goroutine:
+	// wait for the pumps to finish so no append is mid-notification when the
+	// subscriber count is compared with the sink below.
+	waitIdle(t, alice, bob)
 	_ = h.ObserveTask(task.Metadata{TaskID: "t-1", OwnerID: bob.AgentID(), ChannelID: ch.ID, State: task.StateRunning, Spec: task.Spec{Capability: "grind"}})
 	_ = h.UpdateTask("t-1", task.StateFailed, nil, nil, "boom")
 	_ = h.RecordObservation(bob.AgentID(), "grind", task.StateFailed, -1, "t-1")

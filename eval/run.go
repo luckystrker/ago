@@ -13,30 +13,41 @@ import (
 // Case is one unit of evaluation: a prompt for the agent, an optional Expected
 // answer for reference-based scorers (the suite author typically builds
 // Correctness{Expected: c.Expected} from it), and the scorers that grade the
-// case's trace. Python parity: dataset/task.py Task, reduced to the fields the
-// AGo contract carries; tags/metadata and JSONL loading are deferred (D-051).
+// case's trace. Tags and Metadata are the dataset's free-form labels and extra
+// fields (Python parity: dataset/task.py Task.tags / Task.metadata); they ride
+// along to the CaseResult so a report can slice the run by them, and nothing
+// in the runner interprets them.
 type Case struct {
-	Name     string   `json:"name"`
-	Input    string   `json:"input"`
-	Expected string   `json:"expected,omitempty"`
-	Scorers  []Scorer `json:"-"`
+	Name     string         `json:"name"`
+	Input    string         `json:"input"`
+	Expected string         `json:"expected,omitempty"`
+	Tags     []string       `json:"tags,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
+	Scorers  []Scorer       `json:"-"`
 }
 
 // Suite is an ordered collection of cases (Python parity: dataset/suite.py).
+//
+// AGO-DEVIATION: Python's Suite is a container object carrying a name and a
+// source ("inline", or the JSONL path); AGo's Suite is the case slice itself,
+// so the two travel as run options (WithSuiteName / WithSuiteSource) and land
+// on RunResult instead of on the suite.
 type Suite []Case
 
 // CaseResult is one case's outcome: the agent's final answer, its trace, the
 // scorers' verdicts, and whether every scorer passed. A case with no scores is
 // not counted as passed — nothing graded it. Err carries the ask failure, if
 // any (Python parity: the exception on TaskResult/Trace; the AGo Trace has no
-// exception slot, so it lives here — D-051).
+// exception slot, so it lives here — D-051). Tags is the case's tag list,
+// carried through so a report can slice the run.
 type CaseResult struct {
-	Name   string  `json:"name"`
-	Output string  `json:"output"`
-	Trace  *Trace  `json:"trace"`
-	Scores []Score `json:"scores"`
-	Passed bool    `json:"passed"`
-	Err    string  `json:"err,omitempty"`
+	Name   string   `json:"name"`
+	Output string   `json:"output"`
+	Trace  *Trace   `json:"trace"`
+	Scores []Score  `json:"scores"`
+	Passed bool     `json:"passed"`
+	Err    string   `json:"err,omitempty"`
+	Tags   []string `json:"tags,omitempty"`
 }
 
 // RunResult is the outcome of one Run: per-case results and the fraction of
@@ -51,6 +62,15 @@ type RunResult struct {
 	RunID     string    `json:"run_id,omitempty"`
 	Label     string    `json:"label,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitzero"`
+	// SuiteName and SuiteSource identify the suite that ran (Python parity:
+	// Suite.name / Suite.source, which the AGo Suite slice cannot carry —
+	// see WithSuiteName / WithSuiteSource).
+	SuiteName   string `json:"suite_name,omitempty"`
+	SuiteSource string `json:"suite_source,omitempty"`
+	// BudgetViolations counts the cases that exceeded BudgetThresholds
+	// (Python parity: RunResult.aggregates.budget_violations). It is a
+	// regression signal, not a failure: the cases still grade normally.
+	BudgetViolations int `json:"budget_violations,omitempty"`
 }
 
 // RunOption tunes a Run.
@@ -61,6 +81,9 @@ type runOptions struct {
 	label       string
 	storeDir    string
 	reporter    Reporter
+	suiteName   string
+	suiteSource string
+	budgets     BudgetThresholds
 }
 
 // WithConcurrency caps how many cases ask the agent at once (Python parity:
@@ -95,6 +118,25 @@ func WithReporter(r Reporter) RunOption {
 	return func(o *runOptions) { o.reporter = r }
 }
 
+// WithSuiteName records the suite's name on the result (Python parity:
+// Suite(name=...); the AGo Suite is a case slice, so the name travels here).
+func WithSuiteName(name string) RunOption {
+	return func(o *runOptions) { o.suiteName = name }
+}
+
+// WithSuiteSource records where the suite came from — a JSONL path, "inline",
+// a registry key (Python parity: Suite(source=...)).
+func WithSuiteSource(source string) RunOption {
+	return func(o *runOptions) { o.suiteSource = source }
+}
+
+// WithBudgets measures every case against b and counts the cases over budget
+// in RunResult.BudgetViolations. The count is observational: no case is
+// aborted (Python parity: run_agent's budgets).
+func WithBudgets(b BudgetThresholds) RunOption {
+	return func(o *runOptions) { o.budgets = b }
+}
+
 // DefaultConcurrency is how many cases Run asks at once (Python parity:
 // runner.py concurrency=4).
 const DefaultConcurrency = 4
@@ -123,10 +165,12 @@ func Run(ctx context.Context, a *agent.Agent, s Suite, opts ...RunOption) (*RunR
 		limit = len(s)
 	}
 	res := &RunResult{
-		Cases:     make([]CaseResult, len(s)),
-		RunID:     uuid.New(),
-		Label:     o.label,
-		CreatedAt: time.Now().UTC(),
+		Cases:       make([]CaseResult, len(s)),
+		RunID:       uuid.New(),
+		Label:       o.label,
+		CreatedAt:   time.Now().UTC(),
+		SuiteName:   o.suiteName,
+		SuiteSource: o.suiteSource,
 	}
 	if o.reporter != nil {
 		o.reporter.RunStarted(len(s), o.label)
@@ -172,6 +216,15 @@ func Run(ctx context.Context, a *agent.Agent, s Suite, opts ...RunOption) (*RunR
 	if len(res.Cases) > 0 {
 		res.PassRate = float64(passed) / float64(len(res.Cases))
 	}
+	// Budgets are measured once every case is graded: the traces are final
+	// then, and a count is all the signal carries (nothing is aborted).
+	if o.budgets.Enabled() {
+		for _, cr := range res.Cases {
+			if o.budgets.ExceededBy(cr.Trace) {
+				res.BudgetViolations++
+			}
+		}
+	}
 	return finishRun(res, o)
 }
 
@@ -190,7 +243,7 @@ func finishRun(res *RunResult, o runOptions) (*RunResult, error) {
 }
 
 func runCase(ctx context.Context, a *agent.Agent, c Case) CaseResult {
-	cr := CaseResult{Name: c.Name, Trace: &Trace{AgentName: a.Name()}, Scores: []Score{}}
+	cr := CaseResult{Name: c.Name, Trace: &Trace{AgentName: a.Name()}, Scores: []Score{}, Tags: append([]string(nil), c.Tags...)}
 	start := time.Now()
 
 	run, rerr := a.Run(ctx, c.Input)

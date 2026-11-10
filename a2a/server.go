@@ -19,6 +19,9 @@ import (
 const (
 	DefaultCardPath = "/.well-known/agent-card.json"
 	LegacyCardPath  = "/.well-known/agent.json"
+	// ExtendedCardPath is the REST route of the authenticated card (A2A spec
+	// §7.10; the a2a-sdk's rest_routes mount the same path).
+	ExtendedCardPath = "/extendedAgentCard"
 )
 
 // rpcPath is the single JSON-RPC endpoint (parity: build_jsonrpc rpc_url="/").
@@ -112,6 +115,27 @@ type ServerConfig struct {
 	// of the discovery routes (parity: build_jsonrpc card_cache_control), for
 	// example "public, max-age=300". Empty sends no header.
 	CardCacheControl string
+	// ExtendedCard is the authenticated card: the one served by the JSON-RPC
+	// agent/getAuthenticatedExtendedCard method and the REST
+	// /extendedAgentCard route, and reachable only through the request gates
+	// (Authorize, AllowedHosts, AllowedOrigins) — the point of a second card
+	// is to show a caller that authenticated more than the public one does
+	// (parity: server.py extended_card, which also flips
+	// capabilities.extendedAgentCard on the public card). Nil makes both
+	// surfaces answer -32004.
+	ExtendedCard *AgentCard
+	// ExtendedCardModifier rewrites the extended card per request (parity:
+	// transports/_common.py wrap_extended_card_modifier — the hook receives a
+	// copy, so mutate-and-return never leaks into the long-lived card). Nil
+	// serves the card verbatim. The hook must be safe for concurrent use.
+	ExtendedCardModifier func(r *http.Request, card *AgentCard) (*AgentCard, error)
+	// ValidateInputModes makes the message surfaces reject a part whose media
+	// type is not declared by the card (defaultInputModes or a skill's
+	// inputModes), which is the SDK-side check the Python server turns on with
+	// validate_input_modes (parity: server.py _check_input_modes /
+	// the a2a-sdk's input-mode validation). An empty declaration accepts
+	// everything, as in the SDK.
+	ValidateInputModes bool
 	// AllowedOrigins, when non-empty, requires every request carrying an
 	// Origin header (browsers send it cross-origin) to match one entry
 	// exactly (scheme://host[:port], case-insensitive). Requests without
@@ -148,6 +172,11 @@ func NewServer(cfg ServerConfig) *Server {
 	card := withDiscoveryDefaults(cfg.Card)
 	if cfg.PushStore != nil {
 		card.Capabilities.PushNotifications = true
+	}
+	if cfg.ExtendedCard != nil {
+		// The public card advertises the second one (parity: server.py flips
+		// capabilities.extended_agent_card when extended_card is supplied).
+		card.Capabilities.ExtendedAgentCard = true
 	}
 	return &Server{cfg: cfg, card: card, store: store}
 }
@@ -188,6 +217,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == ExtendedCardPath:
+		// A card route, not a REST task route: it answers 405 to a non-GET
+		// like the discovery paths do.
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.serveExtendedCard(w, r)
 	case r.URL.Path == DefaultCardPath || r.URL.Path == LegacyCardPath:
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -245,6 +283,68 @@ func cloneCard(card *AgentCard) (*AgentCard, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// ErrNoExtendedCard reports a server with no authenticated card configured.
+var ErrNoExtendedCard = errors.New("a2a: no authenticated extended agent card configured")
+
+// resolveExtendedCard builds the card both extended-card surfaces serve: the
+// configured one, discovery defaults applied, through the per-request
+// modifier. The request gates in admit have already run, so a caller that gets
+// this far passed whatever authentication the deployment configured.
+func (s *Server) resolveExtendedCard(r *http.Request) (*AgentCard, error) {
+	if s.cfg.ExtendedCard == nil {
+		return nil, ErrNoExtendedCard
+	}
+	card, err := cloneCard(s.cfg.ExtendedCard)
+	if err != nil {
+		return nil, err
+	}
+	fresh := withDiscoveryDefaults(*card)
+	card = &fresh
+	if s.cfg.ExtendedCardModifier != nil {
+		out, err := s.cfg.ExtendedCardModifier(r, card)
+		if err != nil {
+			return nil, err
+		}
+		if out != nil {
+			card = out
+		}
+	}
+	return card, nil
+}
+
+// serveExtendedCard answers REST GET /extendedAgentCard.
+func (s *Server) serveExtendedCard(w http.ResponseWriter, r *http.Request) {
+	card, err := s.resolveExtendedCard(r)
+	switch {
+	case errors.Is(err, ErrNoExtendedCard):
+		http.Error(w, msgNoExtendedCard, http.StatusNotFound)
+		return
+	case err != nil:
+		http.Error(w, msgInternalError, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, card)
+}
+
+// msgNoExtendedCard is the fixed text for a server with no extended card
+// configured: which card to serve is deployment detail, not client business.
+const msgNoExtendedCard = "no authenticated extended agent card is configured"
+
+// serveExtendedRPC answers agent/getAuthenticatedExtendedCard with the same
+// card the REST route serves.
+func (s *Server) serveExtendedRPC(w http.ResponseWriter, r *http.Request, req *rpcRequest) {
+	card, err := s.resolveExtendedCard(r)
+	switch {
+	case errors.Is(err, ErrNoExtendedCard):
+		writeRPCError(w, req.ID, &RPCError{Code: codeUnsupportedOperation, Message: msgNoExtendedCard})
+		return
+	case err != nil:
+		writeRPCError(w, req.ID, &RPCError{Code: codeInternalError, Message: msgInternalError})
+		return
+	}
+	writeRPCResult(w, req.ID, card)
 }
 
 // admit applies the request gates — the Authorize hook, then the Host and
@@ -336,8 +436,12 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request) {
 		s.messageStream(ctx, w, &req)
 	case MethodTasksGet:
 		s.tasksGet(ctx, w, &req)
+	case MethodTasksList:
+		s.tasksList(ctx, w, &req)
 	case MethodTasksCancel:
 		s.tasksCancel(ctx, w, &req)
+	case MethodExtendedCard:
+		s.serveExtendedRPC(w, r, &req)
 	case MethodPushSet:
 		s.servePushSet(ctx, w, &req)
 	case MethodPushGet:
@@ -441,6 +545,13 @@ func errorMessage(err error) *Message {
 	return &Message{Role: RoleAgent, MessageID: uuid.New(), Parts: []Part{NewTextPart(err.Error())}}
 }
 
+// authRequiredMessage is the parked message of an auth-required task: the
+// handler's error text says what credentials the caller has to obtain (the A2A
+// spec's TaskStatus.message half of the auth-required transition).
+func authRequiredMessage(err error) *Message {
+	return &Message{Role: RoleAgent, MessageID: uuid.New(), Parts: []Part{NewTextPart(err.Error())}}
+}
+
 // sendOutcome is what one message/send-style turn produced.
 type sendOutcome struct {
 	task      *Task     // the stored record, terminal or parked
@@ -517,6 +628,15 @@ func (s *Server) runTurn(ctx context.Context, task *Task, msg *Message) (*Messag
 	}
 	reply, state, err := s.dispatchTurn(ctx, msg)
 	if err != nil {
+		// A handler that refuses the task or asks for credentials names the
+		// state itself (parity: a2a TASK_STATE_REJECTED / TASK_STATE_AUTH_REQUIRED);
+		// anything else is a failure.
+		switch {
+		case errors.Is(err, ErrTaskAuthRequired):
+			return authRequiredMessage(err), TaskStateAuthRequired, nil
+		case errors.Is(err, ErrTaskRejected):
+			return errorMessage(err), TaskStateRejected, nil
+		}
 		return nil, TaskStateFailed, err
 	}
 	if len(outgoing) > 0 {
@@ -641,8 +761,10 @@ func (s *Server) commitTask(ctx context.Context, task *Task, msg *Message, reply
 		switch {
 		case handleErr != nil:
 			current.Status = TaskStatus{State: TaskStateFailed, Message: errorMessage(handleErr)}
-		case state == TaskStateInputRequired:
-			current.Status = TaskStatus{State: TaskStateInputRequired, Message: normalizeReply(reply, current)}
+		case state == TaskStateInputRequired || state == TaskStateAuthRequired:
+			current.Status = TaskStatus{State: state, Message: normalizeReply(reply, current)}
+		case state == TaskStateRejected:
+			current.Status = TaskStatus{State: TaskStateRejected, Message: normalizeReply(reply, current)}
 		default:
 			current.Status = TaskStatus{State: TaskStateCompleted, Message: normalizeReply(reply, current)}
 		}
@@ -757,6 +879,10 @@ func (s *Server) messageSend(ctx context.Context, w http.ResponseWriter, req *rp
 		writeRPCError(w, req.ID, rpcErr)
 		return
 	}
+	if rpcErr := s.checkInputModes(msg); rpcErr != nil {
+		writeRPCError(w, req.ID, rpcErr)
+		return
+	}
 	outcome, rpcErr := s.executeSend(ctx, msg)
 	if rpcErr != nil {
 		writeRPCError(w, req.ID, rpcErr)
@@ -769,7 +895,8 @@ func (s *Server) messageSend(ctx context.Context, w http.ResponseWriter, req *rp
 	// A refused commit answers with the stored Task record — the turn lost
 	// the race to a cancel or an earlier terminal transition, and the record
 	// is the only honest reply (same shape as the deferred turns below).
-	if outcome.state == TaskStateInputRequired || outcome.refused {
+	if outcome.state == TaskStateInputRequired || outcome.state == TaskStateAuthRequired ||
+		outcome.state == TaskStateRejected || outcome.refused {
 		writeRPCResult(w, req.ID, outcome.task)
 		return
 	}
@@ -891,6 +1018,10 @@ func (s *Server) messageStream(ctx context.Context, w http.ResponseWriter, req *
 	}
 	msg, rpcErr := decodeMessageParams(req)
 	if rpcErr != nil {
+		writeRPCError(w, req.ID, rpcErr)
+		return
+	}
+	if rpcErr := s.checkInputModes(msg); rpcErr != nil {
 		writeRPCError(w, req.ID, rpcErr)
 		return
 	}

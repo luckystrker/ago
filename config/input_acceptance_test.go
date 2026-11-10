@@ -71,6 +71,16 @@ func add(set map[tripleKey]bool, positions []config.InputPosition, sources []con
 	}
 }
 
+// addFile records the provider-file rows: Python's ("file", None) entries. The
+// kind is written out here on purpose — the oracle must not borrow the
+// implementation's convention for a kind-less row, or a bug in that convention
+// would be invisible to it.
+func addFile(set map[tripleKey]bool, positions ...config.InputPosition) {
+	for _, p := range positions {
+		set[tripleKey{p, config.SourceFile, ""}] = true
+	}
+}
+
 // acceptedByPython is ag2/config/input_acceptance.py `_MEDIA`, transcribed
 // verbatim. It is the oracle for the Go table: every entry and every absence
 // is checked.
@@ -80,25 +90,23 @@ func acceptedByPython() map[config.InputDialect]map[tripleKey]bool {
 	both := []config.InputPosition{config.PositionUser, config.PositionTool}
 	data := []config.InputSource{config.SourceData}
 	dataURL := []config.InputSource{config.SourceData, config.SourceURL}
-	file := []config.InputSource{config.SourceFile}
-
 	table := make(map[config.InputDialect]map[tripleKey]bool)
 
 	completions := make(map[tripleKey]bool)
 	add(completions, user, data, events.BinaryImage)
 	add(completions, user, []config.InputSource{config.SourceURL}, events.BinaryImage)
 	add(completions, user, data, events.BinaryAudio, events.BinaryDocument)
-	add(completions, user, file)
+	addFile(completions, config.PositionUser)
 	table[config.DialectOpenAICompletions] = completions
 
 	responses := make(map[tripleKey]bool)
 	add(responses, both, dataURL, events.BinaryImage, events.BinaryDocument)
-	add(responses, both, file)
+	addFile(responses, config.PositionUser, config.PositionTool)
 	table[config.DialectOpenAIResponses] = responses
 
 	anthropicTable := make(map[tripleKey]bool)
 	add(anthropicTable, both, dataURL, events.BinaryImage, events.BinaryDocument)
-	add(anthropicTable, both, file)
+	addFile(anthropicTable, config.PositionUser, config.PositionTool)
 	table[config.DialectAnthropic] = anthropicTable
 
 	bedrockTable := make(map[tripleKey]bool)
@@ -112,13 +120,13 @@ func acceptedByPython() map[config.InputDialect]map[tripleKey]bool {
 	geminiTable := make(map[tripleKey]bool)
 	add(geminiTable, user, dataURL, events.BinaryImage, events.BinaryAudio, events.BinaryVideo, events.BinaryDocument)
 	add(geminiTable, tool, dataURL, events.BinaryImage, events.BinaryDocument)
-	add(geminiTable, user, file)
+	addFile(geminiTable, config.PositionUser)
 	table[config.DialectGemini] = geminiTable
 	table[config.DialectVertexAI] = geminiTable
 
 	mistralTable := make(map[tripleKey]bool)
 	add(mistralTable, both, dataURL, events.BinaryImage, events.BinaryDocument)
-	add(mistralTable, both, file)
+	addFile(mistralTable, config.PositionUser, config.PositionTool)
 	table[config.DialectMistral] = mistralTable
 
 	ollamaTable := make(map[tripleKey]bool)
@@ -127,7 +135,7 @@ func acceptedByPython() map[config.InputDialect]map[tripleKey]bool {
 
 	xaiTable := make(map[tripleKey]bool)
 	add(xaiTable, user, dataURL, events.BinaryImage, events.BinaryDocument)
-	add(xaiTable, user, file)
+	addFile(xaiTable, config.PositionUser)
 	table[config.DialectXAI] = xaiTable
 
 	table[config.DialectZAI] = map[tripleKey]bool{}
@@ -139,19 +147,21 @@ func acceptedByPython() map[config.InputDialect]map[tripleKey]bool {
 	return table
 }
 
-// everyTriple enumerates the key space the table can describe; the "" kind is
-// the provider-file source, which carries no kind.
+// everyTriple enumerates the key space the table can describe. A data or URL
+// source carries one of the binary kinds; a provider-file source carries none
+// (Python's ("file", None)), so it has exactly one key per position.
 func everyTriple() []tripleKey {
 	positions := []config.InputPosition{config.PositionUser, config.PositionTool}
-	sources := []config.InputSource{config.SourceData, config.SourceURL, config.SourceFile}
-	kinds := []events.BinaryType{"", events.BinaryImage, events.BinaryAudio, events.BinaryVideo, events.BinaryDocument}
+	mediaSources := []config.InputSource{config.SourceData, config.SourceURL}
+	kinds := []events.BinaryType{events.BinaryImage, events.BinaryAudio, events.BinaryVideo, events.BinaryDocument}
 	var out []tripleKey
 	for _, p := range positions {
-		for _, s := range sources {
+		for _, s := range mediaSources {
 			for _, k := range kinds {
 				out = append(out, tripleKey{p, s, k})
 			}
 		}
+		out = append(out, tripleKey{p, config.SourceFile, ""})
 	}
 	return out
 }

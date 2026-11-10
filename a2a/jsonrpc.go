@@ -17,7 +17,12 @@ const (
 	MethodMessageSend   = "message/send"
 	MethodMessageStream = "message/stream"
 	MethodTasksGet      = "tasks/get"
+	MethodTasksList     = "tasks/list"
 	MethodTasksCancel   = "tasks/cancel"
+	// MethodExtendedCard is the authenticated extended-card call (A2A spec
+	// §7.10 agent/getAuthenticatedExtendedCard; the a2a-sdk names it
+	// GetExtendedAgentCard).
+	MethodExtendedCard = "agent/getAuthenticatedExtendedCard"
 
 	MethodPushSet    = "tasks/pushNotificationConfig/set"
 	MethodPushGet    = "tasks/pushNotificationConfig/get"

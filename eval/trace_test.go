@@ -29,11 +29,13 @@ type scriptClient struct {
 	bodies  []string
 	i       int
 	prompts []string
+	opts    []config.CallOptions
 }
 
-func (s *scriptClient) Call(_ context.Context, msgs []events.Event, _ *agocontext.Context, _ config.CallOptions) (*events.ModelResponse, error) {
+func (s *scriptClient) Call(_ context.Context, msgs []events.Event, _ *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
 	req, _ := events.AsValue(msgs[0]).(events.ModelRequest)
 	s.prompts = append(s.prompts, events.RenderForPrompt(req))
+	s.opts = append(s.opts, opts)
 	body := ""
 	if s.i < len(s.bodies) {
 		body = s.bodies[s.i]

@@ -182,9 +182,11 @@ type mappedMessages struct {
 // AGo's served agent cannot take per-run prompt fragments from outside the
 // agent package, so they travel as the opening transcript request instead —
 // the model reads them ahead of the conversation, which is where they belong.
-// Content-part metadata is dropped (ago inputs have no metadata field), and
-// provider-tagged file handles are always skipped: which provider the served
-// agent talks to is not readable here, so only untagged handles are accepted.
+// Content-part metadata is dropped (ago inputs have no metadata field). A file
+// handle tagged for the run's own provider is resolved, one tagged for another
+// provider is skipped (the protocol forbids failing a run over a handle it
+// cannot use), and with no readable provider every tagged handle is skipped —
+// which is what mapRunInputMessages (nil config) does.
 //
 // mapRunInputMessages applies no acceptance filter (a nil model config accepts
 // every part); the server paths use mapRunInputMessagesFor with the agent's own
@@ -204,6 +206,11 @@ func mapRunInputMessagesFor(input RunAgentInput, cfg config.ModelConfig) mappedM
 		names  = map[string]string{} // tool call id -> name, off the assistant messages
 		shared = clientContextPrompt(input.Context)
 	)
+	// The provider the run is served from decides which file handles it can
+	// resolve and whether a replayed call gets its provider value back. An
+	// unknown provider (nil config) matches no handle and restores nothing —
+	// the pre-existing behavior.
+	provider, _ := providerOf(cfg)
 	if shared != "" {
 		folds = append(folds, &events.TextInput{Content: shared})
 	}
@@ -218,7 +225,7 @@ func mapRunInputMessagesFor(input RunAgentInput, cfg config.ModelConfig) mappedM
 	for _, m := range input.Messages {
 		switch m.Role {
 		case "user":
-			parts, _ := mapContent(m.Content, cfg, config.PositionUser)
+			parts, _ := mapContent(m.Content, cfg, config.PositionUser, provider)
 			buf = append(buf, parts...)
 
 		case "system", "developer":
@@ -233,9 +240,10 @@ func mapRunInputMessagesFor(input RunAgentInput, cfg config.ModelConfig) mappedM
 			flush()
 			var calls []events.ToolCallEvent
 			for _, tc := range m.ToolCalls {
-				calls = append(calls, events.ToolCallEvent{
-					ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
-				})
+				// A replayed call carries the provider value the client kept
+				// for it (a Gemini thought signature), so the provider accepts
+				// the continuation.
+				calls = append(calls, RestoreToolCall(provider, tc.ID, tc.Function.Name, tc.Function.Arguments, tc.EncryptedValue))
 				names[tc.ID] = tc.Function.Name
 			}
 			text, _, _ := decodeContent(m.Content)
@@ -254,7 +262,7 @@ func mapRunInputMessagesFor(input RunAgentInput, cfg config.ModelConfig) mappedM
 
 		case "tool":
 			flush()
-			parts, _ := mapContent(m.Content, cfg, config.PositionTool)
+			parts, _ := mapContent(m.Content, cfg, config.PositionTool, provider)
 			// An error is what the model must hear, and leads; the call is owed
 			// a result even when every part was skipped (Python parity).
 			if m.Error != "" {
@@ -299,7 +307,7 @@ func clientContextPrompt(entries []ContextEntry) string {
 // inputs it carries (Python parity: map_agui_parts_to_inputs). Unmappable parts
 // are skipped with a warning; the run carries on without them. A part cfg's
 // mapper does not accept in this position is skipped the same way.
-func mapContent(raw json.RawMessage, cfg config.ModelConfig, position config.InputPosition) ([]events.Input, bool) {
+func mapContent(raw json.RawMessage, cfg config.ModelConfig, position config.InputPosition, provider config.Provider) ([]events.Input, bool) {
 	text, parts, err := decodeContent(raw)
 	if err != nil {
 		slog.Warn("agui: dropping a message whose content does not decode", "err", err)
@@ -313,7 +321,7 @@ func mapContent(raw json.RawMessage, cfg config.ModelConfig, position config.Inp
 	}
 	var out []events.Input
 	for _, part := range parts {
-		inp, ok := mapPart(part)
+		inp, ok := mapPart(part, provider)
 		if !ok {
 			continue
 		}
@@ -328,7 +336,7 @@ func mapContent(raw json.RawMessage, cfg config.ModelConfig, position config.Inp
 
 // mapPart maps one content part, or reports that it is to be skipped (Python
 // parity: map_agui_content_to_input).
-func mapPart(part ContentPart) (events.Input, bool) {
+func mapPart(part ContentPart, provider config.Provider) (events.Input, bool) {
 	switch part.Type {
 	case PartText:
 		return &events.TextInput{Content: part.Text}, true
@@ -353,10 +361,11 @@ func mapPart(part ContentPart) (events.Input, bool) {
 	case SourceURL:
 		return &events.UrlInput{URL: src.Value, Kind: binaryKind(part.Type)}, true
 	case SourceFile:
-		// A handle is opaque and only its provider can resolve it. This server
-		// cannot read the served agent's provider, so a tagged handle is always
-		// someone else's; only an untagged one passes. Never log the value.
-		if src.Provider != "" {
+		// A handle is opaque and only the provider that minted it can resolve
+		// it. An untagged one is taken to be the run's own; one tagged for
+		// another provider is useless here, and the protocol forbids failing
+		// the run over it. Never log the value.
+		if src.Provider != "" && !isSameProvider(src.Provider, provider) {
 			slog.Warn("agui: skipping a file part holding a handle tagged for another provider")
 			return nil, false
 		}

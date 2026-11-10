@@ -327,3 +327,117 @@ func openWorkflow(t *testing.T, h *Hub, graph TransitionGraph, ids []string) str
 	}
 	return ch.ID
 }
+
+// --- priority and fall-through target ---------------------------------------
+
+// A transition with a lower priority is evaluated first, whatever its place in
+// the list; equal priorities keep list order (the pre-priority behavior).
+func TestTransitionPriorityDecidesOrder(t *testing.T) {
+	ctx := &TurnContext{Envelope: Envelope{SenderID: "alice"}}
+	graph := TransitionGraph{
+		Initial: "alice",
+		Transitions: []Transition{
+			{When: Always{}, To: AgentTarget{AgentID: "fallback"}, Priority: 5},
+			{When: FromSpeaker{AgentID: "alice"}, To: AgentTarget{AgentID: "first"}, Priority: -1},
+			{When: Always{}, To: AgentTarget{AgentID: "tie"}, Priority: 5},
+		},
+	}
+	if got := graph.Select(ctx); got.NextSender != "first" {
+		t.Fatalf("lowest priority first: %+v", got)
+	}
+	// Neutralize the winning rule: the two priority-5 rules then resolve in
+	// list order, so "fallback" (listed first) wins.
+	graph.Transitions[1].When = FromSpeaker{AgentID: "nobody"}
+	if got := graph.Select(ctx); got.NextSender != "fallback" {
+		t.Fatalf("tie keeps list order: %+v", got)
+	}
+	// Without any priority the list order alone decides (the old behavior).
+	graph.Transitions[0].Priority, graph.Transitions[2].Priority = 0, 0
+	if got := graph.Select(ctx); got.NextSender != "fallback" {
+		t.Fatalf("zero priorities keep list order: %+v", got)
+	}
+}
+
+// With no matching transition the graph falls through to DefaultTarget; a nil
+// default keeps the old terminate-with-no_transition behavior.
+func TestTransitionDefaultTarget(t *testing.T) {
+	ctx := &TurnContext{Envelope: Envelope{SenderID: "alice"}}
+	graph := TransitionGraph{
+		Initial:       "alice",
+		Transitions:   []Transition{{When: FromSpeaker{AgentID: "bob"}, To: AgentTarget{AgentID: "bob"}}},
+		DefaultTarget: RevertToInitiatorTarget{},
+	}
+	if got := graph.Select(ctx); got.NextSender != "" || !got.Close || got.CloseReason != "workflow_terminated" {
+		// RevertToInitiatorTarget resolves to CreatorID, which is empty here:
+		// the target returns "" and the graph reports its termination.
+		t.Fatalf("default target: %+v", got)
+	}
+	ctx.CreatorID = "carol"
+	if got := graph.Select(ctx); got.NextSender != "carol" || got.Close {
+		t.Fatalf("default target must route to the initiator: %+v", got)
+	}
+
+	graph.DefaultTarget = nil
+	if got := graph.Select(ctx); !got.Close || got.CloseReason != "no_transition" {
+		t.Fatalf("no default target: %+v", got)
+	}
+}
+
+// Priority and the default target survive the channel-knob round trip.
+func TestTransitionGraphDictRoundTripsPriorityAndDefault(t *testing.T) {
+	graph := TransitionGraph{
+		Initial: "alice",
+		Transitions: []Transition{
+			{When: ContextEquals{Key: "phase", Value: "review"}, To: AgentTarget{AgentID: "bob"}, Priority: 2},
+			{When: Always{}, To: &RoundRobinTarget{}},
+		},
+		DefaultTarget: TerminateTarget{Reason: "done"},
+		MaxTurns:      4,
+	}
+	restored, err := GraphFromDict(graph.ToDict())
+	if err != nil {
+		t.Fatalf("GraphFromDict: %v", err)
+	}
+	if len(restored.Transitions) != 2 || restored.Transitions[0].Priority != 2 || restored.Transitions[1].Priority != 0 {
+		t.Fatalf("priorities: %+v", restored.Transitions)
+	}
+	if _, ok := restored.Transitions[0].When.(ContextEquals); !ok {
+		t.Fatalf("condition: %T", restored.Transitions[0].When)
+	}
+	term, ok := restored.DefaultTarget.(TerminateTarget)
+	if !ok || term.Reason != "done" {
+		t.Fatalf("default target: %#v", restored.DefaultTarget)
+	}
+	// A graph built without either keeps the exact old dict shape.
+	old := TransitionGraph{Initial: "a", Transitions: []Transition{{When: Always{}, To: AgentTarget{AgentID: "b"}}}}
+	dict := old.ToDict()
+	if _, has := dict["default_target"]; has {
+		t.Fatal("a nil default target must not appear in the dict")
+	}
+	entry := dict["transitions"].([]any)[0].(map[string]any)
+	if _, has := entry["priority"]; has {
+		t.Fatal("a zero priority must not appear in the dict")
+	}
+}
+
+// ContextEquals routes on a channel-scoped context variable; a missing key
+// compares as nil, so an unset variable can be matched on purpose.
+func TestContextEqualsCondition(t *testing.T) {
+	vars := map[string]any{"phase": "review"}
+	ctx := &TurnContext{ContextVars: vars}
+	if !(ContextEquals{Key: "phase", Value: "review"}).Match(ctx) {
+		t.Fatal("matching value must fire")
+	}
+	if (ContextEquals{Key: "phase", Value: "build"}).Match(ctx) {
+		t.Fatal("another value must not fire")
+	}
+	if !(ContextEquals{Key: "missing"}).Match(ctx) {
+		t.Fatal("an unset key compares as nil and must match a nil value")
+	}
+	if (ContextEquals{Key: "missing", Value: "x"}).Match(ctx) {
+		t.Fatal("an unset key must not match a non-nil value")
+	}
+	if (ContextEquals{Key: "phase", Value: "review"}).Match(&TurnContext{}) {
+		t.Fatal("nil context vars must not panic or match a set value")
+	}
+}

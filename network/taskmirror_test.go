@@ -261,3 +261,42 @@ func TestFireTaskEventWithoutHookIsNoop(t *testing.T) {
 	h := newTestHub(t)
 	h.FireTaskEvent("t", TaskEventMirrorFailed, nil) // must not panic
 }
+
+// The owner's max_concurrent_tasks cap refuses a new task once that many are
+// non-terminal, and is never applied to a re-observation of a known task.
+func TestObserveTaskMaxConcurrentTasks(t *testing.T) {
+	h := newTestHub(t)
+	hc := NewHubClient(h)
+	alice, err := hc.Register("alice", WithAgentRule(Rule{
+		InboundGlobs:       []string{"*"},
+		OutboundGlobs:      []string{"*"},
+		MaxConcurrentTasks: 1,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Close()
+	owner := alice.AgentID()
+
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-1", OwnerID: owner, State: task.StateRunning}); err != nil {
+		t.Fatalf("first task: %v", err)
+	}
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-2", OwnerID: owner, State: task.StateRunning}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("second task over the cap: %v, want ErrAccessDenied", err)
+	}
+	// Re-observing the task that is already counted is not a new task.
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-1", Progress: map[string]any{"pct": 50}}); err != nil {
+		t.Fatalf("re-observe: %v", err)
+	}
+	// A terminal task frees its slot.
+	if err := h.UpdateTask("t-1", task.StateCompleted, nil, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-2", OwnerID: owner, State: task.StateRunning}); err != nil {
+		t.Fatalf("after the slot freed: %v", err)
+	}
+	// A different owner has its own budget (bob has no cap at all).
+	if err := h.ObserveTask(task.Metadata{TaskID: "t-bob", OwnerID: "someone-else", State: task.StateRunning}); err != nil {
+		t.Fatalf("uncapped owner: %v", err)
+	}
+}

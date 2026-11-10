@@ -380,7 +380,7 @@ func TestServerInvalidParams(t *testing.T) {
 
 func TestServerUnknownMethod(t *testing.T) {
 	h := NewServer(ServerConfig{Card: testCard(false)}).Handler()
-	envelope := postRPC(t, h, `{"jsonrpc":"2.0","id":1,"method":"tasks/list"}`)
+	envelope := postRPC(t, h, `{"jsonrpc":"2.0","id":1,"method":"tasks/frobnicate"}`)
 	if envelope.Error == nil || envelope.Error.Code != codeMethodNotFound {
 		t.Fatalf("want code %d, got %+v", codeMethodNotFound, envelope.Error)
 	}

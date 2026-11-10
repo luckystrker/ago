@@ -142,9 +142,13 @@ func (RuleBasedArbiter) AuthorizeDispatch(_ Envelope, sender Passport, recipient
 // AuthorizeChannelOpen implements HubArbiter: each invitee's inbound globs
 // against the creator's name (a pre-flight for the invite handshake —
 // dispatch silently filters blocked senders, so without it an invite to a
-// blocking invitee would hang until the ack timeout), then the creator's
+// blocking invitee would hang until the ack timeout), each side's
+// channel-type access against the manifest's type, then the creator's
 // channel concurrency cap.
-func (RuleBasedArbiter) AuthorizeChannelOpen(_ ChannelManifest, creator Passport, creatorRule Rule, invitees []Passport, inviteeRules []Rule, activeCreatorChannels int) Decision {
+func (RuleBasedArbiter) AuthorizeChannelOpen(manifest ChannelManifest, creator Passport, creatorRule Rule, invitees []Passport, inviteeRules []Rule, activeCreatorChannels int) Decision {
+	if !creatorRule.MayInitiate(manifest.Type) {
+		return Deny(fmt.Sprintf("creator %q may not initiate channel type %q", creator.Name, manifest.Type))
+	}
 	for i, invitee := range invitees {
 		if invitee.AgentID == creator.AgentID {
 			continue
@@ -155,6 +159,9 @@ func (RuleBasedArbiter) AuthorizeChannelOpen(_ ChannelManifest, creator Passport
 		}
 		if !Match(inviteeRule.InboundGlobs, creator.Name) {
 			return Deny(fmt.Sprintf("invitee %q does not accept inbound from %q", invitee.Name, creator.Name))
+		}
+		if !inviteeRule.MayAccept(manifest.Type) {
+			return Deny(fmt.Sprintf("invitee %q does not accept channel type %q", invitee.Name, manifest.Type))
 		}
 	}
 	if cap := creatorRule.MaxConcurrentChannels; cap > 0 && activeCreatorChannels >= cap {

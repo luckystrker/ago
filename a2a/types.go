@@ -5,18 +5,21 @@
 // shapes, stdlib only.
 //
 // Scope: protocol types, agent-card discovery, message/send,
-// message/stream (server SSE), tasks/get, tasks/cancel, an in-memory task
-// store (D-049); push-notification configs with server dispatch and a
-// webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
+// message/stream (server SSE), tasks/get, tasks/list, tasks/cancel, an
+// in-memory task store (D-049); push-notification configs with server dispatch
+// and a webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
 // execution drivers, context-variable sync and HITL-over-the-wire on
 // Message.metadata, the REST transport routes, and the declarative security
 // schemes of security.py (D-056). The client also speaks the REST binding,
 // selects the card interface (with the 1.0 protocol-version check), takes a
 // preset card and request interceptors (clientconn.go, clientrest.go), and the
 // server rewrites the served card per request (ServerConfig.CardModifier,
-// CardCacheControl). Still deferred: the conversational A2AClient
-// turn machinery (full history shipping, reconnect/resubscribe), gRPC and
-// card JWS signing/verification (D-056).
+// CardCacheControl) and serves the authenticated extended card
+// (ServerConfig.ExtendedCard, agent/getAuthenticatedExtendedCard and
+// /extendedAgentCard), with optional input-mode validation
+// (ServerConfig.ValidateInputModes). Still deferred: the conversational
+// A2AClient turn machinery (full history shipping, reconnect/resubscribe), gRPC
+// and card JWS signing/verification (D-056).
 package a2a
 
 import (
@@ -117,6 +120,10 @@ type AgentSkill struct {
 	Description string   `json:"description,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 	Examples    []string `json:"examples,omitempty"`
+	// InputModes narrows the card's defaultInputModes for this skill (parity:
+	// a2a-sdk AgentSkill.inputModes). ValidateInputModes reads them as part of
+	// the card's declared set.
+	InputModes []string `json:"inputModes,omitempty"`
 }
 
 // Part is one typed payload inside a Message. The concrete type is selected by
@@ -285,12 +292,12 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // TaskState enumerates the task lifecycle states of this subset.
 //
-// AGO-DEVIATION: the richer A2A state machine still omits auth-required,
-// rejected and unknown (D-049); input-required joined in the second wave
-// because the urn:ag2:client-tools:v1 extension and HITL-over-the-wire are
-// meaningless without a state that says "answer pending on the caller" —
-// Python transitions to TASK_STATE_INPUT_REQUIRED for exactly that
-// (executor.py updater.requires_input).
+// AGO-DEVIATION: "unknown" exists as a constant for a client decoding a state
+// it does not know, but the server never stores it — it has no server-side
+// meaning. input-required came in the second wave because the
+// urn:ag2:client-tools:v1 extension and HITL-over-the-wire are meaningless
+// without a state that says "answer pending on the caller" (executor.py
+// updater.requires_input); auth-required and rejected came with the third.
 type TaskState string
 
 // Task states.
@@ -298,16 +305,29 @@ const (
 	TaskStateSubmitted     TaskState = "submitted"
 	TaskStateWorking       TaskState = "working"
 	TaskStateInputRequired TaskState = "input-required"
-	TaskStateCompleted     TaskState = "completed"
-	TaskStateFailed        TaskState = "failed"
-	TaskStateCanceled      TaskState = "canceled"
+	// TaskStateAuthRequired parks a task until the caller presents
+	// credentials (A2A spec §4.5). Like input-required it is interrupted, not
+	// terminal: a continuation with the same task id resumes it.
+	TaskStateAuthRequired TaskState = "auth-required"
+	TaskStateCompleted    TaskState = "completed"
+	TaskStateFailed       TaskState = "failed"
+	TaskStateCanceled     TaskState = "canceled"
+	// TaskStateRejected is a terminal refusal: the agent would not take the
+	// task at all (parity: a2a TASK_STATE_REJECTED, A2ATaskRejectedError).
+	TaskStateRejected TaskState = "rejected"
+	// TaskStateUnknown is the forward-compatibility state: a client that
+	// receives a state it does not know treats the task as unreadable. The
+	// server never stores it; it exists so a decoder has a constant to map to.
+	TaskStateUnknown TaskState = "unknown"
 )
 
 // terminalTaskState reports whether state closes the task: a terminal task
 // cannot be canceled (parity: a2a TaskNotCancelableError on terminal states).
+// rejected is terminal; auth-required and input-required are interruptions and
+// stay resumable.
 func terminalTaskState(state TaskState) bool {
 	switch state {
-	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled:
+	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled, TaskStateRejected:
 		return true
 	}
 	return false

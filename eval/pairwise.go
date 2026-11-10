@@ -31,13 +31,20 @@ type PairwiseOutcome struct {
 // orders — a flip resolves to a tie, defending against positional bias. The
 // per-call verdict is position-based ("first"/"second", never A/B).
 //
+// SingleOrder runs one call instead (Python parity: swap=False): faster, and
+// position-biased by construction — use it when the comparison is already
+// known to be position-neutral or the cost of two judge calls is the problem.
+//
 // AGO-DEVIATION: the Python judge is an Agent with a locked response_schema;
 // AGo calls the client headless and parses a JSON verdict
-// {"preferred": "first"|"second"|"tie", "reason": "..."}. The single-order mode
-// (swap=False) and validation retries are not ported — D-051.
+// {"preferred": "first"|"second"|"tie", "reason": "..."}. Validation retries
+// are not ported here (LLMJudge.Retries covers the single-trace judge).
 type Pairwise struct {
 	Client config.LLMClient
 	Rubric string
+	// SingleOrder judges the pair in one order only, reporting that order's
+	// preference as the winner (no swap, no tie-on-flip defense).
+	SingleOrder bool
 }
 
 func (p Pairwise) Name() string { return "pairwise" }
@@ -50,6 +57,13 @@ func (p Pairwise) Compare(ctx context.Context, a, b *Trace) (PairwiseOutcome, er
 	v1, err := p.verdict(ctx, answerText(a), answerText(b))
 	if err != nil {
 		return PairwiseOutcome{}, err
+	}
+	if p.SingleOrder {
+		return PairwiseOutcome{
+			Winner:    prefToAB(v1.preferred, WinsA, WinsB), // order 1: Response 1 = A
+			Reasoning: v1.reason,
+			Detail:    map[string]any{"order1": v1.preferred},
+		}, nil
 	}
 	v2, err := p.verdict(ctx, answerText(b), answerText(a)) // order 2: Response 1 = B
 	if err != nil {
@@ -82,7 +96,7 @@ func (p Pairwise) verdict(ctx context.Context, first, second string) (pairwiseVe
 			`Return ONLY a JSON object: {"preferred": "first"|"second"|"tie", "reason": "<brief justification>"}.`+"\n\n"+
 			"## Response 1\n%s\n\n## Response 2\n%s",
 		p.Rubric, first, second)
-	resp, err := callHeadless(ctx, p.Client, prompt)
+	resp, err := callHeadless(ctx, p.Client, prompt, config.CallOptions{})
 	if err != nil {
 		return pairwiseVerdict{}, fmt.Errorf("eval: pairwise judge call: %w", err)
 	}
