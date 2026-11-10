@@ -51,6 +51,16 @@ type Rule struct {
 	// Inbox is the recipient's inbox capacity policy; the zero value means
 	// no hub-side cap.
 	Inbox InboxBlock `json:"inbox,omitzero"`
+	// ChannelTTLDefault is the lifetime of a channel this agent creates when
+	// the manifest sets no knobs["ttl_seconds"], as a ParseDuration string
+	// ("2h"); "" means no expiry. The hub's TTL sweeper (Hub.SweepTTL)
+	// enforces it.
+	ChannelTTLDefault string `json:"channel_ttl_default,omitempty"`
+	// TaskTTLDefault carries Python's limits.task_ttl_default ("15m") for
+	// parity and is validated, but — as in Python, where nothing reads it — it
+	// is not applied: an observed task expires only from the explicit deadline
+	// its owner stamped (TaskStarted.ExpiresAt), never from a hub default.
+	TaskTTLDefault string `json:"task_ttl_default,omitempty"`
 }
 
 // RateBlock is a token-bucket rate limit: PerMinute tokens refill evenly,
@@ -207,13 +217,39 @@ func (tb *TokenBucket) Allow() bool {
 	return true
 }
 
+// Default lifetimes of DefaultRule (Python limits.channel_ttl_default and
+// task_ttl_default).
+const (
+	DefaultChannelTTL = "2h"
+	DefaultTaskTTL    = "15m"
+)
+
 // DefaultRule is the permissive rule handed out when none is given: every
-// glob is "*", no caps.
+// glob is "*", no caps, channels live DefaultChannelTTL (Python applies
+// limits.channel_ttl_default to every channel created without a ttl) and
+// TaskTTLDefault carries DefaultTaskTTL, unapplied. A Rule literal (not built
+// from DefaultRule) sets no TTLs.
 func DefaultRule() Rule {
 	return Rule{
-		InboundGlobs:  []string{"*"},
-		OutboundGlobs: []string{"*"},
+		InboundGlobs:      []string{"*"},
+		OutboundGlobs:     []string{"*"},
+		ChannelTTLDefault: DefaultChannelTTL,
+		TaskTTLDefault:    DefaultTaskTTL,
 	}
+}
+
+// Validate rejects an unusable rule: an unknown inbox overflow policy or an
+// unparseable TTL string.
+func (r Rule) Validate() error {
+	if err := r.Inbox.Validate(); err != nil {
+		return err
+	}
+	for name, v := range map[string]string{"channel_ttl_default": r.ChannelTTLDefault, "task_ttl_default": r.TaskTTLDefault} {
+		if _, err := ParseDuration(v); err != nil {
+			return fmt.Errorf("%w: rule %s: %v", ErrBadIdentity, name, err)
+		}
+	}
+	return nil
 }
 
 // Clone deep-copies the glob slices so a stored rule never aliases the

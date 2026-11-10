@@ -107,8 +107,10 @@ func WithAutoAck(on bool) AgentOption { return func(o *agentOptions) { o.autoAck
 type AgentClient struct {
 	hub      *Hub
 	Passport Passport
+	ruleMu   sync.RWMutex
 	rule     Rule
 	opts     agentOptions
+	feeds    channelFeeds
 
 	inbox     chan Envelope
 	done      chan struct{}
@@ -191,7 +193,11 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 func (a *AgentClient) AgentID() string { return a.Passport.AgentID }
 
 // Rule is the agent's stored rule.
-func (a *AgentClient) Rule() Rule { return a.rule }
+func (a *AgentClient) Rule() Rule {
+	a.ruleMu.RLock()
+	defer a.ruleMu.RUnlock()
+	return a.rule.Clone()
+}
 
 // Dropped is the number of delivered envelopes a full inbox buffer has
 // discarded. With an Inbox rule each drop is also surfaced through Err as
@@ -214,6 +220,8 @@ func (a *AgentClient) Send(env Envelope) (Envelope, error) {
 
 // CreateChannel opens a channel with this agent as creator.
 func (a *AgentClient) CreateChannel(manifest ChannelManifest, invitees ...string) (*ChannelHandle, error) {
+	// The queue for ch exists once the opened envelope reaches us (every
+	// delivery creates it), so open → say → wait loses no fast reply.
 	return a.hub.CreateChannel(manifest, append([]string{a.AgentID()}, invitees...))
 }
 
@@ -276,6 +284,7 @@ func (a *AgentClient) deliver(env Envelope) {
 		return
 	default:
 	}
+	a.feeds.push(env)
 	if isProtocolEvent(env.EventType) {
 		if env.EventType == EnvChannelInvite && a.opts.autoAck && env.SenderID != a.AgentID() {
 			// An ack failure must not crash the agent: the hub times the
@@ -291,14 +300,14 @@ func (a *AgentClient) deliver(env Envelope) {
 		a.hub.AckInbox(a.AgentID(), 1) // counted at dispatch, never queued
 		return
 	}
-	enqueueWithPolicy(a.inbox, env, a.rule.Inbox.EffectiveOverflow(), a.discard)
+	enqueueWithPolicy(a.inbox, env, a.Rule().Inbox.EffectiveOverflow(), a.discard)
 }
 
 // discard records an envelope the overflow policy threw away and frees its
 // inbox slot at the hub.
 func (a *AgentClient) discard(env Envelope) {
 	atomic.AddInt64(&a.dropped, 1)
-	if a.rule.Inbox != (InboxBlock{}) { // explicit opt-in; no Inbox rule keeps the old silent drop
+	if a.Rule().Inbox != (InboxBlock{}) { // explicit opt-in; no Inbox rule keeps the old silent drop
 		a.errMu.Lock()
 		a.lastErr = fmt.Errorf("%w: agent %s discarded envelope %s on channel %s",
 			ErrInboxFull, a.AgentID(), env.ID, env.ChannelID)
@@ -357,21 +366,34 @@ func (a *AgentClient) pump() {
 // hub's adapter gates and channel state machine reject stale replies
 // deterministically (a rejected reply surfaces through Err).
 func (a *AgentClient) process(env Envelope) {
+	// Idempotent under at-least-once redelivery: a reply to this very
+	// envelope already landed, so the turn is not run (and posted) twice.
+	if env.ID != "" {
+		if _, done := a.hub.FindEnvelopeByCausation(env.ChannelID, a.AgentID(), env.ID); done {
+			return
+		}
+	}
 	round, err := a.runHandlers(env)
 	if err != nil {
-		a.errMu.Lock()
-		a.lastErr = err
-		a.errMu.Unlock()
+		a.failTurn(env, err)
 		return
 	}
 	if round.Empty() {
 		return
 	}
 	if err := a.postRound(env.ChannelID, round, env); err != nil {
-		a.errMu.Lock()
-		a.lastErr = err
-		a.errMu.Unlock()
+		a.failTurn(env, err)
 	}
+}
+
+// failTurn records a failed turn: Err() keeps the last error and the hub
+// fans OnTurnFailed out to its listeners. The channel stays alive and no
+// reply is posted.
+func (a *AgentClient) failTurn(env Envelope, err error) {
+	a.errMu.Lock()
+	a.lastErr = err
+	a.errMu.Unlock()
+	a.hub.ReportTurnFailure(env.ChannelID, a.AgentID(), env.ID, err)
 }
 
 // runHandlers resolves the handler precedence (round > envelope > message)
@@ -496,6 +518,10 @@ type HumanClient struct {
 	inbox     chan Envelope
 	done      chan struct{}
 	closeOnce sync.Once
+
+	feeds     channelFeeds
+	cbMu      sync.Mutex
+	callbacks []*envelopeCallback
 }
 
 // RegisterHuman stamps a passport and binds human delivery.
@@ -591,6 +617,8 @@ func (h *HumanClient) deliver(env Envelope) {
 		return
 	default:
 	}
+	h.feeds.push(env)
+	h.runCallbacks(env)
 	if env.EventType == EnvChannelInvite && env.SenderID != h.AgentID() {
 		_, _ = h.hub.Send(NewChannelAck(env, h.AgentID(), false, ""))
 	}
