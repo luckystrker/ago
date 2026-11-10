@@ -9,6 +9,7 @@
 package anthropic
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -33,6 +34,64 @@ const (
 
 	messagesPath = "/v1/messages"
 )
+
+// ErrInvalidThinking reports a ThinkingConfig the request cannot express (an
+// unknown mode, or an enabled budget the API will refuse).
+var ErrInvalidThinking = errors.New("anthropic: invalid thinking config")
+
+// ThinkingType is the extended-thinking mode of a request.
+type ThinkingType string
+
+const (
+	// ThinkingDisabled asks the API for no extended thinking.
+	ThinkingDisabled ThinkingType = "disabled"
+	// ThinkingEnabled spends a fixed budget of thinking tokens.
+	ThinkingEnabled ThinkingType = "enabled"
+	// ThinkingAdaptive lets the model decide whether and how much to think.
+	ThinkingAdaptive ThinkingType = "adaptive"
+)
+
+// ThinkingConfig is the request's `thinking` object. Nil leaves the field off
+// the wire (the API's own default).
+type ThinkingConfig struct {
+	Type ThinkingType
+	// BudgetTokens is the thinking allowance for ThinkingEnabled. The API wants
+	// a positive value below MaxTokens.
+	BudgetTokens int64
+}
+
+// validate refuses a thinking mode the request cannot express. A nil config is
+// valid (thinking off).
+func (t *ThinkingConfig) validate(maxTokens int64) error {
+	if t == nil {
+		return nil
+	}
+	switch t.Type {
+	case ThinkingDisabled, ThinkingAdaptive:
+		return nil
+	case ThinkingEnabled:
+		if t.BudgetTokens <= 0 {
+			return fmt.Errorf("%w: enabled thinking needs BudgetTokens > 0", ErrInvalidThinking)
+		}
+		if t.BudgetTokens >= maxTokens {
+			return fmt.Errorf("%w: BudgetTokens (%d) must be less than MaxTokens (%d)",
+				ErrInvalidThinking, t.BudgetTokens, maxTokens)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown type %q (want %q, %q or %q)", ErrInvalidThinking,
+			t.Type, ThinkingEnabled, ThinkingAdaptive, ThinkingDisabled)
+	}
+}
+
+// body renders the request's `thinking` field.
+func (t *ThinkingConfig) body() map[string]any {
+	w := map[string]any{"type": string(t.Type)}
+	if t.Type == ThinkingEnabled {
+		w["budget_tokens"] = t.BudgetTokens
+	}
+	return w
+}
 
 // AnthropicConfig is one configured Anthropic model. Immutable after
 // construction; Create is safe for concurrent use and builds a fresh client
@@ -59,7 +118,9 @@ type AnthropicConfig struct {
 	// Temperature and TopP sample the output; nil = unset.
 	// AGO-DEVIATION: the 2026 Python config deprecates these (the newer API
 	// version it targets rejects them); the ported wire version
-	// (2023-06-01) accepts them, so they are sent when set.
+	// (2023-06-01) accepts them, so they are sent when set. With extended
+	// thinking on they are dropped instead: the API samples at temperature 1
+	// there, and AG2's own API version sends neither.
 	Temperature *float64
 	TopP        *float64
 	// Streaming switches the call to SSE consumption.
@@ -73,6 +134,25 @@ type AnthropicConfig struct {
 	// PromptCaching injects cache_control {"type":"ephemeral"} onto the last
 	// system block and the last tool.
 	PromptCaching bool
+	// DefaultHeaders travel on every request (Python parity: default_headers).
+	// A case-insensitive `anthropic-beta` value is folded into the request's
+	// beta header together with the framework's own flags.
+	DefaultHeaders map[string]string
+	// Metadata is the request `metadata` object (Python parity: metadata; the
+	// API's one documented key is user_id). Nil omits it; an empty map sends {}.
+	Metadata map[string]string
+	// ServiceTier selects the API's service tier (e.g. "standard_only");
+	// empty omits the field.
+	ServiceTier string
+	// Speed selects the inference speed ("standard" or "fast"); empty omits
+	// the field. Some models gate it behind an anthropic-beta default header.
+	Speed string
+	// Thinking enables extended thinking; nil leaves the request without it.
+	Thinking *ThinkingConfig
+	// CacheDiagnostics asks the API to explain prompt-cache misses and emits a
+	// CacheDiagnostics event for every reported one (Python parity:
+	// cache_diagnostics).
+	CacheDiagnostics bool
 }
 
 // NewAnthropic returns a config for one model with the documented defaults
@@ -111,23 +191,45 @@ func (c *AnthropicConfig) Create() (config.LLMClient, error) {
 	if maxTokens <= 0 {
 		maxTokens = DefaultMaxTokens
 	}
+	if err := c.Thinking.validate(maxTokens); err != nil {
+		return nil, err
+	}
 	baseURL := c.BaseURL
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
 	return &Client{
-		model:         c.model,
-		apiKey:        key,
-		baseURL:       strings.TrimSuffix(baseURL, "/"),
-		maxTokens:     maxTokens,
-		stopSequences: c.StopSequences,
-		temperature:   c.Temperature,
-		topP:          c.TopP,
-		streaming:     c.Streaming,
-		timeout:       c.Timeout,
-		maxRetries:    c.MaxRetries,
-		promptCaching: c.PromptCaching,
+		model:            c.model,
+		apiKey:           key,
+		baseURL:          strings.TrimSuffix(baseURL, "/"),
+		maxTokens:        maxTokens,
+		stopSequences:    c.StopSequences,
+		temperature:      c.Temperature,
+		topP:             c.TopP,
+		streaming:        c.Streaming,
+		timeout:          c.Timeout,
+		maxRetries:       c.MaxRetries,
+		promptCaching:    c.PromptCaching,
+		defaultHeaders:   copyMap(c.DefaultHeaders),
+		metadata:         copyMap(c.Metadata),
+		serviceTier:      c.ServiceTier,
+		speed:            c.Speed,
+		thinking:         c.Thinking,
+		cacheDiagnostics: c.CacheDiagnostics,
 	}, nil
+}
+
+// copyMap returns a copy of m (nil stays nil), so a client never shares a map a
+// caller may still mutate.
+func copyMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // Clone returns a copy with overrides applied (Python parity:
@@ -139,6 +241,12 @@ func (c *AnthropicConfig) Clone(overrides map[string]any) (config.ModelConfig, e
 	cp := *c
 	if c.StopSequences != nil {
 		cp.StopSequences = append([]string(nil), c.StopSequences...)
+	}
+	cp.DefaultHeaders = copyMap(c.DefaultHeaders)
+	cp.Metadata = copyMap(c.Metadata)
+	if c.Thinking != nil {
+		thinking := *c.Thinking
+		cp.Thinking = &thinking
 	}
 	for key, value := range overrides {
 		if err := cp.applyOverride(key, value); err != nil {
