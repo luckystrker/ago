@@ -360,11 +360,12 @@ func parseCallArguments(arguments string) (map[string]any, error) {
 // one server-side tool block each, after the function declarations (Python
 // parity: build_tools). Everything else fails fast (config.ErrUnsupportedTool).
 //
-// AGO-DEVIATION: Python also builds a ToolConfig for mixed requests
-// (build_tool_config: include_server_side_tool_invocations) and replays the
-// server-side invocations from the response (GeminiServerToolCallEvent); the
-// AGo client does not parse grounding metadata, so no ToolConfig is emitted and
-// grounding travels only as ordinary response text (see docs/DECISIONS.md).
+// AGO-DEVIATION: Python also sets include_server_side_tool_invocations in the
+// ToolConfig of mixed requests and replays the server-side invocations from the
+// response (GeminiServerToolCallEvent); the AGo client does not parse grounding
+// metadata, so that flag is not sent and grounding travels only as ordinary
+// response text (see docs/DECISIONS.md). The only ToolConfig AGo builds is the
+// Google Maps location bias (buildToolConfig).
 func buildTools(schemas []any) ([]map[string]any, error) {
 	declarations := make([]map[string]any, 0, len(schemas))
 	var extras []map[string]any
@@ -443,8 +444,58 @@ func hostedToolsToAPI(t tools.ToolSchema) ([]map[string]any, error) {
 			return nil, err
 		}
 		return []map[string]any{{"fileSearch": w}}, nil
+	case tools.GoogleMapsToolSchema:
+		return []map[string]any{{"googleMaps": googleMaps(s)}}, nil
+	case *tools.GoogleMapsToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.GoogleMapsToolName)
+		}
+		return []map[string]any{{"googleMaps": googleMaps(*s)}}, nil
 	}
 	return nil, fmt.Errorf("%w: hosted tool %q for the generateContent API", config.ErrUnsupportedTool, t.SchemaType())
+}
+
+// googleMaps maps the Maps-grounding tool: only the widget flag travels in the
+// tool entry, and only when set (Python parity: enable_widget=... or None).
+func googleMaps(t tools.GoogleMapsToolSchema) map[string]any {
+	g := map[string]any{}
+	if t.EnableWidget {
+		g["enableWidget"] = true
+	}
+	return g
+}
+
+// buildToolConfig renders the request's toolConfig, nil when nothing needs one.
+// Maps geo-biasing needs a retrievalConfig: it is emitted only when both
+// latitude and longitude are set, with the language code when present (Python
+// parity: build_tool_config; the last Maps schema wins).
+func buildToolConfig(schemas []any) map[string]any {
+	var retrieval map[string]any
+	for _, schema := range schemas {
+		var t tools.GoogleMapsToolSchema
+		switch v := schema.(type) {
+		case tools.GoogleMapsToolSchema:
+			t = v
+		case *tools.GoogleMapsToolSchema:
+			if v == nil {
+				continue
+			}
+			t = *v
+		default:
+			continue
+		}
+		if t.Latitude == nil || t.Longitude == nil {
+			continue
+		}
+		retrieval = map[string]any{"latLng": map[string]any{"latitude": *t.Latitude, "longitude": *t.Longitude}}
+		if t.LanguageCode != "" {
+			retrieval["languageCode"] = t.LanguageCode
+		}
+	}
+	if retrieval == nil {
+		return nil
+	}
+	return map[string]any{"retrievalConfig": retrieval}
 }
 
 // googleSearch maps the web_search fields Gemini honours: only the blocked

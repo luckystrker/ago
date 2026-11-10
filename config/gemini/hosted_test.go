@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/luckystrker/ago/config"
+	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/stream"
 	"github.com/luckystrker/ago/tools"
 )
 
@@ -165,3 +167,106 @@ func TestGeminiHostedToolsInRequest(t *testing.T) {
 }
 
 func ptrSchema[T any](s T) *T { return &s }
+
+// TestGoogleMapsRequestBody: Maps grounding reaches the wire as a googleMaps
+// tool entry plus a toolConfig.retrievalConfig geo bias (Python parity:
+// build_tools / build_tool_config); a request without Maps carries no toolConfig.
+func TestGoogleMapsRequestBody(t *testing.T) {
+	call := func(schemas ...any) map[string]any {
+		t.Helper()
+		srv, cap := captureServer(t, 200, `{"candidates":[]}`)
+		cl := startClient(t, newTestConfig(srv.URL))
+		req := &events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: "cafes nearby"}}}
+		if _, err := cl.Call(context.Background(), []events.Event{req}, nil, config.CallOptions{Tools: schemas}); err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		return cap.JSON(t)
+	}
+
+	full := call(mustSchemas(t, tools.NewGoogleMaps(
+		tools.WithGoogleMapsLocation(59.9, 10.7), tools.WithGoogleMapsLanguageCode("nb"), tools.WithGoogleMapsWidget(true)))[0])
+	if got, want := golden(t, full["tools"]), `[{"googleMaps":{"enableWidget":true}}]`; got != want {
+		t.Fatalf("tools = %s, want %s", got, want)
+	}
+	if got, want := golden(t, full["toolConfig"]),
+		`{"retrievalConfig":{"languageCode":"nb","latLng":{"latitude":59.9,"longitude":10.7}}}`; got != want {
+		t.Fatalf("toolConfig = %s, want %s", got, want)
+	}
+
+	// Maps without a location: the tool entry only, no toolConfig; the widget
+	// flag is absent when false. A language code alone needs a location to travel.
+	bare := call(mustSchemas(t, tools.NewGoogleMaps(tools.WithGoogleMapsLanguageCode("nb")))[0])
+	if got := golden(t, bare["tools"]); got != `[{"googleMaps":{}}]` {
+		t.Fatalf("bare tools = %s", got)
+	}
+	if _, ok := bare["toolConfig"]; ok {
+		t.Fatalf("toolConfig must stay off the wire without lat/lng: %v", bare["toolConfig"])
+	}
+
+	// No Maps tool: the request body is unchanged.
+	plain := call(mustSchemas(t, tools.NewWebSearch())[0])
+	if _, ok := plain["toolConfig"]; ok {
+		t.Fatalf("toolConfig appeared without Maps: %v", plain["toolConfig"])
+	}
+}
+
+// TestBuildToolConfigPartialLocation: a location with one coordinate (reachable
+// through a Variable bound to only latitude or longitude) is not sent and does
+// not panic; the pointer schema form and a nil pointer behave like the value.
+func TestBuildToolConfigPartialLocation(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	cx := agocontext.New(stream.NewMemoryStream())
+	if err := cx.SetVariable("lat", 10.5); err != nil {
+		t.Fatal(err)
+	}
+	byVar := mustSchemasCx(t, tools.NewGoogleMaps(
+		tools.WithGoogleMapsVariable("latitude", tools.NewVariable("lat")),
+		tools.WithGoogleMapsLanguageCode("nb")), cx)[0]
+	if sch := byVar.(tools.GoogleMapsToolSchema); sch.Latitude == nil || sch.Longitude != nil {
+		t.Fatalf("fixture: want latitude only, got %+v", sch)
+	}
+
+	for name, schemas := range map[string][]any{
+		"latitude only (variable)": {byVar},
+		"longitude only":           {tools.GoogleMapsToolSchema{Longitude: f(2)}},
+		"latitude only pointer":    {&tools.GoogleMapsToolSchema{Latitude: f(1)}},
+		"nil pointer":              {(*tools.GoogleMapsToolSchema)(nil)},
+		"no schemas":               nil,
+	} {
+		if got := buildToolConfig(schemas); got != nil {
+			t.Errorf("%s: toolConfig = %v, want none", name, got)
+		}
+	}
+	// The tool entry itself is still produced for a partial location.
+	if got, err := buildTools([]any{byVar}); err != nil || golden(t, got) != `[{"googleMaps":{}}]` {
+		t.Fatalf("buildTools(partial) = %v, %v", got, err)
+	}
+
+	// Pointer form with a full location behaves like the value form; the last
+	// Maps schema wins, and a nil pointer between them is skipped.
+	got := buildToolConfig([]any{
+		tools.GoogleMapsToolSchema{Latitude: f(1), Longitude: f(2), LanguageCode: "en"},
+		(*tools.GoogleMapsToolSchema)(nil),
+		&tools.GoogleMapsToolSchema{Latitude: f(3), Longitude: f(4)},
+	})
+	if want := `{"retrievalConfig":{"latLng":{"latitude":3,"longitude":4}}}`; golden(t, got) != want {
+		t.Fatalf("toolConfig = %s, want %s (last wins, no language code)", golden(t, got), want)
+	}
+	// A nil pointer in tools[] is a fail-fast error, like the other hosted types.
+	if _, err := buildTools([]any{(*tools.GoogleMapsToolSchema)(nil)}); !errors.Is(err, config.ErrUnsupportedTool) {
+		t.Fatalf("nil Maps pointer in buildTools: %v", err)
+	}
+	// The pointer form maps like the value form, widget flag included.
+	if got, err := buildTools([]any{&tools.GoogleMapsToolSchema{EnableWidget: true}}); err != nil || golden(t, got) != `[{"googleMaps":{"enableWidget":true}}]` {
+		t.Fatalf("pointer Maps = %v, %v", got, err)
+	}
+}
+
+func mustSchemasCx(t *testing.T, tool tools.Tool, cx *agocontext.Context) []any {
+	t.Helper()
+	ss, err := tool.Schemas(cx)
+	if err != nil {
+		t.Fatalf("Schemas: %v", err)
+	}
+	return ss
+}

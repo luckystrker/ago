@@ -4,8 +4,8 @@
 //
 // Parity with Python AG2 ag2/tools/ (shell/, code/ + sandbox/local.py,
 // toolkits/filesystem.py, search/, skills/, dynamic/factory.py). The port is a
-// functional subset: sandboxes beyond the local subprocess (Docker, Daytona),
-// provider-hosted tool flags, per-call Variable overrides of search-tool
-// parameters, and the in-process script runtime of skills are deferred — each
-// deviation carries an AGO-DEVIATION comment and a docs/DECISIONS.md entry.
+// functional subset: the Docker and Daytona sandboxes (contrib modules on the
+// Sandbox seam of sandbox.go), provider-hosted tool flags and the in-process
+// script runtime of skills are deferred — each deviation carries an
+// AGO-DEVIATION comment and a docs/DECISIONS.md entry.
 package toolpacks

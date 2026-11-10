@@ -72,6 +72,43 @@ func searchClient(c *http.Client) *http.Client {
 	return &http.Client{Timeout: httpTimeout}
 }
 
+// resolveSearchVariable resolves one per-call Variable kwarg from the
+// conversation (Python parity: builtin/_resolve.py resolve_variable): the
+// variable's name, or param when it has none; then its default; otherwise a
+// tools.ErrNotFound error.
+func resolveSearchVariable(cx *agocontext.Context, tool, param string, v tools.Variable) (any, error) {
+	key := v.Name
+	if key == "" {
+		key = param
+	}
+	if cx != nil {
+		if val, ok := cx.Variable(key); ok {
+			return val, nil
+		}
+	}
+	if v.HasDefault {
+		return v.Default, nil
+	}
+	return nil, fmt.Errorf("%w: tool %q: variable %q for parameter %q is not provided and has no default",
+		tools.ErrNotFound, tool, key, param)
+}
+
+// variableInt coerces a resolved variable to an int: JSON-decoded numbers
+// arrive as float64, and only whole numbers qualify.
+func variableInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		if n == float64(int(n)) {
+			return int(n), true
+		}
+	}
+	return 0, false
+}
+
 // --- DuckDuckGo ---------------------------------------------------------------
 
 // DDGSearchResult is one hit (Python parity: search.duckduckgo.SearchResult).
@@ -102,6 +139,7 @@ type DuckDuckGoSearch struct {
 	baseURL    string
 	client     *http.Client
 	middleware []middleware.Middleware
+	bound      map[string]tools.Variable // per-call Variable kwargs by parameter
 }
 
 var _ tools.Tool = (*DuckDuckGoSearch)(nil)
@@ -141,6 +179,27 @@ func WithDDGSafeSearch(level string) DDGOption {
 		default:
 			return fmt.Errorf("toolpacks: ddg safesearch must be on, moderate or off, got %q", level)
 		}
+		return nil
+	}
+}
+
+// WithDDGVariable binds one parameter ("max_results", "region" or
+// "safesearch") to a conversation Variable resolved on every call (Python
+// parity: these kwargs accept a Variable). The variable's name defaults to the
+// parameter name; its default applies when the conversation has none. The
+// resolved value is validated like the constructor option; a bad value fails
+// the call.
+func WithDDGVariable(param string, v tools.Variable) DDGOption {
+	return func(d *DuckDuckGoSearch) error {
+		switch param {
+		case "max_results", "region", "safesearch":
+		default:
+			return fmt.Errorf("toolpacks: ddg: no variable-capable parameter %q", param)
+		}
+		if d.bound == nil {
+			d.bound = map[string]tools.Variable{}
+		}
+		d.bound[param] = v
 		return nil
 	}
 }
@@ -199,8 +258,12 @@ func NewDuckDuckGoSearch(opts ...DDGOption) (*DuckDuckGoSearch, error) {
 	type ddgArgs struct {
 		Query string `json:"query" agschema:"description=The search query string,required"`
 	}
-	fn := func(args ddgArgs) (DDGSearchResponse, error) {
-		return d.search(args.Query)
+	fn := func(args ddgArgs, cx *agocontext.Context) (DDGSearchResponse, error) {
+		maxResults, region, safesearch, err := d.resolveParams(cx)
+		if err != nil {
+			return DDGSearchResponse{}, err
+		}
+		return d.search(args.Query, maxResults, region, safesearch)
 	}
 	ft, err := tools.NewFunctionTool("duckduckgo_search",
 		"Search the web using DuckDuckGo. Returns titles, URLs, and snippets for each result.",
@@ -212,12 +275,47 @@ func NewDuckDuckGoSearch(opts ...DDGOption) (*DuckDuckGoSearch, error) {
 	return d, nil
 }
 
+// resolveParams applies the per-call Variable bindings over the constructor
+// values.
+func (d *DuckDuckGoSearch) resolveParams(cx *agocontext.Context) (maxResults int, region, safesearch string, err error) {
+	maxResults, region, safesearch = d.maxResults, d.region, d.safesearch
+	for param, v := range d.bound {
+		val, rerr := resolveSearchVariable(cx, "duckduckgo_search", param, v)
+		if rerr != nil {
+			return 0, "", "", rerr
+		}
+		switch param {
+		case "max_results":
+			n, ok := variableInt(val)
+			if !ok || n <= 0 {
+				return 0, "", "", fmt.Errorf("toolpacks: ddg: variable for max_results must be a positive integer, got %v", val)
+			}
+			maxResults = n
+		case "region":
+			str, ok := val.(string)
+			if !ok || str == "" {
+				return 0, "", "", fmt.Errorf("toolpacks: ddg: variable for region must be a non-empty string, got %v", val)
+			}
+			region = str
+		case "safesearch":
+			str, _ := val.(string)
+			switch strings.ToLower(str) {
+			case "on", "moderate", "off":
+				safesearch = strings.ToLower(str)
+			default:
+				return 0, "", "", fmt.Errorf("toolpacks: ddg: variable for safesearch must be on, moderate or off, got %v", val)
+			}
+		}
+	}
+	return maxResults, region, safesearch, nil
+}
+
 // search fetches the HTML result page and parses it.
-func (d *DuckDuckGoSearch) search(query string) (DDGSearchResponse, error) {
+func (d *DuckDuckGoSearch) search(query string, maxResults int, region, safesearch string) (DDGSearchResponse, error) {
 	form := url.Values{
 		"q":  {query},
-		"kl": {d.region},
-		"kp": {ddgSafeSearchCode(d.safesearch)},
+		"kl": {region},
+		"kp": {ddgSafeSearchCode(safesearch)},
 	}
 	resp, err := searchClient(d.client).PostForm(d.baseURL+"/html", form)
 	if err != nil {
@@ -233,7 +331,7 @@ func (d *DuckDuckGoSearch) search(query string) (DDGSearchResponse, error) {
 	}
 	out := DDGSearchResponse{Query: query, Results: []DDGSearchResult{}}
 	snippets := ddgSnippetRe.FindAllStringSubmatch(string(body), -1)
-	for i, m := range ddgResultRe.FindAllStringSubmatch(string(body), d.maxResults) {
+	for i, m := range ddgResultRe.FindAllStringSubmatch(string(body), maxResults) {
 		bodyText := ""
 		if i < len(snippets) {
 			bodyText = stripHTML(snippets[i][1])
@@ -334,9 +432,8 @@ type TavilySearchResponse struct {
 }
 
 // TavilySearch searches through the Tavily REST API (Python parity:
-// ag2/tools/search/tavily.py TavilySearchTool — the parameter subset the porting
-// brief carries; per-call Variable overrides of the optional parameters are
-// deferred, see docs/DECISIONS.md).
+// ag2/tools/search/tavily.py TavilySearchTool — every optional request
+// parameter, each settable at construction or bound to a per-call Variable).
 //
 // The API key comes from the constructor; a conversation variable named
 // "tavily_api_key" overrides it per conversation. The key never appears in the
@@ -347,7 +444,8 @@ type TavilySearch struct {
 	baseURL    string
 	client     *http.Client
 	options    map[string]any
-	variable   bool // override the key from the conversation variable
+	bound      map[string]tools.Variable // per-call Variable kwargs by request parameter
+	variable   bool                      // override the key from the conversation variable
 	middleware []middleware.Middleware
 }
 
@@ -391,12 +489,14 @@ func WithTavilyMaxResults(n int) TavilyOption {
 	}
 }
 
-// WithTavilySearchDepth sets the depth ("basic" or "advanced"; Python parity:
+// WithTavilySearchDepth sets the depth ("basic", "advanced", "fast" or "ultra-fast"; Python parity:
 // search_depth).
 func WithTavilySearchDepth(depth string) TavilyOption {
 	return func(t *TavilySearch) error {
-		if depth != "basic" && depth != "advanced" {
-			return fmt.Errorf("toolpacks: tavily search_depth must be basic or advanced, got %q", depth)
+		switch depth {
+		case "basic", "advanced", "fast", "ultra-fast":
+		default:
+			return fmt.Errorf("toolpacks: tavily search_depth must be basic, advanced, fast or ultra-fast, got %q", depth)
 		}
 		t.options["search_depth"] = depth
 		return nil
@@ -448,6 +548,126 @@ func WithTavilyIncludeRawContent(v any) TavilyOption {
 // parity: include_favicon; omitted when unset).
 func WithTavilyIncludeFavicon(v bool) TavilyOption {
 	return func(t *TavilySearch) error { t.options["include_favicon"] = v; return nil }
+}
+
+// WithTavilyIncludeAnswerMode asks for an LLM answer of the given depth:
+// "basic" or "advanced" (Python parity: include_answer as a literal; the bool
+// form is WithTavilyIncludeAnswer).
+func WithTavilyIncludeAnswerMode(mode string) TavilyOption {
+	return func(t *TavilySearch) error {
+		if mode != "basic" && mode != "advanced" {
+			return fmt.Errorf("toolpacks: tavily include_answer mode must be basic or advanced, got %q", mode)
+		}
+		t.options["include_answer"] = mode
+		return nil
+	}
+}
+
+// WithTavilyIncludeImages asks the API for query-related images (Python
+// parity: include_images).
+func WithTavilyIncludeImages(v bool) TavilyOption {
+	return func(t *TavilySearch) error { t.options["include_images"] = v; return nil }
+}
+
+// WithTavilyTimeRange limits results to a recency window: "day", "week",
+// "month" or "year" (Python parity: time_range).
+func WithTavilyTimeRange(r string) TavilyOption {
+	return func(t *TavilySearch) error {
+		switch r {
+		case "day", "week", "month", "year":
+		default:
+			return fmt.Errorf("toolpacks: tavily time_range must be day, week, month or year, got %q", r)
+		}
+		t.options["time_range"] = r
+		return nil
+	}
+}
+
+// WithTavilyStartDate returns only results published on or after the date
+// (YYYY-MM-DD; Python parity: start_date).
+func WithTavilyStartDate(date string) TavilyOption {
+	return tavilyNonEmpty("start_date", date)
+}
+
+// WithTavilyEndDate returns only results published on or before the date
+// (YYYY-MM-DD; Python parity: end_date).
+func WithTavilyEndDate(date string) TavilyOption {
+	return tavilyNonEmpty("end_date", date)
+}
+
+// WithTavilyDays sets the look-back window in days for the news topic (Python
+// parity: days).
+func WithTavilyDays(n int) TavilyOption {
+	return func(t *TavilySearch) error {
+		if n <= 0 {
+			return errors.New("toolpacks: tavily days must be > 0")
+		}
+		t.options["days"] = n
+		return nil
+	}
+}
+
+// WithTavilyIncludeDomains restricts results to the given domains (Python
+// parity: include_domains).
+func WithTavilyIncludeDomains(domains ...string) TavilyOption {
+	return func(t *TavilySearch) error { t.options["include_domains"] = append([]string{}, domains...); return nil }
+}
+
+// WithTavilyExcludeDomains drops results from the given domains (Python
+// parity: exclude_domains).
+func WithTavilyExcludeDomains(domains ...string) TavilyOption {
+	return func(t *TavilySearch) error { t.options["exclude_domains"] = append([]string{}, domains...); return nil }
+}
+
+// WithTavilyCountry boosts results from one country (Python parity: country).
+func WithTavilyCountry(country string) TavilyOption {
+	return tavilyNonEmpty("country", country)
+}
+
+// WithTavilyAutoParameters lets Tavily choose the search parameters from the
+// query (Python parity: auto_parameters).
+func WithTavilyAutoParameters(v bool) TavilyOption {
+	return func(t *TavilySearch) error { t.options["auto_parameters"] = v; return nil }
+}
+
+// tavilyNonEmpty builds an option for a string request parameter that must not
+// be empty.
+func tavilyNonEmpty(param, val string) TavilyOption {
+	return func(t *TavilySearch) error {
+		if val == "" {
+			return fmt.Errorf("toolpacks: tavily %s must not be empty", param)
+		}
+		t.options[param] = val
+		return nil
+	}
+}
+
+// tavilyVariableParams are the request parameters WithTavilyVariable can bind
+// (Python parity: every optional TavilySearchTool kwarg accepts a Variable).
+var tavilyVariableParams = map[string]bool{
+	"max_results": true, "search_depth": true, "topic": true, "include_answer": true,
+	"include_raw_content": true, "include_images": true, "time_range": true,
+	"start_date": true, "end_date": true, "days": true, "include_domains": true,
+	"exclude_domains": true, "country": true, "auto_parameters": true, "include_favicon": true,
+}
+
+// WithTavilyVariable binds one request parameter (the Tavily API name, e.g.
+// "max_results" or "time_range") to a conversation Variable resolved on every
+// call, overriding any constructor value (Python parity: a Variable kwarg). The
+// variable's name defaults to the parameter name; its default applies when the
+// conversation has none; a resolved nil drops the parameter from the request.
+// The resolved value goes to the API as is.
+func WithTavilyVariable(param string, v tools.Variable) TavilyOption {
+	return func(t *TavilySearch) error {
+		if !tavilyVariableParams[param] {
+			return fmt.Errorf("toolpacks: tavily: no variable-capable parameter %q", param)
+		}
+		if t.bound == nil {
+			t.bound = map[string]tools.Variable{}
+		}
+		t.bound[param] = v
+		return nil
+	}
 }
 
 // WithTavilyAPIKeyVariable reads the key from the conversation variable
@@ -504,7 +724,11 @@ func NewTavilySearch(apiKey string, opts ...TavilyOption) (*TavilySearch, error)
 			}
 			key = s
 		}
-		return t.search(key, args.Query)
+		options, err := t.callOptions(cx)
+		if err != nil {
+			return TavilySearchResponse{}, err
+		}
+		return t.search(key, args.Query, options)
 	}
 	ft, err := tools.NewFunctionTool("tavily_search",
 		"Search the web using Tavily. Returns titles, URLs, snippets, relevance scores, "+
@@ -517,10 +741,31 @@ func NewTavilySearch(apiKey string, opts ...TavilyOption) (*TavilySearch, error)
 	return t, nil
 }
 
-// search performs one API call.
-func (t *TavilySearch) search(key, query string) (TavilySearchResponse, error) {
-	payload := map[string]any{"query": query}
+// callOptions merges the constructor values with the per-call Variable
+// bindings; a binding that resolves to nil removes the parameter.
+func (t *TavilySearch) callOptions(cx *agocontext.Context) (map[string]any, error) {
+	options := make(map[string]any, len(t.options)+len(t.bound))
 	for k, v := range t.options {
+		options[k] = v
+	}
+	for param, v := range t.bound {
+		val, err := resolveSearchVariable(cx, "tavily_search", param, v)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			delete(options, param)
+			continue
+		}
+		options[param] = val
+	}
+	return options, nil
+}
+
+// search performs one API call with the resolved request options.
+func (t *TavilySearch) search(key, query string, options map[string]any) (TavilySearchResponse, error) {
+	payload := map[string]any{"query": query}
+	for k, v := range options {
 		payload[k] = v
 	}
 	var raw struct {

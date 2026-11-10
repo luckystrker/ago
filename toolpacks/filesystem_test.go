@@ -1,6 +1,7 @@
 package toolpacks
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -255,14 +256,14 @@ func TestFilesystemToolkitShape(t *testing.T) {
 	for _, m := range f.Tools() {
 		names = append(names, m.Name())
 	}
-	want := "read_file,write_file,list_directory,make_directory,find_files"
+	want := "read_file,write_file,update_file,delete_file,list_directory,make_directory,find_files"
 	if got := strings.Join(names, ","); got != want {
 		t.Fatalf("members = %q, want %q", got, want)
 	}
 	_, cx := newTestContext()
 	schemas, err := f.Schemas(cx)
-	if err != nil || len(schemas) != 5 {
-		t.Fatalf("schemas = %d, %v; want 5", len(schemas), err)
+	if err != nil || len(schemas) != 7 {
+		t.Fatalf("schemas = %d, %v; want 7", len(schemas), err)
 	}
 	if !f.DeclaredInCode() {
 		t.Fatal("toolkit must be code-declared")
@@ -280,5 +281,118 @@ func TestFilesystemRootValidation(t *testing.T) {
 	}
 	if _, err := NewFilesystemToolkit(file); err == nil {
 		t.Fatal("a file root must be rejected")
+	}
+}
+
+func TestFilesystemReadRawBase64(t *testing.T) {
+	f, root := newFS(t)
+	_, cx := newTestContext()
+	bin := []byte{0x00, 0xff, 0xfe, 0x80, 'A'}
+	if err := os.WriteFile(filepath.Join(root, "b.bin"), bin, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ev := callTool(t, f, cx, "read_file", `{"path":"b.bin","raw":true}`)
+	if got, want := resultPartText(t, ev), base64.StdEncoding.EncodeToString(bin); got != want {
+		t.Fatalf("raw read = %q, want base64 %q", got, want)
+	}
+	ev = callTool(t, f, cx, "read_file", `{"path":"b.bin","raw":false}`)
+	if got := resultPartText(t, ev); got != string(bin) {
+		t.Fatalf("text read changed: %q", got)
+	}
+}
+
+func TestFilesystemUpdateFile(t *testing.T) {
+	f, root := newFS(t)
+	_, cx := newTestContext()
+	file := filepath.Join(root, "n.txt")
+	if err := os.WriteFile(file, []byte("a b a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ev := callTool(t, f, cx, "update_file", `{"path":"n.txt","old_content":"a","new_content":"X"}`)
+	if got := resultPartText(t, ev); got != "Successfully updated n.txt" {
+		t.Fatalf("update result = %q", got)
+	}
+	if b, _ := os.ReadFile(file); string(b) != "X b a" {
+		t.Fatalf("file = %q, want only the first occurrence replaced", b)
+	}
+	for _, args := range []string{
+		`{"path":"n.txt","old_content":"zzz","new_content":"y"}`, // not found
+		`{"path":"n.txt","old_content":"","new_content":"y"}`,    // empty needle on a non-empty file
+		`{"path":"../n.txt","old_content":"a","new_content":"y"}`,
+	} {
+		if got := resultPartText(t, callTool(t, f, cx, "update_file", args)); !strings.Contains(got, "TOOL_ERROR") {
+			t.Fatalf("update %s = %q, want an error", args, got)
+		}
+	}
+	if b, _ := os.ReadFile(file); string(b) != "X b a" {
+		t.Fatalf("failed updates modified the file: %q", b)
+	}
+	// An empty needle is the valid way to fill an empty file.
+	empty := filepath.Join(root, "e.txt")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	callTool(t, f, cx, "update_file", `{"path":"e.txt","old_content":"","new_content":"filled"}`)
+	if b, _ := os.ReadFile(empty); string(b) != "filled" {
+		t.Fatalf("empty file = %q", b)
+	}
+}
+
+func TestFilesystemDeleteFile(t *testing.T) {
+	f, root := newFS(t)
+	_, cx := newTestContext()
+	outside := filepath.Join(filepath.Dir(root), "outside_keep.txt")
+	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(outside) })
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "d", "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resultPartText(t, callTool(t, f, cx, "delete_file", `{"path":"f.txt"}`)); got != "Successfully deleted f.txt" {
+		t.Fatalf("delete file = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "f.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file survived: %v", err)
+	}
+	callTool(t, f, cx, "delete_file", `{"path":"d"}`)
+	if _, err := os.Stat(filepath.Join(root, "d")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("directory survived: %v", err)
+	}
+	for _, p := range []string{"../outside_keep.txt", ".", "missing.txt"} {
+		got := resultPartText(t, callTool(t, f, cx, "delete_file", `{"path":"`+p+`"}`))
+		if !strings.Contains(got, "TOOL_ERROR") {
+			t.Fatalf("delete %q = %q, want an error", p, got)
+		}
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("root was deleted: %v", err)
+	}
+	// A symlink out of the root is unlinked itself; the target stays.
+	if err := os.Symlink(outside, filepath.Join(root, "ln")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	callTool(t, f, cx, "delete_file", `{"path":"ln"}`)
+	if _, err := os.Lstat(filepath.Join(root, "ln")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("link survived: %v", err)
+	}
+	if b, err := os.ReadFile(outside); err != nil || string(b) != "keep" {
+		t.Fatalf("link target damaged: %q %v", b, err)
+	}
+}
+
+func TestFilesystemReadOnlyHasNoUpdateDelete(t *testing.T) {
+	f, err := NewFilesystemToolkit(t.TempDir(), WithFilesystemReadOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range f.Tools() {
+		if m.Name() == "update_file" || m.Name() == "delete_file" {
+			t.Fatalf("read-only toolkit carries %s", m.Name())
+		}
 	}
 }

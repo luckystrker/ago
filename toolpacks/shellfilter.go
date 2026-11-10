@@ -430,3 +430,19 @@ func shellPathBase(program string) string {
 	}
 	return program[strings.LastIndex(program, "/")+1:]
 }
+
+// argvBlocked reports whether argv matches one of the blocked patterns, word by
+// word. The program is matched by its base name too, so "/bin/rm" is caught by
+// the "rm" pattern (Python parity: the head list in ShellAdapter._filter).
+func argvBlocked(patterns, argv []string) bool {
+	if len(patterns) == 0 || len(argv) == 0 {
+		return false
+	}
+	head := append([]string{shellPathBase(argv[0])}, argv[1:]...)
+	for _, pattern := range patterns {
+		if matchesArgv(pattern, argv) || matchesArgv(pattern, head) {
+			return true
+		}
+	}
+	return false
+}

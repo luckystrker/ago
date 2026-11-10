@@ -15,9 +15,9 @@ import (
 )
 
 // ShellTool runs shell commands as local subprocesses (Python parity:
-// ag2/tools/shell/tool.py SandboxShellTool over sandbox/local.py LocalSandbox —
-// the local backend only; Docker/Daytona backends are deferred, see
-// docs/DECISIONS.md).
+// ag2/tools/shell/tool.py SandboxShellTool over sandbox/local.py LocalSandbox).
+// By default it runs commands as local subprocesses; WithShellSandbox runs them
+// in any other backend on the Sandbox seam (sandbox.go).
 //
 // Security contract: the command line comes from the model and executes on this
 // host without isolation — real filesystem, real network, real credentials the
@@ -50,12 +50,38 @@ type ShellTool struct {
 	middleware  []middleware.Middleware
 	tool        *tools.FunctionTool
 	sandbox     localSandbox
+	// factory, when set by WithShellSandbox, runs every command in a pluggable
+	// backend instead of a local subprocess; localOnly names the options that
+	// only configure the local path and are therefore refused alongside it.
+	factory    SandboxFactory
+	localOnly  []string
+	timeoutSet bool
 }
 
 var _ tools.Tool = (*ShellTool)(nil)
 
 // ShellOption configures NewShellTool.
 type ShellOption func(*ShellTool) error
+
+// WithShellSandbox runs every command in a pluggable execution backend (a
+// container, a cloud sandbox, an in-memory fake) instead of a local subprocess
+// (Python parity: SandboxShellTool(environment)). Command filters
+// (WithShellAllowed, WithShellReadonly, WithShellBlockPatterns, WithShellIgnore),
+// the timeout and the middleware apply unchanged; the options that configure
+// the local subprocess (WithShellWorkdir, WithShellEnv, WithShellInheritEnv,
+// WithShellMaxOutput) belong to the backend and make NewShellTool fail when
+// combined with this one. An unrestricted command reaches the backend as
+// ["sh", "-c", command]; a restricted one as its checked argv. Close closes the
+// factory when it owns resources (io.Closer).
+func WithShellSandbox(factory SandboxFactory) ShellOption {
+	return func(s *ShellTool) error {
+		if factory == nil {
+			return errors.New("toolpacks: shell sandbox factory must not be nil")
+		}
+		s.factory = factory
+		return nil
+	}
+}
 
 // WithShellName overrides the tool name (Python parity: the name kwarg).
 func WithShellName(name string) ShellOption {
@@ -85,6 +111,7 @@ func WithShellWorkdir(dir string) ShellOption {
 			return err
 		}
 		s.workdir, s.autoDir = abs, false
+		s.localOnly = append(s.localOnly, "WithShellWorkdir")
 		return nil
 	}
 }
@@ -96,7 +123,7 @@ func WithShellTimeout(d time.Duration) ShellOption {
 		if d <= 0 {
 			return errors.New("toolpacks: shell timeout must be > 0")
 		}
-		s.timeout = d
+		s.timeout, s.timeoutSet = d, true
 		return nil
 	}
 }
@@ -113,6 +140,7 @@ func WithShellEnv(env map[string]string) ShellOption {
 			}
 			s.env[k] = v
 		}
+		s.localOnly = append(s.localOnly, "WithShellEnv")
 		return nil
 	}
 }
@@ -123,7 +151,11 @@ func WithShellEnv(env map[string]string) ShellOption {
 // (API keys included). Without this option the child sees just the whitelisted
 // non-secret variables plus whatever WithShellEnv passed.
 func WithShellInheritEnv() ShellOption {
-	return func(s *ShellTool) error { s.inheritEnv = true; return nil }
+	return func(s *ShellTool) error {
+		s.inheritEnv = true
+		s.localOnly = append(s.localOnly, "WithShellInheritEnv")
+		return nil
+	}
 }
 
 // WithShellMaxOutput caps the reported output in characters; the excess is cut
@@ -134,6 +166,7 @@ func WithShellMaxOutput(n int) ShellOption {
 			return errors.New("toolpacks: shell max_output must be > 0")
 		}
 		s.maxOutput = n
+		s.localOnly = append(s.localOnly, "WithShellMaxOutput")
 		return nil
 	}
 }
@@ -266,6 +299,18 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 	// documented substring contract is kept for existing callers, so only
 	// WithShellAllowed, WithShellReadonly and WithShellIgnore switch it on. In
 	// restricted mode the blocked list is matched word by word, as in Python.
+	if s.factory != nil {
+		if len(s.localOnly) > 0 {
+			_ = os.RemoveAll(dir) // the unused auto workdir
+			return nil, fmt.Errorf("toolpacks: shell: %s configure the local subprocess and cannot be combined with WithShellSandbox", strings.Join(s.localOnly, ", "))
+		}
+		// The backend owns the working directory; the tool only reads it for the
+		// description and the ignore filter.
+		if s.autoDir {
+			_ = os.RemoveAll(s.workdir)
+		}
+		s.workdir, s.autoDir = factoryWorkdir(s.factory), false
+	}
 	if s.readonly && s.allowed == nil {
 		s.allowed = ReadonlyCommands()
 	}
@@ -273,6 +318,13 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 		s.restricted = true
 	}
 	description := s.description
+	if description == "" && s.factory != nil {
+		description = "Execute a shell command in the sandbox working directory: " + s.workdir + "."
+		if s.restricted {
+			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
+				"chaining, globs and variables are not available."
+		}
+	}
 	if description == "" {
 		// AGO-DEVIATION: Python's default description names only the workdir;
 		// AGo's default also states the execution contract, because the model
@@ -324,7 +376,30 @@ func (s *ShellTool) run(cx *agocontext.Context, command string) (string, error) 
 			}
 		}
 	}
+	if s.factory != nil {
+		return s.runInBackend(cx, argv)
+	}
 	res, err := s.sandbox.call(cx.TurnContext(), argv, s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
+	if err != nil {
+		return "", err
+	}
+	return formatExit(res), nil
+}
+
+// runInBackend executes the checked argv in a sandbox opened from the factory
+// (Python parity: ShellAdapter.run — open, exec, format).
+func (s *ShellTool) runInBackend(cx *agocontext.Context, argv []string) (string, error) {
+	ctx := cx.TurnContext()
+	var opts ExecOptions
+	if s.timeoutSet {
+		opts.Timeout = s.timeout
+	}
+	var res ExecResult
+	err := withSandbox(ctx, cx, s.factory, func(sb Sandbox) error {
+		var xerr error
+		res, xerr = sb.Exec(ctx, argv, opts)
+		return xerr
+	})
 	if err != nil {
 		return "", err
 	}
@@ -337,6 +412,9 @@ func (s *ShellTool) run(cx *agocontext.Context, command string) (string, error) 
 // the platform shell (Python parity: ["sh","-c",command]).
 func (s *ShellTool) argvFor(command string) ([]string, error) {
 	if !s.restricted {
+		if s.factory != nil {
+			return []string{"sh", "-c", command}, nil // backends are POSIX
+		}
 		return shellArgv(command), nil
 	}
 	argv, err := splitCommand(command)
@@ -364,15 +442,8 @@ func (s *ShellTool) filter(command string, argv []string) string {
 	if containsShellOperator(command) {
 		return fmt.Sprintf("Command not allowed (shell syntax is not available in restricted mode): %q", command)
 	}
-	if len(s.blocked) > 0 && len(argv) > 0 {
-		// Match the program by its base name too, so "/bin/rm" is caught by
-		// the "rm" pattern (Python parity: the head list).
-		head := append([]string{shellPathBase(argv[0])}, argv[1:]...)
-		for _, pattern := range s.blocked {
-			if matchesArgv(pattern, argv) || matchesArgv(pattern, head) {
-				return fmt.Sprintf("Command not allowed: %q", command)
-			}
-		}
+	if argvBlocked(s.blocked, argv) {
+		return fmt.Sprintf("Command not allowed: %q", command)
 	}
 	if s.ignore != nil {
 		if denied := checkIgnore(command, s.workdir, s.ignore); denied != "" {
@@ -407,6 +478,9 @@ func (s *ShellTool) Workdir() string { return s.workdir }
 // call that starts afterwards reports ErrSandboxClosed.
 func (s *ShellTool) Close() error {
 	s.sandbox.shutdown()
+	if s.factory != nil {
+		return closeFactory(s.factory)
+	}
 	if !s.autoDir || s.workdir == "" {
 		return nil
 	}

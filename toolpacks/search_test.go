@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -534,4 +535,118 @@ func memberNames(ts []tools.Tool) []string {
 		out = append(out, t.Name())
 	}
 	return out
+}
+
+// TestTavilySearchOptionalRequestParameters: every optional parameter of the
+// Python tool reaches the request body; unset ones stay off it.
+func TestTavilySearchOptionalRequestParameters(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = nil
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"query":"q","results":[]}`))
+	}))
+	defer srv.Close()
+	tv, err := NewTavilySearch("k", WithTavilyBaseURL(srv.URL),
+		WithTavilySearchDepth("ultra-fast"), WithTavilyIncludeAnswerMode("advanced"),
+		WithTavilyIncludeImages(true), WithTavilyTimeRange("week"),
+		WithTavilyStartDate("2026-01-01"), WithTavilyEndDate("2026-02-01"), WithTavilyDays(3),
+		WithTavilyIncludeDomains("a.example", "b.example"), WithTavilyExcludeDomains("c.example"),
+		WithTavilyCountry("norway"), WithTavilyAutoParameters(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cx := newTestContext()
+	callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)
+	want := map[string]any{
+		"query": "q", "search_depth": "ultra-fast", "include_answer": "advanced", "include_images": true,
+		"time_range": "week", "start_date": "2026-01-01", "end_date": "2026-02-01", "days": float64(3),
+		"include_domains": []any{"a.example", "b.example"}, "exclude_domains": []any{"c.example"},
+		"country": "norway", "auto_parameters": true,
+	}
+	if !reflect.DeepEqual(body, want) {
+		t.Fatalf("request body = %v\nwant %v", body, want)
+	}
+	for _, opt := range []TavilyOption{
+		WithTavilyTimeRange("decade"), WithTavilyDays(0), WithTavilyStartDate(""),
+		WithTavilyIncludeAnswerMode("full"), WithTavilyVariable("nope", tools.NewVariable("x")),
+	} {
+		if _, err := NewTavilySearch("k", opt); err == nil {
+			t.Fatal("an invalid option must fail construction")
+		}
+	}
+}
+
+// TestTavilySearchVariableKwargs: a bound parameter follows the conversation
+// variable on each call and overrides the constructor value.
+func TestTavilySearchVariableKwargs(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = nil
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"query":"q","results":[]}`))
+	}))
+	defer srv.Close()
+	tv, err := NewTavilySearch("k", WithTavilyBaseURL(srv.URL), WithTavilyMaxResults(2), WithTavilyTopic("news"),
+		WithTavilyVariable("max_results", tools.NewVariable("")),
+		WithTavilyVariable("include_domains", tools.NewVariable("doms", []string{"d.example"})),
+		WithTavilyVariable("topic", tools.NewVariable("topic_var")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cx := newTestContext()
+	// topic has no default and is absent: the call fails, no request goes out.
+	if got := resultPartText(t, callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)); !strings.Contains(got, "TOOL_ERROR") {
+		t.Fatalf("missing variable without default = %q, want an error", got)
+	}
+	_ = cx.SetVariable("max_results", 8)
+	_ = cx.SetVariable("topic_var", nil) // resolves to nil: the parameter is dropped
+	callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)
+	if body["max_results"] != float64(8) || !reflect.DeepEqual(body["include_domains"], []any{"d.example"}) {
+		t.Fatalf("body = %v, want variable max_results and default include_domains", body)
+	}
+	if _, ok := body["topic"]; ok {
+		t.Fatalf("a nil variable must drop the parameter: %v", body)
+	}
+	_ = cx.SetVariable("max_results", 3)
+	callTool(t, tv, cx, tv.Name(), `{"query":"q"}`)
+	if body["max_results"] != float64(3) {
+		t.Fatalf("second call max_results = %v, want 3 (resolved per call)", body["max_results"])
+	}
+}
+
+func TestDuckDuckGoVariableKwargs(t *testing.T) {
+	var form map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		form = map[string]string{"kl": r.FormValue("kl"), "kp": r.FormValue("kp")}
+		_, _ = io.WriteString(w, `<a class="result__a" href="https://a.example/">A</a><a class="result__snippet">s</a>
+<a class="result__a" href="https://b.example/">B</a><a class="result__snippet">s</a>`)
+	}))
+	defer srv.Close()
+	d, err := NewDuckDuckGoSearch(WithDDGBaseURL(srv.URL),
+		WithDDGVariable("max_results", tools.NewVariable("n")),
+		WithDDGVariable("region", tools.NewVariable("rg", "fr-fr")),
+		WithDDGVariable("safesearch", tools.NewVariable("safe")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cx := newTestContext()
+	_ = cx.SetVariable("n", 1)
+	_ = cx.SetVariable("safe", "off")
+	var resp DDGSearchResponse
+	ev := callTool(t, d, cx, d.Name(), `{"query":"q"}`)
+	if err := json.Unmarshal([]byte(firstDataJSON(t, ev)), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 1 || form["kl"] != "fr-fr" || form["kp"] != "-2" {
+		t.Fatalf("results=%d form=%v, want 1 result, default region fr-fr, safesearch off", len(resp.Results), form)
+	}
+	_ = cx.SetVariable("safe", "maybe")
+	if got := resultPartText(t, callTool(t, d, cx, d.Name(), `{"query":"q"}`)); !strings.Contains(got, "safesearch") {
+		t.Fatalf("invalid variable value = %q, want a safesearch error", got)
+	}
+	if _, err := NewDuckDuckGoSearch(WithDDGVariable("query", tools.NewVariable("x"))); err == nil {
+		t.Fatal("an unsupported parameter must fail construction")
+	}
 }
