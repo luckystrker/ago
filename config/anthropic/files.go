@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,11 +49,12 @@ const (
 // FilesClient is the Files API client built by
 // AnthropicConfig.CreateFilesClient. Safe for concurrent use.
 type FilesClient struct {
-	apiKey     string
-	baseURL    string
-	timeout    time.Duration // caps each request
-	maxRetries int
-	http       *http.Client
+	apiKey         string
+	baseURL        string
+	timeout        time.Duration // caps each request
+	maxRetries     int
+	defaultHeaders map[string]string
+	http           *http.Client
 }
 
 // CreateFilesClient returns the Files API client for this configuration
@@ -60,8 +62,8 @@ type FilesClient struct {
 // (config field, then ANTHROPIC_API_KEY); a missing key wraps
 // config.ErrNotProvided. An unset Timeout becomes 600s — Python parity with
 // files.py (`config.timeout if config.timeout is not None else 600.0`).
-// AGO-DEVIATION: Python also forwards default_headers, http_client and
-// open_telemetry to the SDK; the AGo config has no such fields.
+// AGO-DEVIATION: Python also forwards http_client and open_telemetry to the
+// SDK; the AGo config carries no such fields.
 func (c *AnthropicConfig) CreateFilesClient() (files.Client, error) {
 	key := c.APIKey
 	if key == "" {
@@ -79,11 +81,12 @@ func (c *AnthropicConfig) CreateFilesClient() (files.Client, error) {
 		timeout = 600 * time.Second
 	}
 	return &FilesClient{
-		apiKey:     key,
-		baseURL:    strings.TrimSuffix(baseURL, "/"),
-		timeout:    timeout,
-		maxRetries: c.MaxRetries,
-		http:       &http.Client{Timeout: timeout},
+		apiKey:         key,
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		timeout:        timeout,
+		maxRetries:     c.MaxRetries,
+		defaultHeaders: copyMap(c.DefaultHeaders),
+		http:           &http.Client{Timeout: timeout},
 	}, nil
 }
 
@@ -245,7 +248,15 @@ func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, acce
 		}
 		req.Header.Set("x-api-key", c.apiKey)
 		req.Header.Set("anthropic-version", APIVersion)
-		req.Header.Set("anthropic-beta", filesBeta)
+		for name, value := range c.defaultHeaders {
+			req.Header.Set(name, value)
+		}
+		// The Files API answers only under its own beta flag; a caller's default
+		// flag rides in the same header (the SDK replaces a same-named default,
+		// so both must be named here or one is silently dropped).
+		betas := append([]string{filesBeta}, defaultBetas(c.defaultHeaders)...)
+		slices.Sort(betas)
+		req.Header.Set("anthropic-beta", strings.Join(slices.Compact(betas), ","))
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}

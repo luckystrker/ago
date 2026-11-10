@@ -141,3 +141,88 @@ func TestCloneErrors(t *testing.T) {
 		t.Fatal("nil override on a non-pointer field must error")
 	}
 }
+
+func TestCreateThinkingValidation(t *testing.T) {
+	cfgFor := func(thinking *ThinkingConfig, maxTokens int64) *AnthropicConfig {
+		cfg := NewAnthropic("claude-sonnet")
+		cfg.APIKey = "k"
+		cfg.MaxTokens = maxTokens
+		cfg.Thinking = thinking
+		return cfg
+	}
+	cases := []struct {
+		name     string
+		thinking *ThinkingConfig
+		max      int64
+		wantErr  bool
+	}{
+		{"enabled", &ThinkingConfig{Type: ThinkingEnabled, BudgetTokens: 1024}, 4096, false},
+		{"adaptive", &ThinkingConfig{Type: ThinkingAdaptive}, 4096, false},
+		{"disabled", &ThinkingConfig{Type: ThinkingDisabled}, 4096, false},
+		{"unset", nil, 4096, false},
+		{"empty type", &ThinkingConfig{BudgetTokens: 1024}, 4096, true},
+		{"unknown type", &ThinkingConfig{Type: "sometimes"}, 4096, true},
+		{"enabled without budget", &ThinkingConfig{Type: ThinkingEnabled}, 4096, true},
+		{"enabled budget too large", &ThinkingConfig{Type: ThinkingEnabled, BudgetTokens: 4096}, 4096, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := cfgFor(tc.thinking, tc.max).Create()
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidThinking) {
+					t.Fatalf("want ErrInvalidThinking, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+		})
+	}
+}
+
+func TestCloneNewFields(t *testing.T) {
+	cfg := NewAnthropic("claude-sonnet")
+	cfg.DefaultHeaders = map[string]string{"X-A": "1"}
+	cfg.Metadata = map[string]string{"user_id": "u1"}
+	cfg.ServiceTier = "standard_only"
+	cfg.Speed = "fast"
+	cfg.Thinking = &ThinkingConfig{Type: ThinkingEnabled, BudgetTokens: 2048}
+	cfg.CacheDiagnostics = true
+
+	cloned, err := cfg.Clone(map[string]any{
+		"DefaultHeaders":   map[string]string{"X-A": "2"},
+		"Thinking":         &ThinkingConfig{Type: ThinkingAdaptive},
+		"CacheDiagnostics": false,
+	})
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	got := cloned.(*AnthropicConfig)
+	if got.DefaultHeaders["X-A"] != "2" || cfg.DefaultHeaders["X-A"] != "1" {
+		t.Fatalf("DefaultHeaders leaked: clone=%v original=%v", got.DefaultHeaders, cfg.DefaultHeaders)
+	}
+	if got.Thinking == nil || got.Thinking.Type != ThinkingAdaptive {
+		t.Fatalf("Thinking = %+v", got.Thinking)
+	}
+	if got.CacheDiagnostics {
+		t.Fatal("CacheDiagnostics override failed")
+	}
+	// The untouched collections are copies, not shared maps.
+	got.Metadata["user_id"] = "changed"
+	if cfg.Metadata["user_id"] != "u1" {
+		t.Fatal("Metadata map is shared with the original")
+	}
+	if got.ServiceTier != "standard_only" || got.Speed != "fast" {
+		t.Fatalf("scalar fields = %q/%q", got.ServiceTier, got.Speed)
+	}
+	// The thinking config is a copy too.
+	plain, err := cfg.Clone(nil)
+	if err != nil {
+		t.Fatalf("Clone(nil): %v", err)
+	}
+	plain.(*AnthropicConfig).Thinking.Type = ThinkingDisabled
+	if cfg.Thinking.Type != ThinkingEnabled {
+		t.Fatal("Thinking config is shared with the original")
+	}
+}

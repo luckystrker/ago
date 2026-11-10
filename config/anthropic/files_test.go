@@ -305,3 +305,40 @@ func TestAnthropicCreateFilesClient(t *testing.T) {
 		var _ files.Client = fc
 	})
 }
+
+func TestFilesClientDefaultHeadersAndBetaMerge(t *testing.T) {
+	var gotBeta, gotCustom string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("anthropic-beta")
+		gotCustom = r.Header.Get("x-custom")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("ParseMultipartForm: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"file-1","type":"file","filename":"a.txt","mime_type":"text/plain","size_bytes":1,"created_at":"2025-01-01T00:00:00Z"}`)
+	}))
+	defer srv.Close()
+
+	cfg := NewAnthropic("claude-sonnet")
+	cfg.APIKey = "test-key"
+	cfg.BaseURL = srv.URL
+	cfg.DefaultHeaders = map[string]string{
+		"Anthropic-Beta": "fast-mode-2026-02-01",
+		"X-Custom":       "custom-value",
+	}
+	client, err := cfg.CreateFilesClient()
+	if err != nil {
+		t.Fatalf("CreateFilesClient: %v", err)
+	}
+	if _, err := client.Upload(context.Background(), []byte("a"), "a.txt", "user_data"); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if gotCustom != "custom-value" {
+		t.Errorf("X-Custom = %q, want the caller's default header", gotCustom)
+	}
+	// The Files API flag and the caller's default flag share one header.
+	if want := "fast-mode-2026-02-01," + filesBeta; gotBeta != want {
+		t.Errorf("anthropic-beta = %q, want %q", gotBeta, want)
+	}
+}
