@@ -43,6 +43,10 @@ type ShellTool struct {
 	inheritEnv  bool
 	maxOutput   int
 	blocked     []string
+	allowed     []string
+	ignore      []string
+	restricted  bool
+	readonly    bool
 	tool        *tools.FunctionTool
 	sandbox     localSandbox
 }
@@ -136,10 +140,18 @@ func WithShellMaxOutput(n int) ShellOption {
 // WithShellBlockPatterns refuses commands containing any of the patterns,
 // case-insensitive substring match. Python matches its blocked list word by word
 // against the argv in restricted mode, which only exists because the restricted
-// argv runs without a shell; the Go tool always runs through a shell, where a
-// word match cannot see what the shell expands, so the patterns are matched
-// against the raw command line instead. Like Python's own caveat says, this is an
-// advisory filter, not a security boundary — use an isolated container for that.
+// argv runs without a shell; the unrestricted Go tool runs through a shell,
+// where a word match cannot see what the shell expands, so the patterns are
+// matched against the raw command line instead. In restricted mode (switched on
+// by WithShellAllowed, WithShellReadonly or WithShellIgnore) the same list is
+// matched word by word against the checked argv, including the program's base
+// name, exactly as Python does.
+// Like Python's own caveat says, this is an advisory filter, not a security
+// boundary — use an isolated container for that. It is bypassable by design
+// (a program that runs another program, an encoding trick, a substring that
+// never appears literally). The real limiter is WithShellAllowed (restricted
+// mode, checked argv executed without a shell); use it, not this list, when
+// the command must be constrained.
 // See docs/DECISIONS.md.
 func WithShellBlockPatterns(patterns ...string) ShellOption {
 	return func(s *ShellTool) error {
@@ -149,6 +161,58 @@ func WithShellBlockPatterns(patterns ...string) ShellOption {
 			}
 		}
 		s.blocked = append(s.blocked, patterns...)
+		return nil
+	}
+}
+
+// WithShellAllowed sets a whitelist of command prefixes and switches on
+// restricted mode: the command is split into argv once and executed without a
+// shell, so pipes, redirects, globs, variables and brace expansion are not
+// available and nothing can run after the check (Python parity: the allowed
+// kwarg and ShellAdapter.restricted).
+//
+// A prefix is matched word by word: "git log" matches "git log -5" but not
+// "git -c x log"; "git" matches every git invocation.
+func WithShellAllowed(prefixes ...string) ShellOption {
+	return func(s *ShellTool) error {
+		if len(prefixes) == 0 {
+			return errors.New("toolpacks: shell allow list must not be empty")
+		}
+		for _, p := range prefixes {
+			if strings.TrimSpace(p) == "" {
+				return errors.New("toolpacks: shell allow pattern must not be empty")
+			}
+		}
+		s.allowed = append(s.allowed, prefixes...)
+		return nil
+	}
+}
+
+// WithShellReadonly restricts the tool to the commands that cannot write files
+// or run other programs (cat, ls, grep, ...; see ReadonlyCommands). It switches
+// on restricted mode. An explicit WithShellAllowed list takes precedence
+// (Python parity: readonly is ignored when allowed is given).
+func WithShellReadonly() ShellOption {
+	return func(s *ShellTool) error { s.readonly = true; return nil }
+}
+
+// WithShellIgnore refuses a command whose literal path arguments leave the
+// working directory or match one of the glob patterns (Python parity: the
+// ignore kwarg and filter.check_ignore). It switches on restricted mode, so the
+// checked argv is exactly what runs. Tokens are read with POSIX quoting and
+// resolved through symlinks, so "cat ../secret", "cat .env" (with ".env"
+// ignored) and "prog --output=.env" are all refused before execution.
+func WithShellIgnore(patterns ...string) ShellOption {
+	return func(s *ShellTool) error {
+		if len(patterns) == 0 {
+			return errors.New("toolpacks: shell ignore list must not be empty")
+		}
+		for _, p := range patterns {
+			if p == "" {
+				return errors.New("toolpacks: shell ignore pattern must not be empty")
+			}
+		}
+		s.ignore = append(s.ignore, patterns...)
 		return nil
 	}
 }
@@ -175,6 +239,21 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			return nil, err
 		}
 	}
+	// readonly is a preset for the whitelist: only applied when the caller gave
+	// no explicit allowed list (Python parity: a readonly flag never overrides
+	// an allowed list). Any filter switches on restricted mode.
+	//
+	// AGO-DEVIATION: Python treats a blocked list alone as restricted mode too.
+	// The Go WithShellBlockPatterns option predates restricted mode and its
+	// documented substring contract is kept for existing callers, so only
+	// WithShellAllowed, WithShellReadonly and WithShellIgnore switch it on. In
+	// restricted mode the blocked list is matched word by word, as in Python.
+	if s.readonly && s.allowed == nil {
+		s.allowed = ReadonlyCommands()
+	}
+	if s.allowed != nil || s.ignore != nil {
+		s.restricted = true
+	}
 	description := s.description
 	if description == "" {
 		// AGO-DEVIATION: Python's default description names only the workdir;
@@ -185,6 +264,10 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			s.workdir + ". The command is model-controlled and runs without isolation, with full " +
 			"filesystem and network access. This tool is not a security boundary; every call " +
 			"requires human approval."
+		if s.restricted {
+			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
+				"chaining, globs and variables are not available."
+		}
 	}
 	type shellArgs struct {
 		Command string `json:"command" agschema:"description=The shell command to run,required"`
@@ -207,17 +290,78 @@ func (s *ShellTool) run(cx *agocontext.Context, command string) (string, error) 
 	if s.sandbox.isClosed() {
 		return "", ErrSandboxClosed
 	}
-	lower := strings.ToLower(command)
-	for _, p := range s.blocked {
-		if strings.Contains(lower, strings.ToLower(p)) {
-			return fmt.Sprintf("Command not allowed: %q", command), nil
+	argv, err := s.argvFor(command)
+	if err != nil {
+		return fmt.Sprintf("Command not allowed (unbalanced quotes): %q", command), nil
+	}
+	if s.restricted {
+		if denied := s.filter(command, argv); denied != "" {
+			return denied, nil
+		}
+	} else {
+		lower := strings.ToLower(command)
+		for _, p := range s.blocked {
+			if strings.Contains(lower, strings.ToLower(p)) {
+				return fmt.Sprintf("Command not allowed: %q", command), nil
+			}
 		}
 	}
-	res, err := s.sandbox.call(cx.TurnContext(), shellArgv(command), s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
+	res, err := s.sandbox.call(cx.TurnContext(), argv, s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
 	if err != nil {
 		return "", err
 	}
 	return formatExit(res), nil
+}
+
+// argvFor builds the exec argv for one command. In restricted mode it is the
+// checked argv itself, executed without a shell, so nothing can expand or chain
+// after the filter (Python parity: ShellAdapter._argv). Unrestricted mode keeps
+// the platform shell (Python parity: ["sh","-c",command]).
+func (s *ShellTool) argvFor(command string) ([]string, error) {
+	if !s.restricted {
+		return shellArgv(command), nil
+	}
+	argv, err := splitCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	return argv, nil
+}
+
+// filter applies the restricted-mode command policy and returns the refusal
+// text, or "" when the command may run (Python parity: ShellAdapter._filter).
+func (s *ShellTool) filter(command string, argv []string) string {
+	if s.allowed != nil {
+		permitted := false
+		for _, pattern := range s.allowed {
+			if matchesArgv(pattern, argv) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return fmt.Sprintf("Command not allowed: %q", command)
+		}
+	}
+	if containsShellOperator(command) {
+		return fmt.Sprintf("Command not allowed (shell syntax is not available in restricted mode): %q", command)
+	}
+	if len(s.blocked) > 0 && len(argv) > 0 {
+		// Match the program by its base name too, so "/bin/rm" is caught by
+		// the "rm" pattern (Python parity: the head list).
+		head := append([]string{shellPathBase(argv[0])}, argv[1:]...)
+		for _, pattern := range s.blocked {
+			if matchesArgv(pattern, argv) || matchesArgv(pattern, head) {
+				return fmt.Sprintf("Command not allowed: %q", command)
+			}
+		}
+	}
+	if s.ignore != nil {
+		if denied := checkIgnore(command, s.workdir, s.ignore); denied != "" {
+			return denied
+		}
+	}
+	return ""
 }
 
 // shellArgv wraps the command for the platform shell.

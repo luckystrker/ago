@@ -20,7 +20,8 @@ import (
 // confined to one root directory (Python parity: ag2/tools/toolkits/
 // filesystem.py FilesystemToolkit — base_path, the traversal guard, the UTF-8
 // pinning). The member set is the porting brief's read/write/list/mkdir/glob;
-// Python's update_file and delete_file are deferred (docs/DECISIONS.md).
+// WithFilesystemReadOnly drops the mutating members; Python's update_file and
+// delete_file are deferred (docs/DECISIONS.md).
 //
 // All tools read the filesystem per call, so the toolkit is safe for concurrent
 // use; concurrent writers race the way concurrent writers to one file do.
@@ -31,10 +32,34 @@ type FilesystemToolkit struct {
 
 var _ tools.Tool = (*FilesystemToolkit)(nil)
 
-// NewFilesystemToolkit builds the five tools rooted at dir. The root must be an
+// FilesystemOption configures NewFilesystemToolkit.
+type FilesystemOption func(*filesystemConfig) error
+
+// filesystemConfig is the resolved option set.
+type filesystemConfig struct {
+	readOnly bool
+}
+
+// WithFilesystemReadOnly omits every mutating tool (write_file,
+// make_directory), leaving the read-only members (Python parity:
+// FilesystemToolkit(read_only=True), which drops write_file/update_file/
+// delete_file).
+func WithFilesystemReadOnly() FilesystemOption {
+	return func(c *filesystemConfig) error { c.readOnly = true; return nil }
+}
+
+// NewFilesystemToolkit builds the tools rooted at dir. The root must be an
 // existing directory (Python parity: _resolve_dir). Model paths are relative to
 // the root; absolute paths and any path resolving outside the root are refused.
-func NewFilesystemToolkit(root string) (*FilesystemToolkit, error) {
+// The default member set is read, write, list, mkdir and glob;
+// WithFilesystemReadOnly leaves out write_file and make_directory.
+func NewFilesystemToolkit(root string, opts ...FilesystemOption) (*FilesystemToolkit, error) {
+	var cfg filesystemConfig
+	for _, opt := range opts {
+		if err := opt(&cfg); err != nil {
+			return nil, err
+		}
+	}
 	abs, err := absDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: filesystem root: %w", err)
@@ -67,28 +92,34 @@ func NewFilesystemToolkit(root string) (*FilesystemToolkit, error) {
 		return nil, err
 	}
 
-	writeFn := func(args struct {
-		Path    string `json:"path" agschema:"description=Relative path to the file to create or overwrite,required"`
-		Content string `json:"content" agschema:"description=The full content to write to the file,required"`
-	}) (string, error) {
-		target, err := f.resolve(args.Path)
+	var members []tools.Tool
+	members = append(members, readFile)
+
+	if !cfg.readOnly {
+		writeFn := func(args struct {
+			Path    string `json:"path" agschema:"description=Relative path to the file to create or overwrite,required"`
+			Content string `json:"content" agschema:"description=The full content to write to the file,required"`
+		}) (string, error) {
+			target, err := f.resolve(args.Path)
+			if err != nil {
+				return "", err
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return "", err
+			}
+			// UTF-8 always (Python parity: write_text(encoding="utf-8")).
+			if err := os.WriteFile(target, []byte(args.Content), 0o644); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Successfully wrote %d characters to %s", len(args.Content), args.Path), nil
+		}
+		writeFile, err := tools.NewFunctionTool("write_file",
+			"Create or overwrite a file with the given content. Parent directories are created automatically.",
+			writeFn)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return "", err
-		}
-		// UTF-8 always (Python parity: write_text(encoding="utf-8")).
-		if err := os.WriteFile(target, []byte(args.Content), 0o644); err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("Successfully wrote %d characters to %s", len(args.Content), args.Path), nil
-	}
-	writeFile, err := tools.NewFunctionTool("write_file",
-		"Create or overwrite a file with the given content. Parent directories are created automatically.",
-		writeFn)
-	if err != nil {
-		return nil, err
+		members = append(members, writeFile)
 	}
 
 	listFn := func(args struct {
@@ -122,23 +153,27 @@ func NewFilesystemToolkit(root string) (*FilesystemToolkit, error) {
 	if err != nil {
 		return nil, err
 	}
+	members = append(members, listDir)
 
-	mkdirFn := func(args struct {
-		Path string `json:"path" agschema:"description=Relative path of the directory to create,required"`
-	}) (string, error) {
-		target, err := f.resolve(args.Path)
+	if !cfg.readOnly {
+		mkdirFn := func(args struct {
+			Path string `json:"path" agschema:"description=Relative path of the directory to create,required"`
+		}) (string, error) {
+			target, err := f.resolve(args.Path)
+			if err != nil {
+				return "", err
+			}
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Successfully created directory %s", args.Path), nil
+		}
+		mkdir, err := tools.NewFunctionTool("make_directory",
+			"Create a directory (and any missing parents) inside the workspace.", mkdirFn)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if err := os.MkdirAll(target, 0o755); err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("Successfully created directory %s", args.Path), nil
-	}
-	mkdir, err := tools.NewFunctionTool("make_directory",
-		"Create a directory (and any missing parents) inside the workspace.", mkdirFn)
-	if err != nil {
-		return nil, err
+		members = append(members, mkdir)
 	}
 
 	globFn := func(args struct {
@@ -177,8 +212,9 @@ func NewFilesystemToolkit(root string) (*FilesystemToolkit, error) {
 	if err != nil {
 		return nil, err
 	}
+	members = append(members, findFiles)
 
-	tk, err := tools.NewToolkit("filesystem_toolkit", nil, readFile, writeFile, listDir, mkdir, findFiles)
+	tk, err := tools.NewToolkit("filesystem_toolkit", nil, members...)
 	if err != nil {
 		return nil, err
 	}

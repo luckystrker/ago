@@ -62,6 +62,25 @@ func TestFilesystemListAndMkdir(t *testing.T) {
 	}
 }
 
+func TestFilesystemReadOnly(t *testing.T) {
+	root := t.TempDir()
+	f, err := NewFilesystemToolkit(root, WithFilesystemReadOnly())
+	if err != nil {
+		t.Fatalf("NewFilesystemToolkit(read-only): %v", err)
+	}
+	var names []string
+	for _, tool := range f.Tools() {
+		names = append(names, tool.Name())
+	}
+	got := strings.Join(names, "|")
+	if got != "read_file|list_directory|find_files" {
+		t.Fatalf("read-only tools = %q, want the read-only members only", got)
+	}
+	if strings.Contains(got, "write_file") || strings.Contains(got, "make_directory") {
+		t.Fatalf("read-only toolkit registered a mutating tool: %q", got)
+	}
+}
+
 func TestFilesystemGlob(t *testing.T) {
 	f, root := newFS(t)
 	_, cx := newTestContext()
