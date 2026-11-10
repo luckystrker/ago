@@ -25,9 +25,11 @@
 // AGO-DEVIATION from the Python original: KnowledgeConfig/MemoryKnowledgeStore
 // is not ported (the AGo agent has no knowledge wiring yet, and the store played
 // no observable role in the original run); SlidingWindowPolicy has no
-// transparent flag (the AGo policy is always view-only); TailWindowCompact's
-// tunable tail is compact.KeepRecent (fixed 2 conversational events); and the
-// summarizer gets its own scripted client so the turn script stays readable.
+// transparent flag (the AGo policy is always view-only); this example keeps the
+// LLM compaction strategy with compact.KeepRecent (2 conversational events),
+// while the zero-cost rewrite is available separately as
+// compact.NewTailWindowCompact / compact.NewTailWindow; and the summarizer gets
+// its own scripted client so the turn script stays readable.
 //
 // Run: go run ./examples/policies_compact
 package main
