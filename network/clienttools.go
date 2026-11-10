@@ -451,6 +451,7 @@ func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.
 				Audience:  md.OwnerID,
 				EventType: EnvTaskCancelRequest,
 				Payload:   payload,
+				TaskID:    args.TaskID,
 			}
 			if _, err := hub.Send(env); err != nil {
 				return fmt.Sprintf("Error: cancel_request post failed: %v", err), nil

@@ -71,11 +71,18 @@ func (h *Hub) ObserveTask(md task.Metadata) error {
 // parity: the mirror swallows that — progress for a task the hub never saw
 // is dropped).
 func (h *Hub) UpdateTask(taskID string, state task.State, progress map[string]any, result any, errMsg string) error {
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	md, ok := h.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
+	if md.State.Terminal() {
+		// Terminal states are immutable (Python parity): a late event for a
+		// task the hub already expired or completed changes nothing.
+		return nil
 	}
 	if state != "" {
 		md.State = state
@@ -97,6 +104,8 @@ func (h *Hub) UpdateTask(taskID string, state task.State, progress map[string]an
 	}
 	if state.Terminal() {
 		md.CompletedAt = h.now()
+		delete(h.ext.peerCancel, taskID)
+		h.queueTaskTerminal(&evs, md, errMsg)
 	}
 	h.tasks[taskID] = cloneTaskMetadata(md)
 	return nil

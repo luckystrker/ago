@@ -21,6 +21,16 @@ type hubExt struct {
 	rateBuckets     map[string]*TokenBucket        // sender agent id → bucket
 	onInboxPressure func(agentID string, pending, max int)
 	onTaskEvent     func(taskID, kind string, payload map[string]any)
+	listeners       listenerSet
+	audit           *AuditLog
+
+	causation   map[string]map[causeKey]int // channel → (sender, causation id) → index into Hub.logs[channel]
+	peerCancel  map[string]map[string]bool  // task id → non-participants that already sent a cancel request
+	checkpoints map[string]taskCheckpoint   // task id → last checkpoint
+	regSeq      map[string]int              // agent id → registration order
+	nextSeq     int
+
+	lifecycle lifecycleState
 }
 
 func (e *hubExt) init() {
@@ -29,6 +39,11 @@ func (e *hubExt) init() {
 	e.observed = make(map[string]struct{})
 	e.inboxPending = make(map[string]int)
 	e.rateBuckets = make(map[string]*TokenBucket)
+	e.causation = make(map[string]map[causeKey]int)
+	e.peerCancel = make(map[string]map[string]bool)
+	e.checkpoints = make(map[string]taskCheckpoint)
+	e.regSeq = make(map[string]int)
+	e.lifecycle.init()
 }
 
 // WithHubAuth replaces the auth registry consulted at Register (default:
@@ -59,12 +74,13 @@ func WithTaskEventHook(fn func(taskID, kind string, payload map[string]any)) Hub
 // forwarding a task event into the hub fails.
 const TaskEventMirrorFailed = "mirror_failed"
 
-// FireTaskEvent reports a task-side event to the task-event hook (no-op
-// without one).
+// FireTaskEvent reports a task-side event to the task-event hook and to every
+// listener's OnTaskEvent (kind is free-form; see HubListener).
 func (h *Hub) FireTaskEvent(taskID, kind string, payload map[string]any) {
 	if fn := h.ext.onTaskEvent; fn != nil {
 		fn(taskID, kind, payload)
 	}
+	h.fanOut(func(l HubListener) { l.OnTaskEvent(taskID, kind, payload) })
 }
 
 // Authenticate validates a passport's auth claim against the registry: the
@@ -131,6 +147,8 @@ func (h *Hub) reindexLocked(agentID string, old, cur Resume) {
 // is created, whereas Python returns silently when the resume is absent
 // (every Python registration has one; AGo registrations may not).
 func (h *Hub) RecordObservation(ownerID, capability string, outcome task.State, latency time.Duration, taskID string) error {
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.passports[ownerID]; !ok {
@@ -175,6 +193,11 @@ func (h *Hub) RecordObservation(ownerID, capability string, outcome task.State, 
 	if taskID != "" {
 		h.ext.observed[key] = struct{}{}
 	}
+	evs.add(func(l HubListener) {
+		l.OnAgentEvent(ownerID, AgentEventObservationRecorded, map[string]any{
+			"version": cur.Version, "capability": capability, "outcome": string(outcome), "at": cur.LastUpdated,
+		})
+	})
 	return nil
 }
 
@@ -182,6 +205,8 @@ func (h *Hub) RecordObservation(ownerID, capability string, outcome task.State, 
 // clobbering concurrent updates (the read-modify-write happens under the hub
 // lock). An empty When is stamped with the hub clock.
 func (h *Hub) AddResumeExample(agentID string, ex ResumeExample) error {
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.passports[agentID]; !ok {
@@ -199,6 +224,9 @@ func (h *Hub) AddResumeExample(agentID string, ex ResumeExample) error {
 	cur.LastUpdated = h.now()
 	cur.Version++
 	h.resumes[agentID] = cur
+	evs.add(func(l HubListener) {
+		l.OnAgentEvent(agentID, AgentEventResumeSet, map[string]any{"version": cur.Version, "at": cur.LastUpdated})
+	})
 	return nil
 }
 
@@ -312,11 +340,11 @@ func (h *Hub) countDispatchLocked(env Envelope, targets []dispatchTarget) []pres
 
 // firePressure reports high-water crossings; called outside the lock.
 func (h *Hub) firePressure(events []pressureEvent) {
-	if h.ext.onInboxPressure == nil {
-		return
-	}
 	for _, e := range events {
-		h.ext.onInboxPressure(e.agentID, e.pending, e.max)
+		if h.ext.onInboxPressure != nil {
+			h.ext.onInboxPressure(e.agentID, e.pending, e.max)
+		}
+		h.fanOut(func(l HubListener) { l.OnInboxPressure(e.agentID, e.pending, e.max) })
 	}
 }
 
@@ -325,4 +353,5 @@ func (h *Hub) forgetLocked(agentID string, resume Resume) {
 	h.reindexLocked(agentID, resume, Resume{})
 	delete(h.ext.inboxPending, agentID)
 	delete(h.ext.rateBuckets, agentID)
+	delete(h.ext.regSeq, agentID)
 }
