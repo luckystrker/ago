@@ -5,26 +5,31 @@
 // shapes, stdlib only.
 //
 // Scope: protocol types, agent-card discovery, message/send,
-// message/stream (server SSE), tasks/get, tasks/list, tasks/cancel, an
-// in-memory task store (D-049); push-notification configs with server dispatch
-// and a webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
-// execution drivers, context-variable sync and HITL-over-the-wire on
-// Message.metadata, the REST transport routes, and the declarative security
-// schemes of security.py (D-056). The client also speaks the REST binding,
-// selects the card interface (with the 1.0 protocol-version check), takes a
-// preset card and request interceptors (clientconn.go, clientrest.go), and the
-// server rewrites the served card per request (ServerConfig.CardModifier,
-// CardCacheControl) and serves the authenticated extended card
-// (ServerConfig.ExtendedCard, agent/getAuthenticatedExtendedCard and
-// /extendedAgentCard), with optional input-mode validation
-// (ServerConfig.ValidateInputModes), full AG2 history shipping with the server
-// restore hook (history.go, ServerConfig.RestoreHistory), tenants — the claim
-// on the wire plus the request-aware authorization of it (tenant.go,
+// message/stream (server SSE) with artifact streaming (TaskArtifactUpdateEvent
+// chunks through ServerConfig.HandleStream), tasks/get, tasks/list,
+// tasks/cancel, tasks/resubscribe (the live stream of a running task, opened
+// with the task's current state — wave-4 invariant 7), an in-memory task store
+// (D-049); push-notification configs with server dispatch and a webhook
+// receiver, the urn:ag2:client-tools:v1 extension with client-side execution
+// drivers, context-variable sync and HITL-over-the-wire on Message.metadata,
+// the REST transport routes (including /message:stream and
+// /tasks/{id}:subscribe), and the declarative security schemes of security.py
+// (D-056). The client speaks both bindings (JSON-RPC SSE and HTTP+JSON),
+// consumes a task stream with resubscribe-and-backoff (ErrReconnect) and a
+// polling fallback, selects the card interface (with the 1.0 protocol-version
+// check), takes a preset card and request interceptors (clientconn.go,
+// clientrest.go, streamclient.go), and the server rewrites the served card per
+// request (ServerConfig.CardModifier, CardCacheControl) and serves the
+// authenticated extended card (ServerConfig.ExtendedCard,
+// agent/getAuthenticatedExtendedCard and /extendedAgentCard), with optional
+// input-mode validation (ServerConfig.ValidateInputModes), full AG2 history
+// shipping with the server restore hook (history.go,
+// ServerConfig.RestoreHistory), tenants — the claim on the wire plus the
+// request-aware authorization of it (tenant.go,
 // ServerConfig.TenantResolver/StoreForTenant, AuthorizeIdentity) — and
 // agent-card JWS signing/verification over the same canonical payload the
-// a2a-sdk signs (jws.go). Still deferred: the conversational A2AClient
-// turn machinery (reconnect/resubscribe, the LLMClient adapter; D-049) and
-// gRPC (D-071).
+// a2a-sdk signs (jws.go). Still deferred: the conversational A2AClient turn
+// machinery (the LLMClient adapter; D-049) and gRPC (D-071).
 package a2a
 
 import (
@@ -456,6 +461,20 @@ func terminalTaskState(state TaskState) bool {
 	return false
 }
 
+// settledTaskState reports whether nothing more arrives for the current turn:
+// the task is terminal, or it was interrupted and hands control back to the
+// caller (parity: a2a/_states.py SETTLED_STATES = TERMINAL | INTERRUPTED).
+func settledTaskState(state TaskState) bool {
+	if terminalTaskState(state) {
+		return true
+	}
+	switch state {
+	case TaskStateInputRequired, TaskStateAuthRequired:
+		return true
+	}
+	return false
+}
+
 // TaskStatus is the current state of a Task, optionally carrying the message
 // attached to the latest transition (the agent's reply on completed, the
 // failure text on failed).
@@ -516,3 +535,57 @@ type StatusUpdate struct {
 
 // KindStatusUpdate is the wire discriminator of StatusUpdate.
 const KindStatusUpdate = "status-update"
+
+// ArtifactUpdate is one chunk of a running task's output (the A2A
+// TaskArtifactUpdateEvent): the client folds it into the artifact it names.
+// Append says the chunk's parts extend the artifact with the same ArtifactID
+// instead of replacing its parts; LastChunk marks the final chunk of that
+// artifact. Both the server's stored record and the client's view fold chunks
+// with ApplyArtifactUpdate, so a stream and tasks/get agree on the content.
+type ArtifactUpdate struct {
+	Kind      string         `json:"kind"`
+	TaskID    string         `json:"taskId"`
+	ContextID string         `json:"contextId"`
+	Artifact  Artifact       `json:"artifact"`
+	Append    bool           `json:"append,omitempty"`
+	LastChunk bool           `json:"lastChunk,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// KindArtifactUpdate is the wire discriminator of ArtifactUpdate.
+const KindArtifactUpdate = "artifact-update"
+
+// ApplyArtifactUpdate folds one artifact chunk into task.Artifacts under the
+// A2A append rules: Append extends the parts of the artifact with the same id
+// (creating it when absent), no Append replaces them. A non-empty name on the
+// chunk updates the artifact's name. It is the one rule the server writes the
+// task record with and the client builds its view with, so the two cannot
+// drift.
+func ApplyArtifactUpdate(task *Task, update *ArtifactUpdate) {
+	if task == nil || update == nil {
+		return
+	}
+	chunk := update.Artifact
+	if chunk.ArtifactID == "" {
+		return
+	}
+	for i := range task.Artifacts {
+		if task.Artifacts[i].ArtifactID != chunk.ArtifactID {
+			continue
+		}
+		if update.Append {
+			task.Artifacts[i].Parts = append(task.Artifacts[i].Parts, chunk.Parts...)
+		} else {
+			task.Artifacts[i].Parts = chunk.Parts
+		}
+		if chunk.Name != "" {
+			task.Artifacts[i].Name = chunk.Name
+		}
+		return
+	}
+	task.Artifacts = append(task.Artifacts, Artifact{
+		ArtifactID: chunk.ArtifactID,
+		Name:       chunk.Name,
+		Parts:      chunk.Parts,
+	})
+}

@@ -180,7 +180,7 @@ func (s *Server) resolveTenant(ctx context.Context, r *http.Request, requested s
 func tenantSurface(path string) bool {
 	_, rest := splitTenantPath(path)
 	switch {
-	case rest == RESTMessageSendPath, rest == RESTTasksPath:
+	case rest == RESTMessageSendPath, rest == RESTMessageStreamPath, rest == RESTTasksPath:
 		return true
 	case strings.HasPrefix(rest, RESTTasksPath+"/"):
 		return true
@@ -224,7 +224,7 @@ func tenantFromParams(params json.RawMessage) string {
 // REST routes, which therefore cannot be a tenant segment.
 func restBaseRoute(path string) bool {
 	switch {
-	case path == RESTMessageSendPath, path == RESTTasksPath, path == ExtendedCardPath:
+	case path == RESTMessageSendPath, path == RESTMessageStreamPath, path == RESTTasksPath, path == ExtendedCardPath:
 		return true
 	case strings.HasPrefix(path, RESTTasksPath+"/"), strings.HasPrefix(path, "/.well-known/"):
 		return true

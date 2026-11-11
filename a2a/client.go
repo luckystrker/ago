@@ -22,9 +22,10 @@ import (
 // This is not the conversational A2AClient of Python (client.py:159 — an
 // LLMClient that drives the turn machinery itself: it computes the AG2 history
 // and syncs conversation state). The wire half ships here — WithHistory puts
-// the conversation on a continuation, WithTenant scopes a request, and
-// WithCardVerifier checks the served card — while the LLMClient adapter stays
-// deferred (D-049).
+// the conversation on a continuation, WithTenant scopes a request,
+// WithCardVerifier checks the served card, and MessageStream/Resubscribe
+// (streamclient.go) read a task stream with reconnect-and-backoff and a
+// polling fallback — while the LLMClient adapter stays deferred (D-049).
 //
 // AGO-DEVIATION: Python's A2AClient is an LLMClient provider (not a tool), so
 // no tool adapter ships from this package; D-049.
@@ -44,6 +45,13 @@ type Client struct {
 	tenant       string
 	cardVerifier CardVerifier
 	interceptors []CallInterceptor
+
+	// Streaming knobs (streamclient.go); NewClient installs the Python
+	// defaults, so the zero value of a Client built by hand still streams.
+	streaming        bool
+	maxReconnects    int
+	reconnectBackoff time.Duration
+	pollingInterval  time.Duration
 
 	// Resolved endpoint (interface selection, clientconn.go); guarded by
 	// connMu and set only after a successful Connect.
@@ -97,9 +105,13 @@ const defaultHTTPTimeout = 120 * time.Second
 // "http://localhost:8000"). The JSON-RPC endpoint is baseURL + "/".
 func NewClient(baseURL string, opts ...ClientOption) *Client {
 	c := &Client{
-		base:     strings.TrimSuffix(baseURL, "/"),
-		cardPath: DefaultCardPath,
-		http:     &http.Client{Timeout: defaultHTTPTimeout},
+		base:             strings.TrimSuffix(baseURL, "/"),
+		cardPath:         DefaultCardPath,
+		http:             &http.Client{Timeout: defaultHTTPTimeout},
+		streaming:        true,
+		maxReconnects:    defaultMaxReconnects,
+		reconnectBackoff: defaultReconnectBackoff,
+		pollingInterval:  defaultPollingInterval,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -332,6 +344,10 @@ func rpcErrToGo(e *RPCError) error {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, e.Message)
 	case codeTaskNotCancelable:
 		return fmt.Errorf("%w: %s", ErrTaskNotCancelable, e.Message)
+	case codeUnsupportedOperation:
+		// Both sentinels match: callers that only know ErrRPC keep working,
+		// the streaming client detects the spec §3.1.6 case and polls.
+		return fmt.Errorf("%w: %w: %s", ErrRPC, ErrUnsupportedOperation, e.Message)
 	default:
 		return fmt.Errorf("%w: %s", ErrRPC, e.Error())
 	}

@@ -57,6 +57,16 @@ type ServerConfig struct {
 	// A nil Handle answers plain message/send and message/stream with a
 	// JSON-RPC internal error wrapping ErrNoHandler.
 	Handle func(ctx context.Context, msg *Message) (*Message, error)
+	// HandleStream drives message/stream when set: it replaces Handle for
+	// streaming turns and receives a StreamEmitter for the progress the client
+	// sees live — artifact chunks (StreamEmitter.Artifact) and non-terminal
+	// state transitions (StreamEmitter.Status). Its return value ends the
+	// turn exactly like Handle's, and the server streams the terminal status
+	// update. Chunks are folded into the task record as they are emitted, so
+	// tasks/get and a resubscribe see the same artifacts the stream carried.
+	// Nil keeps the two-event stream (working, terminal) over Handle.
+	// Implementations must be safe for concurrent use.
+	HandleStream func(ctx context.Context, msg *Message, emit StreamEmitter) (*Message, error)
 	// HandleClientTools serves the urn:ag2:client-tools:v1 extension (D-056):
 	// when the incoming message announces client-side tools (a tool-schemas
 	// data part), it replaces Handle for that turn. Returning calls parks the
@@ -234,6 +244,10 @@ type Server struct {
 	cfg   ServerConfig
 	card  AgentCard // the config card with discovery defaults applied
 	store TaskStore
+	// hub fans task progress out to live message/stream and tasks/resubscribe
+	// streams (streamhub.go). It is also the write path of a task that has
+	// subscribers, so a transition is persisted and broadcast atomically.
+	hub *taskHub
 	// taskLocks serializes one read-modify-write cycle per task id for stores
 	// without TaskUpdater, which leave the cycle split across a Get and a
 	// Save. Entries live for the Server's lifetime — bounded by the number of
@@ -258,6 +272,7 @@ func NewServer(cfg ServerConfig) *Server {
 		// a payload the server changed.
 		s = &Server{cfg: cfg, card: withDiscoveryDefaults(cfg.Card, cfg.Tenant), staleSignature: err}
 		s.store = s.defaultStore()
+		s.hub = &taskHub{}
 	}
 	return s
 }
@@ -306,7 +321,7 @@ func NewServerChecked(cfg ServerConfig) (*Server, error) {
 			return nil, err
 		}
 	}
-	s := &Server{cfg: cfg, card: card}
+	s := &Server{cfg: cfg, card: card, hub: &taskHub{}}
 	s.store = s.defaultStore()
 	return s, nil
 }
@@ -678,6 +693,8 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request) {
 		s.tasksList(ctx, w, &req)
 	case MethodTasksCancel:
 		s.tasksCancel(ctx, w, &req)
+	case MethodTasksResubscribe:
+		s.tasksResubscribe(ctx, w, &req)
 	case MethodExtendedCard:
 		s.serveExtendedRPC(w, r, &req)
 	case MethodPushSet:
@@ -847,22 +864,82 @@ func (s *Server) beginTurn(ctx context.Context, msg *Message) (*Task, *RPCError)
 // refused and the outcome reports the stored record (a canceled task never
 // resurrects as completed).
 func (s *Server) finishTurn(ctx context.Context, task *Task, msg *Message) *sendOutcome {
+	return s.finishTurnOn(ctx, task, msg, nil)
+}
+
+// finishTurnOn is finishTurn for a streaming turn: turn carries the stream the
+// terminal update is published on and delivered to (nil for a plain turn).
+func (s *Server) finishTurnOn(ctx context.Context, task *Task, msg *Message, turn *streamTurn) *sendOutcome {
 	reply, state, handleErr := s.runTurn(ctx, task, msg)
-	stored, refused, err := s.commitTask(ctx, task, msg, reply, state, handleErr)
-	if err != nil {
-		return &sendOutcome{
-			task: task, state: TaskStateFailed,
-			handleErr: fmt.Errorf("save task: %w", err),
+	outcome, _ := s.commitTurnOutcome(ctx, task, msg, turn, reply, state, handleErr)
+	return outcome
+}
+
+// commitTurnOutcome commits one turn's outcome through the task hub and returns
+// the outcome together with the terminal stream event that describes it. The
+// commit is atomic against other turns on the same task and against
+// tasks/cancel: when the stored record turned terminal in the meantime the
+// turn's outcome is refused and the outcome reports the stored record (a
+// canceled task never resurrects as completed). The hub publishes the terminal
+// update to a streaming turn's subscribers (or the task snapshot for a plain
+// turn) and closes the stream.
+func (s *Server) commitTurnOutcome(ctx context.Context, task *Task, msg *Message, turn *streamTurn, reply *Message, state TaskState, handleErr error) (*sendOutcome, *StatusUpdate) {
+	var outcome *sendOutcome
+	write := func() (*Task, bool, error) {
+		stored, refused, err := s.commitTask(ctx, task, msg, reply, state, handleErr)
+		switch {
+		case err != nil:
+			outcome = &sendOutcome{
+				task: task, state: TaskStateFailed,
+				handleErr: fmt.Errorf("save task: %w", err),
+			}
+			return nil, false, err
+		case refused:
+			outcome = &sendOutcome{
+				task: stored, reply: stored.Status.Message,
+				state: stored.Status.State, refused: true,
+			}
+		default:
+			outcome = &sendOutcome{task: stored, reply: reply, state: state, handleErr: handleErr}
 		}
+		return stored, refused, nil
 	}
-	s.dispatchPush(ctx, stored.ID, stored)
-	if refused {
-		return &sendOutcome{
-			task: stored, reply: stored.Status.Message,
-			state: stored.Status.State, refused: true,
+	var event func(*Task) any
+	if turn != nil {
+		event = func(*Task) any { return terminalStatus(outcome) }
+	}
+	if _, _, err := s.hub.commit(ctx, task.ID, write, event); err != nil {
+		update := terminalStatus(outcome)
+		if turn != nil {
+			turn.deliver(update)
 		}
+		return outcome, update
 	}
-	return &sendOutcome{task: stored, reply: reply, state: state, handleErr: handleErr}
+	s.dispatchPush(ctx, outcome.task.ID, outcome.task)
+	update := terminalStatus(outcome)
+	if turn != nil {
+		turn.deliver(update)
+	}
+	return outcome, update
+}
+
+// terminalStatus builds the final stream event of a turn: the stored record's
+// status, so a streamed turn ends with exactly what tasks/get reports. The one
+// exception is a commit that failed to reach the store — there is no record to
+// echo then, and the stream reports the failure.
+func terminalStatus(outcome *sendOutcome) *StatusUpdate {
+	update := &StatusUpdate{
+		Kind:      KindStatusUpdate,
+		TaskID:    outcome.task.ID,
+		ContextID: outcome.task.ContextID,
+		Final:     true,
+	}
+	if outcome.handleErr != nil && outcome.task.Status.State != TaskStateFailed {
+		update.Status = TaskStatus{State: TaskStateFailed, Message: errorMessage(outcome.handleErr)}
+		return update
+	}
+	update.Status = outcome.task.Status
+	return update
 }
 
 // runTurn dispatches one turn and applies the context-variable sync around
@@ -870,6 +947,24 @@ func (s *Server) finishTurn(ctx context.Context, task *Task, msg *Message) *send
 // returned final set rides the reply (parity: executor.py's
 // _dispatch_to_agent merged_variables / _build_final_message bracket).
 func (s *Server) runTurn(ctx context.Context, task *Task, msg *Message) (*Message, TaskState, error) {
+	return s.runWithContextSync(ctx, task, msg, func() (*Message, TaskState, error) {
+		reply, state, err := s.dispatchTurn(ctx, msg)
+		return s.turnOutcome(reply, state, err)
+	})
+}
+
+// runStreamTurn dispatches one streaming turn through HandleStream, under the
+// same context-variable bracket and the same outcome mapping as runTurn.
+func (s *Server) runStreamTurn(ctx context.Context, task *Task, msg *Message, emit StreamEmitter) (*Message, TaskState, error) {
+	return s.runWithContextSync(ctx, task, msg, func() (*Message, TaskState, error) {
+		reply, err := s.cfg.HandleStream(ctx, msg, emit)
+		return s.turnOutcome(reply, TaskStateCompleted, err)
+	})
+}
+
+// runWithContextSync brackets one dispatch with the configured context-variable
+// sync.
+func (s *Server) runWithContextSync(ctx context.Context, task *Task, msg *Message, dispatch func() (*Message, TaskState, error)) (*Message, TaskState, error) {
 	var outgoing map[string]any
 	if s.cfg.SyncVariables != nil {
 		if incoming := ExtractContextUpdate(msg); len(incoming) > 0 {
@@ -880,17 +975,8 @@ func (s *Server) runTurn(ctx context.Context, task *Task, msg *Message) (*Messag
 			}
 		}
 	}
-	reply, state, err := s.dispatchTurn(ctx, msg)
+	reply, state, err := dispatch()
 	if err != nil {
-		// A handler that refuses the task or asks for credentials names the
-		// state itself (parity: a2a TASK_STATE_REJECTED / TASK_STATE_AUTH_REQUIRED);
-		// anything else is a failure.
-		switch {
-		case errors.Is(err, ErrTaskAuthRequired):
-			return authRequiredMessage(err), TaskStateAuthRequired, nil
-		case errors.Is(err, ErrTaskRejected):
-			return errorMessage(err), TaskStateRejected, nil
-		}
 		return nil, TaskStateFailed, err
 	}
 	if len(outgoing) > 0 {
@@ -900,6 +986,22 @@ func (s *Server) runTurn(ctx context.Context, task *Task, msg *Message) (*Messag
 		WithContextUpdate(reply, StripReservedVariables(outgoing))
 	}
 	return reply, state, nil
+}
+
+// turnOutcome maps a handler's (reply, state, error) into the turn's state: a
+// handler that refuses the task or asks for credentials names the state itself
+// (parity: a2a TASK_STATE_REJECTED / TASK_STATE_AUTH_REQUIRED); anything else
+// is a failure.
+func (s *Server) turnOutcome(reply *Message, state TaskState, err error) (*Message, TaskState, error) {
+	switch {
+	case err == nil:
+		return reply, state, nil
+	case errors.Is(err, ErrTaskAuthRequired):
+		return authRequiredMessage(err), TaskStateAuthRequired, nil
+	case errors.Is(err, ErrTaskRejected):
+		return errorMessage(err), TaskStateRejected, nil
+	}
+	return nil, TaskStateFailed, err
 }
 
 // dispatchTurn picks the turn's leg by the message's extension parts
@@ -1232,13 +1334,19 @@ func (s *Server) tasksCancel(ctx context.Context, w http.ResponseWriter, req *rp
 // the cancel lands first and the turn's commit is refused — a canceled task
 // never resurrects (parity: a2a TaskNotCancelableError).
 func (s *Server) cancelTask(ctx context.Context, id string) (*Task, *RPCError) {
-	stored, refused, err := s.updateTask(ctx, id, func(current *Task) bool {
-		if terminalTaskState(current.Status.State) {
-			return false
-		}
-		current.Status = TaskStatus{State: TaskStateCanceled}
-		return true
-	})
+	var stored *Task
+	var refused bool
+	_, _, err := s.hub.commit(ctx, id, func() (*Task, bool, error) {
+		var err error
+		stored, refused, err = s.updateTask(ctx, id, func(current *Task) bool {
+			if terminalTaskState(current.Status.State) {
+				return false
+			}
+			current.Status = TaskStatus{State: TaskStateCanceled}
+			return true
+		})
+		return stored, refused, err
+	}, nil)
 	if err != nil {
 		return nil, storeError(err)
 	}
@@ -1266,17 +1374,15 @@ func storeError(err error) *RPCError {
 }
 
 // messageStream serves message/stream as a Server-Sent Events body: each SSE
-// data entry is a JSON-RPC response whose result is a StatusUpdate — one
-// working event, then the terminal event carrying the reply on status.message
-// (the shape AG2's client absorbs from a completed transition,
-// client.py:561-566). A turn parked input-required streams a non-final
+// data entry is a JSON-RPC response whose result is one stream item — a
+// StatusUpdate, an ArtifactUpdate from HandleStream, or (on a resubscribe) a
+// Task snapshot. A turn parked input-required streams a non-final
 // input-required update before the final event (the client-tools and HITL
 // continuations resume the task through message/send).
 //
-// AGO-DEVIATION: two terminal-outcome events only — no chunked text
-// artifacts, artifact updates, resubscription or mid-stream cancels; the
-// Handle contract is one synchronous call, so the stream cannot do better
-// (D-050).
+// AGO-DEVIATION: the Handle contract is one synchronous call, so a turn that
+// wants to stream artifacts installs ServerConfig.HandleStream; without it the
+// stream stays the two terminal-outcome events (D-050).
 func (s *Server) messageStream(ctx context.Context, w http.ResponseWriter, req *rpcRequest) {
 	if !s.cfg.Card.Capabilities.Streaming {
 		writeRPCError(w, req.ID, &RPCError{
@@ -1302,57 +1408,50 @@ func (s *Server) messageStream(ctx context.Context, w http.ResponseWriter, req *
 		})
 		return
 	}
+	s.serveMessageStream(ctx, w, flusher, msg, jsonrpcStreamFraming(w, req.ID))
+}
 
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-
-	emit := func(result any) {
-		data, err := json.Marshal(result)
-		if err != nil {
-			return
-		}
-		payload, err := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: idOr(req.ID), Result: data})
-		if err != nil {
-			return
-		}
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
-	}
-
-	task, rpcErr := s.beginTurn(ctx, msg)
-	if rpcErr != nil {
-		// The SSE body is already committed, so the store failure surfaces as
-		// a final failed event rather than a JSON-RPC error.
-		task = s.newTask(msg)
-		emit(&StatusUpdate{
-			Kind: KindStatusUpdate, TaskID: task.ID, ContextID: task.ContextID,
-			Status: TaskStatus{State: TaskStateWorking},
-		})
-		emit(&StatusUpdate{
-			Kind: KindStatusUpdate, TaskID: task.ID, ContextID: task.ContextID, Final: true,
-			Status: TaskStatus{State: TaskStateFailed, Message: errorMessage(errors.New(rpcErr.Message))},
+// tasksResubscribe serves tasks/resubscribe: the live stream of an existing
+// task. It opens with the task as the server currently holds it — so a client
+// that lost the connection while the task moved on converges to the server's
+// state — and then continues with every later event until the terminal state,
+// which closes the stream. A terminal task answers its final state and ends; an
+// unknown task answers -32001. The tenant of the request is resolved through
+// the tenant's store, so a task of another tenant is simply unknown here.
+//
+// AGO-DEVIATION: the a2a-sdk refuses to subscribe to a terminal task with
+// UnsupportedOperationError (spec §3.1.6: it cannot be subscribed to); this
+// server answers the task's final state and closes instead, which is the shape
+// wave-4 invariant 7 needs (the terminal state is always observed) and what
+// this package's client falls back from when a remote server does refuse.
+func (s *Server) tasksResubscribe(ctx context.Context, w http.ResponseWriter, req *rpcRequest) {
+	if !s.cfg.Card.Capabilities.Streaming {
+		writeRPCError(w, req.ID, &RPCError{
+			Code:    codeUnsupportedOperation,
+			Message: "tasks/resubscribe requires capabilities.streaming on the agent card",
 		})
 		return
 	}
-	emit(&StatusUpdate{
-		Kind: KindStatusUpdate, TaskID: task.ID, ContextID: task.ContextID,
-		Status: TaskStatus{State: TaskStateWorking},
-	})
-	outcome := s.finishTurn(ctx, task, msg)
-	done := &StatusUpdate{Kind: KindStatusUpdate, TaskID: task.ID, ContextID: task.ContextID, Final: true}
-	switch {
-	case outcome.handleErr != nil:
-		done.Status = TaskStatus{State: TaskStateFailed, Message: errorMessage(outcome.handleErr)}
-	case outcome.refused:
-		// The stored record turned terminal mid-turn (a cancel won); report
-		// its status verbatim instead of the dropped turn outcome.
-		done.Status = outcome.task.Status
-	default:
-		done.Status = TaskStatus{State: outcome.state, Message: normalizeReply(outcome.reply, outcome.task)}
+	var params struct {
+		ID string `json:"id"`
 	}
-	emit(done)
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		writeRPCError(w, req.ID, &RPCError{Code: codeInvalidParams, Message: "params: " + err.Error()})
+		return
+	}
+	if params.ID == "" {
+		writeRPCError(w, req.ID, &RPCError{Code: codeInvalidParams, Message: "params.id is required"})
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeRPCError(w, req.ID, &RPCError{
+			Code:    codeInternalError,
+			Message: "streaming unsupported by the HTTP connection",
+		})
+		return
+	}
+	s.serveResubscribe(ctx, w, flusher, params.ID, jsonrpcStreamFraming(w, req.ID))
 }
 
 // decodeMessageParams unmarshals the {message} params shared by message/send
