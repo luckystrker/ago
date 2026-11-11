@@ -38,7 +38,9 @@ type RoundFunc func(env Envelope) (Round, error)
 // humans and owns their delivery plumbing (one connection per process,
 // in-process dispatch).
 type HubClient struct {
-	hub *Hub
+	hub    *Hub   // nil on a remote client (ConnectHub)
+	api    hubAPI // what agents and humans talk to: the hub itself or its remote proxy
+	remote *remoteClient
 
 	mu     sync.Mutex
 	agents map[string]*AgentClient
@@ -49,26 +51,36 @@ type HubClient struct {
 func NewHubClient(hub *Hub) *HubClient {
 	return &HubClient{
 		hub:    hub,
+		api:    hub,
 		agents: make(map[string]*AgentClient),
 		humans: make(map[string]*HumanClient),
 	}
 }
 
-// Hub exposes the underlying hub (for channel/WAL access).
+// Hub exposes the underlying hub (for channel/WAL access). It is nil on a
+// remote client (ConnectHub): the hub is on the other end of the link.
 func (c *HubClient) Hub() *Hub { return c.hub }
 
 // AgentOption configures Register.
 type AgentOption func(*agentOptions)
 
 type agentOptions struct {
-	rule    *Rule
-	resume  *Resume
-	kind    PassportKind
-	env     EnvelopeFunc
-	msg     MessageFunc
-	round   RoundFunc
-	inbox   int
-	autoAck bool
+	authScheme string
+	authClaim  map[string]any
+	rule       *Rule
+	resume     *Resume
+	kind       PassportKind
+	env        EnvelopeFunc
+	msg        MessageFunc
+	round      RoundFunc
+	inbox      int
+	autoAck    bool
+}
+
+// WithAgentAuth sets the credentials of the identity: the scheme and claim the
+// hub validates at registration and at every re-attach (hello).
+func WithAgentAuth(scheme string, claim map[string]any) AgentOption {
+	return func(o *agentOptions) { o.authScheme, o.authClaim = scheme, claim }
 }
 
 // WithAgentRule sets the registration rule (nil → DefaultRule).
@@ -105,7 +117,7 @@ func WithAutoAck(on bool) AgentOption { return func(o *agentOptions) { o.autoAck
 // configured handler for substantive envelopes, posting the round result
 // back into the channel.
 type AgentClient struct {
-	hub      *Hub
+	hub      hubAPI
 	Passport Passport
 	ruleMu   sync.RWMutex
 	rule     Rule
@@ -162,7 +174,11 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 	for _, opt := range opts {
 		opt(&o)
 	}
-	passport, err := c.hub.Register(Passport{Name: name, Kind: o.kind}, o.rule)
+	p := Passport{Name: name, Kind: o.kind}
+	if o.authScheme != "" {
+		p.Auth = map[string]any{"scheme": o.authScheme, "claim": o.authClaim}
+	}
+	passport, err := c.api.Register(p, o.rule)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +186,14 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 	if o.rule != nil {
 		rule = o.rule.Clone()
 	}
+	return c.newAgent(passport, rule, o)
+}
+
+// newAgent builds the client for a registered identity: the optional resume,
+// delivery binding and pump.
+func (c *HubClient) newAgent(passport Passport, rule Rule, o agentOptions) (*AgentClient, error) {
 	a := &AgentClient{
-		hub:      c.hub,
+		hub:      c.api,
 		Passport: passport,
 		rule:     rule,
 		opts:     o,
@@ -181,12 +203,15 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 	if o.resume != nil {
 		r := *o.resume
 		r.AgentID = passport.AgentID
-		if err := c.hub.SetResume(r); err != nil {
+		if err := c.api.SetResume(r); err != nil {
 			return nil, err
 		}
 	}
-	if err := c.hub.Attach(passport.AgentID, a.deliver); err != nil {
+	if err := c.api.Attach(passport.AgentID, a.deliver); err != nil {
 		return nil, err
+	}
+	if c.remote != nil {
+		c.remote.setHello(passport.AgentID, HelloBody{Name: passport.Name, AuthScheme: o.authScheme, AuthClaim: o.authClaim})
 	}
 	go a.pump()
 	c.mu.Lock()
@@ -521,7 +546,7 @@ func WithHumanInbox(n int) HumanOption { return func(o *humanOptions) { o.inbox 
 // pushed to the inbox (pull via Recv / Inbox) and invites are auto-acked by
 // default.
 type HumanClient struct {
-	hub      *Hub
+	hub      hubAPI
 	Passport Passport
 	rule     Rule
 
@@ -540,7 +565,7 @@ func (c *HubClient) RegisterHuman(name string, opts ...HumanOption) (*HumanClien
 	for _, opt := range opts {
 		opt(&o)
 	}
-	passport, err := c.hub.Register(Passport{Name: name, Kind: KindHuman}, o.rule)
+	passport, err := c.api.Register(Passport{Name: name, Kind: KindHuman}, o.rule)
 	if err != nil {
 		return nil, err
 	}
@@ -549,14 +574,17 @@ func (c *HubClient) RegisterHuman(name string, opts ...HumanOption) (*HumanClien
 		rule = o.rule.Clone()
 	}
 	h := &HumanClient{
-		hub:      c.hub,
+		hub:      c.api,
 		Passport: passport,
 		rule:     rule,
 		inbox:    make(chan Envelope, max(o.inbox, rule.Inbox.MaxPending)),
 		done:     make(chan struct{}),
 	}
-	if err := c.hub.Attach(passport.AgentID, h.deliver); err != nil {
+	if err := c.api.Attach(passport.AgentID, h.deliver); err != nil {
 		return nil, err
+	}
+	if c.remote != nil {
+		c.remote.setHello(passport.AgentID, HelloBody{Name: passport.Name})
 	}
 	c.mu.Lock()
 	c.humans[passport.AgentID] = h
