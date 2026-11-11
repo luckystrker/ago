@@ -17,9 +17,14 @@
 // CardCacheControl) and serves the authenticated extended card
 // (ServerConfig.ExtendedCard, agent/getAuthenticatedExtendedCard and
 // /extendedAgentCard), with optional input-mode validation
-// (ServerConfig.ValidateInputModes). Still deferred: the conversational
-// A2AClient turn machinery (full history shipping, reconnect/resubscribe), gRPC
-// and card JWS signing/verification (D-056).
+// (ServerConfig.ValidateInputModes), full AG2 history shipping with the server
+// restore hook (history.go, ServerConfig.RestoreHistory), tenants — the claim
+// on the wire plus the request-aware authorization of it (tenant.go,
+// ServerConfig.TenantResolver/StoreForTenant, AuthorizeIdentity) — and
+// agent-card JWS signing/verification over the same canonical payload the
+// a2a-sdk signs (jws.go). Still deferred: the conversational A2AClient
+// turn machinery (reconnect/resubscribe, the LLMClient adapter; D-049) and
+// gRPC (D-071).
 package a2a
 
 import (
@@ -90,6 +95,27 @@ type AgentCard struct {
 	Skills              []AgentSkill               `json:"skills,omitempty"`
 	SecuritySchemes     map[string]*SecurityScheme `json:"securitySchemes,omitempty"`
 	Security            []SecurityRequirement      `json:"securityRequirements,omitempty"`
+	// Provider is the producing organization (parity: a2a-sdk AgentProvider).
+	// Modelled even though nothing in this package fills it: a card served by
+	// another implementation may carry it, and every field of the signed card
+	// has to survive the round trip through this struct or the signature would
+	// be computed over a different payload.
+	Provider *AgentProvider `json:"provider,omitempty"`
+	// DocumentationURL and IconURL are card metadata (parity: a2a-sdk
+	// documentation_url / icon_url).
+	DocumentationURL string `json:"documentationUrl,omitempty"`
+	IconURL          string `json:"iconUrl,omitempty"`
+	// Signatures are the card's JWS signatures, verified by a client that was
+	// configured with a CardVerifier and produced by a server configured with
+	// a CardSigner (jws.go). Empty serves an unsigned card.
+	Signatures []CardSignature `json:"signatures,omitempty"`
+}
+
+// AgentProvider names the organization behind an agent (parity: a2a-sdk
+// AgentProvider — url, organization).
+type AgentProvider struct {
+	URL          string `json:"url,omitempty"`
+	Organization string `json:"organization,omitempty"`
 }
 
 // AgentCapabilities declares what the served endpoints support. Extensions
@@ -97,11 +123,102 @@ type AgentCard struct {
 // a2a-sdk AgentCapabilities.extensions / AgentExtension); a server card
 // advertising urn:ag2:client-tools:v1 must list it here, and
 // ValidateExtensionActivation checks both directions against it.
+//
+// The three flags are proto3 `optional` fields in the a2a-sdk descriptor
+// (synthetic oneofs _streaming / _push_notifications / _extended_agent_card),
+// i.e. they have explicit presence: MessageToDict writes an explicitly set
+// `false` and omits an unset field, and _clean_empty never touches a boolean.
+// Presence therefore changes the signed payload, and the card has to carry it:
+// a served card that says nothing about push support signs differently from one
+// that says "false".
+//
+// The plain bool fields keep the old API. A true value is always present
+// (nothing else can be meant by setting it); false is present only when the
+// Set* method marked it, or when the card came from JSON that spelled the key
+// out (UnmarshalJSON records presence). The wire form follows the same rule, so
+// a card round-trips through JSON with its presence intact.
 type AgentCapabilities struct {
-	Streaming         bool             `json:"streaming"`
-	PushNotifications bool             `json:"pushNotifications"`
+	Streaming         bool             `json:"streaming,omitempty"`
+	PushNotifications bool             `json:"pushNotifications,omitempty"`
 	ExtendedAgentCard bool             `json:"extendedAgentCard,omitempty"`
 	Extensions        []AgentExtension `json:"extensions,omitempty"`
+
+	// presence bits (proto3 optional); unexported so the bool API stays.
+	streamingPresent         bool
+	pushNotificationsPresent bool
+	extendedAgentCardPresent bool
+}
+
+// SetStreaming sets the streaming capability and marks it present, so an
+// explicit false reaches the signed payload. Returns c for chaining.
+func (c *AgentCapabilities) SetStreaming(v bool) *AgentCapabilities {
+	c.Streaming, c.streamingPresent = v, true
+	return c
+}
+
+// SetPushNotifications sets the push-notification capability and marks it
+// present (parity: server.py always passes push_notifications=<bool> to
+// build_card, so AG2 signs an explicit false too).
+func (c *AgentCapabilities) SetPushNotifications(v bool) *AgentCapabilities {
+	c.PushNotifications, c.pushNotificationsPresent = v, true
+	return c
+}
+
+// SetExtendedAgentCard sets the extended-card capability and marks it present.
+func (c *AgentCapabilities) SetExtendedAgentCard(v bool) *AgentCapabilities {
+	c.ExtendedAgentCard, c.extendedAgentCardPresent = v, true
+	return c
+}
+
+// MarshalJSON writes each flag when it is present — set to true, or explicitly
+// marked by a Set* call or by a previous decode (parity: protobuf JSON omits an
+// unset optional field and keeps a set false).
+func (c AgentCapabilities) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Streaming         *bool            `json:"streaming,omitempty"`
+		PushNotifications *bool            `json:"pushNotifications,omitempty"`
+		ExtendedAgentCard *bool            `json:"extendedAgentCard,omitempty"`
+		Extensions        []AgentExtension `json:"extensions,omitempty"`
+	}
+	out := wire{Extensions: c.Extensions}
+	if c.streamingPresent || c.Streaming {
+		v := c.Streaming
+		out.Streaming = &v
+	}
+	if c.pushNotificationsPresent || c.PushNotifications {
+		v := c.PushNotifications
+		out.PushNotifications = &v
+	}
+	if c.extendedAgentCardPresent || c.ExtendedAgentCard {
+		v := c.ExtendedAgentCard
+		out.ExtendedAgentCard = &v
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON decodes the flags and records which ones the card spelled out,
+// so presence survives the wire (a JSON false is present, an absent key is not).
+func (c *AgentCapabilities) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Streaming         *bool            `json:"streaming"`
+		PushNotifications *bool            `json:"pushNotifications"`
+		ExtendedAgentCard *bool            `json:"extendedAgentCard"`
+		Extensions        []AgentExtension `json:"extensions"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*c = AgentCapabilities{Extensions: wire.Extensions}
+	if wire.Streaming != nil {
+		c.Streaming, c.streamingPresent = *wire.Streaming, true
+	}
+	if wire.PushNotifications != nil {
+		c.PushNotifications, c.pushNotificationsPresent = *wire.PushNotifications, true
+	}
+	if wire.ExtendedAgentCard != nil {
+		c.ExtendedAgentCard, c.extendedAgentCardPresent = *wire.ExtendedAgentCard, true
+	}
+	return nil
 }
 
 // AgentExtension is one protocol extension advertised on the card
@@ -124,6 +241,12 @@ type AgentSkill struct {
 	// a2a-sdk AgentSkill.inputModes). ValidateInputModes reads them as part of
 	// the card's declared set.
 	InputModes []string `json:"inputModes,omitempty"`
+	// OutputModes narrows defaultOutputModes for this skill, and
+	// SecurityRequirements narrows the card's requirements (parity: a2a-sdk
+	// AgentSkill.output_modes / security_requirements). Modelled for signature
+	// round-trip fidelity like Provider above.
+	OutputModes          []string              `json:"outputModes,omitempty"`
+	SecurityRequirements []SecurityRequirement `json:"securityRequirements,omitempty"`
 }
 
 // Part is one typed payload inside a Message. The concrete type is selected by

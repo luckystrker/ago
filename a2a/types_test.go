@@ -124,7 +124,9 @@ func TestAgentCardWireShape(t *testing.T) {
 			{URL: "http://localhost:8000", ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: ProtocolVersionCurrent},
 			{URL: "http://rest.example/t", ProtocolBinding: "HTTP+JSON", ProtocolVersion: ProtocolVersionCurrent, Tenant: "acme"},
 		},
-		Capabilities:       AgentCapabilities{Streaming: true, PushNotifications: false},
+		// pushNotifications is proto3 optional: the card says "false" only when
+		// the flag is present, so a round trip keeps the statement.
+		Capabilities:       *(&AgentCapabilities{Streaming: true}).SetPushNotifications(false),
 		DefaultInputModes:  []string{"text/plain"},
 		DefaultOutputModes: []string{"text/plain"},
 		Skills:             []AgentSkill{{ID: "s1", Name: "answer", Tags: []string{"qa"}}},
@@ -145,6 +147,20 @@ func TestAgentCardWireShape(t *testing.T) {
 	}
 	if back.Name != "helper" || !back.Capabilities.Streaming || len(back.Skills) != 1 {
 		t.Fatalf("card drifted: %+v", back)
+	}
+	// Presence survives the wire: the explicit false is still spelled out...
+	if !strings.Contains(string(data), `"pushNotifications":false`) {
+		t.Fatalf("card JSON lost the explicit pushNotifications false: %s", data)
+	}
+	// ...and an unset optional flag stays out of it.
+	quiet, err := json.Marshal(AgentCard{Name: "quiet"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, absent := range []string{`"streaming"`, `"pushNotifications"`, `"extendedAgentCard"`} {
+		if strings.Contains(string(quiet), absent) {
+			t.Fatalf("unset capability %s was written: %s", absent, quiet)
+		}
 	}
 	if back.ProtocolVersion != ProtocolVersionCurrent || len(back.SupportedInterfaces) != 2 {
 		t.Fatalf("discovery fields drifted: %+v", back)

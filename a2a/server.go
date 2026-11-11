@@ -1,6 +1,7 @@
 package a2a
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	agoevents "github.com/luckystrker/ago/events"
 	"github.com/luckystrker/ago/internal/uuid"
 )
 
@@ -42,6 +44,14 @@ type ServerConfig struct {
 	// Card is served verbatim from the discovery routes. Its
 	// Capabilities.Streaming flag gates message/stream.
 	Card AgentCard
+	// CardSigner signs every card the server serves, after the discovery
+	// defaults and capability flips are applied and after any per-request
+	// CardModifier/ExtendedCardModifier has rewritten it (parity:
+	// transports/_common.py prepare_public_card / wrap_card_modifier). Nil
+	// serves the cards as configured. Signing a card that already carries
+	// signatures replaces them, so a composed signer (key rotation) lands one
+	// signature per key and no stale one rides along.
+	CardSigner CardSigner
 	// Handle turns one incoming user Message into the agent's reply Message.
 	// It runs per request; implementations must be safe for concurrent use.
 	// A nil Handle answers plain message/send and message/stream with a
@@ -61,6 +71,23 @@ type ServerConfig struct {
 	// continuation leg). A message carrying results without this callback
 	// fails the turn.
 	HandleToolResults func(ctx context.Context, msg *Message, results []ToolResultEntry) (*Message, error)
+	// RestoreHistory engages full-history shipping on continuations (parity:
+	// executor.py's `stream.history.replace(parsed.history_events)`): when the
+	// incoming message carries ag2.history+json data parts, the server decodes
+	// them once per turn, in wire order, and hands the events here together
+	// with the task the turn belongs to, before any handler runs. The hook is
+	// where an embedder re-hydrates its own conversation state for the task;
+	// the A2A layer itself stays stateless on AG2 history. Nil ignores the
+	// parts (the pre-shipping behavior: history rode the wire but never
+	// reached the server's handler). An error fails the turn as an internal
+	// error, with the text kept off the wire.
+	//
+	// AGO-DEVIATION: Python's executor replaces the history of the per-request
+	// MemoryStream (`stream.history.replace`); AGo's server owns no agent
+	// stream — embedders keep their own conversation state — so the decode is
+	// handed to a hook instead of written into a stream this package would
+	// have to own.
+	RestoreHistory func(ctx context.Context, taskID string, history []agoevents.Event) error
 	// SyncVariables engages the context-variable sync (D-056): when the
 	// incoming message carries a context_update metadata delta, it is
 	// stripped of reserved prefixes and handed here keyed by task id; the
@@ -68,10 +95,10 @@ type ServerConfig struct {
 	// key (parity: executor.py merged_variables / _build_final_message over
 	// mappers/messages.py extract_context_update). Nil disables the sync.
 	SyncVariables func(ctx context.Context, taskID string, incoming map[string]any) (outgoing map[string]any, err error)
-	// PushStore enables the push-notification surface (parity: server.py —
-	// push_config_store is not None flips capabilities.pushNotifications).
-	// Nil keeps the card flag as configured and refuses the push JSON-RPC
-	// methods with -32004.
+	// PushStore enables the push-notification surface. The served card states
+	// the capability either way — pushNotifications is always set, to "the
+	// store exists", and marked present, which is what AG2 signs (server.py:218).
+	// Nil leaves the push JSON-RPC methods answering -32004.
 	PushStore PushConfigStore
 	// PushSender delivers a terminal task to one subscriber webhook; nil
 	// defaults to DefaultPushSender. Delivery is best-effort and asynchronous.
@@ -85,6 +112,52 @@ type ServerConfig struct {
 	// Store persists tasks for tasks/get and tasks/cancel. Nil defaults to
 	// NewMemoryTaskStore.
 	Store TaskStore
+	// Tenant names the tenant this server serves when a request names none.
+	// It is stamped on the discovery interface the server generates, so a
+	// client resolving that interface adopts it. Meaningful only together
+	// with StoreForTenant: without a resolver the server keeps one store and
+	// tenant names are inert.
+	Tenant string
+	// StoreForTenant resolves the TaskStore a tenant's tasks live in, which is
+	// what keeps tenants apart (parity: the a2a-sdk's owner-resolved
+	// InMemoryTaskStore — a per-tenant dictionary keyed from the call context).
+	// When set, every request naming a tenant (JSON-RPC params "tenant", the
+	// REST "/{tenant}/..." prefix, or Tenant) reads and writes that tenant's
+	// store; a tenant the resolver answers nil for is refused as unknown. Nil
+	// keeps the single Store for every caller — the pre-tenant behavior, where
+	// a tenant name changes nothing.
+	//
+	// The resolver must be safe for concurrent use and should return stable
+	// stores per tenant for the Server's lifetime; a store returned once must
+	// keep answering for the tenant.
+	//
+	// AGO-DEVIATION: the a2a-sdk threads a ServerCallContext into every store
+	// method and the store resolves the owner itself; AGo keeps TaskStore free
+	// of context plumbing and resolves the tenant here. A side effect is that
+	// a tenant name is inert while no resolver is configured (Python always
+	// scopes by owner): the zero value keeps the pre-tenant single store.
+	//
+	// WARNING — this hook does not authorize anything. The tenant it receives
+	// is the one the *client named* (JSON-RPC "tenant" param, REST path
+	// segment, or Tenant), so on its own any caller can reach any tenant's
+	// store simply by asking for it. Configure TenantResolver to check the
+	// tenant against the authenticated caller and refuse a foreign one.
+	StoreForTenant func(tenant string) TaskStore
+	// TenantResolver authorizes and canonicalizes the tenant of every request
+	// the server resolves a tenant for: the REST message/task routes and every
+	// JSON-RPC method. It receives the request, the tenant the client named and
+	// the identity AuthorizeIdentity produced, so a deployment can refuse "this
+	// tenant is not yours" (an error answers -32602 on JSON-RPC and 403 on
+	// REST) or ignore the client's claim and derive the tenant from the
+	// identity. It runs even when the request names no tenant. The card routes
+	// (discovery and the extended card) are public and are not tenant-resolved.
+	//
+	// WARNING — a server configured with neither TenantResolver nor
+	// StoreForTenant is single-tenant: a tenant name on the wire is inert and
+	// every caller shares one store. A server with only StoreForTenant trusts
+	// the client's tenant; that is the pre-resolver behavior, kept for
+	// compatibility, not an isolation guarantee.
+	TenantResolver TenantResolver
 	// Authorize gates every request before dispatch — card, REST and JSON-RPC
 	// surfaces alike: returning a non-nil error rejects the request with 403
 	// and a fixed message, keeping the error text off the wire. Nil disables
@@ -92,6 +165,14 @@ type ServerConfig struct {
 	// safe for concurrent use, and is the surface's only built-in auth point —
 	// any non-loopback exposure needs one.
 	Authorize func(r *http.Request) error
+	// AuthorizeIdentity is Authorize with a result: the identity it returns is
+	// put on the request context (IdentityFrom) and handed to TenantResolver,
+	// so a tenant check can compare "who called" with "which tenant it asks
+	// for". Returning an error rejects the request with 403 and a fixed
+	// message, exactly like Authorize. Both hooks run when both are set —
+	// Authorize first, then AuthorizeIdentity — so adding an identity check
+	// never removes the older gate.
+	AuthorizeIdentity func(r *http.Request) (identity any, err error)
 	// AllowedHosts, when non-empty, admits only requests whose Host header
 	// matches one entry exactly (host or host:port, case-insensitive);
 	// anything else answers 403. This closes DNS-rebinding against loopback
@@ -159,26 +240,90 @@ type Server struct {
 	// distinct task ids, and unused at all with the default MemoryTaskStore.
 	locksMu   sync.Mutex
 	taskLocks map[string]*sync.Mutex
+	// staleSignature is the configuration error of a server that must change
+	// a card it has no key to re-sign: the card routes answer 500 rather than
+	// serving a signature over a payload it does not match. NewServerChecked
+	// returns it at construction instead.
+	staleSignature error
 }
 
 // NewServer builds a Server from cfg. The served card flips the
 // pushNotifications capability from the configured PushStore (parity:
 // server.py:218), so the config card does not have to keep the flag in sync.
 func NewServer(cfg ServerConfig) *Server {
-	store := cfg.Store
-	if store == nil {
-		store = NewMemoryTaskStore()
+	s, err := NewServerChecked(cfg)
+	if err != nil {
+		// Serve the refusal on the card routes instead of dropping it: a
+		// misconfigured deployment must not quietly publish a signature over
+		// a payload the server changed.
+		s = &Server{cfg: cfg, card: withDiscoveryDefaults(cfg.Card, cfg.Tenant), staleSignature: err}
+		s.store = s.defaultStore()
 	}
-	card := withDiscoveryDefaults(cfg.Card)
-	if cfg.PushStore != nil {
-		card.Capabilities.PushNotifications = true
-	}
+	return s
+}
+
+// NewServerChecked builds a Server from cfg and refuses a configuration that
+// cannot be served honestly: a card that carries signatures while the server
+// must flip a capability on it and has no CardSigner to re-sign the result
+// (parity: errors.py A2AStaleCardSignatureError — flipping a flag voids the
+// JWS). Everything NewServer accepts, this accepts; the difference is the
+// error at construction instead of a 500 on the card routes.
+func NewServerChecked(cfg ServerConfig) (*Server, error) {
+	card := withDiscoveryDefaults(cfg.Card, cfg.Tenant)
+	// The server derives two flags and must say so explicitly: push support is
+	// always stated (parity: server.py:218 passes push_notifications=<bool> to
+	// build_card, so AG2 signs an explicit false), the extended card only when
+	// there is one (parity: clone_card_with_capabilities flips it on). Both are
+	// proto3 optional fields, so presence is part of what gets signed.
+	card.Capabilities.SetPushNotifications(cfg.PushStore != nil)
 	if cfg.ExtendedCard != nil {
-		// The public card advertises the second one (parity: server.py flips
-		// capabilities.extended_agent_card when extended_card is supplied).
-		card.Capabilities.ExtendedAgentCard = true
+		card.Capabilities.SetExtendedAgentCard(true)
 	}
-	return &Server{cfg: cfg, card: card, store: store}
+	// AGO-DEVIATION: Python raises A2AStaleCardSignatureError from the
+	// transport builder (build_jsonrpc/build_rest); AGo builds the server from
+	// one config, so NewServerChecked refuses it up front and NewServer answers
+	// 500 on the card routes — a published signature is never silently wrong.
+	//
+	// The comparison is over the signed payload, not just the capability flags:
+	// discovery defaults are applied here too, so a card that arrives without
+	// interfaces or without a stated push capability is exactly as stale as one
+	// whose flags the server flipped.
+	if len(cfg.Card.Signatures) > 0 && cfg.CardSigner == nil {
+		signed, err := cardSigningPayload(&cfg.Card)
+		if err != nil {
+			return nil, err
+		}
+		served, err := cardSigningPayload(&card)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(signed, served) {
+			return nil, fmt.Errorf("%w: the card carries signatures and the server must change it", ErrStaleCardSignature)
+		}
+	}
+	if cfg.CardSigner != nil {
+		if err := resignCard(&card, cfg.CardSigner); err != nil {
+			return nil, err
+		}
+	}
+	s := &Server{cfg: cfg, card: card}
+	s.store = s.defaultStore()
+	return s, nil
+}
+
+// defaultStore is the store a request with no tenant falls back to.
+func (s *Server) defaultStore() TaskStore {
+	if s.cfg.Store != nil {
+		return s.cfg.Store
+	}
+	return NewMemoryTaskStore()
+}
+
+// resignCard replaces the signatures on card with fresh ones from signer
+// (parity: _common.py sign_card on a signature-stripped copy).
+func resignCard(card *AgentCard, signer CardSigner) error {
+	card.Signatures = nil
+	return signer(card)
 }
 
 // withDiscoveryDefaults returns card with the fields a 1.x client requires to
@@ -188,7 +333,7 @@ func NewServer(cfg ServerConfig) *Server {
 // stamped with PROTOCOL_VERSION_CURRENT; an SDK 1.x or AG2 client fails card
 // resolution on an empty supportedInterfaces, _http.py select_interface).
 // Interfaces the config declares are served verbatim.
-func withDiscoveryDefaults(card AgentCard) AgentCard {
+func withDiscoveryDefaults(card AgentCard, tenant string) AgentCard {
 	version := card.ProtocolVersion
 	if version == "" {
 		version = ProtocolVersionCurrent
@@ -198,6 +343,7 @@ func withDiscoveryDefaults(card AgentCard) AgentCard {
 			URL:             card.URL,
 			ProtocolBinding: ProtocolBindingJSONRPC,
 			ProtocolVersion: version,
+			Tenant:          tenant,
 		}}
 	}
 	card.ProtocolVersion = version
@@ -210,8 +356,17 @@ func (s *Server) Handler() http.Handler { return s }
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !s.admit(w, r) {
+	r, ok := s.admit(w, r)
+	if !ok {
 		return
+	}
+	if s.tenantRouting() && tenantSurface(r.URL.Path) {
+		routed, err := s.withPathTenant(r)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		r = routed
 	}
 	if s.serveREST(w, r) {
 		return
@@ -245,9 +400,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// withPathTenant resolves the request's tenant — from the path segment of
+// "/{tenant}/tasks" when there is one (parity: the SDK mounting the REST
+// routes under Mount(path="/{tenant}")), and always through the configured
+// TenantResolver — and strips the segment so every route below matches as if
+// the tenant were not there. An error is the resolver refusing the request
+// (the caller answers 403); the resolver also decides for a request that names
+// no tenant, so a deployment can force tenancy from the identity alone.
+func (s *Server) withPathTenant(r *http.Request) (*http.Request, error) {
+	requested, rest := splitTenantPath(r.URL.Path)
+	ctx, err := s.resolveTenant(r.Context(), r, requested)
+	if err != nil {
+		return nil, err
+	}
+	if rest == r.URL.Path {
+		return r.WithContext(ctx), nil
+	}
+	clone := new(http.Request)
+	*clone = *r
+	u := *r.URL
+	u.Path = rest
+	clone.URL = &u
+	return clone.WithContext(ctx), nil
+}
+
 // serveCard answers a discovery request: the static card, or the
 // CardModifier's per-request rewrite of a deep copy of it.
 func (s *Server) serveCard(w http.ResponseWriter, r *http.Request) {
+	if s.staleSignature != nil {
+		http.Error(w, msgStaleSignature, http.StatusInternalServerError)
+		return
+	}
 	card := &s.card
 	if s.cfg.CardModifier != nil {
 		clone, err := cloneCard(&s.card)
@@ -263,6 +446,14 @@ func (s *Server) serveCard(w http.ResponseWriter, r *http.Request) {
 		card = clone
 		if out != nil {
 			card = out
+		}
+		if s.cfg.CardSigner != nil {
+			// The modifier rewrote the payload the static signature covered:
+			// re-sign what is actually served (parity: wrap_card_modifier).
+			if err := resignCard(card, s.cfg.CardSigner); err != nil {
+				http.Error(w, msgInternalError, http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	if s.cfg.CardCacheControl != "" {
@@ -300,7 +491,7 @@ func (s *Server) resolveExtendedCard(r *http.Request) (*AgentCard, error) {
 	if err != nil {
 		return nil, err
 	}
-	fresh := withDiscoveryDefaults(*card)
+	fresh := withDiscoveryDefaults(*card, s.cfg.Tenant)
 	card = &fresh
 	if s.cfg.ExtendedCardModifier != nil {
 		out, err := s.cfg.ExtendedCardModifier(r, card)
@@ -311,11 +502,23 @@ func (s *Server) resolveExtendedCard(r *http.Request) (*AgentCard, error) {
 			card = out
 		}
 	}
+	if s.cfg.CardSigner != nil {
+		// The extended card is signed for every served copy, including a
+		// modifier's rewrite, so the client can verify the second card too
+		// (parity: wrap_extended_card_modifier).
+		if err := resignCard(card, s.cfg.CardSigner); err != nil {
+			return nil, err
+		}
+	}
 	return card, nil
 }
 
 // serveExtendedCard answers REST GET /extendedAgentCard.
 func (s *Server) serveExtendedCard(w http.ResponseWriter, r *http.Request) {
+	if s.staleSignature != nil {
+		http.Error(w, msgStaleSignature, http.StatusInternalServerError)
+		return
+	}
 	card, err := s.resolveExtendedCard(r)
 	switch {
 	case errors.Is(err, ErrNoExtendedCard):
@@ -332,9 +535,21 @@ func (s *Server) serveExtendedCard(w http.ResponseWriter, r *http.Request) {
 // configured: which card to serve is deployment detail, not client business.
 const msgNoExtendedCard = "no authenticated extended agent card is configured"
 
+// msgTenantForbidden is the fixed answer when a TenantResolver refuses the
+// request's tenant: the reason is the deployment's, not the caller's business.
+const msgTenantForbidden = "tenant not allowed"
+
+// msgStaleSignature is the fixed text of the card routes of a server whose
+// configured card carries signatures the server cannot re-create.
+const msgStaleSignature = "agent card signatures do not cover the card this server must serve"
+
 // serveExtendedRPC answers agent/getAuthenticatedExtendedCard with the same
 // card the REST route serves.
 func (s *Server) serveExtendedRPC(w http.ResponseWriter, r *http.Request, req *rpcRequest) {
+	if s.staleSignature != nil {
+		writeRPCError(w, req.ID, &RPCError{Code: codeInternalError, Message: msgStaleSignature})
+		return
+	}
 	card, err := s.resolveExtendedCard(r)
 	switch {
 	case errors.Is(err, ErrNoExtendedCard):
@@ -353,22 +568,35 @@ func (s *Server) serveExtendedRPC(w http.ResponseWriter, r *http.Request, req *r
 // carry internal detail (hook errors, configured hosts) that has no business
 // on the wire. The gates are fail-closed: a set allowlist admits nothing
 // until a header matches.
-func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) admit(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
+	// Both gates run, in this order: Authorize is the older request-level check
+	// (an IP fence, a shared token) and must not be bypassed by adding the
+	// identity form. A refusal from either answers 403.
 	if s.cfg.Authorize != nil {
 		if err := s.cfg.Authorize(r); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
-			return false
+			return nil, false
 		}
+	}
+	if s.cfg.AuthorizeIdentity != nil {
+		identity, err := s.cfg.AuthorizeIdentity(r)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return nil, false
+		}
+		// The identity rides the request context: TenantResolver and the
+		// handlers read it with IdentityFrom.
+		r = r.WithContext(withIdentity(r.Context(), identity))
 	}
 	if len(s.cfg.AllowedHosts) > 0 && !matchFold(r.Host, s.cfg.AllowedHosts) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
+		return nil, false
 	}
 	if origin := r.Header.Get("Origin"); len(s.cfg.AllowedOrigins) > 0 && origin != "" && !matchFold(origin, s.cfg.AllowedOrigins) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
+		return nil, false
 	}
-	return true
+	return r, true
 }
 
 // matchFold reports whether s equals one of the allowed entries
@@ -429,6 +657,16 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if s.tenantRouting() {
+		resolved, err := s.resolveTenant(ctx, r, tenantFromParams(req.Params))
+		if err != nil {
+			// The resolver refused this tenant for this caller. The text stays
+			// off the wire; -32602 is the A2A client's "bad request" shape.
+			writeRPCError(w, req.ID, &RPCError{Code: codeInvalidParams, Message: msgTenantForbidden})
+			return
+		}
+		ctx = resolved
+	}
 	switch req.Method {
 	case MethodMessageSend:
 		s.messageSend(ctx, w, &req)
@@ -511,7 +749,11 @@ func (s *Server) newTask(msg *Message) *Task {
 // record, so it cannot be resurrected or pre-created from the client side.
 func (s *Server) loadOrCreateTask(ctx context.Context, msg *Message) (*Task, error) {
 	if msg.TaskID != "" {
-		if task, err := s.store.Get(ctx, msg.TaskID); err == nil {
+		store, err := s.storeFor(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if task, err := store.Get(ctx, msg.TaskID); err == nil {
 			return task, nil
 		}
 	}
@@ -578,11 +820,23 @@ func (s *Server) executeSend(ctx context.Context, msg *Message) (*sendOutcome, *
 	return s.finishTurn(ctx, task, msg), nil
 }
 
-// beginTurn resolves the task a turn continues.
+// beginTurn resolves the task a turn continues and re-hydrates the AG2
+// conversation history the message ships (RestoreHistory).
 func (s *Server) beginTurn(ctx context.Context, msg *Message) (*Task, *RPCError) {
 	task, err := s.loadOrCreateTask(ctx, msg)
 	if err != nil {
 		return nil, storeError(err)
+	}
+	if s.cfg.RestoreHistory != nil {
+		history, err := ParseHistory(msg)
+		if err != nil {
+			return nil, &RPCError{Code: codeInvalidParams, Message: err.Error()}
+		}
+		if len(history) > 0 {
+			if err := s.cfg.RestoreHistory(ctx, task.ID, history); err != nil {
+				return nil, &RPCError{Code: codeInternalError, Message: msgInternalError}
+			}
+		}
 	}
 	return task, nil
 }
@@ -697,7 +951,11 @@ func (s *Server) dispatchTurn(ctx context.Context, msg *Message) (*Message, Task
 // untouched and refused reports that. ErrTaskNotFound passes through for
 // absent ids.
 func (s *Server) updateTask(ctx context.Context, id string, mutate func(current *Task) (apply bool)) (stored *Task, refused bool, err error) {
-	if up, ok := s.store.(TaskUpdater); ok {
+	store, storeErr := s.storeFor(ctx)
+	if storeErr != nil {
+		return nil, false, storeErr
+	}
+	if up, ok := store.(TaskUpdater); ok {
 		stored, err := up.Update(ctx, id, func(current *Task) (*Task, error) {
 			if !mutate(current) {
 				refused = true
@@ -708,14 +966,14 @@ func (s *Server) updateTask(ctx context.Context, id string, mutate func(current 
 	}
 	unlock := s.lockTask(id)
 	defer unlock()
-	current, err := s.store.Get(ctx, id)
+	current, err := store.Get(ctx, id)
 	if err != nil {
 		return nil, false, err
 	}
 	if !mutate(current) {
 		return current, true, nil
 	}
-	if err := s.store.Save(ctx, current); err != nil {
+	if err := store.Save(ctx, current); err != nil {
 		return nil, false, fmt.Errorf("save task: %w", err)
 	}
 	return current, false, nil
@@ -787,7 +1045,11 @@ func (s *Server) commitTask(ctx context.Context, task *Task, msg *Message, reply
 // fallback uses. apply receives the fresh task from newTask when the record
 // is absent — its working state lets the commit proceed.
 func (s *Server) updateOrCreateTask(ctx context.Context, task *Task, apply func(current *Task) bool) (*Task, bool, error) {
-	if up, ok := s.store.(TaskUpserter); ok {
+	store, storeErr := s.storeFor(ctx)
+	if storeErr != nil {
+		return nil, false, storeErr
+	}
+	if up, ok := store.(TaskUpserter); ok {
 		var refused bool
 		stored, err := up.Upsert(ctx, task.ID, func(current *Task) (*Task, error) {
 			if current == nil {
@@ -803,14 +1065,14 @@ func (s *Server) updateOrCreateTask(ctx context.Context, task *Task, apply func(
 		}
 		return stored, refused, nil
 	}
-	if _, ok := s.store.(TaskUpdater); ok {
+	if _, ok := store.(TaskUpdater); ok {
 		for {
 			stored, refused, err := s.updateTask(ctx, task.ID, apply)
 			if !errors.Is(err, ErrTaskNotFound) {
 				return stored, refused, err
 			}
 			unlock := s.lockTask(task.ID)
-			_, getErr := s.store.Get(ctx, task.ID)
+			_, getErr := store.Get(ctx, task.ID)
 			switch {
 			case getErr == nil:
 				// A parallel turn created the record: release and update it
@@ -822,7 +1084,7 @@ func (s *Server) updateOrCreateTask(ctx context.Context, task *Task, apply func(
 				return nil, false, getErr
 			}
 			apply(task)
-			if err := s.store.Save(ctx, task); err != nil {
+			if err := store.Save(ctx, task); err != nil {
 				unlock()
 				return nil, false, fmt.Errorf("save task: %w", err)
 			}
@@ -832,19 +1094,19 @@ func (s *Server) updateOrCreateTask(ctx context.Context, task *Task, apply func(
 	}
 	unlock := s.lockTask(task.ID)
 	defer unlock()
-	current, err := s.store.Get(ctx, task.ID)
+	current, err := store.Get(ctx, task.ID)
 	switch {
 	case err == nil:
 		if !apply(current) {
 			return current, true, nil
 		}
-		if err := s.store.Save(ctx, current); err != nil {
+		if err := store.Save(ctx, current); err != nil {
 			return nil, false, fmt.Errorf("save task: %w", err)
 		}
 		return current, false, nil
 	case errors.Is(err, ErrTaskNotFound):
 		apply(task)
-		if err := s.store.Save(ctx, task); err != nil {
+		if err := store.Save(ctx, task); err != nil {
 			return nil, false, fmt.Errorf("save task: %w", err)
 		}
 		return task, false, nil
@@ -928,7 +1190,11 @@ func (s *Server) tasksGet(ctx context.Context, w http.ResponseWriter, req *rpcRe
 
 // getTask is the transport-independent tasks/get body.
 func (s *Server) getTask(ctx context.Context, id string, historyLength int) (*Task, *RPCError) {
-	task, err := s.store.Get(ctx, id)
+	store, err := s.storeFor(ctx)
+	if err != nil {
+		return nil, storeError(err)
+	}
+	task, err := store.Get(ctx, id)
 	if err != nil {
 		return nil, storeError(err)
 	}
@@ -992,6 +1258,9 @@ func (s *Server) cancelTask(ctx context.Context, id string) (*Task, *RPCError) {
 func storeError(err error) *RPCError {
 	if errors.Is(err, ErrTaskNotFound) {
 		return &RPCError{Code: codeTaskNotFound, Message: "task not found"}
+	}
+	if errors.Is(err, ErrUnknownTenant) {
+		return &RPCError{Code: codeInvalidParams, Message: "unknown tenant"}
 	}
 	return &RPCError{Code: codeInternalError, Message: msgInternalError}
 }

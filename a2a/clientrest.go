@@ -34,7 +34,7 @@ func (c *Client) sendRaw(ctx context.Context, msg *Message) (json.RawMessage, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode message: %v", ErrTransport, err)
 	}
-	return c.restDo(ctx, MethodMessageSend, http.MethodPost, ep.restURL+RESTMessageSendPath, body)
+	return c.restDo(ctx, MethodMessageSend, http.MethodPost, restPath(ep, RESTMessageSendPath), body)
 }
 
 // getRaw performs tasks/get on the resolved binding, honouring
@@ -51,7 +51,7 @@ func (c *Client) getRaw(ctx context.Context, taskID string) (json.RawMessage, er
 		}
 		return c.call(ctx, MethodTasksGet, params)
 	}
-	target := ep.restURL + RESTTasksPath + "/" + url.PathEscape(taskID)
+	target := restPath(ep, RESTTasksPath+"/"+url.PathEscape(taskID))
 	if c.historyLen > 0 {
 		target += "?historyLength=" + strconv.Itoa(c.historyLen)
 	}
@@ -68,7 +68,7 @@ func (c *Client) cancelRaw(ctx context.Context, taskID string) (json.RawMessage,
 		return c.call(ctx, MethodTasksCancel, map[string]any{"id": taskID})
 	}
 	return c.restDo(ctx, MethodTasksCancel, http.MethodPost,
-		ep.restURL+RESTTasksPath+"/"+url.PathEscape(taskID)+":cancel", nil)
+		restPath(ep, RESTTasksPath+"/"+url.PathEscape(taskID)+":cancel"), nil)
 }
 
 // restDo performs one REST exchange and returns the raw 2xx body.

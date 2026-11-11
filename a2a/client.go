@@ -20,8 +20,11 @@ import (
 // for concurrent use.
 //
 // This is not the conversational A2AClient of Python (client.py:159 — an
-// LLMClient that ships full AG2 history per turn and syncs conversation
-// state); that turn machinery is deferred (D-049).
+// LLMClient that drives the turn machinery itself: it computes the AG2 history
+// and syncs conversation state). The wire half ships here — WithHistory puts
+// the conversation on a continuation, WithTenant scopes a request, and
+// WithCardVerifier checks the served card — while the LLMClient adapter stays
+// deferred (D-049).
 //
 // AGO-DEVIATION: Python's A2AClient is an LLMClient provider (not a tool), so
 // no tool adapter ships from this package; D-049.
@@ -38,6 +41,8 @@ type Client struct {
 	preset       *AgentCard
 	prefer       string
 	historyLen   int
+	tenant       string
+	cardVerifier CardVerifier
 	interceptors []CallInterceptor
 
 	// Resolved endpoint (interface selection, clientconn.go); guarded by
@@ -102,11 +107,41 @@ func NewClient(baseURL string, opts ...ClientOption) *Client {
 	return c
 }
 
+// WithCardVerifier makes the client verify the JWS signatures of every card
+// it consumes — the fetched card, the preset card, and the authenticated
+// extended card — and refuse a card that does not verify, with
+// ErrCardSignature (parity: A2AConfig.card_signature_verifier, which the
+// Python client applies to all three sources). Nil accepts any card, the
+// unsigned default.
+func WithCardVerifier(v CardVerifier) ClientOption {
+	return func(c *Client) { c.cardVerifier = v }
+}
+
+// verifyCard runs the configured verifier on card, naming the source that
+// failed (parity: client.py _verify_card wrapping the SDK error in
+// A2ACardSignatureError with the source and URL).
+func (c *Client) verifyCard(card *AgentCard, source string) error {
+	if c.cardVerifier == nil {
+		return nil
+	}
+	if err := c.cardVerifier(card); err != nil {
+		return fmt.Errorf("%w (%s) for %q: %v", ErrCardSignature, source, c.base, err)
+	}
+	return nil
+}
+
 // AgentCard fetches and decodes the server's agent card; with WithPresetCard
 // it returns a copy of the injected card without any request.
 func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 	if c.preset != nil {
-		return cloneCard(c.preset)
+		card, err := cloneCard(c.preset)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.verifyCard(card, "preset agent card"); err != nil {
+			return nil, err
+		}
+		return card, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+c.cardPath, nil)
 	if err != nil {
@@ -129,6 +164,9 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 	// streams an endless "card" into the decoder.
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRequestBody)).Decode(&card); err != nil {
 		return nil, fmt.Errorf("%w: decode agent card: %v", ErrWire, err)
+	}
+	if err := c.verifyCard(&card, "fetched agent card"); err != nil {
+		return nil, err
 	}
 	return &card, nil
 }
@@ -211,6 +249,7 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode params: %v", ErrTransport, err)
 	}
+	paramsJSON = tenantParams(paramsJSON, ep.tenant)
 	payload, err := json.Marshal(rpcRequest{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(fmt.Sprintf("%d", id)),
@@ -311,6 +350,9 @@ func (c *Client) ExtendedCard(ctx context.Context) (*AgentCard, error) {
 	var card AgentCard
 	if err := json.Unmarshal(result, &card); err != nil {
 		return nil, fmt.Errorf("%w: decode extended card: %v", ErrWire, err)
+	}
+	if err := c.verifyCard(&card, "extended agent card"); err != nil {
+		return nil, err
 	}
 	return &card, nil
 }
