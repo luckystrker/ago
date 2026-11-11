@@ -31,6 +31,7 @@ type hubExt struct {
 	cursors     map[string]map[string]string // agent id → channel id → last-acked envelope id (persist.go)
 	nacks       map[string][]Nack            // agent id → nack log (persist.go)
 	nextSeq     int
+	envIndex    map[string]envRef // envelope id → its channel and position in Hub.logs (appendLogLocked)
 
 	lifecycle lifecycleState
 	wire      wireState // endpoint registry of the wire server (hubserver.go)
@@ -46,6 +47,7 @@ func (e *hubExt) init() {
 	e.peerCancel = make(map[string]map[string]bool)
 	e.checkpoints = make(map[string]taskCheckpoint)
 	e.regSeq = make(map[string]int)
+	e.envIndex = make(map[string]envRef)
 	e.cursors = make(map[string]map[string]string)
 	e.nacks = make(map[string][]Nack)
 	e.lifecycle.init()

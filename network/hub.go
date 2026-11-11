@@ -328,6 +328,13 @@ type HubOption func(*Hub)
 // channel transition is appended).
 func WithHubWAL(w WAL) HubOption { return func(h *Hub) { h.wal = w } }
 
+// WithHubAdapter registers a channel adapter at construction, so OpenHub's
+// Hydrate can fold channels of that type from the WAL (adapters referenced by
+// the WAL must be registered before it is replayed). version "" is "1".
+func WithHubAdapter(a ChannelAdapter, version string) HubOption {
+	return func(h *Hub) { h.RegisterAdapter(a, version) }
+}
+
 // WithHubClock overrides the hub clock (tests).
 func WithHubClock(now func() time.Time) HubOption { return func(h *Hub) { h.now = now } }
 
@@ -1034,7 +1041,7 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	if err := h.recordLocked(WALRecord{Kind: "envelope", Envelope: &env}); err != nil {
 		return Envelope{}, fmt.Errorf("network: append envelope %s to wal: %w", env.ID, err)
 	}
-	h.logs[ch.ID] = append(h.logs[ch.ID], env)
+	h.appendLogLocked(ch.ID, env)
 	h.indexCausationLocked(env, len(h.logs[ch.ID])-1)
 	if peerCancel {
 		h.markPeerCancelLocked(env)
@@ -1231,7 +1238,7 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 	}
 	closeEnv.ID = h.ids.Next()
 	closeEnv.CreatedAt = h.now()
-	h.logs[channelID] = append(h.logs[channelID], closeEnv)
+	h.appendLogLocked(channelID, closeEnv)
 	// AGO-DEVIATION: Python surfaces the close envelope's WAL append failure
 	// through close_channel; AGo's closeChannel is void and also runs as a
 	// post-send follow-up where no caller could receive the error, so the
@@ -1335,6 +1342,7 @@ func (h *Hub) Replay() error {
 	// appending the envelopes a second time.
 	h.channels = make(map[string]*ChannelHandle)
 	h.logs = make(map[string][]Envelope)
+	h.ext.envIndex = make(map[string]envRef)
 	h.ext.causation = make(map[string]map[causeKey]int)
 	h.ext.peerCancel = make(map[string]map[string]bool)
 	h.ext.checkpoints = make(map[string]taskCheckpoint)
@@ -1408,7 +1416,7 @@ func (h *Hub) Replay() error {
 					}
 				}
 			}
-			h.logs[ch.ID] = append(h.logs[ch.ID], env)
+			h.appendLogLocked(ch.ID, env)
 			h.indexCausationLocked(env, len(h.logs[ch.ID])-1)
 			// Rebuild the one-cancel-per-sender limit from the log (Python
 			// parity: hydrate does the same for active channels).

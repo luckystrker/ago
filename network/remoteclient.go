@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -46,7 +47,72 @@ type RemoteConfig struct {
 	// RPCTimeout bounds one request (default 45s: longer than the hub's invite
 	// ack wait, which a create_channel request spans).
 	RPCTimeout time.Duration
+	// Reconnect, when set, makes the client re-dial by itself after the link
+	// drops: with the policy's backoff and attempt limit it opens a new
+	// connection and re-attaches every agent with a hello carrying its
+	// per-channel high-water marks, then re-acknowledges them, so delivery
+	// continues where it stopped. nil: the caller drives HubClient.Reconnect
+	// (Python parity: ws.py leaves reconnect to the tenant).
+	Reconnect *ReconnectPolicy
+	// OnEvent, when set, is told about link loss, a completed reconnect and
+	// giving up. It runs on the client's goroutines and must not block.
+	OnEvent func(ConnectionEvent)
 }
+
+// ReconnectPolicy is the backoff of an automatic reconnect: attempt n waits
+// Initial·Factor^(n-1), capped at Max, spread by ±Jitter (a fraction), and the
+// client gives up after MaxAttempts failed attempts (0 = never).
+type ReconnectPolicy struct {
+	Initial     time.Duration
+	Max         time.Duration
+	Factor      float64
+	Jitter      float64
+	MaxAttempts int
+}
+
+// DefaultReconnectPolicy retries after 250ms, doubling up to 30s, ±20%, and
+// gives up after 10 failed attempts (about two minutes).
+func DefaultReconnectPolicy() ReconnectPolicy {
+	return ReconnectPolicy{Initial: 250 * time.Millisecond, Max: 30 * time.Second, Factor: 2, Jitter: 0.2, MaxAttempts: 10}
+}
+
+// delay is the wait before attempt n (1-based); rnd yields a value in [0,1).
+func (p ReconnectPolicy) delay(attempt int, rnd func() float64) time.Duration {
+	d := float64(p.Initial)
+	if p.Factor > 1 {
+		for i := 1; i < attempt; i++ {
+			d *= p.Factor
+			if p.Max > 0 && d >= float64(p.Max) {
+				d = float64(p.Max)
+				break
+			}
+		}
+	}
+	if p.Max > 0 && d > float64(p.Max) {
+		d = float64(p.Max)
+	}
+	if p.Jitter > 0 && rnd != nil {
+		d *= 1 + p.Jitter*(2*rnd()-1)
+	}
+	if d < 0 {
+		d = 0
+	}
+	return time.Duration(d)
+}
+
+// ConnectionEvent reports a change of the link of a remote client.
+type ConnectionEvent struct {
+	Kind    string // ConnLost | ConnReconnected | ConnGaveUp
+	Attempt int    // the attempt that succeeded or was the last one
+	Err     error  // why the link was lost / why the client gave up
+}
+
+// Connection event kinds.
+const (
+	ConnLost        = "lost"
+	ConnReconnected = "reconnected"
+	ConnGaveUp      = "gave_up"
+)
 
 // ConnectHub opens the first connection and returns a HubClient whose
 // registrations, requests and deliveries travel over the link: the same
@@ -78,7 +144,11 @@ type remoteClient struct {
 	conn   *remoteConn
 	epoch  uint64
 	closed bool
-	agents map[string]*remoteAgent
+	stop   chan struct{} // closed by close(); lazily created (stopChan)
+	// reconnecting is set while an automatic reconnect runs (one at a time).
+	reconnecting bool
+	reconnMu     sync.Mutex // serialises reconnect (manual and automatic)
+	agents       map[string]*remoteAgent
 	// early holds notifies that arrive for an agent not attached yet (the hub
 	// binds a connection at register/hello, before the reply is processed), in
 	// order, until its Attach.
@@ -97,6 +167,7 @@ type remoteAgent struct {
 	wake    chan struct{}
 	done    chan struct{}
 	high    map[string]string // channel id → highest envelope id delivered
+	nacked  map[string]bool   // channel id → this connection nacked it: nothing more is delivered or acked there until a reconnect
 	hello   HelloBody         // name and credentials for re-attaching
 	stopped bool
 }
@@ -156,7 +227,9 @@ func (cn *remoteConn) loop() {
 	for {
 		f, err := cn.link.Recv(context.Background())
 		if err != nil {
-			cn.shutdown(fmt.Errorf("%w: %w", ErrConnectionLost, err))
+			lost := fmt.Errorf("%w: %w", ErrConnectionLost, err)
+			cn.shutdown(lost)
+			cn.rc.connLost(cn, lost)
 			return
 		}
 		switch f.Kind {
@@ -365,9 +438,30 @@ func (a *remoteAgent) run() {
 }
 
 func (a *remoteAgent) deliver(fn Notifier, f transport.Frame) {
+	// After a nack the hub stops sending that channel, but envelopes already in
+	// flight still arrive: delivering or acking one would move the cursor past
+	// the nacked envelope (model D19). They are dropped; the reconnect's replay
+	// brings them back in order.
+	a.mu.Lock()
+	stalled := a.nacked[f.ChannelID]
+	a.mu.Unlock()
+	if stalled {
+		return
+	}
 	var env Envelope
 	if err := json.Unmarshal(f.Payload, &env); err != nil {
-		a.receipt(f, ReceiptNack, "undecodable envelope: "+err.Error())
+		a.nack(f, "undecodable envelope: "+err.Error())
+		return
+	}
+	// The hub never repeats an envelope on a live connection; a repeat is a
+	// redelivery after a lost acknowledgement. Within this process it is not
+	// handed to the agent again, only acknowledged again (invariant 3: at most
+	// duplicates until the ack is persisted — and not even those here).
+	a.mu.Lock()
+	seen := env.ID != "" && env.ID <= a.high[env.ChannelID]
+	a.mu.Unlock()
+	if seen {
+		a.receipt(f, ReceiptAck, "")
 		return
 	}
 	status, reason := ReceiptAck, ""
@@ -381,12 +475,29 @@ func (a *remoteAgent) deliver(fn Notifier, f transport.Frame) {
 			fn(env)
 		}
 	}()
+	if status == ReceiptNack {
+		a.nack(f, reason)
+		return
+	}
 	a.mu.Lock()
 	if env.ID > a.high[env.ChannelID] {
 		a.high[env.ChannelID] = env.ID
 	}
 	a.mu.Unlock()
 	a.receipt(f, status, reason)
+}
+
+// nack reports an envelope the agent could not process and stops the channel
+// on this connection. The high-water mark does not pass a nacked envelope, or
+// a reconnect would ask the hub to skip it.
+func (a *remoteAgent) nack(f transport.Frame, reason string) {
+	a.mu.Lock()
+	if a.nacked == nil {
+		a.nacked = map[string]bool{}
+	}
+	a.nacked[f.ChannelID] = true
+	a.mu.Unlock()
+	a.receipt(f, ReceiptNack, reason)
 }
 
 // receipt acknowledges one delivery on the current connection.
@@ -430,13 +541,15 @@ func (rc *remoteClient) attach(agentID string, fn Notifier) error {
 	}
 	early := rc.early[agentID]
 	delete(rc.early, agentID)
-	rc.mu.Unlock()
 	ag.mu.Lock()
 	ag.notify = fn
 	ag.mu.Unlock()
+	// The buffered notifies are queued before rc.mu is released: a frame that
+	// arrives for the agent right after must not overtake them.
 	for _, f := range early {
 		ag.enqueue(f)
 	}
+	rc.mu.Unlock()
 	return nil
 }
 
@@ -465,6 +578,8 @@ func (rc *remoteClient) setHello(agentID string, body HelloBody) {
 // ErrConnectionLost), dials a new one and re-binds every attached agent with a
 // hello that carries its per-channel high-water marks.
 func (rc *remoteClient) reconnect(ctx context.Context) error {
+	rc.reconnMu.Lock()
+	defer rc.reconnMu.Unlock()
 	if _, err := rc.current(); err != nil {
 		return err
 	}
@@ -484,6 +599,7 @@ func (rc *remoteClient) reconnect(ctx context.Context) error {
 		for c, id := range ag.high {
 			since[c] = id
 		}
+		ag.nacked = nil // a new connection starts with every channel delivered again
 		ag.mu.Unlock()
 		if body.Name == "" {
 			continue
@@ -492,8 +608,107 @@ func (rc *remoteClient) reconnect(ctx context.Context) error {
 		if err := rc.sendHello(ctx, body); err != nil {
 			return fmt.Errorf("network: re-attach %s: %w", body.Name, err)
 		}
+		// AGO-DEVIATION: Python's replay uses the hello's since only to bound the
+		// replay and never moves the cursor from it, so an ack lost with the old
+		// connection leaves the cursor behind for good. The AGo client re-sends
+		// an ack for its high-water mark of every channel right after the welcome
+		// (model D13).
+		ag.reack(since)
 	}
 	return nil
+}
+
+// reack re-acknowledges the high-water marks on the current connection.
+func (a *remoteAgent) reack(marks map[string]string) {
+	cn, err := a.rc.current()
+	if err != nil || cn == nil {
+		return
+	}
+	for ch, id := range marks {
+		_ = cn.link.Send(transport.Frame{
+			Kind: transport.FrameReceipt, RecipientID: a.id, ChannelID: ch, EnvelopeID: id, Code: ReceiptAck,
+		})
+	}
+}
+
+func (rc *remoteClient) stopChan() chan struct{} {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.stop == nil {
+		rc.stop = make(chan struct{})
+	}
+	return rc.stop
+}
+
+func (rc *remoteClient) emit(ev ConnectionEvent) {
+	if rc.cfg.OnEvent != nil {
+		rc.cfg.OnEvent(ev)
+	}
+}
+
+// connLost reacts to the end of a connection's read loop: when it is still the
+// current connection of a client that reconnects by itself, a backoff loop
+// starts.
+func (rc *remoteClient) connLost(cn *remoteConn, err error) {
+	rc.mu.Lock()
+	if rc.closed || rc.conn != cn {
+		rc.mu.Unlock()
+		return
+	}
+	start := rc.cfg.Reconnect != nil && !rc.reconnecting
+	if start {
+		rc.reconnecting = true
+	}
+	rc.mu.Unlock()
+	rc.emit(ConnectionEvent{Kind: ConnLost, Err: err})
+	if start {
+		go rc.autoReconnect()
+	}
+}
+
+func (rc *remoteClient) autoReconnect() {
+	defer func() {
+		rc.mu.Lock()
+		rc.reconnecting = false
+		rc.mu.Unlock()
+	}()
+	pol := *rc.cfg.Reconnect
+	stop := rc.stopChan()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	var last error
+	for attempt := 1; ; attempt++ {
+		if pol.MaxAttempts > 0 && attempt > pol.MaxAttempts {
+			rc.emit(ConnectionEvent{Kind: ConnGaveUp, Attempt: attempt - 1, Err: last})
+			return
+		}
+		select {
+		case <-time.After(pol.delay(attempt, rand.Float64)):
+		case <-ctx.Done():
+			return
+		}
+		err := rc.reconnect(ctx)
+		if err == nil {
+			rc.emit(ConnectionEvent{Kind: ConnReconnected, Attempt: attempt})
+			return
+		}
+		last = err
+		switch {
+		case errors.Is(err, ErrClientClosed) || ctx.Err() != nil:
+			return
+		case errors.Is(err, ErrAuth) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrAccessDenied):
+			// The hub refuses the identity itself: retrying cannot help.
+			rc.emit(ConnectionEvent{Kind: ConnGaveUp, Attempt: attempt, Err: err})
+			return
+		}
+	}
 }
 
 func (rc *remoteClient) close() error {
@@ -503,6 +718,10 @@ func (rc *remoteClient) close() error {
 		return nil
 	}
 	rc.closed = true
+	if rc.stop == nil {
+		rc.stop = make(chan struct{})
+	}
+	close(rc.stop)
 	cn := rc.conn
 	agents := rc.agents
 	rc.agents = make(map[string]*remoteAgent)
@@ -538,10 +757,25 @@ func (c *HubClient) Reconnect(ctx context.Context) error {
 	return c.remote.reconnect(ctx)
 }
 
-// Close tears a remote client down: its link closes, waiting requests fail
-// with ErrConnectionLost and attached agents stop receiving. The identities
-// stay registered at the hub. An in-process client has nothing to close.
+// Close stops every agent and human this client built (their pumps and
+// delivery queues end) and, for a remote client, tears the link down: waiting
+// requests fail with ErrConnectionLost. The identities stay registered at the
+// hub.
 func (c *HubClient) Close() error {
+	// Stop every agent and human this client built: their pumps and delivery
+	// queues end (the identities stay registered at the hub).
+	c.mu.Lock()
+	var ids []string
+	for id := range c.agents {
+		ids = append(ids, id)
+	}
+	for id := range c.humans {
+		ids = append(ids, id)
+	}
+	c.mu.Unlock()
+	for _, id := range ids {
+		_ = c.Detach(id)
+	}
 	if c.remote == nil {
 		return nil
 	}

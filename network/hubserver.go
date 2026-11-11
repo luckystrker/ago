@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ type wireState struct {
 	endpoints map[string]*wireEndpoint // endpoint id → endpoint
 	agentEP   map[string]*wireEndpoint // agent id → the endpoint holding it
 	nextGen   uint64
+	warnOnce  sync.Once // the NoAuth warning is logged once per hub
 }
 
 // wireEndpoint is the hub-side handle to one connection (Python's
@@ -38,6 +40,9 @@ type wireEndpoint struct {
 	link  transport.Link
 	bound map[string]bool // agents this connection acts as (guarded by wireState.mu)
 	since map[string]HelloSince
+	// senders holds one ordered sender per bound agent (guarded by wireState.mu;
+	// see delivery.go).
+	senders map[string]*agentSender
 }
 
 // wireCtx is what request handling needs besides the frame.
@@ -93,6 +98,7 @@ func (h *Hub) Serve(ctx context.Context, l Acceptor) error {
 func (h *Hub) ServeLink(ctx context.Context, l transport.Link) error {
 	ep := h.newEndpoint(l)
 	defer h.dropEndpoint(ep)
+	defer l.Close() // the connection is over when this call returns: the client sees it
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	wc := wireCtx{ctx: ctx, ep: ep}
@@ -123,6 +129,15 @@ func (h *Hub) ServeLink(ctx context.Context, l transport.Link) error {
 
 func (h *Hub) newEndpoint(l transport.Link) *wireEndpoint {
 	w := &h.ext.wire
+	w.warnOnce.Do(func() {
+		for _, scheme := range h.ext.auth.Schemes() {
+			if scheme == AuthSchemeNone {
+				slog.Warn("network: this hub is served over a transport and accepts the \"none\" auth scheme: " +
+					"any client that knows an agent's name can take that agent over with a hello " +
+					"(serve with a registry without NoAuth, or only on a trusted transport)")
+			}
+		}
+	})
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.endpoints == nil {
@@ -130,7 +145,7 @@ func (h *Hub) newEndpoint(l transport.Link) *wireEndpoint {
 		w.agentEP = make(map[string]*wireEndpoint)
 	}
 	w.nextGen++
-	ep := &wireEndpoint{id: uuid.New(), gen: w.nextGen, link: l, bound: make(map[string]bool), since: make(map[string]HelloSince)}
+	ep := &wireEndpoint{id: uuid.New(), gen: w.nextGen, link: l, bound: make(map[string]bool), since: make(map[string]HelloSince), senders: make(map[string]*agentSender)}
 	w.endpoints[ep.id] = ep
 	return ep
 }
@@ -138,7 +153,7 @@ func (h *Hub) newEndpoint(l transport.Link) *wireEndpoint {
 // bindEndpoint makes ep the connection that holds agentID: delivery routes
 // through it and an earlier holder loses the binding (Python bind_endpoint:
 // the old connection stays up for its other agents).
-func (h *Hub) bindEndpoint(ep *wireEndpoint, agentID string) error {
+func (h *Hub) bindEndpoint(ep *wireEndpoint, agentID string, since HelloSince) error {
 	w := &h.ext.wire
 	w.mu.Lock()
 	if w.endpoints[ep.id] != ep {
@@ -148,8 +163,10 @@ func (h *Hub) bindEndpoint(ep *wireEndpoint, agentID string) error {
 	if prior := w.agentEP[agentID]; prior != nil && prior != ep {
 		delete(prior.bound, agentID)
 		delete(prior.since, agentID)
+		delete(prior.senders, agentID)
 	}
 	ep.bound[agentID] = true
+	ep.senders[agentID] = newAgentSender(since) // a (re)bind starts a fresh walk: replay from the mark, no stall
 	w.agentEP[agentID] = ep
 	w.mu.Unlock()
 	return h.Attach(agentID, h.wireNotifier(ep, agentID))
@@ -162,6 +179,7 @@ func (h *Hub) unbindAgent(agentID string) {
 	if ep := w.agentEP[agentID]; ep != nil {
 		delete(ep.bound, agentID)
 		delete(ep.since, agentID)
+		delete(ep.senders, agentID)
 	}
 	delete(w.agentEP, agentID)
 	w.mu.Unlock()
@@ -185,6 +203,7 @@ func (h *Hub) dropEndpoint(ep *wireEndpoint) {
 		}
 	}
 	ep.bound = make(map[string]bool)
+	ep.senders = make(map[string]*agentSender)
 	w.mu.Unlock()
 	for _, id := range released {
 		_ = h.Attach(id, nil)
@@ -212,25 +231,16 @@ func (h *Hub) boundAgents(ep *wireEndpoint) []string {
 	return out
 }
 
-// wireNotifier delivers dispatched envelopes of agentID to its connection as
-// notify frames. A dead link releases the connection; an overflowing one
-// reports a dispatch failure.
+// wireNotifier is the dispatch hook of a wire-bound agent. The envelope that
+// triggered it is already in the channel log, so the hook only runs the agent's
+// ordered sender (pump), which delivers it — and anything older still pending —
+// in log order.
 func (h *Hub) wireNotifier(ep *wireEndpoint, agentID string) Notifier {
 	return func(env Envelope) {
-		payload, err := json.Marshal(env)
-		if err == nil {
-			err = ep.link.Send(transport.Frame{
-				Kind:        transport.FrameNotify,
-				RecipientID: agentID, ChannelID: env.ChannelID, EnvelopeID: env.ID, Payload: payload,
-			})
+		if s := h.senderOf(ep, agentID); s != nil {
+			s.markLive(env)
 		}
-		if err == nil {
-			return
-		}
-		if errors.Is(err, transport.ErrLinkClosed) {
-			h.dropEndpoint(ep)
-		}
-		h.fanOut(func(l HubListener) { l.OnDispatchFailed(env, agentID, err) })
+		h.pump(ep, agentID)
 	}
 }
 
@@ -266,6 +276,11 @@ func (h *Hub) handleHello(wc wireCtx, f transport.Frame) {
 		return
 	}
 	scheme, _ := authSchemeAndClaim(stored)
+	// WARNING: for a NoAuth identity ("none" scheme) this check is the whole
+	// authentication: anyone who names it here takes it over — the connection is
+	// bound to it and the previous holder loses it (Python parity). Only
+	// credentialed identities (WithHubAuth) are protected against that.
+	//
 	// AGO-DEVIATION: Python's HelloFrame defaults auth_scheme to "none"; the
 	// AGo hello omits an empty field, so "" is read as "none" (NoAuth).
 	want := body.AuthScheme
@@ -280,18 +295,25 @@ func (h *Hub) handleHello(wc wireCtx, f transport.Frame) {
 		reject(err)
 		return
 	}
-	if err := h.bindEndpoint(wc.ep, stored.AgentID); err != nil {
+	// AGO-DEVIATION: Python replays only when the hello carries
+	// since_envelope_id (None skips replay). AGo always replays from
+	// max(persisted cursor, since mark): a hello without marks means "from my
+	// cursor", otherwise an agent that reconnects without remembering anything
+	// would silently lose what arrived while it was offline (invariant 1).
+	since := body.SinceMarks()
+	if err := h.bindEndpoint(wc.ep, stored.AgentID, since); err != nil {
 		reject(err)
 		return
 	}
 	w := &h.ext.wire
 	w.mu.Lock()
 	if w.agentEP[stored.AgentID] == wc.ep {
-		wc.ep.since[stored.AgentID] = body.SinceMarks() // consumed by the replay (receipts and replay: wave-4 task N3)
+		wc.ep.since[stored.AgentID] = since
 	}
 	w.mu.Unlock()
 	payload, _ := json.Marshal(WelcomeBody{EndpointID: wc.ep.id, HubTime: h.now().UTC().Format(time.RFC3339Nano)})
 	wc.reply(transport.Frame{Kind: transport.FrameWelcome, RequestID: f.RequestID, Payload: payload})
+	h.pump(wc.ep, stored.AgentID) // replay: strictly after the mark, in log order
 }
 
 // --- receipts ----------------------------------------------------------------------------------
@@ -313,7 +335,11 @@ func (h *Hub) handleReceipt(wc wireCtx, f transport.Frame) {
 		// recipient was sent (wave-4 model: CursorBacked); an ack for anything
 		// else has nothing to advance.
 		env, ok := h.envelopeByID(f.ChannelID, f.EnvelopeID)
-		if !ok || env.SenderID == f.RecipientID {
+		// Python moves the cursor for any envelope the recipient names. AGo also
+		// refuses an ack for the recipient's own envelope — it never received
+		// it — except lifecycle broadcasts, which address the creator too (so a
+		// creator that acked `opened` is not sent it again after a reconnect).
+		if !ok || (env.SenderID == f.RecipientID && !isLifecycleEvent(env.EventType)) {
 			return
 		}
 		if ch, err := h.Channel(f.ChannelID); err != nil || !ch.hasParticipant(f.RecipientID) {
@@ -325,8 +351,18 @@ func (h *Hub) handleReceipt(wc wireCtx, f transport.Frame) {
 		if substantive(env) {
 			h.AckInbox(f.RecipientID, 1)
 		}
+		h.pump(wc.ep, f.RecipientID) // flow control: a drained link takes the next entries
 	case ReceiptNack:
 		_ = h.RecordNack(f.RecipientID, f.ChannelID, f.EnvelopeID, f.Message)
+		// AGO-DEVIATION: after a nack AGo stops delivering that channel to the
+		// connection until it re-binds (model D19). Python leaves the cursor
+		// but keeps delivering, so a later ack of a newer envelope would move
+		// the cursor past the nacked one and it would never be replayed.
+		h.stallChannel(wc.ep, f.RecipientID, f.ChannelID)
+		if env, ok := h.envelopeByID(f.ChannelID, f.EnvelopeID); ok {
+			reason := fmt.Errorf("network: recipient %s nacked envelope %s: %s", f.RecipientID, f.EnvelopeID, f.Message)
+			h.fanOut(func(l HubListener) { l.OnDispatchFailed(env, f.RecipientID, reason) })
+		}
 	}
 }
 
@@ -410,7 +446,7 @@ func (h *Hub) dispatchOp(wc wireCtx, op string, raw json.RawMessage) (any, error
 				return nil, err
 			}
 		}
-		if err := h.bindEndpoint(ep, reg.AgentID); err != nil {
+		if err := h.bindEndpoint(ep, reg.AgentID, HelloSince{}); err != nil {
 			_ = h.Unregister(reg.AgentID)
 			return nil, err
 		}
