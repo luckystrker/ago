@@ -142,7 +142,7 @@ const (
 
 func (a *AgentClient) peersFindDescribe(hc *HubClient) func(peersArgs) (any, error) {
 	return func(args peersArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "find":
 			limit := args.Limit
@@ -311,7 +311,7 @@ type channelsArgs struct {
 
 func (a *AgentClient) channelsLifecycle(hc *HubClient) func(channelsArgs) (any, error) {
 	return func(args channelsArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "list":
 			includeTerminal := args.State == "all"
@@ -453,7 +453,7 @@ type tasksArgs struct {
 
 func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.Context) (any, error) {
 	return func(args tasksArgs, cx *agocontext.Context) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "progress", "complete":
 			// The active task comes from the context dependency the task
@@ -583,7 +583,7 @@ func taskSummary(md task.Metadata) map[string]any {
 // AGO-DEVIATION: Python's tasks list scope=all passes no owner filter and
 // returns every task the hub mirrors; AGo gates it on ownership or channel
 // participation.
-func participantTasks(hub *Hub, metas []task.Metadata, agentID string) []task.Metadata {
+func participantTasks(hub hubAPI, metas []task.Metadata, agentID string) []task.Metadata {
 	out := make([]task.Metadata, 0, len(metas))
 	for _, md := range metas {
 		if md.OwnerID == agentID {
@@ -616,7 +616,7 @@ const contextExcerptChars = 240
 
 func (a *AgentClient) contextRead(hc *HubClient) func(contextArgs) (any, error) {
 	return func(args contextArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "search":
 			if args.Query == "" {
@@ -754,7 +754,7 @@ func delegateCandidates(target string) []string {
 
 func (a *AgentClient) delegateConsult(hc *HubClient) func(delegateArgs) (any, error) {
 	return func(args delegateArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		if args.Target == "" || args.Prompt == "" {
 			return "Error: delegate requires `target` and `prompt`", nil
 		}

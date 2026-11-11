@@ -33,6 +33,7 @@ type hubExt struct {
 	nextSeq     int
 
 	lifecycle lifecycleState
+	wire      wireState // endpoint registry of the wire server (hubserver.go)
 }
 
 func (e *hubExt) init() {

@@ -333,7 +333,7 @@ func NewNetworkPlugin(hc *HubClient, self *AgentClient) (plugin.Plugin, error) {
 // ClientTask is a typed handle on a task the hub observes: id, owner, state,
 // with Info refreshing from the hub.
 type ClientTask struct {
-	hub *Hub
+	hub hubAPI
 
 	mu sync.Mutex
 	md task.Metadata

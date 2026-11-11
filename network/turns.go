@@ -95,8 +95,8 @@ func expectedNextLocked(ch *ChannelHandle) *ExpectedTurn {
 
 // PendingTurn is a turn the protocol still expects from an agent.
 type PendingTurn struct {
-	ChannelID            string
-	TriggeringEnvelopeID string // "" when no envelope put the turn on the agent
+	ChannelID            string `json:"channel_id"`
+	TriggeringEnvelopeID string `json:"triggering_envelope_id,omitempty"` // "" when no envelope put the turn on the agent
 }
 
 // PendingTurnsFor lists the turns in active channels where the protocol
@@ -257,7 +257,10 @@ func SayTool(self *AgentClient, channelID string) (tools.Tool, error) {
 // on a conversation, none on workflow and discussion). Empty for a channel
 // whose adapter offers none.
 func (a *AgentClient) ChannelTools(channelID string) ([]tools.Tool, error) {
-	h := a.hub
+	h, ok := a.hub.(*Hub)
+	if !ok {
+		return a.remoteChannelTools(channelID)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	ch, ok := h.channels[channelID]
@@ -271,4 +274,62 @@ func (a *AgentClient) ChannelTools(channelID string) ([]tools.Tool, error) {
 		return tp.ToolsFor(a, ch, a.AgentID())
 	}
 	return nil, nil
+}
+
+// remoteChannelTools is ChannelTools against a remote hub, which sends the
+// channel record without its adapter state: the client resolves the built-in
+// adapter of the channel's manifest and folds the state from the channel log —
+// the same deterministic fold the hub performs on Replay. A channel whose
+// adapter the client does not know offers no tools.
+func (a *AgentClient) remoteChannelTools(channelID string) ([]tools.Tool, error) {
+	ch, err := a.hub.Channel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	if ch.State != ChannelActive {
+		return nil, nil
+	}
+	adapter := builtinAdapter(ch.Manifest.Type, ch.Manifest.Version)
+	if adapter == nil {
+		return nil, nil
+	}
+	ch.adapter = adapter
+	initAdapterState(adapter, ch)
+	wal, err := a.hub.ReadWAL(channelID)
+	if err != nil {
+		return nil, err
+	}
+	for _, env := range wal {
+		switch env.EventType {
+		case EnvChannelAck, EnvChannelReject, EnvChannelOpened, EnvChannelClosed, EnvChannelExpired:
+			// Lifecycle state arrives with the channel record; nothing to fold.
+		default:
+			if _, err := adapter.OnEnvelope(ch, env); err != nil {
+				return nil, fmt.Errorf("fold of channel %s failed: %w", channelID, err)
+			}
+		}
+	}
+	if tp, ok := adapter.(ToolProvider); ok {
+		return tp.ToolsFor(a, ch, a.AgentID())
+	}
+	return nil, nil
+}
+
+// builtinAdapter returns the built-in adapter for a manifest type (version ""
+// = "1"), or nil.
+func builtinAdapter(manifestType, version string) ChannelAdapter {
+	if version != "" && version != "1" {
+		return nil
+	}
+	switch manifestType {
+	case TypeConsulting:
+		return ConsultingAdapter{}
+	case TypeConversation:
+		return ConversationAdapter{}
+	case TypeDiscussion:
+		return DiscussionAdapter{}
+	case TypeWorkflow:
+		return WorkflowAdapter{}
+	}
+	return nil
 }

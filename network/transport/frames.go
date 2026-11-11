@@ -11,9 +11,9 @@ import (
 	"fmt"
 )
 
-// Frame kinds. The vocabulary is fixed: handshake (Hello/Welcome), control
-// plane (Request/Response, correlated by RequestID), data plane
-// (Notify/Receipt) and heartbeat (Ping/Pong).
+// Frame kinds. The vocabulary is fixed: handshake (Hello/Welcome, or Error
+// when the hub rejects it), control plane (Request/Response, correlated by
+// RequestID), data plane (Notify/Receipt) and heartbeat (Ping/Pong).
 const (
 	FrameHello    = "hello"
 	FrameWelcome  = "welcome"
@@ -23,6 +23,9 @@ const (
 	FrameReceipt  = "receipt"
 	FramePing     = "ping"
 	FramePong     = "pong"
+	// FrameError is a structured rejection outside the request/response path
+	// (a failed handshake): Code is the stable error code, Message the text.
+	FrameError = "error"
 )
 
 // Frame is one wire unit between a client and a hub.
@@ -39,7 +42,9 @@ type Frame struct {
 	RequestID   string `json:"request_id,omitempty"` // correlates Request ↔ Response
 	RecipientID string `json:"recipient_id,omitempty"`
 	ChannelID   string `json:"channel_id,omitempty"`
-	Code        string `json:"code,omitempty"` // stable error code (Response failure, handshake rejection)
+	Op          string `json:"op,omitempty"`          // Request: the control-plane operation
+	EnvelopeID  string `json:"envelope_id,omitempty"` // Notify/Receipt: the envelope concerned
+	Code        string `json:"code,omitempty"`        // stable error code (Response failure, handshake rejection), Receipt status
 	Message     string `json:"message,omitempty"`
 	Payload     []byte `json:"payload,omitempty"`
 }
@@ -58,6 +63,7 @@ var validKinds = map[string]bool{
 	FrameReceipt:  true,
 	FramePing:     true,
 	FramePong:     true,
+	FrameError:    true,
 }
 
 // MarshalFrame serialises a frame to JSON. The payload travels base64-encoded
