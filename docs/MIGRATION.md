@@ -572,3 +572,77 @@ add them with `go get github.com/luckystrker/ago/contrib/<name>`.
 | `ContextEquals(key=, value=)` | `network.ContextEquals{Key, Value}` | Deep comparison; a missing key = nil |
 | `Transition(priority=)`, `TransitionGraph(default_target=)` | `network.Transition.Priority`, `network.TransitionGraph.DefaultTarget` | Lower priority first, ties in list order; a nil default → the old `no_transition` |
 | `peers(action="find", sort_by="name"\|"cost"\|"track_record")` | the same tool, `sort_by` argument | Peer summaries now carry `cost` and `observed_success_rate`; without `sort_by`, the hub order |
+
+## 10. Gap-audit wave 4 (2026-11-11)
+
+Python → AGo mappings for the API added in wave 4 (D-117..D-123). Everything is
+additive unless a row says otherwise: existing signatures did not change, a hub
+built without a store behaves as before, and a streaming server without
+`ServerConfig.HandleStream` keeps the two-event `message/stream`. The invariants
+behind the `network` changes are in `docs/acceptance/wave4-invariants.md`.
+
+### Network: persistence and the idempotent post (D-118)
+
+| Python | Go | Differences |
+|---|---|---|
+| `Hub.hydrate()` / `Hub.open(...)` on an existing store | `network.OpenHub(network.WithHubStore(store))` | `OpenHub` now calls `Hydrate()` (registry, then WAL). **It can return an error on a corrupted store where it used to start** — that is the point; previously only channels were restored, so a reconnecting client could register a second passport under a name already on disk |
+| `Hub(store=...)` and `store_wal` | `network.WithHubStore(knowledge.Store)`, `network.NewStoreWAL(store)` | Python's per-entity layout: `/agents/<id>/{passport,rule,resume}.json`, `inbox.cursors.json`, `inbox_nacks.jsonl`, `/registry/by_capability.json`, `/channels/<id>/{metadata.json,wal.jsonl}`, `/tasks/<id>/checkpoint.json`. The passport file is the commit point; a directory without one is deleted on hydrate (Python leaves it) |
+| `inbox_cursor(agent, channel)` / `_advance_cursor` | `Hub.InboxCursor(agentID, channelID)`, `Hub.AdvanceInboxCursor(agentID, channelID, envelopeID)` | Forward-only, per channel; the store is written before memory (Python: memory first). No envelope-existence check here — the wire does that (D-119) |
+| `inbox_nacks.jsonl` | `Hub.RecordNack(...)`, `Hub.Nacks(agentID) []Nack` | A nack never moves the cursor |
+| `find_envelope_by_causation(channel, sender, causation_id)` | `Hub.Send` now dedupes on the same key; the lookup still exists | A retried post returns the accepted envelope and appends/dispatches nothing; the index is rebuilt from the WAL by `Replay`/`Hydrate` and pruned when the channel ends |
+| `checkpoint.json` + `checkpoint_writers.json` | `/tasks/<id>/checkpoint.json` | State and claimed writer share one file |
+
+### Network: the wire endpoint and remote mode (D-119)
+
+| Python | Go | Differences |
+|---|---|---|
+| `Hub.attach_endpoint(addr, link)` / `LinkEndpoint` | `Hub.ServeLink(ctx, link transport.Link)` | No address argument: one call serves one connection and the endpoint id is minted by the hub. `Frame.From`/`Frame.To` are never read, so a frame cannot act as another connection's agent |
+| `LocalLink(hub).client()` | `transport.NewMemListener(n)` + `Hub.Serve(ctx, l)`, client through `ListenerDialer(l)` | `transport.NewPipe(n)` gives an unaddressed pair for tests. The old address-addressed `LocalLink` stays for in-process use |
+| `HubClient(WsLink(url))` (cross-process) | `ConnectHub(ctx, network.RemoteConfig{Dial, RPCTimeout})`, then `Attach`/`Detach`/`Reconnect`/`Close` | `Dialer` opens one fresh link per call; `RPCTimeout` defaults to 45 s (a `create_channel` request spans the invite ack). `HubClient.Hub()` is nil remotely |
+| `HelloFrame.since_envelope_id` | `network.HelloBody.Since` (per channel) + `HelloBody.SinceEnvelopeID` (legacy) | `null` skips replay, `""` replays everything; the per-channel map wins when both are sent |
+| `ResponseFrame.ok` / `error_code` | `Frame.Code == ""` = success; `Code`/`Message` = error | Codes are strings (`name_taken`, `channel_closed`, `access_denied`, …) so `errors.Is` works across the link |
+| `add_resume_example` (get+set in Python) | the `add_resume_example` op, `AgentClient.AddExample` | Atomic: 24 concurrent calls keep all 24 examples. No Python op of that name; `Hub.AddResumeExample` is the hub-side method |
+| `get_skill` / `set_skill` | answered by the wire as `null` / `protocol_error` | AGo has no SKILL.md registry |
+| remote `remote_agent` Hello | refused (`auth_failed`/protocol error) | The owner-tracking that makes a re-attach safe is not ported |
+
+### A2A: history, tenants, JWS and streaming (D-120..D-123)
+
+| Python | Go | Differences |
+|---|---|---|
+| `build_user_message(history_events=)`, `build_tool_result_message(history_events=)`, `events_to_payload`, `payload_to_events` | `a2a.WithHistory(events)`, `a2a.AttachHistory`, `a2a.ParseHistory`, `a2a.EventsToPayload`/`PayloadToEvents`, `ServerConfig.RestoreHistory` | `application/vnd.ag2.history+json`; all seven event kinds and five input-part types; restore runs once per turn on every binding; a malformed part is `-32602`. Non-text tool results are JSON, a failed result inside a batch keeps its error text in the content, and an empty `arguments` comes back as `"{}"` |
+| `tenant=` / `_maybe_tenant` / `a2a:tenant` in the context | `a2a.WithTenant(name)` on the client; `ServerConfig.Tenant`, `ServerConfig.StoreForTenant`, `ServerConfig.TenantResolver`, `ServerConfig.AuthorizeIdentity`, `a2a.IdentityFrom(ctx)` on the server | JSON-RPC `params.tenant` and the REST prefix `/{tenant}/message:send`, `/{tenant}/tasks[/{id}[:cancel]]`; `//tasks` and `/acme/` are not tenant paths. An unknown tenant (the store resolver returns nil) is 400/`-32602`; a resolver refusal is 403 (REST) or `-32602` (JSON-RPC/SSE). The resolver sees `TenantRequest{Request, Tenant, Identity}` and runs even when the client named no tenant; `Authorize` runs before `AuthorizeIdentity` and both must pass |
+| `sign_card` / `CardSigner` / `card_signature_verifier` / `A2ACardSignatureError` | `a2a.SignCardJWS`, `a2a.NewCardSigner`/`CardSigner`, `a2a.NewCardSignatureVerifier`/`WithCardVerifier`, `a2a.NewServerChecked`, `ErrCardSignature`, `ErrStaleCardSignature` | Detached JWS, ES256/384/512, RS*, PS*, EdDSA, HS*; payload = the a2a-sdk 1.3.0 proto-JSON form (defaults dropped, `signatures` removed, `_clean_empty`, RFC 8785, depth 128, integers ±(2^53−1)). A stale signature is compared on the payload; `NewServer` answers 500 on the card routes, `NewServerChecked` refuses at construction |
+| `message/stream` client consumption; `tasks/resubscribe`; `client.subscribe` | `Client.MessageStream(ctx, msg) (*TaskStream, error)`, `Client.Resubscribe`, `WithMaxReconnects`, `WithReconnectBackoff`, `WithPollingInterval`, `WithStreaming(false)`, `ErrReconnect` | JSON-RPC SSE and REST `POST /message:stream`; resubscribe opens with the current task and closes at the terminal state; a failed open is retried inside the budget; polling fallback on a clean EOF, `ErrUnsupportedOperation` and `ErrTaskNotFound` |
+| server artifact streaming (`chunk_to_text_artifact`) | `ServerConfig.HandleStream` + `StreamEmitter.Artifact`/`Status`, `a2a.ApplyArtifactUpdate`, `KindArtifactUpdate`, `ErrStreamClosed` | Each chunk folds into the task record, so `tasks/get` agrees with the stream. `Status` is progress-only; terminal/interrupted states come from the handler's return value. A subscriber more than 32 events behind is disconnected, not blocked |
+
+### Card wire and semantics changes to check before upgrading
+
+- **The served agent card.** An unset `streaming: false` is no longer written, so a zero
+  card now serializes as `{"pushNotifications":false}` where it used to carry both
+  keys; a client that reads an absent key as `false` sees no difference. A card with
+  `PushNotifications: true` and no `PushStore` is now served with `false` (the server
+  always declares the flag, `server.py:218`), and `extendedAgentCard` is declared only
+  when a second card exists. Presence is state: `reflect.DeepEqual` between a decoded
+  and a literal card now distinguishes `false`-present from unset — compare the
+  marshalled JSON, or use `SetStreaming`/`SetPushNotifications`/`SetExtendedAgentCard`
+  to state intent.
+- **`OpenHub` may fail.** A corrupted store is reported instead of silently producing a
+  half-restored hub (see the network table above). A hub without a store is unaffected.
+- **Remote mode is not federation.** `ServeLink`/`ConnectHub` connect one client to one
+  hub over a `transport.Link`; `RemoteAgentProxy` is still a stub. `ClientTools` and
+  `AgentClient.ChannelTools` work remotely, but `ChannelTools` rebuilds the channel state
+  with the built-in adapters only — a custom hub-side adapter gives an empty tool set on
+  the client.
+
+### Warnings — read before exposing a hub or a tenant server
+
+- **Tenants are a client's claim unless you resolve them.** A server with no
+  `TenantResolver` and no `StoreForTenant` is single-tenant; a server with only
+  `StoreForTenant` serves whatever tenant the caller asks for. The tenant is *not*
+  derived from the caller. Configure `TenantResolver` and, to bind the tenant to the
+  caller, `AuthorizeIdentity`; the same warning is on the fields and on `WithTenant`.
+- **`NoAuth` agents are taken over by name on the wire.** A Hello for an unauthenticated
+  agent displaces the current holder (Python parity). Any deployment that serves
+  `Hub.ServeLink` outside a trusted boundary must register agents with `ApiKeyAuth`/an
+  `AuthAdapter` — the boundary no longer has to invent a "link → allowed AgentID" map
+  (that is now built in), but it must not run unauthenticated agents.

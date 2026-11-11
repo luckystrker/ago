@@ -6,7 +6,8 @@ is fixed; harm 10 (money, data) goes to the owner. Each entry names where it cam
 decision records are in [DECISIONS.md](DECISIONS.md), the per-package status in
 [PORT_STATUS.md](PORT_STATUS.md).
 
-Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated otherwise.
+Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated otherwise;
+the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-11-11).
 
 ## Flaky tests
 
@@ -45,6 +46,9 @@ Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated o
   (`RunScript` host-Python choice, a sort comparator) are equivalent.
 - **Sandboxes (D-115):** 15 surviving mutants, all equivalent or boundary cases (an exact
   status of 300, the 64 MiB file limit, an empty query or content type).
+- **`network` wire boundaries (W4-N2, risk 2):** the surviving mutants are boundary cases with
+  no exact-edge test — the channel sort comparator, `len == limit`, a value of exactly 500
+  characters.
 
 ## Behavior notes
 
@@ -52,6 +56,33 @@ Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated o
   remembers the `(owner, task)` pairs it already counted in memory, so after a hub restart a
   repeated terminal event of the same task counts a second time in the owner's observed track
   record. Python does the same (`_observed_task_ids` is memory-only), so it is left as is.
+- **`network` remote `AgentClient.ChannelTools` uses the built-in adapters only (W4-N2,
+  risk 2).** Over the wire the tool set is rebuilt on the client from the channel log; a
+  custom adapter registered on the hub yields an empty tool set remotely, while the
+  in-process client still sees it.
+- **`network` the creator never acks its own lifecycle event (W4-N2, risk 4).**
+  `handleReceipt` drops an ack whose sender is the recipient, and the creator is the sender of
+  its own `ag2.channel.opened`, so that envelope is never acked (Python advances the cursor
+  there). Harmless while nothing replays; once the replay lands, a fresh client can be sent
+  `opened` twice.
+- **`network` an ack scans the channel log under the hub lock (W4-N2, risk 4).** Resolving the
+  envelope (`envelopeByID`) is O(n) per ack on a hot path.
+- **`network` cursor API vs the wire (W4-N1/N2, risk 2).** `Hub.AdvanceInboxCursor` and
+  `Hub.RecordNack` do not check that the envelope exists in the channel; the wire path does
+  (existence, participant, not the sender). An embedder calling the methods directly can move
+  a cursor past an envelope it never received.
+- **`network` `NoAuth` takeover (W4-N2, risk 2).** A Hello for an agent registered with `NoAuth`
+  displaces the current holder by name, as in Python; it is documented in D-119 and MIGRATION
+  and pinned by a test, but `NoAuth`, `DefaultAuthRegistry` and `handleHello` carry no warning
+  comment in the code.
+- **The race detector does not run in this environment** (no C compiler for cgo), so the wave-4
+  concurrency was checked by reading the lock order (`dispatch` outside `h.mu`;
+  `bindEndpoint`/`dropEndpoint` release `w.mu` before `h.Attach`) rather than by
+  `go test -race`. Unverified area, not a known defect.
+- **TLC gate budget (W4-F, D-117).** The gate runs all six models in one `spawnSync` with a
+  120 s budget; measured 40–53 s at load 9–15, of which `HubMulti` is 20–28 s. On a heavily
+  loaded host the budget can be exceeded, and the failure then reads like a broken model
+  rather than a timeout.
 
 - **`mcpserver` (D-109).** Not done by design: the standalone listener of the *client* makes no
   second attempt after a 405 (the SDK tries twice; the outcome is the same); a resume stream does
@@ -85,6 +116,11 @@ Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated o
 
 ## Cleanup follow-ups
 
+- `a2a/jws.go:40-45`: the `AGO-DEVIATION` comment still says AGo cards "always spell out
+  capability booleans"; after the presence work (D-122) the signed payload follows
+  `MessageToDict`, so the comment describes the previous revision. The code is right.
+- `network/lifecycle.go`: the `OpenHub` doc comment became a single ~130-character line
+  (found by the W4-N1 reviewer).
 - `agent/overrides.go`: the field `turnPluginContributions.observers` is never read.
 - `examples/policies_compact/main.go`: its header comment still says `SlidingWindowPolicy` has
   no transparent flag; `policies.WithWindowTransparency` exists since D-106.
