@@ -24,7 +24,9 @@ const (
 	MIMEToolSchemas = "application/vnd.ag2.tool-schemas+json"
 	MIMEToolCall    = "application/vnd.ag2.tool-call+json"
 	MIMEToolResult  = "application/vnd.ag2.tool-result+json"
-	MIMEHistory     = "application/vnd.ag2.history+json"
+	// MIMEHistory carries the full AG2 conversation on a continuation
+	// (history.go; parity: extension.py MIME_HISTORY).
+	MIMEHistory = "application/vnd.ag2.history+json"
 
 	// HeaderA2AExtensions activates extension URIs per request (parity:
 	// extension_call_context — the A2A-Extensions service parameter, an HTTP
@@ -156,11 +158,11 @@ func ParseToolResults(msg *Message) ([]ToolResultEntry, error) {
 
 // BuildToolResultMessage builds the continuation message reporting executed
 // results for taskID: the results part first, then the schemas again so the
-// stateless server can rebuild tool definitions on the resume turn (parity:
-// build_tool_result_message — results, schemas, history ride on every
-// continuation; history shipping itself is a deferred conversational-client
-// feature, D-049/D-056).
-func BuildToolResultMessage(taskID, contextID string, results []ToolResultEntry, schemas []ToolSchema) *Message {
+// stateless server can rebuild tool definitions on the resume turn, then
+// everything opts add (parity: build_tool_result_message — results, schemas,
+// history; the full conversation ships through WithHistory, the caller's job
+// because only it knows the transcript).
+func BuildToolResultMessage(taskID, contextID string, results []ToolResultEntry, schemas []ToolSchema, opts ...MessageOption) *Message {
 	msg := NewMessage(RoleUser, ToolResultsPart(results))
 	msg.TaskID = taskID
 	msg.ContextID = contextID
@@ -168,7 +170,7 @@ func BuildToolResultMessage(taskID, contextID string, results []ToolResultEntry,
 	if len(schemas) > 0 {
 		msg.Parts = append(msg.Parts, ToolSchemasPart(schemas))
 	}
-	return msg
+	return applyMessageOptions(msg, opts)
 }
 
 // NewInputResponseMessage wraps a human answer as the continuation message

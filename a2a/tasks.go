@@ -84,7 +84,11 @@ func (s *MemoryTaskStore) List(_ context.Context) ([]*Task, error) {
 
 // listTasks is the transport-independent tasks/list body: read, filter, page.
 func (s *Server) listTasks(ctx context.Context, params ListTasksParams) (*ListTasksResult, *RPCError) {
-	lister, ok := s.store.(TaskLister)
+	store, storeErr := s.storeFor(ctx)
+	if storeErr != nil {
+		return nil, storeError(storeErr)
+	}
+	lister, ok := store.(TaskLister)
 	if !ok {
 		return nil, &RPCError{
 			Code:    codeUnsupportedOperation,
@@ -258,7 +262,7 @@ func (c *Client) listRaw(ctx context.Context, params ListTasksParams) (json.RawM
 	if params.IncludeArtifacts {
 		add("includeArtifacts", "true")
 	}
-	target := ep.restURL + RESTTasksPath
+	target := restPath(ep, RESTTasksPath)
 	if len(q) > 0 {
 		target += "?" + strings.Join(q, "&")
 	}

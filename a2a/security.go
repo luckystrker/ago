@@ -20,9 +20,9 @@ import (
 // {"schemes": {name: {} | {"list": [...]}}}. The card carries
 // securitySchemes + securityRequirements (a2a/agent.go).
 //
-// NOT ported (D-056): JWS card signing/verification (sign_card, CardSigner,
-// A2ACardSignatureError in errors.py) — that is real cryptography over the
-// card payload and the stdlib has no JWS/JWT.
+// Card JWS signing/verification (sign_card, CardSigner, A2ACardSignatureError
+// in errors.py) lives in jws.go: it is cryptography over the card payload, and
+// the stdlib crypto packages cover every algorithm the a2a-sdk offers.
 
 // SecurityScheme is one authentication scheme definition on the card.
 // Exactly one variant is populated; the wire selects it by field name.

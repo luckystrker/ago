@@ -88,6 +88,11 @@ type endpoint struct {
 	binding string
 	rpcURL  string // JSON-RPC endpoint (binding jsonrpc)
 	restURL string // REST base without trailing slash (binding rest)
+	// tenant is the tenant every request of this client names: the client's
+	// own WithTenant value, or the one the selected interface advertises. It
+	// lives on the resolved endpoint rather than on the Client so Connect can
+	// fill it without racing the calls that read it.
+	tenant string
 }
 
 // Connect resolves the connection target: it takes the preset card or
@@ -114,6 +119,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err := validateProtocolVersion(iface, binding); err != nil {
 		return err
 	}
+	tenant := c.tenant
+	if tenant == "" {
+		// The interface names the tenant it serves; a client that was not told
+		// one adopts it (parity: the SDK's TenantTransportDecorator taking the
+		// tenant from the selected interface).
+		tenant = iface.Tenant
+	}
 	// The interface URL is the JSON-RPC endpoint verbatim, and (trailing slash
 	// trimmed) the base of the REST routes; an interface without one is
 	// reached through the client's own base URL.
@@ -122,7 +134,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	if rpc == "" {
 		rpc, rest = c.base+rpcPath, c.base
 	}
-	ep := &endpoint{binding: binding, rpcURL: rpc, restURL: rest}
+	ep := &endpoint{binding: binding, rpcURL: rpc, restURL: rest, tenant: tenant}
 	c.resolved = ep
 	return nil
 }
@@ -137,7 +149,7 @@ func (c *Client) endpoint(ctx context.Context) (*endpoint, error) {
 		return resolved, nil
 	}
 	if c.preset == nil && c.prefer == "" {
-		return &endpoint{binding: bindingJSONRPC, rpcURL: c.base + rpcPath, restURL: c.base}, nil
+		return &endpoint{binding: bindingJSONRPC, rpcURL: c.base + rpcPath, restURL: c.base, tenant: c.tenant}, nil
 	}
 	if err := c.Connect(ctx); err != nil {
 		return nil, err

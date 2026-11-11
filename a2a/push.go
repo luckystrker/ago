@@ -373,7 +373,12 @@ func (s *Server) servePushSet(ctx context.Context, w http.ResponseWriter, req *r
 		return
 	}
 	// Task must exist — a push config scopes to a live task record.
-	if _, err := s.store.Get(ctx, params.TaskID); err != nil {
+	store, err := s.storeFor(ctx)
+	if err != nil {
+		writeRPCError(w, req.ID, storeError(err))
+		return
+	}
+	if _, err := store.Get(ctx, params.TaskID); err != nil {
 		writeRPCError(w, req.ID, storeError(err))
 		return
 	}
@@ -483,7 +488,13 @@ func (s *Server) pushConfigOp(ctx context.Context, w http.ResponseWriter, req *r
 		writeRPCError(w, req.ID, err)
 		return nil, err
 	}
-	if _, err := s.store.Get(ctx, params.TaskID); err != nil {
+	store, err := s.storeFor(ctx)
+	if err != nil {
+		rpcErr := storeError(err)
+		writeRPCError(w, req.ID, rpcErr)
+		return nil, rpcErr
+	}
+	if _, err := store.Get(ctx, params.TaskID); err != nil {
 		err := storeError(err)
 		writeRPCError(w, req.ID, err)
 		return nil, err
