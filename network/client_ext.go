@@ -165,7 +165,11 @@ func (h *Hub) SetRule(agentID string, r Rule) error {
 	if _, ok := h.passports[agentID]; !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
-	h.rules[agentID] = r.Clone()
+	cur := r.Clone()
+	if err := h.persistRuleLocked(agentID, cur); err != nil {
+		return err
+	}
+	h.rules[agentID] = cur
 	delete(h.ext.rateBuckets, agentID)
 	evs.add(func(l HubListener) {
 		l.OnAgentEvent(agentID, AgentEventRuleSet, map[string]any{"at": h.at()})

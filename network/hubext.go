@@ -24,10 +24,12 @@ type hubExt struct {
 	listeners       listenerSet
 	audit           *AuditLog
 
-	causation   map[string]map[causeKey]int // channel → (sender, causation id) → index into Hub.logs[channel]
-	peerCancel  map[string]map[string]bool  // task id → non-participants that already sent a cancel request
-	checkpoints map[string]taskCheckpoint   // task id → last checkpoint
-	regSeq      map[string]int              // agent id → registration order
+	causation   map[string]map[causeKey]int  // channel → (sender, causation id) → index into Hub.logs[channel]
+	peerCancel  map[string]map[string]bool   // task id → non-participants that already sent a cancel request
+	checkpoints map[string]taskCheckpoint    // task id → last checkpoint
+	regSeq      map[string]int               // agent id → registration order
+	cursors     map[string]map[string]string // agent id → channel id → last-acked envelope id (persist.go)
+	nacks       map[string][]Nack            // agent id → nack log (persist.go)
 	nextSeq     int
 
 	lifecycle lifecycleState
@@ -43,6 +45,8 @@ func (e *hubExt) init() {
 	e.peerCancel = make(map[string]map[string]bool)
 	e.checkpoints = make(map[string]taskCheckpoint)
 	e.regSeq = make(map[string]int)
+	e.cursors = make(map[string]map[string]string)
+	e.nacks = make(map[string][]Nack)
 	e.lifecycle.init()
 }
 
@@ -188,8 +192,12 @@ func (h *Hub) RecordObservation(ownerID, capability string, outcome task.State, 
 	cur.Observed[capability] = stat
 	cur.LastUpdated = h.now()
 	cur.Version++
+	if err := h.persistResumeLocked(ownerID, cur); err != nil {
+		return err
+	}
 	h.resumes[ownerID] = cur
 	h.reindexLocked(ownerID, old, cur)
+	h.persistCapIndexLocked()
 	if taskID != "" {
 		h.ext.observed[key] = struct{}{}
 	}
@@ -223,6 +231,9 @@ func (h *Hub) AddResumeExample(agentID string, ex ResumeExample) error {
 	cur.Examples = append(cur.Examples, ex)
 	cur.LastUpdated = h.now()
 	cur.Version++
+	if err := h.persistResumeLocked(agentID, cur); err != nil {
+		return err
+	}
 	h.resumes[agentID] = cur
 	evs.add(func(l HubListener) {
 		l.OnAgentEvent(agentID, AgentEventResumeSet, map[string]any{"version": cur.Version, "at": cur.LastUpdated})
@@ -354,4 +365,6 @@ func (h *Hub) forgetLocked(agentID string, resume Resume) {
 	delete(h.ext.inboxPending, agentID)
 	delete(h.ext.rateBuckets, agentID)
 	delete(h.ext.regSeq, agentID)
+	delete(h.ext.cursors, agentID)
+	delete(h.ext.nacks, agentID)
 }
