@@ -549,6 +549,12 @@ func FromAgent(a *agent.Agent) (*AgentSpec, error)
 func (s *AgentSpec) ToAgent(available map[string]tools.Tool, opts ...agent.Option) (*agent.Agent, error) // missing tool → tools.ErrResolution
 ```
 
+The directory also holds `spec/tla/` — the TLA+ models of the wave-4 hub and A2A
+invariants (`HubCore`, `HubDelivery`, `HubMulti`, `HubAccess`, `HubRestart`, `LinkRPC`,
+`A2AResubscribe` plus their `.cfg` files). They are data checked by the commit gate
+(`tlc.mjs`), not a Go package; the invariants they state are recorded in D-117 and
+`docs/acceptance/wave4-invariants.md`.
+
 ### package `network` (specs: events-network.md §4 — port the functional subset)
 
 Subpackages: `network` (root: Envelope, Channel types, Rule, Passport, Handoff/Finish),
@@ -567,6 +573,16 @@ or network boundary (e.g. `contrib/wslink`) or third-party code writes into the 
 forged sender name grants the forger that agent's full authority. Such deployments must
 authenticate at the boundary — a signature or token on each envelope, or a
 "link → allowed AgentID" mapping — before envelopes enter the hub.
+
+Since wave 4 the hub itself serves the second half of that rule (D-119):
+`Hub.ServeLink(ctx, link)` serves exactly one connection, the endpoint id is minted by the
+hub, and `Frame.From`/`Frame.To` are never read, so a frame cannot act as another
+connection's agent. A connection holds only the agents its Hello bound to it, and losing
+the connection releases them. What is *not* built in is authentication of the agent's
+identity: an agent registered with `NoAuth` is taken over by name by the next Hello that
+asks for it (Python parity), so a hub served beyond a trusted boundary must register its
+agents with `ApiKeyAuth`/an `AuthAdapter`. `RemoteAgentProxy` stays an interface stub —
+a wire endpoint is not federation (D-056).
 
 ### package `mcp`
 

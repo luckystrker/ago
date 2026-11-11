@@ -827,6 +827,12 @@ Package `policies` (spec events-network.md §3; Python `ag2/policies` +
 
 ## D-031 — 2026-10-29 — network: functional single-host subset, hub/adapters/clients in Go
 
+**Reduced by D-118/D-119 (wave 4):** hub persistence across restarts
+(`WithHubStore`/`Hydrate`, D-118), the wire endpoint and a remote `HubClient`
+over `transport.Link` (D-119) and the idempotent post (D-118) are in; the
+deferral line "Replay does NOT restore passports" is superseded by D-118.
+WebSocket links and federation stay as written here.
+
 Wave-3 network brief implemented (`network/` + `network/transport/`): Envelope/Channel/
 Passport/Rule/Transitions/Handoff, Hub (registries, pending→invite→ack→opened handshake,
 send gates, WAL + Replay), Consulting/Conversation/Discussion/Workflow adapters,
@@ -1310,6 +1316,14 @@ first. Every rejection wraps `config.ErrUnsupportedTool`.
 
 ## D-049 — 2026-10-30 — a2a: transport-level subset — the conversational A2AClient machinery is not ported
 
+**Reduced by D-120..D-123 (wave 4):** the deferrals listed below are closed —
+full history shipping (D-120), tenants (D-121, through a request-and-identity
+resolver rather than a context-carrying store), card JWS signing/verification
+(D-122) and reconnect/resubscribe plus client streaming (D-123);
+`validate_input_modes` was already closed by D-116. Still open: the
+conversational `A2AClient` LLMClient adapter and cluster mode. gRPC stays
+permanently deferred (D-071).
+
 Supersedes the `a2a/` deferral in D-010 for this slice (owner directive): `ago/a2a`
 ports the A2A wire surface — protocol types with camelCase tags and the `kind`
 part discriminator, agent-card discovery at `/.well-known/agent-card.json` plus the
@@ -1363,6 +1377,13 @@ signing/verification (D-067 — no stdlib JWS/JWT), and the `a2a:tenant` /
 `TENANT_VARIABLE_KEY` per-call routing (wire shape only).
 
 ## D-050 — 2026-10-30 — a2a: message/stream is a two-event SSE; client-side streaming is not ported
+
+**Superseded by D-123 (wave 4):** with `ServerConfig.HandleStream` set,
+`message/stream` streams task and artifact updates instead of two events, the
+server publishes `TaskArtifactUpdateEvent`s and the client consumes streams
+(`Client.MessageStream`) with reconnect and resubscribe — the "client-side
+streaming is not ported" half of this entry is closed. Without `HandleStream`
+the two-event shape remains the default.
 
 The server implements `message/stream` as Server-Sent Events with exactly two
 JSON-RPC-wrapped `status-update` results: `working` (`final=false`) then the
@@ -2100,6 +2121,12 @@ other's calls.
 
 ## D-056 — 2026-10-30 — network wave 2: views, arbiter, expectation sweepers, task mirror, client tools, federation stub
 
+**Reduced by D-119 (wave 4):** the cross-process case this stub stood in for now
+has a real wire — `Hub.ServeLink`/`Hub.Serve` and a remote-mode `HubClient`
+(`ConnectHub`, `Dialer`, `ListenerDialer`). `RemoteAgentProxy` remains an
+interface stub with no implementations and the hub still does not consult it,
+so federation itself is unchanged.
+
 The six deferred pieces of the D-031 network subset land in `github.com/luckystrker/ago/network`
 (owner directive; each was listed as deferred in the D-031 row of PORT_STATUS).
 
@@ -2444,6 +2471,12 @@ sweep. The race detector could not run in the authoring environment (no C
 compiler for cgo), same note as D-065.
 
 ## D-067 — 2026-10-30 — a2a wave 2: push notifications, the client-tools extension, context/HITL over the wire, REST, declarative security schemes; card JWS signing stays deferred
+
+**Reduced by D-120..D-123 (wave 4):** the deferrals in this entry are closed —
+full history shipping (D-120), tenants (D-121), card JWS signing and
+verification (D-122) and reconnect/resubscribe (D-123). The remainders are
+`validate_input_modes` (closed by D-116), cluster mode and gRPC (permanent,
+D-071).
 
 Owner directive, the same wave as the D-049/D-050 supplements above. `ago/a2a`
 closes the remaining a2a deferrals that do not need new dependencies. What
@@ -4777,4 +4810,441 @@ Owner-chosen recorded deferrals (D-049/D-050/D-053/D-056/D-061/D-065/D-066/D-067
 - **network `WaitIdle` counts pending deliveries** — the queue length alone left a window where a pump that had just dequeued an envelope looked idle; `pending` is incremented before queueing (and decremented by `discard`/after the handler), so a delivery in flight is always visible. Test helpers wait for two consecutive all-idle passes because delivery happens inside the sender's turn.
 
 Also fixed: the `network/TestWorkflowRoundRobinMaxTurns` and `TestAuditLogRecordsListenerEvents` flakes (WaitIdle above). Verified by two Sonnet review rounds: the acceptance table checked by hand on 216 combinations, the WaitIdle A/B, 600 loaded runs clean, the extended card refused to anonymous callers.
+
+## D-117 — 2026-11-11 — spec/tla: formal models of the seven wave-4 invariants, checked before any code; TLC's findings and the owner's deviations (gap audit 2026-11-09, wave 4)
+
+Wave 4 ran models first (W4-F): the task was blocked on TLC passing, and every
+executor code task was blocked on this one. Models, `.cfg` files and the report
+live in `spec/tla/` and `docs/acceptance/wave4-invariants.md`; the commit gate
+runs them through `node ~/.agent-toolkit/bin/tlc.mjs`.
+
+**The seven invariants** (owner-confirmed; words → the names in the model):
+
+1. Every accepted envelope is eventually received and acked by *every*
+   addressee — across offline time, a dropped link and a hub restart — if the
+   addressee reconnects and stays: `HubCore!NothingLost`, weak fairness on
+   connect/send/receive/ack/restart.
+2. (a) A persisted cursor per (agent, channel) only moves forward:
+   `CursorMonotonic`, `PersistedCursorMonotone`. (b) A replay starts strictly
+   after max(persisted cursor, client `since`), in WAL order:
+   `ReplayStrictlyAfter`, `OrderedDelivery`. (c) An ack in one channel never
+   suppresses replay in another: `CursorBacked`.
+3. (a) Duplicates are allowed but never after the ack is persisted:
+   `ReplayStrictlyAfter`, and duplicates are reachable — the witness
+   `NoDupWitness` (defined in `HubCore.tla`, deliberately in no `.cfg`) goes red
+   in 8 steps. (b) A post retried under the same causation key is not accepted
+   twice: `NoDoubleAccept`, `IndexFaithful`.
+4. Never delivered to a non-audience member, a non-participant or the sender,
+   and an ack from a connection that does not hold the agent moves no cursor:
+   `NoLeak`, `CursorBacked`.
+5. After a crash and restart the registry and the cursors equal the last
+   persisted state, nothing deleted resurrects, hydrate is idempotent and the
+   WAL only grows: `RestartFaithful`, `MemoryEqualsPersisted`, `NoResurrection`,
+   `NoOrphanCursor`, `WalAppendOnly`.
+6. Each request gets at most one response, that response is its own, and after a
+   reconnect no response of the old connection satisfies a new request:
+   `AtMostOneResponse`, `ResponseIsOwn`, `NoStaleSatisfy`.
+7. After a reconnect the client's view converges to the server's task, the
+   terminal state is observed exactly once and nothing follows it:
+   `Converges`, `TerminalObserved`, `TerminalIsLast`, `ViewMonotone`.
+
+`HubCore.tla` is the generic protocol (no `.cfg`); the scenarios instantiate it:
+`HubDelivery` (1, 2, 3, index half of 5 — one addressee, two channels, two
+posts, link drops, client restart, nacks, lost receipts, hub crash/restart,
+retried posts), `HubMulti` (invariant 1 for two addressees and same-channel
+order), `HubAccess` (4, safety of 2–3), `HubRestart` (5), `LinkRPC` (6) and
+`A2AResubscribe` (7). Final state counts: 2 178 / 9 563 / 15 460 / 5 260 /
+5 956 / 564. The whole gate is one `spawnSync` with a 120 s budget: measured
+40–53 s at load 9–15 (`HubMulti` 20–22 s is half of it). The first cut took
+136 s because `HubAccess` carried `NothingLost`; liveness now lives in the two
+delivery models and `HubDelivery` was compressed to one addressee and two posts
+— the reviewer re-ran its own mutations afterwards and they stay red, so the
+compression did not weaken the properties. All 34 mutations plus the 2
+assumption mutants (D19, D20) go red; the committed models are unmutated.
+
+**What TLC found in Python.** Neither finding is a bug on Python's default path:
+the single `since` is an API trap, and the missing hub-side dedupe is behaviour
+Python's hub does not provide (requirement 5 of the report). That is why Go
+deviates instead of copying:
+
+- **One `since` for all channels.** `HelloFrame` carries a single
+  `since_envelope_id` compared against every channel's cursor
+  (`hub/core.py:3037` `max(channel_cursor, since_envelope_id)`). The default `""`
+  is safe; an envelope is skipped only when a client passes a *high* single
+  `since` while an older envelope of another channel is still undelivered
+  (mutation D8). Go's wire carries the high-water per channel (D-119), so the
+  trap cannot be constructed; the hub still accepts the legacy single field.
+- **No dedupe of a retried post.** `find_envelope_by_causation` is a lookup for
+  handlers (`core.py:2146/2162` mints a new id and appends without a check), so
+  invariant 3b needs new hub behaviour (D-118).
+
+**Owner's decisions, 2026-11-11.** Keep the invariants; deviate from Python
+where the model forces it:
+
+- per-channel `since` on the wire, and the hub accepts the legacy single
+  `since_envelope_id` as well;
+- the post is idempotent per `(channel, sender, causation_id)`;
+- the client re-acks its per-channel high-water on reconnect (Python only bounds
+  replay by `since` and never advances the cursor from it, so a lost receipt
+  leaves the cursor behind forever);
+- a nack stops delivery of that channel until the reconnect (otherwise a later
+  ack moves the cursor past the nacked envelope);
+- the A2A tenant resolver receives the request and the identity, not just a
+  tenant name (D-121).
+
+**Where the nine requirements the models impose landed.** Landed in the merged
+wave: 2 (per-channel `since` — D-119), 4 (a receipt is refused unless the
+connection holds the agent and the envelope exists — D-119), 5 (idempotent post,
+index rebuilt from the WAL on hydrate — D-118), 8 (request ids unique for the
+process, not per connection — D-119), 9 (resubscribe opens with the current task
+and the server closes at the terminal event — D-123). Not landed, and not
+claimed: 1 (one ordered sender per connection and channel for live dispatch and
+replay), 3 (re-ack) and 6 (nack stops the channel) are delivery-path work — the
+replay itself is in a later entry; 7 stays a transport assumption (a transport
+that can drop a single frame needs an ack timeout and a resend).
+
+**Outside the models** (recorded, not promised): framing, auth, TLS, ping,
+backpressure and inbox capacity; timeouts, backoff and `max_reconnects`;
+WAL durability details (an append is assumed atomic and durable once acked, and
+the cursor map one atomic write); envelope id generation (ids must stay totally
+ordered in WAL order across restarts and clock skew); a connection holding
+several agents; federation and remote owners; channel lifecycle; protocol
+adapters. Liveness is checked under weak fairness and a finite fault budget
+(`MaxFaults`).
+
+## D-118 — 2026-11-11 — network: the hub persists across restarts and a retried post is accepted once (gap audit 2026-11-09, wave 4)
+
+W4-N1 closes invariant 5, the persistence half of 3. Coded in
+`network/persist.go` (+ `network/lifecycle.go`). Everything is additive: a hub
+built without a store behaves exactly as before.
+
+- **Durable registry.** `WithHubStore(knowledge.Store)` persists passports,
+  rules, resumes (including the observed track record), the capability index,
+  inbox cursors and nacks in Python's per-entity layout: `/agents/<id>/`
+  `passport.json`, `rule.json`, `resume.json`, `inbox.cursors.json`,
+  `inbox_nacks.jsonl`; `/registry/by_capability.json`; `/channels/<id>/`
+  `metadata.json` + `wal.jsonl`; `/tasks/<id>/checkpoint.json`. `StoreWAL` /
+  `NewStoreWAL` binds the existing `WAL` seam to the same store, so a hub with
+  only `WithHubStore` also logs channels and envelopes there. `Hydrate()`
+  rebuilds registry, cursors, nacks and the WAL; with no store it is `Replay`.
+- **`OpenHub` hydrates.** The production entry used to call `Replay()`, which
+  restored channels but not the registry — a restart gave a half-restored hub
+  and a reconnecting client could register the same name a second time
+  (reviewer round 1, risk 24). `OpenHub` now calls `Hydrate()`. Consequence
+  worth knowing: `OpenHub` can return an error on a corrupted store where it
+  used to start.
+- **Write order is disk first, memory second** (*AGO-DEVIATION:* Python and
+  `HubRestart.tla`'s `Ack` update memory first). Safe for invariant 5: memory is
+  never ahead of the store, a failed write leaves the live hub untouched, and a
+  crash between the steps loses only memory while the restart reads the newer
+  durable cursor. The same order is used for every registry write.
+- **The passport file is the commit point.** `Register` writes the rule first
+  and the passport last, `Unregister` deletes the passport first, and hydrate
+  collects directories left without a passport (*AGO-DEVIATION:* Python skips
+  such a directory and leaves it in the store; AGo deletes it, so a stale cursor
+  or rule can never reappear — `NoOrphanCursor`; a failed delete is retried by
+  the next hydrate). The capability index is a derived cache, rebuilt and
+  repaired from the resumes.
+- **Idempotent post** (*AGO-DEVIATION*): in `postLocked`, a post under the
+  `(channel, sender, causation_id)` of an accepted envelope returns that
+  envelope and appends or dispatches nothing. The index is rebuilt from the WAL
+  by `Replay`/`Hydrate` and pruned when the channel ends. Python's
+  `find_envelope_by_causation` stays a lookup for handlers.
+- **New API.** `Hub.AdvanceInboxCursor`, `Hub.InboxCursor`, `Hub.RecordNack`,
+  `Hub.Nacks`, the `Nack` struct. A cursor moves only forward, one channel never
+  touches another's, and a nack never moves it.
+- **One file per checkpoint** (*AGO-DEVIATION*): Python keeps
+  `checkpoint.json` and a separate `checkpoint_writers.json`; here the
+  checkpoint and its claimed writer share one file, so the claim cannot
+  disagree with the state it protects.
+- **Channel snapshot history is not kept** (*AGO-DEVIATION*):
+  `metadata.json` is overwritten as in Python, so `Replay` folds adapter state
+  for every envelope, including on channels that already ended terminal.
+
+Verified by `network/persist_prop_test.go`: 2 500 sequences (seeds
+20261111000..20261113499, ~19 650 restarts) that crash at every write boundary
+— register, unregister, rule/resume, open, close, post, ack, nack and inside
+hydrate — and check, after each restart, that the hub equals an independent
+parse of the store, that no acknowledged operation is lost, that nothing deleted
+comes back, that a second hydrate changes nothing, that the WAL only grows and
+that each causation key appears once. `AGO_PROP_SEQUENCES` shortens the run for
+mutation work only; CI leaves it unset (2 500). Reviewer round 2 accepted:
+mutant "`OpenHub` calls `Replay`" dies on the first seed, `persist.go`
+70/72 killed with both survivors equivalent.
+
+**Not done, on purpose:** the `(owner, task)` set behind `RecordObservation` is
+not persisted, so a repeated terminal event of the same task counts twice after
+a restart (Python's `_observed_task_ids` is memory-only too) — `known-issues.md`,
+risk 4; `AdvanceInboxCursor` does not check that the envelope exists in the
+channel — that check lives on the wire (D-119); the replay itself is a later
+entry.
+
+## D-119 — 2026-11-11 — network: the remote hub — a per-connection wire endpoint and `HubClient` remote mode over transport links (gap audit 2026-11-09, wave 4)
+
+W4-N2 turns the hub into something a process can serve and another process can
+use, and closes invariant 6. Coded in `network/hubserver.go`, `wire.go`,
+`remoteclient.go`, `hubapi.go` and `network/transport/{pipe.go,frames.go}`.
+Exported signatures of `AgentClient`, `HumanClient` and `ClientTask` are
+unchanged: they now speak to an unexported `hubAPI` interface implemented by
+both `*Hub` and the remote proxy.
+
+- **Identity belongs to the connection.** `Hub.ServeLink(ctx, transport.Link)`
+  serves exactly one connection; the endpoint id is minted by the hub inside the
+  call and no frame can choose one. `Frame.From`/`Frame.To` are not consulted
+  anywhere in the server or the client. `Hub.Serve(ctx, Acceptor)` serves a
+  listener, and `transport.NewPipe` / `transport.NewMemListener` give tests and
+  in-process deployments a link with no addressing at all. Reviewer round 1
+  found the opposite (`ServeLink` took the identity from `Frame.From`, so a
+  foreign connection could unregister or post as somebody else, risk 10); the
+  fix is pinned by a test that sends all 31 operations from a foreign
+  connection with forged `From` values: the 20 operations on the victim's
+  resources answer `access_denied`, the 10 open discovery operations answer
+  normally, and the victim is unchanged.
+- **The wire.** 31 operations: Python's 30 (`register` … `read_task_checkpoint`)
+  plus `add_resume_example` (*AGO-DEVIATION:* a new op — Python's
+  `AddResumeExample` is a get+set pair that loses concurrent appends; here 24
+  parallel calls keep all 24 examples). Op names are Python's, parameters are
+  Go structs (*AGO-DEVIATION:* Python passes dicts). Hello/Welcome/Error carry
+  an echoed `RequestID` (*AGO-DEVIATION:* Python matches Hello by FIFO, where a
+  stale frame of the old connection could confirm a new request). Error codes
+  travel as strings (`name_taken`, `channel_closed`, `access_denied`, …) so
+  `errors.Is` works across the link.
+- **Per-channel `since`.** `HelloBody.Since` is the per-channel high-water
+  (`HelloSince`), `HelloBody.SinceEnvelopeID` is the legacy single field the hub
+  still accepts (`null` skips replay, `""` replays everything). This is the
+  owner's decision in D-117: the single value can hide a lost envelope of
+  another channel (mutation D8).
+- **Receipts.** `ack` moves the cursor (`AdvanceInboxCursor`, D-118) and frees
+  an inbox slot; `nack` is recorded. A receipt is honoured only when the
+  envelope exists in the channel log, the recipient is a participant and is not
+  the sender, and the connection holds that agent; anything else is dropped
+  silently. The replay and the nack-stop are the later delivery entry.
+- **No skill registry on the wire** (*AGO-DEVIATION*): `get_skill` answers
+  `null` and `set_skill` with a non-empty value is a protocol error — AGo has no
+  SKILL.md registry (`listener.go:64`).
+- **`remote_agent` is refused on the wire** (*AGO-DEVIATION*): Python lets a
+  remote agent re-attach to a connection that already has an owner; the
+  owner-tracking that would make that safe is not ported, so the Hello is
+  rejected.
+- **`auth_scheme: ""` means `"none"`** (*AGO-DEVIATION*, Python's
+  `HelloFrame` default): an agent registered with `NoAuth` is taken over by name
+  by the next Hello that asks for it — same as Python, pinned by a test. Every
+  deployment that exposes `ServeLink` beyond a trusted boundary must therefore
+  register agents with `ApiKeyAuth`/an `AuthAdapter`; this is a warning, not a
+  default change.
+- **Remote client.** `ConnectHub(ctx, RemoteConfig{Dial, RPCTimeout})`,
+  `Dialer`, `ListenerDialer(*transport.MemListener)`, `HubClient.Attach`,
+  `Detach`, `Reconnect`, `Close`. Notifications arrive in a per-agent ordered
+  queue. `HubClient.Hub()` is nil on a remote client. `ClientTools` (the five
+  tools `peers`/`channels`/`tasks`/`context`/`delegate`), `NewNetworkPlugin` and
+  `AgentClient.ChannelTools` (the adapter's per-channel tools, `say`) work over
+  the wire; `ChannelTools` reconstructs a channel's state on the client by
+  folding the hub's log with the built-in adapters only — a custom hub-side
+  adapter gives an empty tool set remotely (`known-issues.md`).
+- **Request ids and correlation.** Ids are unique for the process, not per
+  connection (mutation L2), and a response is stamped with the serial number of
+  the connection the hub received the request on, so a late answer of an old
+  connection is rejected. Property test `TestRemoteRPCProperty`: 2 500 sequences
+  (seeds 20261112000..20261114499) with drops, duplicates, misroutes and
+  reconnects, asserting exactly one own response per request, no dangling
+  waiters and only typed errors (`ErrConnectionLost`, `ErrRPCTimeout`).
+- **Errors and limits.** `ErrNotRemote`, `ErrClientClosed`;
+  `RemoteConfig.RPCTimeout` defaults to 45 s because one `create_channel`
+  request spans the hub's invite-ack wait. `AddResumeExample` is atomic; a
+  remote `AckInbox` is a no-op because the hub already frees the slot on ack.
+- **Import edge.** `network` keeps its existing edges; the new code uses
+  `network/transport` only. No new package.
+
+**Deliberately not done:** the replay (`since` is parsed and validated, the
+replay itself is the later delivery entry), delivery to a `remote_agent`
+(D-056 federation stub unchanged) and skills over the wire (D-056).
+
+## D-120 — 2026-11-11 — a2a: full conversation history on continuations (gap audit 2026-11-09, wave 4)
+
+W4-A2 (first item). `a2a/history.go` carries the AG2 history payload in a
+`vnd.ag2.history+json` (`a2a.MIMEHistory`) data part: `EventsToPayload` /
+`PayloadToEvents` cover all seven event kinds (`HistoryKind*`) and the five
+input-part types (`HistoryPartText`, `HistoryPartBinary`, `HistoryPartURL`,
+`HistoryPartFileID`, `HistoryPartData`; transient and
+unknown events are dropped), `AttachHistory` / `ParseHistory` attach and decode
+it, `WithHistory` is the `MessageOption`, and `BuildToolResultMessage` takes
+options too, emitting parts in Python's order (results → schemas → history).
+Server side, `ServerConfig.RestoreHistory` is called once per turn in
+`beginTurn` (the shared path of JSON-RPC, SSE and REST) with the decoded events;
+a malformed part is `-32602`. *AGO-DEVIATION:* the restore is a hook the
+application implements; Python's executor replaces the turn stream's history
+directly (`stream.history.replace`), but the a2a server here owns no agent
+stream, so the caller decides where the history goes.
+
+Deviations, each `// AGO-DEVIATION` in `history.go`:
+
+- **Non-text tool results render as their JSON encoding** — Python falls back to
+  `str()` on the dataclass, whose repr no peer can parse and which loses the
+  payload. Text parts concatenate as in Python.
+- **A failed result inside a `tool_results` batch keeps its error text in the
+  content** — the batch decodes to `[]ToolResultEvent`, which cannot hold the
+  narrower `ToolErrorEvent`; a standalone `tool_result` entry does round-trip as
+  the error event.
+- **An empty `arguments` string comes back as `"{}"`** — `omitempty` on the wire
+  cannot tell `""` from absent, and `"{}"` is the documented SDK default; AG2
+  always builds calls with `"{}"`.
+
+**Not done:** the `RunClientTools` / `RunWithHumanInput` drivers do not
+synthesise the history themselves — a transport client has no AG2 stream, so the
+caller passes it with `WithHistory`; the LLMClient adapter stays deferred with
+D-049.
+
+## D-121 — 2026-11-11 — a2a: tenants — the claim on the wire, a request-aware resolver and an identity hook (gap audit 2026-11-09, wave 4)
+
+W4-A2 (second item). `a2a/tenant.go` makes the `tenant` field of D-049/D-056
+routing: the tenant comes from JSON-RPC `params.tenant`, from the REST prefix
+`/{tenant}/message:send`, `/{tenant}/tasks[/{id}[:cancel]]`, or from
+`ServerConfig.Tenant`; `ServerConfig.StoreForTenant(tenant)` selects the
+`TaskStore` a turn's tasks live in, so read/cancel/list of another tenant's task
+is "not found". An unknown tenant (`StoreForTenant` returns nil,
+`ErrUnknownTenant`) is `400` on REST and `-32602` on JSON-RPC/SSE; a resolver
+that refuses answers `403` on REST and `-32602` on the RPC surfaces. The client
+side is `WithTenant(name)` (params and REST path) and adoption of the tenant from
+the declared interface.
+
+The owner's decision of 2026-11-11 (D-117) is that the server must be able to
+*authorize* the claim, so the seam carries the request and the identity:
+
+- `ServerConfig.AuthorizeIdentity func(*http.Request) (any, error)` runs after
+  `Authorize` (both must pass; a refusal is `403` and the identity hook is not
+  reached), and its result is put on the request context (`IdentityFrom`) and
+  handed to the resolver.
+- `ServerConfig.TenantResolver func(ctx, *TenantRequest) (string, error)` with
+  `TenantRequest{Request, Tenant, Identity}` runs on every JSON-RPC method and on
+  the REST message/task routes — including when the client named no tenant, so a
+  deployment can derive the tenant from the identity alone. A refusal is `403`
+  (`-32602` on the RPC surfaces) with a fixed message. The card routes stay
+  public and are not resolved.
+
+*AGO-DEVIATION:* the a2a-sdk threads a `ServerCallContext` into every store
+method and lets the store resolve the owner; AGo keeps `TaskStore` free of
+context plumbing and resolves the tenant in the server. A side effect, stated as
+a warning on `ServerConfig.StoreForTenant`/`TenantResolver` and on `WithTenant`:
+**without a resolver the tenant is nothing but a client's claim** and every
+caller shares one store — a deployment that isolates tenants must configure
+`TenantResolver` (and, to bind it to a caller, `AuthorizeIdentity`).
+
+REST grammar detail, pinned by `TestSplitTenantPathParses`: `/{tenant}/message:send`,
+`/{tenant}/tasks[/{id}[:cancel]]` are tenant paths; `//tasks` and `/acme/` are
+not. **Not done:** a tenant in a REST request body is not read (the SDK puts it
+in the path); push configs are not keyed by tenant separately (the task's
+existence in the tenant's store is the guard).
+
+## D-122 — 2026-11-11 — a2a: agent-card JWS signatures, compatible with a2a-sdk 1.3.0 including proto3 presence (gap audit 2026-11-09, wave 4)
+
+W4-A2 (third item). `a2a/jws.go` and the card route in `server.go`: a detached
+JWS in the A2A card shape (`{protected, signature}`, signature over
+`ASCII(base64url(header) + "." + base64url(payload))`), algorithms ES256/384/512,
+RS256/384/512, PS*, EdDSA and HS*; keys are typed or PEM. `SignCardJWS`,
+`NewCardSigner` → `CardSigner`, `NewCardSignatureVerifier` → `CardVerifier`,
+`WithCardVerifier` on the client, `ErrCardSignature`, `ErrStaleCardSignature`,
+`NewServerChecked`.
+
+- **The signed payload is the SDK's proto-JSON form.** The card is rendered the
+  way `MessageToDict` renders the protobuf message (camelCase, proto3 defaults
+  dropped), `signatures` is removed, empty strings/lists/objects are dropped
+  (`_clean_empty`), then RFC 8785 (JCS). Depth is capped at 128 and integers
+  outside ±(2^53−1) are rejected instead of rounded (both `_jcs.py` rules).
+  Checked in both directions against the real SDK descriptor and PyJWT
+  (`TestCardSigningPayloadMatchesSDKForm`, `TestCardSignatureGoldenVector`,
+  `TestSigningPresenceGoldenVector`).
+- **Proto3 `optional` presence is part of the signature.** `streaming`,
+  `pushNotifications` and `extendedAgentCard` are `optional` in the SDK
+  descriptor: an explicitly set `false` is written, an unset field is omitted,
+  and the two payloads sign differently. The Go struct keeps the `bool` API and
+  records presence in unexported bits: `SetStreaming`, `SetPushNotifications`,
+  `SetExtendedAgentCard` mark a field present, `MarshalJSON`/`UnmarshalJSON`
+  keep presence across a JSON round trip and a clone.
+- **Card wire changes to know about** (all three from this entry; harmless to a
+  client that reads absence as `false`): an unset `streaming: false` is no
+  longer written, so a zero card now serves `{"pushNotifications":false}` where
+  it used to serve `{"streaming":false,"pushNotifications":false}`; a card with
+  `PushNotifications: true` and no `PushStore` is served as `false` (the server
+  always declares the flag —
+  `card.Capabilities.SetPushNotifications(cfg.PushStore != nil)`, parity
+  `server.py:218`); `extendedAgentCard` is declared only when a second card
+  exists. `reflect.DeepEqual` between a decoded and a literal card now sees the
+  presence bits.
+- **A stale signature is detected on the payload, not on the flags:**
+  `NewServerChecked` fails at construction and `NewServer` answers `500` on the
+  card routes when the prepared card canonicalizes differently from the signed
+  one without a `CardSigner` (*AGO-DEVIATION:* Python raises
+  `A2AStaleCardSignatureError` from `build_jsonrpc`/`build_rest`).
+- **`CardSigner` mutates and returns an error** (*AGO-DEVIATION*): Python's
+  signer returns the card, so a signer could swap what the server serves; the Go
+  shape cannot.
+
+Reviewer history worth keeping: round 1 called the payload incompatible (it
+stripped explicit `false`); round 2 wrongly claimed the SDK does that, then
+corrected itself from the descriptor — the executor had already followed the
+descriptor, so round 3 accepted with the five reachable optional fields
+(`streaming`, `pushNotifications`, `extendedAgentCard`, `documentationUrl`,
+`iconUrl`) checked against `ParseDict → MessageToDict → _clean_empty` on five
+cards, and PyJWT accepting Go signatures for ES256/ES384/RS256/PS256/EdDSA/HS256.
+
+## D-123 — 2026-11-11 — a2a: client streaming, server artifact streaming, reconnect and resubscribe (gap audit 2026-11-09, wave 4)
+
+W4-A1 closes invariant 7 and the D-050 deferral ("client-side streaming is not
+ported"). Coded in `a2a/streamclient.go`, `streamhub.go` and `serverstream.go`.
+
+- **Client.** `Client.MessageStream(ctx, msg)` returns a `TaskStream` that
+  consumes JSON-RPC `message/stream` over SSE and the REST twin
+  `POST /message:stream`: task snapshot, status-update, artifact-update and
+  message frames. The stream ends on a settled state (terminal or interrupted,
+  parity `_states.py`). Knobs: `WithMaxReconnects` (default 3),
+  `WithReconnectBackoff` (500 ms × 2^(n−1)), `WithPollingInterval`,
+  `WithStreaming(false)`.
+- **Reconnect.** A broken stream resubscribes (`tasks/resubscribe`, REST
+  `GET /tasks/{id}:subscribe`); a failed *open* is an attempt like any other —
+  pause, retry, `ErrReconnect` with the last cause once the budget is spent
+  (round-1 finding: the first version returned the transport error immediately,
+  while Python catches it inside the loop). Next() without an open source goes
+  through the same loop.
+- **Polling fallback.** A clean EOF, a server answering `ErrUnsupportedOperation`
+  (`-32004`) and — *AGO-DEVIATION* — a "task not found" answer all fall back to
+  `tasks/get` polling; Python falls back only on `UnsupportedOperationError`, but
+  an evicted or restarted task is equally unstreamable and polling surfaces the
+  same `ErrTaskNotFound`.
+- **Server.** `ServerConfig.HandleStream(ctx, msg, StreamEmitter)` replaces
+  `Handle` for a turn that streams; `StreamEmitter.Artifact`/`Status` publish
+  `TaskArtifactUpdateEvent`s and fold each chunk into the task record
+  (`ApplyArtifactUpdate`, `KindArtifactUpdate`), so a stream and `tasks/get`
+  agree. A chunk after a cancel is `ErrStreamClosed`. `Status` is
+  progress-only: terminal and interrupted states come from the handler's return
+  value, so a streamed turn cannot contradict the record.
+  *AGO-DEVIATION:* the handler contract is one synchronous call, so streaming
+  needs this second entry point; without it the stream stays the two terminal
+  events of D-050.
+- **Slow subscriber** (*AGO-DEVIATION*): the per-server hub buffers 32 events
+  and disconnects a slow subscriber instead of blocking the producing turn (the
+  SDK's event queue blocks); the client resubscribes and opens with the current
+  task, so nothing is lost.
+- **Resubscribe opens with the current task** and closes at the terminal state;
+  on a terminal task it answers that final state and closes
+  (*AGO-DEVIATION*, required by the owner-confirmed invariant 7: the SDK refuses with
+  `UnsupportedOperationError`, and wave-4 invariant 7 needs the terminal state
+  always observed; this package's client falls back to polling when a remote
+  server does refuse). Unknown task → `-32001`/`404`; tenant-scoped through the
+  D-121 seam.
+
+Verified by `TestStreamConvergesAfterDrops` (2 000 seeds per binding; ~2 300
+breaks, 1 561 resubscribe snapshots) asserting convergence of status and
+artifacts, the terminal state exactly once and last, nothing after it, no
+foreign-task event and a monotone view; A1–A5 of the model are regression tests
+(`TestResubscribeOpensWithCurrentTask`,
+`TestResubscribeTerminalTaskReturnsFinalState`,
+`TestClientStreamIgnoresEventsAfterTerminal`, `TestServerMessageStreamArtifacts`,
+`TestServerResubscribeClosesStreamAtTerminal`). The reviewer's round-1 findings
+(failed-open retry, four surviving mutants, A2 not tested at the HTTP level) are
+closed; mutation harness `streamhub.go` 20/20 and `streamclient.go` 87/87
+killed, `serverstream.go` 13/13.
+
+**Not done:** `input-required`/`cancel` states, artifact content semantics and
+polling-a-fresh-task are outside the model; the LLMClient adapter stays with
+D-049; the replay half of the offline story is the later delivery entry.
 
