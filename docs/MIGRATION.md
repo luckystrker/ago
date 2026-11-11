@@ -615,6 +615,14 @@ behind the `network` changes are in `docs/acceptance/wave4-invariants.md`.
 | `message/stream` client consumption; `tasks/resubscribe`; `client.subscribe` | `Client.MessageStream(ctx, msg) (*TaskStream, error)`, `Client.Resubscribe`, `WithMaxReconnects`, `WithReconnectBackoff`, `WithPollingInterval`, `WithStreaming(false)`, `ErrReconnect` | JSON-RPC SSE and REST `POST /message:stream`; resubscribe opens with the current task and closes at the terminal state; a failed open is retried inside the budget; polling fallback on a clean EOF, `ErrUnsupportedOperation` and `ErrTaskNotFound` |
 | server artifact streaming (`chunk_to_text_artifact`) | `ServerConfig.HandleStream` + `StreamEmitter.Artifact`/`Status`, `a2a.ApplyArtifactUpdate`, `KindArtifactUpdate`, `ErrStreamClosed` | Each chunk folds into the task record, so `tasks/get` agrees with the stream. `Status` is progress-only; terminal/interrupted states come from the handler's return value. A subscriber more than 32 events behind is disconnected, not blocked |
 
+### Network: offline delivery and reconnect (D-124)
+
+| Python | AGo | Differences |
+|---|---|---|
+| `_replay_for_recipient` (active channels, after `max(cursor, since_envelope_id)`) | replay inside the per-(connection, agent) sender (`network/delivery.go`) | Per-channel since marks; a Hello without marks replays from the cursor; ended channels replay too |
+| `ReceiptFrame` ack / nack | the remote client acks every delivered envelope | A nack stops that channel until reconnect; the client re-acks its marks after reconnect |
+| `ws.py` reconnect | `RemoteConfig.Reconnect` (`ReconnectPolicy`); `contrib/wslink` `Dialer` / `RemoteConfig` / `HubHandler` | Backoff and attempt limit; `HubClient.Close` stops every pump |
+
 ### Card wire and semantics changes to check before upgrading
 
 - **The served agent card.** An unset `streaming: false` is no longer written, so a zero

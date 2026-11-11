@@ -2197,6 +2197,8 @@ live peer); `go build ./examples/...` / `go vet ./examples/...` clean. The optio
 
 ## D-057 — 2026-10-30 — contrib/ layout: optional modules with their own go.mod
 
+> **Extended by D-124** — `contrib/wslink` gains reconnect with backoff and a Hello carrying per-channel since marks.
+
 First `contrib/<name>` module: `contrib/wslink` (`module
 github.com/luckystrker/ago/contrib/wslink`), the WebSocket `transport.Link` port of
 `ag2/network/transport/ws.py`. Pattern, for every future contrib module:
@@ -5247,4 +5249,49 @@ killed, `serverstream.go` 13/13.
 **Not done:** `input-required`/`cancel` states, artifact content semantics and
 polling-a-fresh-task are outside the model; the LLMClient adapter stays with
 D-049; the replay half of the offline story is the later delivery entry.
+
+## D-124 — 2026-11-11 — network: offline delivery — store-and-forward, client receipts, per-channel replay and reconnect (gap audit 2026-11-09, wave 4)
+
+Closes the last network slice of wave 4 (invariants 1–4 of D-117, models
+`spec/tla/HubDelivery`, `HubMulti`, `HubAccess`).
+
+- **One ordered sender** per (connection, agent) walks each channel's WAL for
+  live delivery and replay together (`network/delivery.go`), so a live envelope
+  never overtakes replay and is never duplicated by it; per channel, order is
+  the WAL order the model requires. *AGO-DEVIATION:* Python replays and
+  dispatches on separate paths.
+- **Replay** runs strictly after max(persisted cursor, the client's per-channel
+  since), in WAL order, only to participants in the audience, never the
+  agent's own envelopes (Python parity: `sender_id == agent_id` is skipped; the
+  channel creator still receives its live `ag2.channel.opened`, and its ack
+  moves the cursor), and honours the inbound arbiter exactly as live dispatch
+  does. A dispatch failure stops that channel's replay (`OnDispatchFailed`).
+  *AGO-DEVIATIONs* required by invariant 1 under the owner's decision to keep
+  the invariants: a Hello without marks replays from the cursor (Python: a null
+  since skips replay); ended channels replay too (Python: active only);
+  ack/reject frames are never delivered.
+- **Receipts on the client:** every delivered envelope is acked; a duplicate at
+  or below the mark is acked again but not handed to the agent; a nack stops
+  that channel on the connection until reconnect (*AGO-DEVIATION*, owner
+  decision); after a reconnect the client sends its per-channel marks in Hello
+  and re-acks them (*AGO-DEVIATION*, owner decision: a lost receipt must not
+  leave the cursor behind forever).
+- **Reconnect:** `ReconnectPolicy` / `RemoteConfig.Reconnect` (backoff, attempt
+  limit; an identity refusal gives up at once); `HubClient.Close` stops every
+  pump. `contrib/wslink`: `Dialer`, `RemoteConfig`, `HubHandler` reconnect a
+  WebSocket client and pick up where it left off.
+- **Review fixes carried here:** acks are O(1) through an envelope-id index;
+  `NoAuth`/`DefaultAuthRegistry` and the Hello handler warn loudly that a NoAuth
+  agent can be taken over by name (as in Python), logged once per hub.
+
+Verified by the property test `TestDeliveryProperty` (2500 seeded sequences:
+2295 hub restarts through `OpenHub`, 7275 link drops, nacks, forged acks, three
+addressees, two channels, audiences; invariants 1–4 checked against the WAL and
+the audience independently of the delivery code), regression tests from the
+model's mutation traces (D13, D15, X1, X2), an end-to-end offline → hub restart
+→ reconnect test, wslink reconnect tests over httptest, and two DeepSeek review
+rounds (the arbiter-on-replay mutant killed; the `HubClient.Close` pump leak
+reproduced and fixed; remaining mutants equivalent). Known issue (risk 3): a
+race between the ack pump and `markLive` may skip the creator's own live
+`opened`, which is not a required delivery.
 

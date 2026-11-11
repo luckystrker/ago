@@ -124,3 +124,5 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
 - `agent/overrides.go`: the field `turnPluginContributions.observers` is never read.
 - `examples/policies_compact/main.go`: its header comment still says `SlidingWindowPolicy` has
   no transparent flag; `policies.WithWindowTransparency` exists since D-106.
+
+- **network (D-124, risk 3):** a race between the ack pump and `markLive` may skip the channel creator's own live `ag2.channel.opened`. That delivery is not required by invariant 1.
