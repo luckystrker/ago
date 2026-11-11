@@ -48,6 +48,11 @@ Entries below come from the gap-audit wave 3 review (2026-11-10) unless stated o
 
 ## Behavior notes
 
+- **`network` observation de-duplication is memory-only (W4-N1, risk 4).** `Hub.RecordObservation`
+  remembers the `(owner, task)` pairs it already counted in memory, so after a hub restart a
+  repeated terminal event of the same task counts a second time in the owner's observed track
+  record. Python does the same (`_observed_task_ids` is memory-only), so it is left as is.
+
 - **`mcpserver` (D-109).** Not done by design: the standalone listener of the *client* makes no
   second attempt after a 405 (the SDK tries twice; the outcome is the same); a resume stream does
   not repeat the priming event, and its `200` is sent before the replay result is known (same as

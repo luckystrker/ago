@@ -120,14 +120,14 @@ func (h *Hub) RegisterDefaultAdapters() {
 }
 
 // OpenHub is the production entry point: NewHub, the built-in adapters
-// (unless WithoutDefaultAdapters), a Replay of the WAL when one is attached,
-// then Start. NewHub stays the entry for tests that want no background work.
+// (unless WithoutDefaultAdapters), Hydrate (the registry from the store, then
+// a Replay of the WAL; either only when attached), then Start. NewHub stays the entry for tests that want no background work.
 func OpenHub(opts ...HubOption) (*Hub, error) {
 	h := NewHub(opts...)
 	if h.ext.lifecycle.defaultAdapters {
 		h.RegisterDefaultAdapters()
 	}
-	if err := h.Replay(); err != nil {
+	if err := h.Hydrate(); err != nil {
 		return nil, err
 	}
 	h.Start()

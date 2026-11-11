@@ -314,6 +314,7 @@ type Hub struct {
 	expectHandlers   map[string]ViolationHandler
 	firedViolations  map[string]map[string]bool // channel → "(idx|kind|violator)" fires (in-memory dedup)
 	wal              WAL
+	store            knowledge.Store // durable registry (WithHubStore); nil = in-memory only
 	now              func() time.Time
 	ids              *idMinter
 	ackWait          time.Duration
@@ -375,6 +376,9 @@ func NewHub(opts ...HubOption) *Hub {
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.store != nil && h.wal == nil {
+		h.wal = NewStoreWAL(h.store)
 	}
 	if log := h.ext.audit; log != nil {
 		if !log.clockSet {
@@ -445,6 +449,9 @@ func (h *Hub) Register(p Passport, r *Rule) (Passport, error) {
 		return Passport{}, fmt.Errorf("%w: %q", ErrNameTaken, stamped.Name)
 	}
 	stamped.CreatedAt = h.now()
+	if err := h.persistRegistrationLocked(stamped, *r); err != nil {
+		return Passport{}, err
+	}
 	h.passports[stamped.AgentID] = stamped
 	h.byName[stamped.Name] = stamped.AgentID
 	h.rules[stamped.AgentID] = r.Clone()
@@ -467,7 +474,11 @@ func (h *Hub) Unregister(agentID string) error {
 	if !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
+	if err := h.deleteRegistrationLocked(agentID); err != nil {
+		return err
+	}
 	h.forgetLocked(agentID, h.resumes[agentID])
+	h.persistCapIndexLocked()
 	delete(h.passports, agentID)
 	delete(h.byName, p.Name)
 	delete(h.rules, agentID)
@@ -557,8 +568,12 @@ func (h *Hub) SetResume(r Resume) error {
 	case cur.Version == 0:
 		cur.Version = 1
 	}
+	if err := h.persistResumeLocked(r.AgentID, cur); err != nil {
+		return err
+	}
 	h.resumes[r.AgentID] = cur
 	h.reindexLocked(r.AgentID, old, cur)
+	h.persistCapIndexLocked()
 	evs.add(func(l HubListener) {
 		l.OnAgentEvent(r.AgentID, AgentEventResumeSet, map[string]any{"version": cur.Version, "at": cur.LastUpdated})
 	})
@@ -963,6 +978,20 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 			ErrProtocol, ch.ID, ch.Manifest.Type, ch.Manifest.Version)
 	}
 
+	// Idempotent post. AGO-DEVIATION: Python's hub only exposes
+	// find_envelope_by_causation to handlers; here a post under the
+	// (channel, sender, causation_id) key of an accepted envelope returns that
+	// envelope and appends nothing, dispatches nothing — a retried post (client
+	// restart, lost reply, hub restart in between) is accepted once. The index
+	// is rebuilt from the WAL by Replay and pruned when the channel ends.
+	if env.CausationID != "" {
+		if pos, dup := h.ext.causation[ch.ID][causeKey{env.SenderID, env.CausationID}]; dup {
+			if log := h.logs[ch.ID]; pos >= 0 && pos < len(log) {
+				return log[pos], nil
+			}
+		}
+	}
+
 	// Per-envelope TTL (sender-asserted: only meaningful when the sender
 	// supplied a CreatedAt to measure from).
 	if env.TTLSecs > 0 && !env.CreatedAt.IsZero() && h.now().After(env.CreatedAt.Add(time.Duration(env.TTLSecs)*time.Second)) {
@@ -1301,6 +1330,14 @@ func (h *Hub) Replay() error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Rebuild from scratch: Replay (and Hydrate) is idempotent, running it
+	// again on a live hub folds the same WAL into the same state instead of
+	// appending the envelopes a second time.
+	h.channels = make(map[string]*ChannelHandle)
+	h.logs = make(map[string][]Envelope)
+	h.ext.causation = make(map[string]map[causeKey]int)
+	h.ext.peerCancel = make(map[string]map[string]bool)
+	h.ext.checkpoints = make(map[string]taskCheckpoint)
 	peerMarks := make(map[string]string) // task id → channel it was cancelled on
 	for _, rec := range recs {
 		switch rec.Kind {
@@ -1362,7 +1399,10 @@ func (h *Hub) Replay() error {
 			case EnvChannelClosed, EnvChannelExpired:
 				// State arrives via the channel snapshot; nothing to fold.
 			default:
-				if ch.adapter != nil && !ch.State.Terminal() {
+				// The fold runs for every other envelope, also on a channel
+				// whose (latest) snapshot is terminal: a store-backed WAL keeps
+				// only the final snapshot.
+				if ch.adapter != nil {
 					if _, err := ch.adapter.OnEnvelope(ch, env); err != nil {
 						return fmt.Errorf("replay fold failed on channel %s: %w", ch.ID, err)
 					}
