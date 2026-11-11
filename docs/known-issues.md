@@ -126,3 +126,8 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   no transparent flag; `policies.WithWindowTransparency` exists since D-106.
 
 - **network (D-124, risk 3):** a race between the ack pump and `markLive` may skip the channel creator's own live `ag2.channel.opened`. That delivery is not required by invariant 1.
+
+- **CI (v0.10.0 release, risk 2×2):** one `go test ./...` run on a GitHub runner failed in the release
+  workflow (darwin/arm64 build job, attempt 1 of run 43057561603) while five identical runs passed; the failing
+  test is unknown (job logs need an admin token) and two local full runs at GOMAXPROCS=2 were clean. Capture
+  the log on the next occurrence.
