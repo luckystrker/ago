@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -461,7 +462,7 @@ func TestRemoteEarlyNotifiesAreBufferedUpToTheBound(t *testing.T) {
 	rc := newRemoteOnFake(t, n)
 	cn, _ := rc.current()
 	for i := 0; i < 300; i++ {
-		payload, _ := json.Marshal(Envelope{ID: string(rune('a'+i%26)) + string(rune('a'+i/26)), ChannelID: "ch", EventType: EnvText})
+		payload, _ := json.Marshal(Envelope{ID: fmt.Sprintf("%04d", i), ChannelID: "ch", EventType: EnvText})
 		rc.onNotify(cn, transport.Frame{Kind: transport.FrameNotify, RecipientID: "late", ChannelID: "ch", EnvelopeID: "x", Payload: payload})
 	}
 	var mu sync.Mutex

@@ -130,17 +130,35 @@ func (h *Hub) PendingTurnsFor(agentID string) []PendingTurn {
 	return out
 }
 
+// envRef locates an accepted envelope: its channel and its position in the
+// channel's log.
+type envRef struct {
+	channel string
+	pos     int
+}
+
+// appendLogLocked appends env to the channel's in-memory log and indexes its id,
+// so a lookup by id is O(1) (every receipt asks for one). Callers hold h.mu.
+func (h *Hub) appendLogLocked(channelID string, env Envelope) {
+	h.logs[channelID] = append(h.logs[channelID], env)
+	if env.ID != "" {
+		h.ext.envIndex[env.ID] = envRef{channel: channelID, pos: len(h.logs[channelID]) - 1}
+	}
+}
+
 // envelopeByID finds one accepted envelope of a channel by hub-stamped id.
 func (h *Hub) envelopeByID(channelID, envelopeID string) (Envelope, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	log := h.logs[channelID]
-	for i := len(log) - 1; i >= 0; i-- {
-		if log[i].ID == envelopeID {
-			return log[i], true
-		}
+	ref, ok := h.ext.envIndex[envelopeID]
+	if !ok || ref.channel != channelID {
+		return Envelope{}, false
 	}
-	return Envelope{}, false
+	log := h.logs[channelID]
+	if ref.pos >= len(log) {
+		return Envelope{}, false
+	}
+	return log[ref.pos], true
 }
 
 // --- per-adapter LLM tools ---------------------------------------------------------

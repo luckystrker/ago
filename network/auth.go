@@ -28,6 +28,14 @@ type AuthAdapter interface {
 }
 
 // NoAuth accepts every claim; it is the default registry's only entry.
+//
+// WARNING: an identity registered under the "none" scheme has no credential
+// at all. On a hub that is reachable over a transport (Hub.ServeLink /
+// Hub.Serve) anyone who knows its name can send a hello for it and take it
+// over — the connection is then bound to that identity and receives its
+// messages (Python behaves the same). Serve a hub to untrusted peers only with
+// a registry without NoAuth (WithHubAuth) or on a loopback/private transport;
+// serving a hub that still accepts "none" logs a warning.
 type NoAuth struct{}
 
 // Scheme implements AuthAdapter.
@@ -118,7 +126,8 @@ func NewAuthRegistry(adapters ...AuthAdapter) *AuthRegistry {
 }
 
 // DefaultAuthRegistry is the NoAuth-only registry a hub uses unless
-// WithHubAuth says otherwise.
+// WithHubAuth says otherwise. WARNING: with it, every identity of the hub can
+// be taken over by name over a served link — see NoAuth.
 func DefaultAuthRegistry() *AuthRegistry { return NewAuthRegistry(NoAuth{}) }
 
 // Get resolves a scheme; unknown schemes fail with ErrAuth.
