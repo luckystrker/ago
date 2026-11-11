@@ -5295,3 +5295,14 @@ reproduced and fixed; remaining mutants equivalent). Known issue (risk 3): a
 race between the ack pump and `markLive` may skip the creator's own live
 `opened`, which is not a required delivery.
 
+
+## D-125 — 2026-11-11 — release v0.10.0: speed gate on allocation evidence
+
+The release rule (more than 10 % slower than the baseline means no release) needs a wall-clock measurement. On
+2026-11-11 the VPS was loaded by other projects (load average 9–15 on 6 cores) and paired, alternating
+`benchmarks/agobench` runs of `main` and the candidate spread from −42 % to +206 %, so the rule could not be
+applied honestly. Allocations per iteration, which do not depend on load, are identical between `main` and the
+candidate in all four scenarios (plain_chat, tool_roundtrip, streaming, concurrent); bytes per iteration grew by
+2.6–7.6 % with the wider configuration structs. **Owner decision:** release v0.10.0 on this allocation evidence;
+the report is `docs/releases/2026-11-11-v0.10.0.md`. Next time, measure timing on a quiet machine before the
+release candidate is cut.
