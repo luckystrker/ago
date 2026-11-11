@@ -3,6 +3,8 @@ package zai
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/luckystrker/ago/config"
 	agocontext "github.com/luckystrker/ago/context"
@@ -11,14 +13,27 @@ import (
 
 // chatClient is the LLMClient that ZAIConfig.Create returns: the shared
 // OpenAI-compatible chat engine bound to one validated parameter set.
-// Immutable; safe for concurrent use.
+// Immutable after construction; safe for concurrent use.
 type chatClient struct {
 	params config.CompatParams
+	// tokenAuth mints a fresh short-lived bearer token on every call (Python
+	// parity: disable_token_cache=False); params.APIKey then holds the raw key.
+	tokenAuth bool
 }
 
 // Call performs one model call (config.LLMClient).
 func (c *chatClient) Call(ctx context.Context, messages []events.Event, conv *agocontext.Context, opts config.CallOptions) (*events.ModelResponse, error) {
-	return config.RunChatCompat(ctx, c.params, messages, conv, opts)
+	params := c.params
+	if c.tokenAuth {
+		// A turn can outlive one token (210 s): minting per request means a
+		// long tool loop never sends an expired bearer.
+		token, err := mintAuthToken(params.APIKey, nowFunc())
+		if err != nil {
+			return nil, err
+		}
+		params.APIKey = token
+	}
+	return config.RunChatCompat(ctx, params, messages, conv, opts)
 }
 
 // Compile-time contract checks.
@@ -85,6 +100,77 @@ func setI64(dst **int64, name string, v any) error {
 		*dst = &n64
 	default:
 		return fmt.Errorf("config/zai: override %q: got %T, want int64", name, v)
+	}
+	return nil
+}
+
+func setDuration(dst *time.Duration, name string, v any) error {
+	d, ok := v.(time.Duration)
+	if !ok {
+		return fmt.Errorf("config/zai: override %q: got %T, want time.Duration", name, v)
+	}
+	*dst = d
+	return nil
+}
+
+func setHTTPClient(dst **http.Client, name string, v any) error {
+	switch h := v.(type) {
+	case nil:
+		*dst = nil
+	case *http.Client:
+		*dst = h
+	default:
+		return fmt.Errorf("config/zai: override %q: got %T, want *http.Client", name, v)
+	}
+	return nil
+}
+
+func setBoolPtr(dst **bool, name string, v any) error {
+	switch b := v.(type) {
+	case nil:
+		*dst = nil
+	case *bool:
+		*dst = b
+	case bool:
+		*dst = &b
+	default:
+		return fmt.Errorf("config/zai: override %q: got %T, want bool", name, v)
+	}
+	return nil
+}
+
+func setStrings(dst *[]string, name string, v any) error {
+	switch s := v.(type) {
+	case nil:
+		*dst = nil
+	case []string:
+		*dst = s
+	default:
+		return fmt.Errorf("config/zai: override %q: got %T, want []string", name, v)
+	}
+	return nil
+}
+
+func setStringMap(dst *map[string]string, name string, v any) error {
+	switch m := v.(type) {
+	case nil:
+		*dst = nil
+	case map[string]string:
+		*dst = m
+	default:
+		return fmt.Errorf("config/zai: override %q: got %T, want map[string]string", name, v)
+	}
+	return nil
+}
+
+func setAnyMap(dst *map[string]any, name string, v any) error {
+	switch m := v.(type) {
+	case nil:
+		*dst = nil
+	case map[string]any:
+		*dst = m
+	default:
+		return fmt.Errorf("config/zai: override %q: got %T, want map[string]any", name, v)
 	}
 	return nil
 }

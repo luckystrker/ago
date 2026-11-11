@@ -20,6 +20,7 @@ var _ Tool = (*ShellTool)(nil)
 var _ Tool = (*MemoryTool)(nil)
 var _ Tool = (*MCPServerTool)(nil)
 var _ Tool = (*ToolSearchTool)(nil)
+var _ Tool = (*RetrievalTool)(nil)
 
 func newHostedTools() []Tool {
 	mcp, _ := NewMCPServer("https://mcp.example", "docs")
@@ -34,6 +35,7 @@ func newHostedTools() []Tool {
 		NewMemory(),
 		mcp,
 		search,
+		NewRetrieval("kb-1"),
 	}
 }
 
@@ -52,6 +54,7 @@ func TestHostedToolNames(t *testing.T) {
 		{MemoryToolName, "memory", true},
 		{MCPServerToolName, "mcp_server", true},
 		{ToolSearchToolName, "tool_search", true},
+		{RetrievalToolName, "retrieval", true},
 	}
 	for i, tt := range want {
 		tool := newHostedTools()[i]
@@ -218,6 +221,16 @@ func TestHostedSchemaGoldenJSON(t *testing.T) {
 			name: "tool_search bm25",
 			tool: mustToolSearch(t, "bm25", NewMemory()),
 			want: `{"mode":"bm25"}`,
+		},
+		{
+			name: "retrieval id only",
+			tool: NewRetrieval("kb-1"),
+			want: `{"knowledge_id":"kb-1"}`,
+		},
+		{
+			name: "retrieval with template",
+			tool: NewRetrieval("kb-1", WithRetrievalPromptTemplate("Use {{knowledge}} to answer {{question}}")),
+			want: `{"knowledge_id":"kb-1","prompt_template":"Use {{knowledge}} to answer {{question}}"}`,
 		},
 	}
 	for _, tc := range cases {
@@ -422,4 +435,139 @@ func mustToolSearch(t *testing.T, mode string, ts ...Tool) *ToolSearchTool {
 		t.Fatalf("NewToolSearch: %v", err)
 	}
 	return s
+}
+
+func varContext(t *testing.T, vars map[string]any) *agocontext.Context {
+	t.Helper()
+	cx := agocontext.New(stream.NewMemoryStream())
+	for k, v := range vars {
+		if err := cx.SetVariable(k, v); err != nil {
+			t.Fatalf("SetVariable(%s): %v", k, err)
+		}
+	}
+	return cx
+}
+
+func firstSchemaJSON(t *testing.T, tool Tool, cx *agocontext.Context) string {
+	t.Helper()
+	ss, err := tool.Schemas(cx)
+	if err != nil {
+		t.Fatalf("Schemas: %v", err)
+	}
+	b, err := json.Marshal(ss[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestHostedVariableKwargsResolvePerTurn: a bound parameter follows the
+// conversation variable on every Schemas call (Python: resolve_variable).
+func TestHostedVariableKwargsResolvePerTurn(t *testing.T) {
+	tool := NewWebSearch(
+		WithWebSearchMaxUses(1), // overridden by the binding
+		WithWebSearchVariable("max_uses", NewVariable("")),
+		WithWebSearchVariable("allowed_domains", NewVariable("doms", []string{"default.example"})),
+		WithWebSearchVariable("user_location", NewVariable("loc")),
+	)
+	cx := varContext(t, map[string]any{
+		"max_uses": 7,
+		"loc":      map[string]any{"city": "Oslo", "country": "NO"},
+	})
+	want := `{"max_uses":7,"user_location":{"city":"Oslo","country":"NO"},` +
+		`"allowed_domains":["default.example"],"web_search_version":"web_search_20250305"}`
+	if got := firstSchemaJSON(t, tool, cx); got != want {
+		t.Fatalf("turn 1 schema =\n%s\nwant\n%s", got, want)
+	}
+	// The next turn sees the new value: nothing is cached at construction.
+	if err := cx.SetVariable("max_uses", 9); err != nil {
+		t.Fatal(err)
+	}
+	ss, _ := tool.Schemas(cx)
+	if got := *ss[0].(WebSearchToolSchema).MaxUses; got != 9 {
+		t.Fatalf("turn 2 max_uses = %d, want 9", got)
+	}
+}
+
+func TestHostedVariableKwargsErrors(t *testing.T) {
+	cx := varContext(t, map[string]any{"mu": "not-a-number"})
+	if _, err := NewWebSearch(WithWebSearchVariable("max_uses", NewVariable("absent"))).Schemas(cx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing variable without default: err = %v, want ErrNotFound", err)
+	}
+	if _, err := NewWebSearch(WithWebSearchVariable("max_uses", NewVariable("mu"))).Schemas(cx); err == nil ||
+		!strings.Contains(err.Error(), "wrong type") {
+		t.Fatalf("mistyped variable: err = %v, want a wrong-type error", err)
+	}
+	if _, err := NewWebSearch(WithWebSearchVariable("nope", NewVariable("x", 1))).Schemas(cx); err == nil ||
+		!strings.Contains(err.Error(), "unknown parameter") {
+		t.Fatalf("unknown parameter: err = %v", err)
+	}
+	// A nil context resolves through defaults only.
+	ss, err := NewWebFetch(WithWebFetchVariable("max_uses", NewVariable("m", 3))).Schemas(nil)
+	if err != nil || *ss[0].(WebFetchToolSchema).MaxUses != 3 {
+		t.Fatalf("nil-context default: %v, %v", ss, err)
+	}
+}
+
+// TestHostedVariableCarriersAllBind covers the remaining carriers, including
+// MCP server url/label supplied by variable only.
+func TestHostedVariableCarriersAllBind(t *testing.T) {
+	cx := varContext(t, map[string]any{
+		"url": "https://mcp.example", "label": "docs", "kb": "kb-9", "size": "512x512",
+		"stores": []string{"fileSearchStores/a"}, "env": map[string]any{"reference": map[string]any{"container_id": "c1"}},
+	})
+	mcp, err := NewMCPServer("", "", WithMCPServerVariable("server_url", NewVariable("url")),
+		WithMCPServerVariable("server_label", NewVariable("label")))
+	if err != nil {
+		t.Fatalf("NewMCPServer with variables: %v", err)
+	}
+	if _, err := NewMCPServer("", "x"); err == nil {
+		t.Fatal("an empty url without a bound variable must still fail")
+	}
+	for _, tc := range []struct {
+		tool Tool
+		want string
+	}{
+		{mcp, `{"server_url":"https://mcp.example","server_label":"docs"}`},
+		{NewRetrieval("", WithRetrievalVariable("knowledge_id", NewVariable("kb"))), `{"knowledge_id":"kb-9"}`},
+		{NewImageGeneration(WithImageGenerationVariable("size", NewVariable("size"))), `{"size":"512x512"}`},
+		{NewFileSearch(WithFileSearchVariable("store_names", NewVariable("stores"))),
+			`{"vector_store_ids":[],"store_names":["fileSearchStores/a"]}`},
+		{NewShell(WithShellVariable("environment", NewVariable("env"))),
+			`{"version":"bash_20250124","environment":{"reference":{"container_id":"c1"}}}`},
+	} {
+		if got := firstSchemaJSON(t, tc.tool, cx); got != tc.want {
+			t.Errorf("%s = %s, want %s", tc.tool.Name(), got, tc.want)
+		}
+	}
+}
+
+func TestGoogleMapsCarrier(t *testing.T) {
+	var _ Tool = (*GoogleMapsTool)(nil)
+	plain := NewGoogleMaps(WithGoogleMapsLocation(59.9, 10.7), WithGoogleMapsLanguageCode("nb"), WithGoogleMapsWidget(true))
+	if got, want := firstSchemaJSON(t, plain, nil), `{"latitude":59.9,"longitude":10.7,"language_code":"nb","enable_widget":true}`; got != want {
+		t.Fatalf("schema = %s, want %s", got, want)
+	}
+	if got := firstSchemaJSON(t, NewGoogleMaps(), nil); got != `{"enable_widget":false}` {
+		t.Fatalf("bare schema = %s", got)
+	}
+	if plain.Name() != "google_maps" || !plain.DeclaredInCode() {
+		t.Fatalf("name/declared = %q/%v", plain.Name(), plain.DeclaredInCode())
+	}
+	ts, _ := plain.Schemas(nil)
+	if ts[0].(ToolSchema).SchemaType() != GoogleMapsToolName {
+		t.Fatal("schema type")
+	}
+	if ids, err := plain.Register(nil, nil); err != nil || len(ids) != 0 {
+		t.Fatalf("Register = %v, %v; want a no-op", ids, err)
+	}
+	// Per-turn latitude/longitude from the conversation (user location).
+	byVar := NewGoogleMaps(
+		WithGoogleMapsVariable("latitude", NewVariable("user_lat")),
+		WithGoogleMapsVariable("longitude", NewVariable("user_lng")),
+	)
+	cx := varContext(t, map[string]any{"user_lat": 1.5, "user_lng": 2.5})
+	if got, want := firstSchemaJSON(t, byVar, cx), `{"latitude":1.5,"longitude":2.5,"enable_widget":false}`; got != want {
+		t.Fatalf("variable schema = %s, want %s", got, want)
+	}
 }

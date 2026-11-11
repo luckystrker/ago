@@ -42,7 +42,7 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	body := map[string]any{
 		"model":    c.cfg.model,
 		"messages": wireMessages,
-		"stream":   false,
+		"stream":   c.cfg.streaming,
 	}
 	if o := c.options(); len(o) > 0 {
 		body["options"] = o
@@ -72,12 +72,16 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	}
 
 	url := strings.TrimSuffix(c.host, "/") + "/api/chat"
+	if c.cfg.streaming {
+		return c.callStreaming(ctx, url, headers, body, conv)
+	}
+
 	status, data, err := c.http.PostJSON(ctx, url, headers, body)
 	if err != nil {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("ollama: chat returned %d: %s", status, snippet(data))
+		return nil, config.NewAPIError(config.ProviderOllama, "ollama: chat", status, nil, data)
 	}
 	var raw chatResponse
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -126,15 +130,11 @@ func (c *client) options() map[string]any {
 	if c.cfg.seed != nil {
 		o["seed"] = *c.cfg.seed
 	}
-	return o
-}
-
-// snippet renders the first bytes of an error response body.
-func snippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		return s[:max] + "…"
+	if c.cfg.frequencyPenalty != nil {
+		o["frequency_penalty"] = *c.cfg.frequencyPenalty
 	}
-	return s
+	if c.cfg.presencePenalty != nil {
+		o["presence_penalty"] = *c.cfg.presencePenalty
+	}
+	return o
 }

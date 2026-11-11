@@ -8,18 +8,24 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Client is a transport-level A2A client: agent-card discovery plus the
-// request/response JSON-RPC methods against one server, the push-notification
+// request/response methods (JSON-RPC, or REST when the card or WithTransport
+// selects it) against one server, the push-notification
 // config surface, and the client-tools / HITL drivers (clienttools.go). Safe
 // for concurrent use.
 //
 // This is not the conversational A2AClient of Python (client.py:159 — an
-// LLMClient that ships full AG2 history per turn and syncs conversation
-// state); that turn machinery is deferred (D-049).
+// LLMClient that drives the turn machinery itself: it computes the AG2 history
+// and syncs conversation state). The wire half ships here — WithHistory puts
+// the conversation on a continuation, WithTenant scopes a request,
+// WithCardVerifier checks the served card, and MessageStream/Resubscribe
+// (streamclient.go) read a task stream with reconnect-and-backoff and a
+// polling fallback — while the LLMClient adapter stays deferred (D-049).
 //
 // AGO-DEVIATION: Python's A2AClient is an LLMClient provider (not a tool), so
 // no tool adapter ships from this package; D-049.
@@ -30,6 +36,27 @@ type Client struct {
 	headers    map[string]string
 	extensions []string
 	nextID     atomic.Int64
+
+	// Knobs (client_options.go). Zero values keep the plain behavior: post
+	// JSON-RPC to base+"/", no card resolution, no hooks.
+	preset       *AgentCard
+	prefer       string
+	historyLen   int
+	tenant       string
+	cardVerifier CardVerifier
+	interceptors []CallInterceptor
+
+	// Streaming knobs (streamclient.go); NewClient installs the Python
+	// defaults, so the zero value of a Client built by hand still streams.
+	streaming        bool
+	maxReconnects    int
+	reconnectBackoff time.Duration
+	pollingInterval  time.Duration
+
+	// Resolved endpoint (interface selection, clientconn.go); guarded by
+	// connMu and set only after a successful Connect.
+	connMu   sync.Mutex
+	resolved *endpoint
 }
 
 // ClientOption configures a Client.
@@ -78,9 +105,13 @@ const defaultHTTPTimeout = 120 * time.Second
 // "http://localhost:8000"). The JSON-RPC endpoint is baseURL + "/".
 func NewClient(baseURL string, opts ...ClientOption) *Client {
 	c := &Client{
-		base:     strings.TrimSuffix(baseURL, "/"),
-		cardPath: DefaultCardPath,
-		http:     &http.Client{Timeout: defaultHTTPTimeout},
+		base:             strings.TrimSuffix(baseURL, "/"),
+		cardPath:         DefaultCardPath,
+		http:             &http.Client{Timeout: defaultHTTPTimeout},
+		streaming:        true,
+		maxReconnects:    defaultMaxReconnects,
+		reconnectBackoff: defaultReconnectBackoff,
+		pollingInterval:  defaultPollingInterval,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -88,13 +119,49 @@ func NewClient(baseURL string, opts ...ClientOption) *Client {
 	return c
 }
 
-// AgentCard fetches and decodes the server's agent card.
+// WithCardVerifier makes the client verify the JWS signatures of every card
+// it consumes — the fetched card, the preset card, and the authenticated
+// extended card — and refuse a card that does not verify, with
+// ErrCardSignature (parity: A2AConfig.card_signature_verifier, which the
+// Python client applies to all three sources). Nil accepts any card, the
+// unsigned default.
+func WithCardVerifier(v CardVerifier) ClientOption {
+	return func(c *Client) { c.cardVerifier = v }
+}
+
+// verifyCard runs the configured verifier on card, naming the source that
+// failed (parity: client.py _verify_card wrapping the SDK error in
+// A2ACardSignatureError with the source and URL).
+func (c *Client) verifyCard(card *AgentCard, source string) error {
+	if c.cardVerifier == nil {
+		return nil
+	}
+	if err := c.cardVerifier(card); err != nil {
+		return fmt.Errorf("%w (%s) for %q: %v", ErrCardSignature, source, c.base, err)
+	}
+	return nil
+}
+
+// AgentCard fetches and decodes the server's agent card; with WithPresetCard
+// it returns a copy of the injected card without any request.
 func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
+	if c.preset != nil {
+		card, err := cloneCard(c.preset)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.verifyCard(card, "preset agent card"); err != nil {
+			return nil, err
+		}
+		return card, nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+c.cardPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build request: %v", ErrTransport, err)
 	}
-	c.applyHeaders(req)
+	if err := c.intercept(ctx, "agent-card", req); err != nil {
+		return nil, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: fetch agent card: %v", ErrTransport, err)
@@ -110,6 +177,9 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRequestBody)).Decode(&card); err != nil {
 		return nil, fmt.Errorf("%w: decode agent card: %v", ErrWire, err)
 	}
+	if err := c.verifyCard(&card, "fetched agent card"); err != nil {
+		return nil, err
+	}
 	return &card, nil
 }
 
@@ -121,7 +191,7 @@ func (c *Client) AgentCard(ctx context.Context) (*AgentCard, error) {
 // turn input-required answers with a Task record, which this method refuses —
 // use SendMessageTask or one of the drivers for extension/HITL exchanges.
 func (c *Client) SendMessage(ctx context.Context, msg *Message) (*Message, error) {
-	result, err := c.call(ctx, MethodMessageSend, map[string]any{"message": msg})
+	result, err := c.sendRaw(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +216,7 @@ func (c *Client) SendMessage(ctx context.Context, msg *Message) (*Message, error
 // TasksGet fetches one task by id; ErrTaskNotFound when the server does not
 // know it.
 func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
-	result, err := c.call(ctx, MethodTasksGet, map[string]any{"id": taskID})
+	result, err := c.getRaw(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +230,7 @@ func (c *Client) TasksGet(ctx context.Context, taskID string) (*Task, error) {
 // TasksCancel cancels a submitted/working task and returns its record; a
 // terminal task yields ErrTaskNotCancelable.
 func (c *Client) TasksCancel(ctx context.Context, taskID string) (*Task, error) {
-	result, err := c.call(ctx, MethodTasksCancel, map[string]any{"id": taskID})
+	result, err := c.cancelRaw(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -173,11 +243,25 @@ func (c *Client) TasksCancel(ctx context.Context, taskID string) (*Task, error) 
 
 // call performs one JSON-RPC exchange and returns the raw result on success.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	ep, err := c.endpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ep.binding == bindingREST {
+		// AGO-DEVIATION: the push-notification config methods exist on
+		// JSON-RPC only in this package (rest.go serves no push routes); a
+		// REST-selected client refuses them with ErrBindingUnsupported rather
+		// than silently speaking JSON-RPC to a REST-only server. Python's SDK
+		// client carries push over whatever binding it negotiated.
+		return nil, fmt.Errorf("%w: %s needs the JSON-RPC binding; this client resolved REST",
+			ErrBindingUnsupported, method)
+	}
 	id := c.nextID.Add(1)
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode params: %v", ErrTransport, err)
 	}
+	paramsJSON = tenantParams(paramsJSON, ep.tenant)
 	payload, err := json.Marshal(rpcRequest{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(fmt.Sprintf("%d", id)),
@@ -187,12 +271,14 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode request: %v", ErrTransport, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+rpcPath, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.rpcURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("%w: build request: %v", ErrTransport, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.applyHeaders(req)
+	if err := c.intercept(ctx, method, req); err != nil {
+		return nil, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrTransport, method, err)
@@ -226,6 +312,18 @@ func (c *Client) applyHeaders(req *http.Request) {
 	}
 }
 
+// intercept stamps the configured headers, then runs the interceptors in
+// registration order; the first failure aborts the request.
+func (c *Client) intercept(ctx context.Context, method string, req *http.Request) error {
+	c.applyHeaders(req)
+	for _, fn := range c.interceptors {
+		if err := fn(ctx, method, req); err != nil {
+			return fmt.Errorf("%w: interceptor for %s: %w", ErrTransport, method, err)
+		}
+	}
+	return nil
+}
+
 // ValidateExtensions fetches the agent card and reconciles the client's
 // activated URIs against it in both directions (parity: client.py:328 —
 // validate_extension_activation at connect). ErrExtensionNotSupported on a
@@ -246,7 +344,43 @@ func rpcErrToGo(e *RPCError) error {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, e.Message)
 	case codeTaskNotCancelable:
 		return fmt.Errorf("%w: %s", ErrTaskNotCancelable, e.Message)
+	case codeUnsupportedOperation:
+		// Both sentinels match: callers that only know ErrRPC keep working,
+		// the streaming client detects the spec §3.1.6 case and polls.
+		return fmt.Errorf("%w: %w: %s", ErrRPC, ErrUnsupportedOperation, e.Message)
 	default:
 		return fmt.Errorf("%w: %s", ErrRPC, e.Error())
 	}
+}
+
+// ExtendedCard fetches the authenticated extended agent card: the JSON-RPC
+// agent/getAuthenticatedExtendedCard method, or GET /extendedAgentCard on the
+// REST binding. ErrRPC wraps the -32004 a server without an extended card
+// answers; the card is served only to a caller that passed the server's
+// request gates (WithHeaders carries whatever credentials they need).
+func (c *Client) ExtendedCard(ctx context.Context) (*AgentCard, error) {
+	result, err := c.extendedCardRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var card AgentCard
+	if err := json.Unmarshal(result, &card); err != nil {
+		return nil, fmt.Errorf("%w: decode extended card: %v", ErrWire, err)
+	}
+	if err := c.verifyCard(&card, "extended agent card"); err != nil {
+		return nil, err
+	}
+	return &card, nil
+}
+
+// extendedCardRaw performs the extended-card fetch on the resolved binding.
+func (c *Client) extendedCardRaw(ctx context.Context) (json.RawMessage, error) {
+	ep, err := c.endpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ep.binding != bindingREST {
+		return c.call(ctx, MethodExtendedCard, struct{}{})
+	}
+	return c.restDo(ctx, MethodExtendedCard, http.MethodGet, ep.restURL+ExtendedCardPath, nil)
 }

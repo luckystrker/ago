@@ -15,9 +15,9 @@ import (
 )
 
 // ShellTool runs shell commands as local subprocesses (Python parity:
-// ag2/tools/shell/tool.py SandboxShellTool over sandbox/local.py LocalSandbox —
-// the local backend only; Docker/Daytona backends are deferred, see
-// docs/DECISIONS.md).
+// ag2/tools/shell/tool.py SandboxShellTool over sandbox/local.py LocalSandbox).
+// By default it runs commands as local subprocesses; WithShellSandbox runs them
+// in any other backend on the Sandbox seam (sandbox.go).
 //
 // Security contract: the command line comes from the model and executes on this
 // host without isolation — real filesystem, real network, real credentials the
@@ -43,14 +43,49 @@ type ShellTool struct {
 	inheritEnv  bool
 	maxOutput   int
 	blocked     []string
+	allowed     []string
+	ignore      []string
+	restricted  bool
+	readonly    bool
+	middleware  []middleware.Middleware
 	tool        *tools.FunctionTool
 	sandbox     localSandbox
+	// factory, when set by WithShellSandbox, runs every command in a pluggable
+	// backend instead of a local subprocess; localOnly names the options that
+	// only configure the local path and are therefore refused alongside it.
+	factory SandboxFactory
+	// remoteFS is set when the factory's working directory is a path inside a
+	// remote or container sandbox rather than a host directory: the ignore
+	// filter then checks it lexically as a POSIX path (checkIgnorePosix).
+	remoteFS   bool
+	localOnly  []string
+	timeoutSet bool
 }
 
 var _ tools.Tool = (*ShellTool)(nil)
 
 // ShellOption configures NewShellTool.
 type ShellOption func(*ShellTool) error
+
+// WithShellSandbox runs every command in a pluggable execution backend (a
+// container, a cloud sandbox, an in-memory fake) instead of a local subprocess
+// (Python parity: SandboxShellTool(environment)). Command filters
+// (WithShellAllowed, WithShellReadonly, WithShellBlockPatterns, WithShellIgnore),
+// the timeout and the middleware apply unchanged; the options that configure
+// the local subprocess (WithShellWorkdir, WithShellEnv, WithShellInheritEnv,
+// WithShellMaxOutput) belong to the backend and make NewShellTool fail when
+// combined with this one. An unrestricted command reaches the backend as
+// ["sh", "-c", command]; a restricted one as its checked argv. Close closes the
+// factory when it owns resources (io.Closer).
+func WithShellSandbox(factory SandboxFactory) ShellOption {
+	return func(s *ShellTool) error {
+		if factory == nil {
+			return errors.New("toolpacks: shell sandbox factory must not be nil")
+		}
+		s.factory = factory
+		return nil
+	}
+}
 
 // WithShellName overrides the tool name (Python parity: the name kwarg).
 func WithShellName(name string) ShellOption {
@@ -80,6 +115,7 @@ func WithShellWorkdir(dir string) ShellOption {
 			return err
 		}
 		s.workdir, s.autoDir = abs, false
+		s.localOnly = append(s.localOnly, "WithShellWorkdir")
 		return nil
 	}
 }
@@ -91,7 +127,7 @@ func WithShellTimeout(d time.Duration) ShellOption {
 		if d <= 0 {
 			return errors.New("toolpacks: shell timeout must be > 0")
 		}
-		s.timeout = d
+		s.timeout, s.timeoutSet = d, true
 		return nil
 	}
 }
@@ -108,6 +144,7 @@ func WithShellEnv(env map[string]string) ShellOption {
 			}
 			s.env[k] = v
 		}
+		s.localOnly = append(s.localOnly, "WithShellEnv")
 		return nil
 	}
 }
@@ -118,7 +155,11 @@ func WithShellEnv(env map[string]string) ShellOption {
 // (API keys included). Without this option the child sees just the whitelisted
 // non-secret variables plus whatever WithShellEnv passed.
 func WithShellInheritEnv() ShellOption {
-	return func(s *ShellTool) error { s.inheritEnv = true; return nil }
+	return func(s *ShellTool) error {
+		s.inheritEnv = true
+		s.localOnly = append(s.localOnly, "WithShellInheritEnv")
+		return nil
+	}
 }
 
 // WithShellMaxOutput caps the reported output in characters; the excess is cut
@@ -129,6 +170,7 @@ func WithShellMaxOutput(n int) ShellOption {
 			return errors.New("toolpacks: shell max_output must be > 0")
 		}
 		s.maxOutput = n
+		s.localOnly = append(s.localOnly, "WithShellMaxOutput")
 		return nil
 	}
 }
@@ -136,10 +178,18 @@ func WithShellMaxOutput(n int) ShellOption {
 // WithShellBlockPatterns refuses commands containing any of the patterns,
 // case-insensitive substring match. Python matches its blocked list word by word
 // against the argv in restricted mode, which only exists because the restricted
-// argv runs without a shell; the Go tool always runs through a shell, where a
-// word match cannot see what the shell expands, so the patterns are matched
-// against the raw command line instead. Like Python's own caveat says, this is an
-// advisory filter, not a security boundary — use an isolated container for that.
+// argv runs without a shell; the unrestricted Go tool runs through a shell,
+// where a word match cannot see what the shell expands, so the patterns are
+// matched against the raw command line instead. In restricted mode (switched on
+// by WithShellAllowed, WithShellReadonly or WithShellIgnore) the same list is
+// matched word by word against the checked argv, including the program's base
+// name, exactly as Python does.
+// Like Python's own caveat says, this is an advisory filter, not a security
+// boundary — use an isolated container for that. It is bypassable by design
+// (a program that runs another program, an encoding trick, a substring that
+// never appears literally). The real limiter is WithShellAllowed (restricted
+// mode, checked argv executed without a shell); use it, not this list, when
+// the command must be constrained.
 // See docs/DECISIONS.md.
 func WithShellBlockPatterns(patterns ...string) ShellOption {
 	return func(s *ShellTool) error {
@@ -149,6 +199,75 @@ func WithShellBlockPatterns(patterns ...string) ShellOption {
 			}
 		}
 		s.blocked = append(s.blocked, patterns...)
+		return nil
+	}
+}
+
+// WithShellAllowed sets a whitelist of command prefixes and switches on
+// restricted mode: the command is split into argv once and executed without a
+// shell, so pipes, redirects, globs, variables and brace expansion are not
+// available and nothing can run after the check (Python parity: the allowed
+// kwarg and ShellAdapter.restricted).
+//
+// A prefix is matched word by word: "git log" matches "git log -5" but not
+// "git -c x log"; "git" matches every git invocation.
+func WithShellAllowed(prefixes ...string) ShellOption {
+	return func(s *ShellTool) error {
+		if len(prefixes) == 0 {
+			return errors.New("toolpacks: shell allow list must not be empty")
+		}
+		for _, p := range prefixes {
+			if strings.TrimSpace(p) == "" {
+				return errors.New("toolpacks: shell allow pattern must not be empty")
+			}
+		}
+		s.allowed = append(s.allowed, prefixes...)
+		return nil
+	}
+}
+
+// WithShellReadonly restricts the tool to the commands that cannot write files
+// or run other programs (cat, ls, grep, ...; see ReadonlyCommands). It switches
+// on restricted mode. An explicit WithShellAllowed list takes precedence
+// (Python parity: readonly is ignored when allowed is given).
+func WithShellReadonly() ShellOption {
+	return func(s *ShellTool) error { s.readonly = true; return nil }
+}
+
+// WithShellIgnore refuses a command whose literal path arguments leave the
+// working directory or match one of the glob patterns (Python parity: the
+// ignore kwarg and filter.check_ignore). It switches on restricted mode, so the
+// checked argv is exactly what runs. Tokens are read with POSIX quoting and
+// resolved through symlinks, so "cat ../secret", "cat .env" (with ".env"
+// ignored) and "prog --output=.env" are all refused before execution.
+func WithShellIgnore(patterns ...string) ShellOption {
+	return func(s *ShellTool) error {
+		if len(patterns) == 0 {
+			return errors.New("toolpacks: shell ignore list must not be empty")
+		}
+		for _, p := range patterns {
+			if p == "" {
+				return errors.New("toolpacks: shell ignore pattern must not be empty")
+			}
+		}
+		s.ignore = append(s.ignore, patterns...)
+		return nil
+	}
+}
+
+// WithShellMiddleware adds tool-scoped middleware, the Go spelling of the
+// Python tool's middleware= kwarg: the first entry is the outermost layer of
+// the tool's own chain, and agent middleware still wraps it from outside. Use
+// it for per-tool approval, telemetry or argument rewriting without wrapping
+// every tool the agent has.
+func WithShellMiddleware(mw ...middleware.Middleware) ShellOption {
+	return func(s *ShellTool) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: shell middleware must not be nil")
+			}
+		}
+		s.middleware = append(s.middleware, mw...)
 		return nil
 	}
 }
@@ -175,7 +294,42 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			return nil, err
 		}
 	}
+	// readonly is a preset for the whitelist: only applied when the caller gave
+	// no explicit allowed list (Python parity: a readonly flag never overrides
+	// an allowed list). Any filter switches on restricted mode.
+	//
+	// AGO-DEVIATION: Python treats a blocked list alone as restricted mode too.
+	// The Go WithShellBlockPatterns option predates restricted mode and its
+	// documented substring contract is kept for existing callers, so only
+	// WithShellAllowed, WithShellReadonly and WithShellIgnore switch it on. In
+	// restricted mode the blocked list is matched word by word, as in Python.
+	if s.factory != nil {
+		if len(s.localOnly) > 0 {
+			_ = os.RemoveAll(dir) // the unused auto workdir
+			return nil, fmt.Errorf("toolpacks: shell: %s configure the local subprocess and cannot be combined with WithShellSandbox", strings.Join(s.localOnly, ", "))
+		}
+		// The backend owns the working directory; the tool only reads it for the
+		// description and the ignore filter.
+		if s.autoDir {
+			_ = os.RemoveAll(s.workdir)
+		}
+		s.workdir, s.autoDir = factoryWorkdir(s.factory), false
+		s.remoteFS = !hostBacked(s.factory)
+	}
+	if s.readonly && s.allowed == nil {
+		s.allowed = ReadonlyCommands()
+	}
+	if s.allowed != nil || s.ignore != nil {
+		s.restricted = true
+	}
 	description := s.description
+	if description == "" && s.factory != nil {
+		description = "Execute a shell command in the sandbox working directory: " + s.workdir + "."
+		if s.restricted {
+			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
+				"chaining, globs and variables are not available."
+		}
+	}
 	if description == "" {
 		// AGO-DEVIATION: Python's default description names only the workdir;
 		// AGo's default also states the execution contract, because the model
@@ -185,12 +339,16 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			s.workdir + ". The command is model-controlled and runs without isolation, with full " +
 			"filesystem and network access. This tool is not a security boundary; every call " +
 			"requires human approval."
+		if s.restricted {
+			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
+				"chaining, globs and variables are not available."
+		}
 	}
 	type shellArgs struct {
 		Command string `json:"command" agschema:"description=The shell command to run,required"`
 	}
 	fn := func(args shellArgs, cx *agocontext.Context) (string, error) { return s.run(cx, args.Command) }
-	ft, err := tools.NewFunctionTool(s.toolName, description, fn)
+	ft, err := tools.NewFunctionTool(s.toolName, description, fn, tools.WithMiddleware(s.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: shell tool: %w", err)
 	}
@@ -207,17 +365,101 @@ func (s *ShellTool) run(cx *agocontext.Context, command string) (string, error) 
 	if s.sandbox.isClosed() {
 		return "", ErrSandboxClosed
 	}
-	lower := strings.ToLower(command)
-	for _, p := range s.blocked {
-		if strings.Contains(lower, strings.ToLower(p)) {
-			return fmt.Sprintf("Command not allowed: %q", command), nil
+	argv, err := s.argvFor(command)
+	if err != nil {
+		return fmt.Sprintf("Command not allowed (unbalanced quotes): %q", command), nil
+	}
+	if s.restricted {
+		if denied := s.filter(command, argv); denied != "" {
+			return denied, nil
+		}
+	} else {
+		lower := strings.ToLower(command)
+		for _, p := range s.blocked {
+			if strings.Contains(lower, strings.ToLower(p)) {
+				return fmt.Sprintf("Command not allowed: %q", command), nil
+			}
 		}
 	}
-	res, err := s.sandbox.call(cx.TurnContext(), shellArgv(command), s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
+	if s.factory != nil {
+		return s.runInBackend(cx, argv)
+	}
+	res, err := s.sandbox.call(cx.TurnContext(), argv, s.workdir, s.env, s.inheritEnv, s.timeout, s.maxOutput)
 	if err != nil {
 		return "", err
 	}
 	return formatExit(res), nil
+}
+
+// runInBackend executes the checked argv in a sandbox opened from the factory
+// (Python parity: ShellAdapter.run — open, exec, format).
+func (s *ShellTool) runInBackend(cx *agocontext.Context, argv []string) (string, error) {
+	ctx := cx.TurnContext()
+	var opts ExecOptions
+	if s.timeoutSet {
+		opts.Timeout = s.timeout
+	}
+	var res ExecResult
+	err := withSandbox(ctx, cx, s.factory, func(sb Sandbox) error {
+		var xerr error
+		res, xerr = sb.Exec(ctx, argv, opts)
+		return xerr
+	})
+	if err != nil {
+		return "", err
+	}
+	return formatExit(res), nil
+}
+
+// argvFor builds the exec argv for one command. In restricted mode it is the
+// checked argv itself, executed without a shell, so nothing can expand or chain
+// after the filter (Python parity: ShellAdapter._argv). Unrestricted mode keeps
+// the platform shell (Python parity: ["sh","-c",command]).
+func (s *ShellTool) argvFor(command string) ([]string, error) {
+	if !s.restricted {
+		if s.factory != nil {
+			return []string{"sh", "-c", command}, nil // backends are POSIX
+		}
+		return shellArgv(command), nil
+	}
+	argv, err := splitCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	return argv, nil
+}
+
+// filter applies the restricted-mode command policy and returns the refusal
+// text, or "" when the command may run (Python parity: ShellAdapter._filter).
+func (s *ShellTool) filter(command string, argv []string) string {
+	if s.allowed != nil {
+		permitted := false
+		for _, pattern := range s.allowed {
+			if matchesArgv(pattern, argv) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return fmt.Sprintf("Command not allowed: %q", command)
+		}
+	}
+	if containsShellOperator(command) {
+		return fmt.Sprintf("Command not allowed (shell syntax is not available in restricted mode): %q", command)
+	}
+	if argvBlocked(s.blocked, argv) {
+		return fmt.Sprintf("Command not allowed: %q", command)
+	}
+	if s.ignore != nil {
+		check := checkIgnore
+		if s.remoteFS {
+			check = checkIgnorePosix
+		}
+		if denied := check(command, s.workdir, s.ignore); denied != "" {
+			return denied
+		}
+	}
+	return ""
 }
 
 // shellArgv wraps the command for the platform shell.
@@ -245,6 +487,9 @@ func (s *ShellTool) Workdir() string { return s.workdir }
 // call that starts afterwards reports ErrSandboxClosed.
 func (s *ShellTool) Close() error {
 	s.sandbox.shutdown()
+	if s.factory != nil {
+		return closeFactory(s.factory)
+	}
 	if !s.autoDir || s.workdir == "" {
 		return nil
 	}

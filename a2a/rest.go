@@ -14,9 +14,13 @@ import (
 // scope is the message/task pair the wave committed to:
 //
 //	POST /message:send     — one exchange (the 1.x send path)
+//	POST /message:stream   — the same exchange streamed as Server-Sent Events
 //	POST /tasks            — the same exchange under the wave's alias path
+//	GET  /tasks            — tasks/list (filters as query parameters)
 //	GET  /tasks/{id}       — tasks/get (historyLength query parameter)
 //	POST /tasks/{id}:cancel — tasks/cancel
+//	GET  /tasks/{id}:subscribe — tasks/resubscribe, as Server-Sent Events
+//	GET  /extendedAgentCard — the authenticated extended card
 //
 // Payloads and errors use application/a2a+json (the a2a-sdk binding media
 // type, src/a2a/utils/constants.py A2A_JSON_MEDIA_TYPE); failures map to HTTP
@@ -25,7 +29,14 @@ import (
 // object in the body.
 const (
 	RESTMessageSendPath = "/message:send"
-	RESTTasksPath       = "/tasks"
+	// RESTMessageStreamPath is the streaming twin of message/send: one Message
+	// in, an SSE body of StreamResponse items out (a2a-sdk rest_routes
+	// "/message:stream").
+	RESTMessageStreamPath = "/message:stream"
+	RESTTasksPath         = "/tasks"
+	// RESTSubscribeSuffix appends to "/tasks/{id}" for the resubscribe twin
+	// (a2a-sdk rest_routes GET "/tasks/{id}:subscribe").
+	RESTSubscribeSuffix = ":subscribe"
 	// MediaA2AJSON is the HTTP+JSON binding payload media type
 	// (a2a-sdk constants.py A2A_JSON_MEDIA_TYPE).
 	MediaA2AJSON = "application/a2a+json"
@@ -35,10 +46,16 @@ const (
 func (s *Server) serveREST(w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
 	switch {
+	case r.Method == http.MethodPost && path == RESTMessageStreamPath:
+		s.restMessageStream(w, r)
 	case r.Method == http.MethodPost && (path == RESTMessageSendPath || path == RESTTasksPath):
 		s.restMessageSend(w, r)
+	case r.Method == http.MethodGet && path == RESTTasksPath:
+		s.restTasksList(w, r)
 	case r.Method == http.MethodPost && strings.HasSuffix(path, ":cancel") && strings.HasPrefix(path, RESTTasksPath+"/"):
 		s.restTaskCancel(w, r)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, RESTSubscribeSuffix) && strings.HasPrefix(path, RESTTasksPath+"/"):
+		s.restTaskSubscribe(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, RESTTasksPath+"/"):
 		s.restTaskGet(w, r)
 	default:
@@ -61,6 +78,10 @@ func (s *Server) restMessageSend(w http.ResponseWriter, r *http.Request) {
 		writeRESTError(w, http.StatusBadRequest, codeInvalidRequest, "decode message: "+err.Error())
 		return
 	}
+	if rpcErr := s.checkInputModes(&msg); rpcErr != nil {
+		writeREST(w, rpcErr)
+		return
+	}
 	outcome, rpcErr := s.executeSend(r.Context(), &msg)
 	if rpcErr != nil {
 		writeREST(w, rpcErr)
@@ -72,7 +93,8 @@ func (s *Server) restMessageSend(w http.ResponseWriter, r *http.Request) {
 	}
 	// A refused commit answers with the stored Task record: the turn lost
 	// the race to a cancel or an earlier terminal transition.
-	if outcome.state == TaskStateInputRequired || outcome.refused {
+	if outcome.state == TaskStateInputRequired || outcome.state == TaskStateAuthRequired ||
+		outcome.state == TaskStateRejected || outcome.refused {
 		writeRESTJSON(w, http.StatusOK, outcome.task)
 		return
 	}
@@ -102,6 +124,62 @@ func (s *Server) restTaskGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRESTJSON(w, http.StatusOK, task)
+}
+
+// restMessageStream handles POST /message:stream: the same turn as
+// /message:send, streamed as Server-Sent Events with the bare StreamResponse
+// items (the HTTP+JSON twin of message/stream).
+func (s *Server) restMessageStream(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.Card.Capabilities.Streaming {
+		writeREST(w, &RPCError{
+			Code:    codeUnsupportedOperation,
+			Message: "message/stream requires capabilities.streaming on the agent card",
+		})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+	if err != nil {
+		writeRESTError(w, http.StatusBadRequest, codeInvalidRequest, "read body: "+err.Error())
+		return
+	}
+	var msg Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		writeRESTError(w, http.StatusBadRequest, codeInvalidRequest, "decode message: "+err.Error())
+		return
+	}
+	if rpcErr := s.checkInputModes(&msg); rpcErr != nil {
+		writeREST(w, rpcErr)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeRESTError(w, http.StatusInternalServerError, codeInternalError, "streaming unsupported by the HTTP connection")
+		return
+	}
+	s.serveMessageStream(r.Context(), w, flusher, &msg, restStreamFraming(w))
+}
+
+// restTaskSubscribe handles GET /tasks/{id}:subscribe: the REST twin of
+// tasks/resubscribe.
+func (s *Server) restTaskSubscribe(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, RESTTasksPath+"/"), RESTSubscribeSuffix)
+	if id == "" || strings.Contains(id, "/") {
+		writeRESTError(w, http.StatusNotFound, codeTaskNotFound, "task id is required: GET /tasks/{id}:subscribe")
+		return
+	}
+	if !s.cfg.Card.Capabilities.Streaming {
+		writeREST(w, &RPCError{
+			Code:    codeUnsupportedOperation,
+			Message: "tasks/resubscribe requires capabilities.streaming on the agent card",
+		})
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeRESTError(w, http.StatusInternalServerError, codeInternalError, "streaming unsupported by the HTTP connection")
+		return
+	}
+	s.serveResubscribe(r.Context(), w, flusher, id, restStreamFraming(w))
 }
 
 // restTaskCancel handles POST /tasks/{id}:cancel.

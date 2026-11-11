@@ -4,10 +4,10 @@
 // output, exhausted token budget, ...).
 //
 // Parity with Python AG2 ag2/observers/: the Observer protocol, StreamObserver,
-// CompositeObserver and the built-ins LoopDetector and TokenMonitor. The alert flow
-// is Observer → ObserverAlert on the stream; the assembly AlertPolicy (policies
-// package) dedups alerts, injects non-fatal ones into the prompt and turns fatal
-// ones into HaltEvent.
+// BaseObserver, CompositeObserver and the built-ins LoopDetector and TokenMonitor.
+// The alert flow is Observer → ObserverAlert on the stream; the assembly
+// AlertPolicy (policies package) dedups alerts, injects non-fatal ones into the
+// prompt and turns fatal ones into HaltEvent.
 //
 // AGO-DEVIATION: Python registers observers under a caller-owned ExitStack and
 // buffers events through a Watch before processing; AGo subscribes directly on the
@@ -18,6 +18,7 @@ package observers
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/events"
@@ -57,15 +58,47 @@ func validateTarget(ctx *agocontext.Context) error {
 // StreamObserver is the lightweight shape: a condition → callback subscription.
 // fn runs for every stream event matching cond (nil cond = every event), inline
 // in the dispatching Send. It replaces the Python @observer decorator factory.
+//
+// Without options it runs after every other non-interrupt subscriber and has no
+// deadline, the pre-existing behaviour.
 type StreamObserver struct {
-	name string
-	cond events.Condition
-	fn   func(ev events.Event)
+	name      string
+	cond      events.Condition
+	fn        func(ev events.Event)
+	interrupt bool
+	timeout   time.Duration
+}
+
+// StreamObserverOption configures NewStreamObserver.
+type StreamObserverOption func(*StreamObserver)
+
+// WithInterrupt runs the observer before normal subscribers (Python parity:
+// interrupt=True), so it sees an event first. The observer cannot swallow the
+// event: its callback has no error result.
+func WithInterrupt() StreamObserverOption {
+	return func(o *StreamObserver) { o.interrupt = true }
+}
+
+// WithTimeout bounds one callback call (Python parity: timeout=). Zero or
+// negative waits indefinitely. On expiry the dispatching Send reports an error
+// wrapping stream.ErrSubscriberTimeout and stops delivering that event to later
+// handlers; the callback is not cancelled and keeps running on its goroutine.
+//
+// AGO-DEVIATION: Python's observer also carries sync_to_thread=, which decides
+// whether a synchronous callback is offloaded from the event loop. Go has no
+// event loop and no GIL, so the knob has no Go meaning and is not ported; a
+// timed callback runs on its own goroutine, an untimed one inline.
+func WithTimeout(d time.Duration) StreamObserverOption {
+	return func(o *StreamObserver) { o.timeout = d }
 }
 
 // NewStreamObserver watches the stream with cond and calls fn on each match.
-func NewStreamObserver(name string, cond events.Condition, fn func(ev events.Event)) *StreamObserver {
-	return &StreamObserver{name: name, cond: cond, fn: fn}
+func NewStreamObserver(name string, cond events.Condition, fn func(ev events.Event), opts ...StreamObserverOption) *StreamObserver {
+	o := &StreamObserver{name: name, cond: cond, fn: fn}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
 }
 
 // Name returns the observer's display name.
@@ -84,7 +117,7 @@ func (o *StreamObserver) Register(ctx *agocontext.Context) error {
 	ctx.Stream.Subscribe(func(ev events.Event) error {
 		o.fn(ev)
 		return nil
-	}, stream.SubscribeOptions{Condition: o.cond})
+	}, stream.SubscribeOptions{Interrupt: o.interrupt, Condition: o.cond, Timeout: o.timeout})
 	return nil
 }
 

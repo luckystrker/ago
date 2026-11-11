@@ -55,7 +55,7 @@ func (s *Server) serveIO(in io.Reader, out io.Writer) error {
 			continue
 		}
 		ctx, cancel := s.callCtx()
-		reply := s.handle(ctx, &req)
+		reply := s.handle(withStdio(ctx), &req)
 		cancel()
 		if reply == nil {
 			continue // a notification: never answered

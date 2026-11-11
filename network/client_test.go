@@ -27,13 +27,25 @@ func (l *msgLog) all() []string {
 	return append([]string(nil), l.msgs...)
 }
 
+// waitIdle waits until the whole cascade has quiesced: every client has
+// drained its deliveries in two consecutive passes. One pass is not enough —
+// a client that looks idle can be handed an envelope by another client that
+// is still finishing its turn (delivery happens inside the sender's turn,
+// before the sender's own pending count drops), so a single sweep can read
+// "idle" for the recipient before the delivery lands and "idle" for the
+// sender after it finished.
 func waitIdle(t *testing.T, clients ...*AgentClient) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	for _, c := range clients {
-		if err := c.WaitIdle(ctx); err != nil {
-			t.Fatalf("client %s never went idle: %v", c.AgentID(), err)
+	for pass := 0; pass < 2; pass++ {
+		for _, c := range clients {
+			if err := c.WaitIdle(ctx); err != nil {
+				t.Fatalf("client %s never went idle: %v", c.AgentID(), err)
+			}
+		}
+		if pass == 0 {
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 }

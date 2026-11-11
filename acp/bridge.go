@@ -29,6 +29,29 @@ type AgentInfo struct {
 type TurnResult struct {
 	Text       string
 	StopReason string
+	// Usage is the token accounting the agent attached to the prompt
+	// response; nil when it reported none.
+	Usage *PromptUsage
+}
+
+// PromptUsage is the token accounting of one prompt turn (Python parity: the
+// acp schema Usage on PromptResponse). Fields the agent did not report stay
+// nil.
+type PromptUsage struct {
+	InputTokens       *int64 `json:"inputTokens,omitempty"`
+	OutputTokens      *int64 `json:"outputTokens,omitempty"`
+	TotalTokens       *int64 `json:"totalTokens,omitempty"`
+	ThoughtTokens     *int64 `json:"thoughtTokens,omitempty"`
+	CachedReadTokens  *int64 `json:"cachedReadTokens,omitempty"`
+	CachedWriteTokens *int64 `json:"cachedWriteTokens,omitempty"`
+}
+
+// AgentCaps are the agent capabilities the initialize handshake reported that
+// this client acts on.
+type AgentCaps struct {
+	// MCPHTTP is mcpCapabilities.http: the agent can dial HTTP MCP servers
+	// declared in session/new.
+	MCPHTTP bool
 }
 
 // Bridge drives an external ACP agent running as a subprocess (the consume
@@ -100,6 +123,17 @@ type Bridge struct {
 	// Info is what the agent advertised in the initialize handshake.
 	Info AgentInfo
 
+	// Caps is what the agent advertised it can do (see AgentCaps).
+	Caps AgentCaps
+
+	// Handshake-time settings. They shape the subprocess and the capabilities
+	// advertised in initialize, so they only take effect when set before the
+	// handshake: the in-package provider (provider.go) builds the Bridge
+	// itself; NewBridge callers keep the defaults.
+	dir               string // subprocess working directory ("" inherits)
+	advertiseTerminal bool   // advertise the terminal capability (needs FS)
+	afterStart        func() // runs right after the process starts, before the handshake
+
 	mu     sync.Mutex
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -137,6 +171,7 @@ func NewBridge(cmd string, args []string, env []string) (*Bridge, error) {
 // (os/exec pipes bytes).
 func (b *Bridge) start(cmdName string, args []string, env []string) error {
 	cmd := exec.Command(cmdName, args...)
+	cmd.Dir = b.dir
 	if env == nil {
 		env = os.Environ()
 	}
@@ -159,6 +194,9 @@ func (b *Bridge) start(cmdName string, args []string, env []string) error {
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), scanBuffer)
 	b.cmd, b.stdin, b.stdout = cmd, stdin, sc
+	if b.afterStart != nil {
+		b.afterStart()
+	}
 	if b.FS != nil {
 		root, rerr := b.FS.root()
 		if rerr != nil {
@@ -182,8 +220,13 @@ func (b *Bridge) start(cmdName string, args []string, env []string) error {
 		return err
 	}
 	var parsed struct {
-		ProtocolVersion *int `json:"protocolVersion"`
-		AgentInfo       struct {
+		ProtocolVersion   *int `json:"protocolVersion"`
+		AgentCapabilities struct {
+			MCPCapabilities struct {
+				HTTP bool `json:"http"`
+			} `json:"mcpCapabilities"`
+		} `json:"agentCapabilities"`
+		AgentInfo struct {
 			Name    string `json:"name"`
 			Title   string `json:"title"`
 			Version string `json:"version"`
@@ -203,6 +246,7 @@ func (b *Bridge) start(cmdName string, args []string, env []string) error {
 		Title:           parsed.AgentInfo.Title,
 		Version:         parsed.AgentInfo.Version,
 	}
+	b.Caps = AgentCaps{MCPHTTP: parsed.AgentCapabilities.MCPCapabilities.HTTP}
 	return nil
 }
 
@@ -216,6 +260,11 @@ func clientCapabilities(b *Bridge) map[string]any {
 	caps := map[string]any{}
 	if b != nil && b.FS != nil {
 		caps["fs"] = map[string]any{"readTextFile": true, "writeTextFile": true}
+		// The mediated terminals share the FS root and exist whenever FS is
+		// set; advertising them is the provider's choice (allow_terminal).
+		if b.advertiseTerminal {
+			caps["terminal"] = true
+		}
 	}
 	return caps
 }
@@ -242,28 +291,127 @@ func (b *Bridge) SessionNewWithServers(cwd string, servers []MCPServer) (string,
 	return b.sessionNew(declaredServersParams{CWD: cwd, MCPServers: servers})
 }
 
-// sessionNew sends one session/new and decodes the id. Caller holds b.mu.
+// sessionNew sends one session/new and decodes the id.
 func (b *Bridge) sessionNew(params declaredServersParams) (string, error) {
+	info, err := b.newSession(params)
+	if err != nil {
+		return "", err
+	}
+	return info.ID, nil
+}
+
+// SessionParams is the full session/new request: the working directory, the
+// extra workspace roots and the MCP servers announced to the agent (the same
+// declaration rules as SessionNewWithServers).
+type SessionParams struct {
+	CWD                   string
+	AdditionalDirectories []string
+	MCPServers            []MCPServer
+}
+
+// SessionInfo is the session/new answer: the session id and, when the agent
+// advertised a model picker among its config options, the picker's state.
+type SessionInfo struct {
+	ID string
+	// ModelOption is the agent's "model" select option; nil when it
+	// advertised none.
+	ModelOption *ConfigSelect
+}
+
+// ConfigSelect is one select-type session config option (Python parity: the
+// acp schema SessionConfigOptionSelect): its id, the value currently chosen
+// and every selectable value (group members flattened).
+type ConfigSelect struct {
+	ID           string
+	CurrentValue string
+	Values       []string
+}
+
+// NewSession creates a session from the full parameter set and reports what
+// the agent offered back.
+func (b *Bridge) NewSession(p SessionParams) (SessionInfo, error) {
+	for _, s := range p.MCPServers {
+		if err := declarable(s); err != nil {
+			return SessionInfo{}, err
+		}
+	}
+	return b.newSession(declaredServersParams{
+		CWD: p.CWD, AdditionalDirectories: p.AdditionalDirectories, MCPServers: p.MCPServers,
+	})
+}
+
+// newSession sends one session/new and decodes the reply.
+func (b *Bridge) newSession(params declaredServersParams) (SessionInfo, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed.Load() {
-		return "", ErrClosed
+		return SessionInfo{}, ErrClosed
 	}
 	b.nextID++
 	res, err := b.exchange(b.nextID, "session/new", params, nil)
 	if err != nil {
-		return "", err
+		return SessionInfo{}, err
 	}
 	var parsed struct {
-		SessionID string `json:"sessionId"`
+		SessionID     string            `json:"sessionId"`
+		ConfigOptions []json.RawMessage `json:"configOptions"`
 	}
 	if err := json.Unmarshal(res, &parsed); err != nil {
-		return "", fmt.Errorf("%w: session/new result: %v", ErrProtocol, err)
+		return SessionInfo{}, fmt.Errorf("%w: session/new result: %v", ErrProtocol, err)
 	}
 	if parsed.SessionID == "" {
-		return "", fmt.Errorf("%w: session/new returned no sessionId", ErrProtocol)
+		return SessionInfo{}, fmt.Errorf("%w: session/new returned no sessionId", ErrProtocol)
 	}
-	return parsed.SessionID, nil
+	return SessionInfo{ID: parsed.SessionID, ModelOption: modelOption(parsed.ConfigOptions)}, nil
+}
+
+// modelOption picks the select option with id "model" out of the raw config
+// options (Python parity: session._model_option); nil when there is none.
+func modelOption(raw []json.RawMessage) *ConfigSelect {
+	for _, r := range raw {
+		var o struct {
+			ID           string `json:"id"`
+			Type         string `json:"type"`
+			CurrentValue string `json:"currentValue"`
+			Options      []struct {
+				Value   string `json:"value"`
+				Options []struct {
+					Value string `json:"value"`
+				} `json:"options"`
+			} `json:"options"`
+		}
+		if err := json.Unmarshal(r, &o); err != nil || o.ID != "model" || (o.Type != "" && o.Type != "select") {
+			continue
+		}
+		sel := &ConfigSelect{ID: o.ID, CurrentValue: o.CurrentValue}
+		for _, e := range o.Options {
+			if len(e.Options) > 0 { // a group of choices
+				for _, c := range e.Options {
+					sel.Values = append(sel.Values, c.Value)
+				}
+				continue
+			}
+			sel.Values = append(sel.Values, e.Value)
+		}
+		return sel
+	}
+	return nil
+}
+
+// SetConfigOption sets one session config option (session/set_config_option;
+// Python parity: conn.set_config_option) — the model picker is the use the
+// provider makes of it.
+func (b *Bridge) SetConfigOption(sessionID, configID, value string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed.Load() {
+		return ErrClosed
+	}
+	b.nextID++
+	_, err := b.exchange(b.nextID, "session/set_config_option", map[string]any{
+		"sessionId": sessionID, "configId": configID, "value": value,
+	}, nil)
+	return err
 }
 
 // Prompt sends one user turn (a single text block) and returns the agent's
@@ -298,7 +446,8 @@ func (b *Bridge) PromptTurn(sessionID, text string) (TurnResult, error) {
 		return TurnResult{}, err
 	}
 	var parsed struct {
-		StopReason string `json:"stopReason"`
+		StopReason string       `json:"stopReason"`
+		Usage      *PromptUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(res, &parsed); err != nil {
 		return TurnResult{}, fmt.Errorf("%w: session/prompt result: %v", ErrProtocol, err)
@@ -306,7 +455,7 @@ func (b *Bridge) PromptTurn(sessionID, text string) (TurnResult, error) {
 	if parsed.StopReason == "" {
 		parsed.StopReason = StopEndTurn
 	}
-	return TurnResult{Text: strings.Join(chunks, ""), StopReason: parsed.StopReason}, nil
+	return TurnResult{Text: strings.Join(chunks, ""), StopReason: parsed.StopReason, Usage: parsed.Usage}, nil
 }
 
 // Cancel asks the agent to stop sessionID's running turn and everything
@@ -362,6 +511,16 @@ func (b *Bridge) Close() error {
 	b.closed.Store(true)
 	b.stop()
 	return nil
+}
+
+// kill ends the subprocess outright, without taking the operation lock — the
+// lock is held by the exchange that is parked on the dead agent, and killing
+// the process is what lets that exchange fail instead of hanging (the same
+// unblocking ExchangeTimeout relies on). The Bridge is unusable afterwards.
+func (b *Bridge) kill() {
+	if b.cmd != nil && b.cmd.Process != nil {
+		_ = b.cmd.Process.Kill()
+	}
 }
 
 // stop tears the process down without touching the closed flag (also used for
@@ -454,7 +613,7 @@ func (b *Bridge) readReply(wantID int64, chunks *[]string) (json.RawMessage, err
 	if err := b.stdout.Err(); err != nil {
 		return nil, fmt.Errorf("%w: agent stdout: %v", ErrProtocol, err)
 	}
-	return nil, fmt.Errorf("%w: agent exited before answering request %d", ErrProtocol, wantID)
+	return nil, fmt.Errorf("%w: %w before answering request %d", ErrProtocol, ErrAgentExited, wantID)
 }
 
 // answerRequest responds to one agent→client request: the permission and

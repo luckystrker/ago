@@ -3,7 +3,7 @@
 // ag2/config/anthropic/files.py (AnthropicFilesClient), which drives the
 // anthropic SDK's beta.files namespace; AGo speaks the wire protocol
 // directly: {base}/v1/files under the files-api beta flag. The transport
-// retries mirror internal/httpx (connection errors and 429/5xx, Retry-After
+// retries mirror internal/httpx (connection errors and 408/409/429/5xx, Retry-After
 // honored) — httpx itself only speaks POST+JSON, which cannot carry these
 // multipart/GET/DELETE requests.
 
@@ -23,12 +23,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/files"
+	"github.com/luckystrker/ago/internal/httpx"
 )
 
 // ErrFilesAPI marks a non-2xx Files API response. Match with errors.Is.
@@ -48,11 +50,12 @@ const (
 // FilesClient is the Files API client built by
 // AnthropicConfig.CreateFilesClient. Safe for concurrent use.
 type FilesClient struct {
-	apiKey     string
-	baseURL    string
-	timeout    time.Duration // caps each request
-	maxRetries int
-	http       *http.Client
+	apiKey         string
+	baseURL        string
+	timeout        time.Duration // caps each request
+	maxRetries     int
+	defaultHeaders map[string]string
+	http           *http.Client
 }
 
 // CreateFilesClient returns the Files API client for this configuration
@@ -60,8 +63,8 @@ type FilesClient struct {
 // (config field, then ANTHROPIC_API_KEY); a missing key wraps
 // config.ErrNotProvided. An unset Timeout becomes 600s — Python parity with
 // files.py (`config.timeout if config.timeout is not None else 600.0`).
-// AGO-DEVIATION: Python also forwards default_headers, http_client and
-// open_telemetry to the SDK; the AGo config has no such fields.
+// HTTPClient carries over (Python parity: http_client); the AGo config has no
+// open_telemetry field.
 func (c *AnthropicConfig) CreateFilesClient() (files.Client, error) {
 	key := c.APIKey
 	if key == "" {
@@ -79,12 +82,21 @@ func (c *AnthropicConfig) CreateFilesClient() (files.Client, error) {
 		timeout = 600 * time.Second
 	}
 	return &FilesClient{
-		apiKey:     key,
-		baseURL:    strings.TrimSuffix(baseURL, "/"),
-		timeout:    timeout,
-		maxRetries: c.MaxRetries,
-		http:       &http.Client{Timeout: timeout},
+		apiKey:         key,
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		timeout:        timeout,
+		maxRetries:     c.MaxRetries,
+		defaultHeaders: copyMap(c.DefaultHeaders),
+		http:           httpClient(c.HTTPClient, timeout),
 	}, nil
+}
+
+// httpClient returns the caller's client, or a default one capped by timeout.
+func httpClient(c *http.Client, timeout time.Duration) *http.Client {
+	if c != nil {
+		return c
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 // Upload stores data under filename. The purpose argument only fills the
@@ -231,7 +243,7 @@ func (c *FilesClient) readBytes(ctx context.Context, reqPath string) ([]byte, er
 }
 
 // do performs one Files API request with the transport retries: connection
-// errors and 429/5xx are retried up to maxRetries times with exponential
+// errors and retryable statuses (408/409/429/5xx) are retried up to maxRetries times with exponential
 // backoff, honoring a server-sent Retry-After (internal/httpx semantics).
 func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, accept string, body []byte) (*http.Response, error) {
 	client := c.http
@@ -245,7 +257,15 @@ func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, acce
 		}
 		req.Header.Set("x-api-key", c.apiKey)
 		req.Header.Set("anthropic-version", APIVersion)
-		req.Header.Set("anthropic-beta", filesBeta)
+		for name, value := range c.defaultHeaders {
+			req.Header.Set(name, value)
+		}
+		// The Files API answers only under its own beta flag; a caller's default
+		// flag rides in the same header (the SDK replaces a same-named default,
+		// so both must be named here or one is silently dropped).
+		betas := append([]string{filesBeta}, defaultBetas(c.defaultHeaders)...)
+		slices.Sort(betas)
+		req.Header.Set("anthropic-beta", strings.Join(slices.Compact(betas), ","))
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
@@ -281,8 +301,10 @@ func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, acce
 
 func statusOK(code int) bool { return code >= 200 && code < 300 }
 
+// filesStatusErr wraps a non-2xx answer so both errors.Is(ErrFilesAPI) and
+// errors.As(*config.APIError) work.
 func filesStatusErr(status int, data []byte) error {
-	return fmt.Errorf("%w: returned %d: %s", ErrFilesAPI, status, snippet(data))
+	return fmt.Errorf("%w: %w", ErrFilesAPI, config.NewAPIError(config.ProviderAnthropic, "", status, nil, data))
 }
 
 // readAndClose drains and closes the response body.
@@ -333,9 +355,7 @@ func retryBackoff(attempt int) time.Duration {
 	return d
 }
 
-func retryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code >= 500
-}
+func retryableStatus(code int) bool { return httpx.RetryableStatus(code) }
 
 func retryAfter(h http.Header) (time.Duration, bool) {
 	v := h.Get("Retry-After")

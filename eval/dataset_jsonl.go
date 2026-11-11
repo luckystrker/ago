@@ -8,18 +8,20 @@ import (
 )
 
 // SuiteFromJSONL loads a Suite from a JSONL file, one case per line (Python
-// parity: dataset/suite.py Suite.from_jsonl, reduced to the fields the AGo Case
-// carries — AGO-DEVIATION: Python's suite name/source metadata and tags have no
-// slot on Suite []Case and are dropped — D-061).
+// parity: dataset/suite.py Suite.from_jsonl; the suite's own name/source are
+// not part of the AGo Suite slice — pass them with WithSuiteName /
+// WithSuiteSource).
 //
 // Each non-blank line is a JSON object:
 //
 //	{"name": "weather", "input": "Weather in Paris?", "expected": "sunny",
+//	 "tags": ["happy-path"], "metadata": {"owner": "team-a"},
 //	 "scorers": ["correctness", {"name": "tools_called", "params": {"names": ["get_weather"]}}]}
 //
 // "input" is required (the prompt the agent is asked); "name" auto-fills
 // "task-0000", "task-0001", … in dataset order; "expected" feeds the case and
-// the scorers' scope. "scorers" entries are a registered scorer name or an
+// the scorers' scope; "tags" and "metadata" are carried through to the case
+// result untouched. "scorers" entries are a registered scorer name or an
 // object {"name": …, "params": {…}}, resolved through r — nil r with scorers
 // present is an error. Blank lines are skipped; a UTF-8 BOM is tolerated
 // (Python parity: encoding="utf-8-sig"). Errors carry the file and line number.
@@ -71,6 +73,20 @@ func caseFromItem(item map[string]any, index int, r *ScorerRegistry) (Case, erro
 		return c, err
 	} else if ok {
 		c.Expected = v
+	}
+	if raw, ok := item["tags"]; ok {
+		tags, err := stringList(raw, "tags")
+		if err != nil {
+			return c, err
+		}
+		c.Tags = tags
+	}
+	if raw, ok := item["metadata"]; ok {
+		metadata, ok := raw.(map[string]any)
+		if !ok {
+			return c, fmt.Errorf("field \"metadata\" must be an object, got %T", raw)
+		}
+		c.Metadata = metadata
 	}
 	if raw, ok := item["scorers"]; ok {
 		specs, err := scorerSpecs(raw)
@@ -159,4 +175,21 @@ func jsonKind(v any) string {
 	default:
 		return "object"
 	}
+}
+
+// stringList decodes a JSON array of strings.
+func stringList(raw any, field string) ([]string, error) {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("field %q must be a list, got %T", field, raw)
+	}
+	out := make([]string, 0, len(items))
+	for i, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("field %q entry %d must be a string, got %T", field, i, item)
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }

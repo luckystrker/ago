@@ -122,3 +122,51 @@ func TestVisibleTo(t *testing.T) {
 		t.Error("addressed envelope visible to sender + addressee only")
 	}
 }
+
+// TestEnvelopeTaskTraceWire pins the Python wire names of the two optional
+// correlation fields and their omission when unset.
+func TestEnvelopeTaskTraceWire(t *testing.T) {
+	env := Envelope{
+		ChannelID: "ch", SenderID: "a", EventType: EnvTaskCancelRequest,
+		Payload: []byte(`{"task_id":"t-1"}`),
+		TaskID:  "t-1",
+		TraceID: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if raw["task_id"] != "t-1" || raw["trace_id"] != env.TraceID {
+		t.Fatalf("wire keys task_id/trace_id missing: %s", data)
+	}
+	var back Envelope
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.TaskID != "t-1" || back.TraceID != env.TraceID {
+		t.Fatalf("round trip lost fields: %+v", back)
+	}
+
+	// Unset fields stay off the wire; a Python-shaped fragment with explicit
+	// nulls decodes to empty strings.
+	plain, _ := json.Marshal(Envelope{ChannelID: "ch", SenderID: "a", EventType: EnvText})
+	var plainRaw map[string]any
+	_ = json.Unmarshal(plain, &plainRaw)
+	if _, ok := plainRaw["task_id"]; ok {
+		t.Fatalf("task_id must be omitted when empty: %s", plain)
+	}
+	if _, ok := plainRaw["trace_id"]; ok {
+		t.Fatalf("trace_id must be omitted when empty: %s", plain)
+	}
+	var fromPython Envelope
+	if err := json.Unmarshal([]byte(`{"channel_id":"c","sender_id":"s","event_type":"ag2.msg.text","task_id":null,"trace_id":null}`), &fromPython); err != nil {
+		t.Fatalf("python nulls: %v", err)
+	}
+	if fromPython.TaskID != "" || fromPython.TraceID != "" {
+		t.Fatalf("nulls must decode empty: %+v", fromPython)
+	}
+}

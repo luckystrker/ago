@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -22,6 +23,11 @@ type Subscriber func(ev events.Event) error
 // delivery stops silently and the event is not persisted.
 var ErrHandled = errors.New("stream: event handled by interrupt subscriber")
 
+// ErrSubscriberTimeout reports that a subscriber outlived SubscribeOptions.Timeout.
+// Send returns it (Python parity: asyncio.TimeoutError raised to send) and stops
+// delivery of that event to later handlers.
+var ErrSubscriberTimeout = errors.New("stream: subscriber timeout")
+
 // SubID identifies a subscription for Unsubscribe.
 type SubID uint64
 
@@ -29,6 +35,21 @@ type SubID uint64
 type SubscribeOptions struct {
 	Interrupt bool             // runs before normal subscribers; may swallow the event
 	Condition events.Condition // nil = match everything
+	// Timeout bounds one handler call (Python parity: subscribe(timeout=)).
+	// Zero or negative waits indefinitely, the pre-existing behaviour. On expiry
+	// Send returns an error wrapping ErrSubscriberTimeout and stops delivery to
+	// later handlers. Interrupt and normal subscribers are both bounded.
+	//
+	// AGO-DEVIATION: Python rejects a non-positive timeout with ValueError;
+	// Subscribe has no error result, so a non-positive duration means "no
+	// deadline" instead of failing the subscription.
+	//
+	// A timed-out handler is not cancelled: Subscriber carries no context, so it
+	// keeps running on its own goroutine and may still touch shared state after
+	// Send has returned the timeout error. A panic in the handler becomes an
+	// error from Send only when Timeout is set; without a timeout the handler
+	// runs inline and the panic propagates to the Send caller.
+	Timeout time.Duration
 }
 
 // Stream is the conversation event bus: dispatch, transcript and inbox.
@@ -162,7 +183,7 @@ func (m *MemoryStream) Send(ev events.Event) error {
 		if err := validateDelivery(ev); err != nil {
 			return err
 		}
-		if err := se.fn(ev); err != nil {
+		if err := runSubscriber(se.fn, ev, se.opt.Timeout); err != nil {
 			if errors.Is(err, ErrHandled) {
 				return nil
 			}
@@ -186,12 +207,47 @@ func (m *MemoryStream) Send(ev events.Event) error {
 		if err := validateDelivery(ev); err != nil {
 			return err
 		}
-		if err := se.fn(ev); err != nil && firstErr == nil {
+		if err := runSubscriber(se.fn, ev, se.opt.Timeout); err != nil {
 			m.logger.Error("stream: subscriber failed", "event", ev.EventType(), "err", err)
-			firstErr = err
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Python parity: a timed-out handler stops delivery of the event to
+			// the handlers registered after it.
+			if errors.Is(err, ErrSubscriberTimeout) {
+				return firstErr
+			}
 		}
 	}
 	return firstErr
+}
+
+// runSubscriber calls one subscriber, bounded by timeout when it is positive.
+// The deadline runs the handler on its own goroutine, so a handler that never
+// returns leaks that goroutine; the Python reference has the same property
+// ("worker threads can continue after expiry"). A panicking handler is turned
+// into an error because the caller's recover cannot reach another goroutine.
+func runSubscriber(fn Subscriber, ev events.Event, timeout time.Duration) error {
+	if timeout <= 0 {
+		return fn(ev)
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("stream: subscriber panicked: %v", r)
+			}
+		}()
+		done <- fn(ev)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("%w: %s after %s", ErrSubscriberTimeout, ev.EventType(), timeout)
+	}
 }
 
 // validateDelivery runs the delivery marker's guard, if the event carries one.

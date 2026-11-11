@@ -17,9 +17,9 @@ import (
 //	image         → BinaryInput (base64-decoded, kind image)
 //	audio         → BinaryInput (base64-decoded, kind audio)
 //	resource_link → UrlInput (kind from the link's media type)
-//	resource      → TextInput carrying the block's JSON   (AGO-DEVIATION:
-//	                Python maps text contents to TextInput(text) and blobs to
-//	                BinaryInput; the porting brief pins the JSON form)
+//	resource      → TextInput (text contents) or BinaryInput (base64 blob,
+//	                kind from the media type); a resource carrying neither is
+//	                kept as its JSON, never dropped
 //	anything else → TextInput carrying the block's JSON (future variants are
 //	                preserved, never dropped)
 //
@@ -50,8 +50,14 @@ func mapContent(blocks []map[string]any, raw json.RawMessage) ([]events.Input, e
 			uri, _ := block["uri"].(string)
 			mimeType, _ := block["mimeType"].(string)
 			parts = append(parts, &events.UrlInput{URL: uri, Kind: kindFromMime(mimeType)})
+		case "resource":
+			part, err := resourcePart(block)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, part)
 		default:
-			// "resource" (embedded) and any future block variant: JSON text.
+			// Any future block variant: JSON text.
 			b, err := json.Marshal(block)
 			if err != nil {
 				return nil, fmt.Errorf("%w: encode %q content block: %v", ErrProtocol, text, err)
@@ -60,6 +66,34 @@ func mapContent(blocks []map[string]any, raw json.RawMessage) ([]events.Input, e
 		}
 	}
 	return parts, nil
+}
+
+// resourcePart maps an embedded resource block: text contents become a
+// TextInput, a base64 blob a BinaryInput typed by its media type (Python
+// parity: _extract_content). A resource with neither payload is preserved as
+// the block's JSON.
+func resourcePart(block map[string]any) (events.Input, error) {
+	res, _ := block["resource"].(map[string]any)
+	if text, ok := res["text"].(string); ok {
+		return &events.TextInput{Content: text}, nil
+	}
+	if blob, ok := res["blob"].(string); ok {
+		data, err := base64.StdEncoding.DecodeString(blob)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resource content: %v", ErrProtocol, err)
+		}
+		mediaType, _ := res["mimeType"].(string)
+		kind := kindFromMime(mediaType)
+		if mediaType == "" {
+			mediaType = "application/octet-stream"
+		}
+		return &events.BinaryInput{Data: data, MediaType: mediaType, Kind: kind}, nil
+	}
+	b, err := json.Marshal(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encode \"resource\" content block: %v", ErrProtocol, err)
+	}
+	return &events.TextInput{Content: string(b)}, nil
 }
 
 // binaryPart decodes one base64 media block (image/audio).

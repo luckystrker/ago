@@ -206,6 +206,7 @@ func functionToolToAPI(t tools.Schema) map[string]any {
 
 type chatResponse struct {
 	Model   string `json:"model"`
+	Error   string `json:"error"`
 	Message struct {
 		Content   string `json:"content"`
 		Thinking  string `json:"thinking"`
@@ -217,6 +218,7 @@ type chatResponse struct {
 		} `json:"tool_calls"`
 	} `json:"message"`
 	DoneReason      string `json:"done_reason"`
+	Done            bool   `json:"done"`
 	PromptEvalCount *int64 `json:"prompt_eval_count"`
 	EvalCount       *int64 `json:"eval_count"`
 }

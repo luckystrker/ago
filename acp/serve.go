@@ -98,6 +98,13 @@ type ServeConfig struct {
 	// process it names runs on this side.
 	AllowedMCPCommands []string
 
+	// MCPHTTP advertises mcpCapabilities.http in initialize: the agent can
+	// dial the HTTP MCP servers a client declares in session/new (through
+	// Session.Gateway). Off by default, like the Python agent, which
+	// advertises no MCP transport; turn it on for a handler that serves the
+	// client's declared servers.
+	MCPHTTP bool
+
 	// OnSession, when set, is called with the session handle during
 	// session/new, before the response (Python parity: the ACPAgent on_session
 	// observer). A handler that needs the outbound permission/elicitation
@@ -235,6 +242,22 @@ type Emitter struct {
 
 	mu        sync.Mutex
 	delivered []string
+	usage     *PromptUsage
+}
+
+// PromptUsage reports the turn's token accounting; it travels on the
+// session/prompt response (Python parity: PromptResponse.usage), not as a
+// session/update. The last call wins.
+func (e *Emitter) PromptUsage(u PromptUsage) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.usage = &u
+}
+
+func (e *Emitter) promptUsage() *PromptUsage {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.usage
 }
 
 func (e *Emitter) push(u Update) {
@@ -269,6 +292,20 @@ func (e *Emitter) Thought(chunk string) {
 // parity: acp.update_plan).
 func (e *Emitter) Plan(entries []PlanEntry) {
 	e.push(Update{Kind: "plan", Entries: entries})
+}
+
+// Mode tells the client the session is now in the mode modeID (Python parity:
+// acp.update_current_mode). The ids a client may expect are the ones the agent
+// advertises; this only reports a change.
+func (e *Emitter) Mode(modeID string) {
+	e.push(Update{Kind: "current_mode_update", ModeID: modeID})
+}
+
+// AvailableCommands replaces the client's list of the agent's slash commands
+// wholesale (Python parity: acp.update_available_commands); nil or empty
+// clears it.
+func (e *Emitter) AvailableCommands(commands []AvailableCommand) {
+	e.push(Update{Kind: "available_commands_update", Commands: commands})
 }
 
 // ToolCall announces a tool call: id, a title, the kind (KindOther unless the
@@ -425,6 +462,9 @@ func (c *serveConn) readLoop() {
 			continue
 		}
 		if msg.ID == nil {
+			if guardNotification(msg.Method, msg.Params) {
+				continue // a colliding _meta on a notification drops it
+			}
 			if msg.Method == "session/cancel" {
 				c.cancelTurn(msg.Params)
 			}
@@ -472,6 +512,11 @@ func (c *serveConn) write(msg any) error {
 // goroutine's while a nested exchange (permission/elicitation) waits for the
 // client on the replies channel.
 func (c *serveConn) dispatch(method string, params json.RawMessage) (any, *rpcError) {
+	// _meta may not displace a request's own fields (acp/guard.py): refuse
+	// before anything reads the parameters.
+	if collisions := collidingMetaKeys(method, params); len(collisions) > 0 {
+		return nil, metaGuardError(collisions)
+	}
 	switch method {
 	case "initialize":
 		var p struct {
@@ -499,6 +544,9 @@ func (c *serveConn) dispatch(method string, params json.RawMessage) (any, *rpcEr
 				"audio":           false,
 				"embeddedContext": false,
 			},
+		}
+		if c.cfg.MCPHTTP {
+			caps["mcpCapabilities"] = map[string]any{"http": true, "sse": false}
 		}
 		resp := map[string]any{
 			"protocolVersion":   version,
@@ -637,7 +685,11 @@ func (c *serveConn) runPrompt(session *Session, userText string) (any, *rpcError
 	if final != "" && final != emit.messageText() {
 		emit.Message(final)
 	}
-	return map[string]any{"stopReason": StopEndTurn}, nil
+	resp := map[string]any{"stopReason": StopEndTurn}
+	if u := emit.promptUsage(); u != nil {
+		resp["usage"] = u
+	}
+	return resp, nil
 }
 
 // loadSession reattaches the client to a session by id and replays its stored
@@ -922,19 +974,12 @@ func serveAgentIO(in io.Reader, out io.Writer, a *agent.Agent, cfg ServeConfig) 
 	usageTotals := map[string]events.Usage{}
 
 	cfg.Handle = func(ctx context.Context, sessionID, userText string, emit *Emitter) (string, error) {
-		var run *agent.AgentRun
-		var err error
-		if prev := replies[sessionID]; prev != nil {
-			run, err = prev.Run(ctx, userText)
-		} else {
-			run, err = a.Run(ctx, userText)
-		}
-		if err != nil {
-			return "", fmt.Errorf("acp: start turn: %w", err)
-		}
-		defer run.Close()
-
-		sub := run.Stream().Subscribe(func(ev events.Event) error {
+		// The projection is attached to the turn's stream BEFORE the turn can
+		// run: a continuation turn (AgentReply.Run) starts the moment it is
+		// opened, so subscribing afterwards races the model call and loses the
+		// chunks it streamed first — the reply then arrives as one final-text
+		// chunk instead of streaming.
+		project := func(ev events.Event) error {
 			// The live projection maps what the turn loop sends as it runs:
 			// per-call (loose) tool events, not the batch records — the batch
 			// ToolCallsEvent/ToolResultsEvent are the loop's own bookkeeping
@@ -967,8 +1012,35 @@ func serveAgentIO(in io.Reader, out io.Writer, a *agent.Agent, cfg ServeConfig) 
 				}
 			}
 			return nil
-		}, stream.SubscribeOptions{})
-		defer run.Stream().Unsubscribe(sub)
+		}
+		var (
+			run      *agent.AgentRun
+			err      error
+			subbed   stream.Stream
+			sub      stream.SubID
+			attached bool
+		)
+		attach := func(st stream.Stream) {
+			subbed, sub, attached = st, st.Subscribe(project, stream.SubscribeOptions{}), true
+		}
+		defer func() {
+			if attached {
+				subbed.Unsubscribe(sub)
+			}
+		}()
+		if prev := replies[sessionID]; prev != nil {
+			attach(prev.Context().Stream)
+			run, err = prev.Run(ctx, userText)
+		} else {
+			run, err = a.Run(ctx, userText)
+			if err == nil {
+				attach(run.Stream())
+			}
+		}
+		if err != nil {
+			return "", fmt.Errorf("acp: start turn: %w", err)
+		}
+		defer run.Close()
 
 		// The final text — streamed chunk by chunk when the provider streams,
 		// sent whole by runPrompt when it does not — is deduped by runPrompt.

@@ -73,6 +73,7 @@ type dynamicOptions struct {
 	name        string
 	description string
 	agentOpts   []agent.Option
+	middleware  []middleware.Middleware
 }
 
 // WithDynamicName overrides the tool name (default create_and_run_agent; Python
@@ -105,6 +106,22 @@ func WithDynamicOption(opt agent.Option) DynamicOption {
 			return nil
 		}
 		o.agentOpts = append(o.agentOpts, opt)
+		return nil
+	}
+}
+
+// WithDynamicMiddleware adds tool-scoped middleware to the factory's own
+// execution (the call that spawns and drives the child), the Go spelling of the
+// Python tool's middleware= kwarg. It does not become part of the child agent's
+// middleware: use WithDynamicOption(agent.WithMiddleware(...)) for that.
+func WithDynamicMiddleware(mw ...middleware.Middleware) DynamicOption {
+	return func(o *dynamicOptions) error {
+		for _, m := range mw {
+			if m == nil {
+				return errors.New("toolpacks: dynamic middleware must not be nil")
+			}
+		}
+		o.middleware = append(o.middleware, mw...)
 		return nil
 	}
 }
@@ -156,7 +173,7 @@ func NewDynamicAgentFactory(cfg config.ModelConfig, pool []tools.Tool, opts ...D
 	fn := func(args dynamicArgs, cx *agocontext.Context) (string, error) {
 		return f.run(args.Spec, args.Objective, cx)
 	}
-	ft, err := tools.NewFunctionTool(o.name, description, fn)
+	ft, err := tools.NewFunctionTool(o.name, description, fn, tools.WithMiddleware(o.middleware...))
 	if err != nil {
 		return nil, fmt.Errorf("toolpacks: dynamic factory: %w", err)
 	}

@@ -106,7 +106,9 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 // client. Spread them into agent.New. A WithHitlHook of the application's own
 // passed after these replaces the fallback — the served questions still reach
 // the client through the middleware, and the application hook answers only
-// what runs outside this server.
+// what runs outside this server. Client tools need no option: each served run
+// receives the tools its client declared as that run's tools
+// (agent.RunOptions.Tools).
 func (s *Server) Options() []agent.Option {
 	return []agent.Option{
 		agent.WithHitlHook(s.fallbackHook),
@@ -214,7 +216,6 @@ func (s *Server) resume(ctx context.Context, input RunAgentInput, ex *exchange, 
 		// Unknown, already answered, or expired: which of them is timing or
 		// routing, and none is the client's error. What it sent answers nothing
 		// this server asked (Python parity: resume_held_turn's None path).
-		t.release()
 		s.turns.discard(t)
 		return false
 	}
@@ -319,7 +320,7 @@ func (s *Server) begin(ctx context.Context, a *agent.Agent, input RunAgentInput,
 	// scope). Cancellation travels through release/Close instead, which is why
 	// the run scope is opened on the detached context too.
 	turnCtx := context.WithoutCancel(ctx)
-	run, err := a.Run(turnCtx)
+	run, err := a.RunWith(turnCtx, agent.RunOptions{Tools: clientToolsForRun(a, input.Tools)})
 	if err != nil {
 		ex.emit(runErrorEvent(err))
 		return
@@ -328,9 +329,10 @@ func (s *Server) begin(ctx context.Context, a *agent.Agent, input RunAgentInput,
 	t.streamID = run.Stream().ID()
 	s.turns.bind(t.streamID, t)
 
-	mapped := mapRunInputMessages(input)
+	mapped := mapRunInputMessagesFor(input, a.Config())
 	if err := run.Stream().History().Replace(mapped.history); err != nil {
 		ex.emit(runErrorEvent(err))
+		s.endTurn(t)
 		run.Close()
 		s.turns.discard(t)
 		return

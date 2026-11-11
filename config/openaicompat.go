@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -48,12 +49,70 @@ type CompatParams struct {
 	Streaming  bool
 	MaxRetries int
 	Timeout    time.Duration
+	// HTTPClient performs the requests when non-nil (proxies, custom root
+	// CAs, mTLS, test transports). The client owns its own Timeout and
+	// redirect policy; the Timeout field above applies only to the default
+	// client. Nil keeps the engine's default client.
+	HTTPClient *http.Client
+
+	// Query is appended to every request URL (SDK parity: default_query).
+	Query map[string]string
+
+	// The fields below are the typed Chat Completions options (SDK parity:
+	// the create() keyword arguments). The zero value of each means "not
+	// sent"; Extra still overrides all of them.
+	// ToolChoice is a mode string ("auto", "none", "required") or a map
+	// ({"type":"function","function":{"name":...}}).
+	ToolChoice any
+	// ReasoningEffort travels as reasoning_effort.
+	ReasoningEffort string
+	// Seed travels as seed; providers whose wire name differs (Mistral
+	// random_seed) set Extra instead.
+	Seed *int64
+	// MaxCompletionTokens travels as max_completion_tokens.
+	MaxCompletionTokens               *int64
+	FrequencyPenalty, PresencePenalty *float64
+	// User travels as user.
+	User string
+	// N is the number of completions to request; the engine reads the first
+	// choice only (SDK parity: ag2 reads choices[0]).
+	N *int64
+	// Logprobs and TopLogprobs travel as logprobs / top_logprobs.
+	Logprobs    *bool
+	TopLogprobs *int64
+	// LogitBias maps token ids (as strings) to a bias in [-100, 100].
+	LogitBias map[string]int64
+	// Metadata travels as metadata (string pairs stored with the request).
+	Metadata map[string]string
+	// Modalities travels as modalities ("text", "audio").
+	Modalities []string
+	// Prediction travels as prediction (predicted output content).
+	Prediction map[string]any
+	// PromptCacheKey is the prompt-cache routing hint; PromptCacheOptions the
+	// cache tuning object.
+	PromptCacheKey     string
+	PromptCacheOptions map[string]any
+	// SafetyIdentifier travels as safety_identifier.
+	SafetyIdentifier string
+	// ServiceTier travels as service_tier.
+	ServiceTier string
+	// Store travels as store.
+	Store *bool
+	// Verbosity travels as verbosity ("low", "medium", "high").
+	Verbosity string
+	// WebSearchOptions travels as web_search_options.
+	WebSearchOptions map[string]any
 
 	// ResponseFormat sends an explicit response_format (provider config);
 	// a per-call ResponseSchema in CallOptions takes precedence over it.
 	ResponseFormat map[string]any
 	// Extra merges into the request body last (Python parity: extra_body).
 	Extra map[string]any
+
+	// MapTool lets a provider map hosted tool schemas the Chat Completions
+	// dialect cannot carry (Z.AI retrieval). It is asked first for every tool;
+	// handled == false falls through to ToolToAPI.
+	MapTool func(tool any) (wire map[string]any, handled bool, err error)
 }
 
 // RunChatCompat performs one chat-completions call. messages is the full event
@@ -80,13 +139,23 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 			prompt = append(prompt, sp)
 		}
 	}
-	wireMessages, err := BuildMessages(prompt, messages)
+	wireMessages, err := BuildMessagesFor(p.provider(), prompt, messages)
 	if err != nil {
 		return nil, err
 	}
 
 	wireTools := make([]map[string]any, 0, len(opts.Tools))
 	for _, t := range opts.Tools {
+		if p.MapTool != nil {
+			wt, handled, err := p.MapTool(t)
+			if err != nil {
+				return nil, err
+			}
+			if handled {
+				wireTools = append(wireTools, wt)
+				continue
+			}
+		}
 		wt, err := ToolToAPI(t)
 		if err != nil {
 			return nil, err
@@ -113,6 +182,7 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 	if p.ParallelToolCalls != nil {
 		body["parallel_tool_calls"] = *p.ParallelToolCalls
 	}
+	p.applyOptions(body)
 	if rf := responseFormat(p, opts.ResponseSchema); rf != nil {
 		body["response_format"] = rf
 	}
@@ -135,13 +205,74 @@ func RunChatCompat(ctx context.Context, p CompatParams, messages []events.Event,
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
-	url := joinURL(p.BaseURL, p.Path)
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	url := httpx.WithQuery(joinURL(p.BaseURL, p.Path), p.Query)
 
 	if p.Streaming {
 		return runChatStream(ctx, client, url, headers, body, conv, p.provider())
 	}
 	return runChatOnce(ctx, client, url, headers, body, conv, p.provider())
+}
+
+// applyOptions writes the typed Chat Completions options onto body; a zero
+// value is not sent.
+func (p CompatParams) applyOptions(body map[string]any) {
+	if p.ToolChoice != nil {
+		body["tool_choice"] = p.ToolChoice
+	}
+	setString := func(key, v string) {
+		if v != "" {
+			body[key] = v
+		}
+	}
+	setString("reasoning_effort", p.ReasoningEffort)
+	setString("user", p.User)
+	setString("prompt_cache_key", p.PromptCacheKey)
+	setString("safety_identifier", p.SafetyIdentifier)
+	setString("service_tier", p.ServiceTier)
+	setString("verbosity", p.Verbosity)
+	if p.Seed != nil {
+		body["seed"] = *p.Seed
+	}
+	if p.MaxCompletionTokens != nil {
+		body["max_completion_tokens"] = *p.MaxCompletionTokens
+	}
+	if p.FrequencyPenalty != nil {
+		body["frequency_penalty"] = *p.FrequencyPenalty
+	}
+	if p.PresencePenalty != nil {
+		body["presence_penalty"] = *p.PresencePenalty
+	}
+	if p.N != nil {
+		body["n"] = *p.N
+	}
+	if p.Logprobs != nil {
+		body["logprobs"] = *p.Logprobs
+	}
+	if p.TopLogprobs != nil {
+		body["top_logprobs"] = *p.TopLogprobs
+	}
+	if p.Store != nil {
+		body["store"] = *p.Store
+	}
+	if p.LogitBias != nil {
+		body["logit_bias"] = p.LogitBias
+	}
+	if p.Metadata != nil {
+		body["metadata"] = p.Metadata
+	}
+	if len(p.Modalities) > 0 {
+		body["modalities"] = p.Modalities
+	}
+	if p.Prediction != nil {
+		body["prediction"] = p.Prediction
+	}
+	if len(p.PromptCacheOptions) > 0 { // an empty object is not a setting (SDK parity)
+		body["prompt_cache_options"] = p.PromptCacheOptions
+	}
+	if p.WebSearchOptions != nil {
+		body["web_search_options"] = p.WebSearchOptions
+	}
 }
 
 func (p CompatParams) provider() Provider {
@@ -191,12 +322,26 @@ func responseFormat(p CompatParams, schema response.Proto) map[string]any {
 // --- wire message building ---------------------------------------------------
 
 // BuildMessages converts the system prompt plus the event history into
+// Chat-Completions wire messages for the OpenAI dialect. It is BuildMessagesFor
+// bound to ProviderOpenAI; use BuildMessagesFor to map another vendor's
+// dialect.
+func BuildMessages(prompt []string, evs []events.Event) ([]map[string]any, error) {
+	return BuildMessagesFor(ProviderOpenAI, prompt, evs)
+}
+
+// BuildMessagesFor converts the system prompt plus the event history into
 // Chat-Completions wire messages: system first, then user turns (ModelRequest),
 // assistant turns (ModelResponse, with replayed tool calls), tool answers
 // (ToolResultsEvent) and compaction summaries. Everything else (usage events,
 // streaming chunks, standalone tool-call events, human traffic) is skipped,
 // Python parity.
-func BuildMessages(prompt []string, evs []events.Event) ([]map[string]any, error) {
+//
+// provider selects the input-part dialect: OpenAI and Mistral map their own
+// media vocabulary, while the remaining engine users (Z.AI, DashScope) keep
+// the image-only mapping their port carried before (Python parity:
+// zai/mappers.py and dashscope/mappers.py accept images only).
+func BuildMessagesFor(provider Provider, prompt []string, evs []events.Event) ([]map[string]any, error) {
+	dialect := inputDialectFor(provider)
 	out := make([]map[string]any, 0, len(evs)+1)
 	out = append(out, map[string]any{
 		"role":    "system",
@@ -207,13 +352,13 @@ func BuildMessages(prompt []string, evs []events.Event) ([]map[string]any, error
 		case events.ModelResponse:
 			out = append(out, assistantMessage(e))
 		case events.ModelRequest:
-			msg, err := userMessage(e.Parts)
+			msg, err := userMessage(dialect, e.Parts)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, msg)
 		case events.DrainedModelRequest:
-			msg, err := userMessage(e.Parts)
+			msg, err := userMessage(dialect, e.Parts)
 			if err != nil {
 				return nil, err
 			}
@@ -260,13 +405,43 @@ func assistantMessage(r events.ModelResponse) map[string]any {
 	return m
 }
 
+// inputDialect is the input-part vocabulary of one engine tenant. The shared
+// engine serves vendors whose Python mappers differ, so the part mapping is
+// selected per provider rather than guessed from the wire.
+type inputDialect int
+
+const (
+	// inputDialectCompat is the image-only mapping the engine carried for
+	// Z.AI and DashScope, which keep their own mappers in Python.
+	inputDialectCompat inputDialect = iota
+	// inputDialectOpenAI is openai/mappers.py convert_messages.
+	inputDialectOpenAI
+	// inputDialectMistral is mistral/mappers.py _content_from_input.
+	inputDialectMistral
+)
+
+func inputDialectFor(provider Provider) inputDialect {
+	// AGO-DEVIATION: the Go engine is shared, so the Z.AI and DashScope
+	// bindings keep the pre-existing image-only mapping instead of porting
+	// their own mappers (zai maps text only, dashscope has its own chunk
+	// shape); changing them is a separate port.
+	switch provider {
+	case ProviderOpenAI:
+		return inputDialectOpenAI
+	case ProviderMistral:
+		return inputDialectMistral
+	default:
+		return inputDialectCompat
+	}
+}
+
 // userMessage maps one ModelRequest's parts to a user turn. A single text part
 // collapses to a plain string (Python parity); otherwise the parts travel as an
 // array.
-func userMessage(parts []events.Input) (map[string]any, error) {
+func userMessage(dialect inputDialect, parts []events.Input) (map[string]any, error) {
 	wire := make([]map[string]any, 0, len(parts))
 	for _, part := range parts {
-		w, err := inputPart(part)
+		w, err := inputPart(dialect, part)
 		if err != nil {
 			return nil, err
 		}
@@ -284,10 +459,11 @@ func userMessage(parts []events.Input) (map[string]any, error) {
 	return map[string]any{"role": "user", "content": content}, nil
 }
 
-// inputPart maps one input part to one wire content part. The Chat-Completions
-// dialect of this engine carries text and images; every other part fails fast
-// with ErrUnsupportedInput (never silently dropped).
-func inputPart(part events.Input) (map[string]any, error) {
+// inputPart maps one input part to one wire content part. Every dialect
+// carries text, data-as-text and images; audio, documents and provider files
+// differ, and a part the dialect cannot carry fails fast with
+// ErrUnsupportedInput (never silently dropped).
+func inputPart(dialect inputDialect, part events.Input) (map[string]any, error) {
 	switch p := events.AsValue(part).(type) {
 	case events.TextInput:
 		return map[string]any{"type": "text", "text": p.Content}, nil
@@ -300,6 +476,12 @@ func inputPart(part events.Input) (map[string]any, error) {
 		}
 		return map[string]any{"type": "text", "text": string(b)}, nil
 	case events.BinaryInput:
+		switch dialect {
+		case inputDialectOpenAI:
+			return openAIBinaryPart(p)
+		case inputDialectMistral:
+			return mistralBinaryPart(p)
+		}
 		if p.Kind != events.BinaryImage {
 			return nil, fmt.Errorf("%w: BinaryInput(%s) for the chat-completions API", ErrUnsupportedInput, p.Kind)
 		}
@@ -308,20 +490,180 @@ func inputPart(part events.Input) (map[string]any, error) {
 			"image_url": map[string]any{"url": dataURL(p.MediaType, p.Data)},
 		}, nil
 	case events.UrlInput:
-		if p.Kind != events.BinaryImage {
-			return nil, fmt.Errorf("%w: UrlInput(%s) for the chat-completions API", ErrUnsupportedInput, p.Kind)
+		switch dialect {
+		case inputDialectOpenAI:
+			if p.Kind != events.BinaryImage {
+				return nil, fmt.Errorf("%w: UrlInput(%s) for the chat-completions API", ErrUnsupportedInput, p.Kind)
+			}
+		case inputDialectMistral:
+			return mistralURLPart(p)
+		default:
+			if p.Kind != events.BinaryImage {
+				return nil, fmt.Errorf("%w: UrlInput(%s) for the chat-completions API", ErrUnsupportedInput, p.Kind)
+			}
 		}
 		return map[string]any{
 			"type":      "image_url",
 			"image_url": map[string]any{"url": p.URL},
 		}, nil
 	case events.FileIdInput:
-		// AGO-DEVIATION: Python's OpenAI client accepts file references; the
-		// shared engine has no Files API, so they fail fast per the brief.
+		// An uploaded file travels by reference, in the OpenAI dialect only
+		// (Python parity: the openai mapper's file part). The other tenants of
+		// the shared engine have their own mappers in Python and fail fast.
+		// AGO-DEVIATION: Python refuses a file uploaded through another
+		// vendor's Files API; AGo's UploadedFile carries no provider tag, so
+		// that check does not exist and the API answers a foreign file id.
+		if dialect == inputDialectOpenAI {
+			return map[string]any{
+				"type": "file",
+				"file": map[string]any{"file_id": p.FileID},
+			}, nil
+		}
 		return nil, fmt.Errorf("%w: FileIdInput for the chat-completions API", ErrUnsupportedInput)
 	default:
 		return nil, fmt.Errorf("%w: %T for the chat-completions API", ErrUnsupportedInput, part)
 	}
+}
+
+// audioFormats is the only set of input_audio formats Chat Completions
+// accepts, keyed by MIME type (Python parity: _MIME_TO_AUDIO_FORMAT).
+var audioFormats = map[string]string{
+	"audio/wav":  "wav",
+	"audio/mpeg": "mp3",
+	"audio/mp3":  "mp3",
+}
+
+// chatImageDetails is the detail vocabulary Chat Completions knows (Python
+// parity: _CHAT_IMAGE_DETAILS).
+var chatImageDetails = map[string]bool{"auto": true, "low": true, "high": true}
+
+// openAIBinaryPart maps inline bytes for the OpenAI Chat Completions dialect:
+// audio as input_audio, images as a data URL with optional detail, documents
+// as file_data under a filename (Python parity: openai/mappers.py).
+func openAIBinaryPart(p events.BinaryInput) (map[string]any, error) {
+	switch p.Kind {
+	case events.BinaryAudio:
+		format, ok := audioFormats[p.MediaType]
+		if !ok {
+			// The API answers anything else with "Supported values are: 'wav'
+			// and 'mp3'"; fail here with the same set.
+			return nil, fmt.Errorf("%w: BinaryInput(audio, media_type=%s) for the chat-completions API",
+				ErrUnsupportedInput, p.MediaType)
+		}
+		return map[string]any{
+			"type":        "input_audio",
+			"input_audio": map[string]any{"data": base64.StdEncoding.EncodeToString(p.Data), "format": format},
+		}, nil
+	case events.BinaryImage:
+		image := map[string]any{"url": dataURL(p.MediaType, p.Data)}
+		detail, err := chatImageDetail(p.VendorMetadata)
+		if err != nil {
+			return nil, err
+		}
+		if detail != "" {
+			image["detail"] = detail
+		}
+		return map[string]any{"type": "image_url", "image_url": image}, nil
+	case events.BinaryDocument:
+		return map[string]any{
+			"type": "file",
+			"file": map[string]any{
+				"file_data": dataURL(p.MediaType, p.Data),
+				"filename":  inlineFilename(p.VendorMetadata, p.MediaType),
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("%w: BinaryInput(%s) for the chat-completions API", ErrUnsupportedInput, p.Kind)
+	}
+}
+
+// chatImageDetail reads BinaryInput.vendor_metadata["detail"], refusing a value
+// the API does not know (Python parity: _image_detail). An absent key means
+// "no detail" and leaves the API default in place.
+func chatImageDetail(vendor map[string]any) (string, error) {
+	raw, ok := vendor["detail"]
+	if !ok {
+		return "", nil
+	}
+	detail, ok := raw.(string)
+	if !ok || !chatImageDetails[detail] {
+		return "", fmt.Errorf("%w: BinaryInput(image, detail=%v) for the chat-completions API",
+			ErrUnsupportedInput, raw)
+	}
+	return detail, nil
+}
+
+// inlineFilename is the name inline file data travels under; the API requires
+// one (Python parity: _filename). No vendor name means the media subtype, so
+// application/pdf becomes file.pdf.
+func inlineFilename(vendor map[string]any, mediaType string) string {
+	if s, ok := vendor["filename"].(string); ok && s != "" {
+		return s
+	}
+	suffix := mediaType
+	if i := strings.LastIndex(suffix, "/"); i >= 0 {
+		suffix = suffix[i+1:]
+	}
+	if i := strings.Index(suffix, "+"); i >= 0 {
+		suffix = suffix[:i]
+	}
+	return "file." + suffix
+}
+
+// mistralBinaryPart maps inline bytes for the Mistral dialect: images as a
+// data URL with optional detail, documents (and untyped binaries) as
+// document_url with an optional document_name (Python parity:
+// mistral/mappers.py _content_from_input).
+func mistralBinaryPart(p events.BinaryInput) (map[string]any, error) {
+	switch p.Kind {
+	case events.BinaryImage:
+		return mistralImagePart(dataURL(p.MediaType, p.Data), p.VendorMetadata)
+	case events.BinaryDocument, events.BinaryBinary:
+		chunk := map[string]any{
+			"type":         "document_url",
+			"document_url": dataURL(p.MediaType, p.Data),
+		}
+		if name, ok := p.VendorMetadata["filename"].(string); ok && name != "" {
+			chunk["document_name"] = name
+		}
+		return chunk, nil
+	default:
+		return nil, fmt.Errorf("%w: BinaryInput(%s) for the Mistral chat API", ErrUnsupportedInput, p.Kind)
+	}
+}
+
+// mistralURLPart maps a URL part for the Mistral dialect.
+//
+// AGO-DEVIATION: UrlInput has no metadata container in the Go event
+// vocabulary, so a document URL travels without document_name and an image URL
+// without detail (Python reads UrlInput.metadata for both).
+func mistralURLPart(p events.UrlInput) (map[string]any, error) {
+	switch p.Kind {
+	case events.BinaryImage:
+		return map[string]any{"type": "image_url", "image_url": p.URL}, nil
+	case events.BinaryDocument, events.BinaryBinary:
+		return map[string]any{"type": "document_url", "document_url": p.URL}, nil
+	default:
+		return nil, fmt.Errorf("%w: UrlInput(%s) for the Mistral chat API", ErrUnsupportedInput, p.Kind)
+	}
+}
+
+// mistralImagePart renders one image chunk: a bare URL unless vendor_metadata
+// carries a detail level (Python parity: _image_chunk). Any string detail is
+// forwarded as-is; a non-string one cannot be put on the wire.
+func mistralImagePart(url string, vendor map[string]any) (map[string]any, error) {
+	raw, ok := vendor["detail"]
+	if !ok {
+		return map[string]any{"type": "image_url", "image_url": url}, nil
+	}
+	detail, ok := raw.(string)
+	if !ok {
+		return nil, fmt.Errorf("%w: BinaryInput(image, detail=%v) for the Mistral chat API", ErrUnsupportedInput, raw)
+	}
+	return map[string]any{
+		"type":      "image_url",
+		"image_url": map[string]any{"url": url, "detail": detail},
+	}, nil
 }
 
 func dataURL(mediaType string, data []byte) string {
@@ -541,10 +883,101 @@ type wireToolCall struct {
 type wireChoice struct {
 	FinishReason string `json:"finish_reason"`
 	Message      struct {
-		Content   string         `json:"content"`
-		Reasoning string         `json:"reasoning"`
-		ToolCalls []wireToolCall `json:"tool_calls"`
+		// Content is a plain string in most dialects and a chunk array when
+		// Mistral answers with reasoning (ThinkChunk) or prompt-mode chunks.
+		Content   json.RawMessage `json:"content"`
+		Reasoning string          `json:"reasoning"`
+		ToolCalls []wireToolCall  `json:"tool_calls"`
 	} `json:"message"`
+}
+
+// splitWireContent separates a message content value into answer text and
+// reasoning text (Python parity: mistral/mappers.py split_content).
+//
+// AGO-DEVIATION: Python splits content only in the Mistral client; the Go
+// engine is shared, so the split applies to every dialect. Only a "thinking"
+// chunk produces reasoning and no other dialect emits one, so the difference
+// is unobservable for them.
+func splitWireContent(raw json.RawMessage) (text, reasoning string, err error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", "", nil
+	}
+	var plain string
+	if err := json.Unmarshal(raw, &plain); err == nil {
+		return plain, "", nil
+	}
+	var chunks []json.RawMessage
+	if err := json.Unmarshal(raw, &chunks); err != nil {
+		return "", "", fmt.Errorf("config: decoding message content: %w", err)
+	}
+	var (
+		texts  strings.Builder
+		traces strings.Builder
+	)
+	for i, rawChunk := range chunks {
+		var str string
+		if err := json.Unmarshal(rawChunk, &str); err == nil {
+			texts.WriteString(str)
+			continue
+		}
+		var chunk struct {
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Thinking json.RawMessage `json:"thinking"`
+		}
+		if err := json.Unmarshal(rawChunk, &chunk); err != nil {
+			return "", "", fmt.Errorf("config: decoding message content chunk %d: %w", i, err)
+		}
+		switch chunk.Type {
+		case "text":
+			texts.WriteString(chunk.Text)
+		case "thinking":
+			// ThinkChunk.thinking is itself a chunk list (usually TextChunk),
+			// occasionally a bare string.
+			think, err := thinkText(chunk.Thinking)
+			if err != nil {
+				return "", "", err
+			}
+			traces.WriteString(think)
+		}
+		// Reference, file and tool chunks carry citation metadata, not answer
+		// text (Python parity: skipped).
+	}
+	return texts.String(), traces.String(), nil
+}
+
+// thinkText joins the text of a ThinkChunk's thinking payload.
+func thinkText(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	var plain string
+	if err := json.Unmarshal(raw, &plain); err == nil {
+		return plain, nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return "", fmt.Errorf("config: decoding thinking chunk: %w", err)
+	}
+	var out strings.Builder
+	for i, item := range items {
+		var str string
+		if err := json.Unmarshal(item, &str); err == nil {
+			out.WriteString(str)
+			continue
+		}
+		var chunk struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(item, &chunk); err != nil {
+			return "", fmt.Errorf("config: decoding thinking chunk %d: %w", i, err)
+		}
+		if chunk.Type == "text" {
+			out.WriteString(chunk.Text)
+		}
+	}
+	return out.String(), nil
 }
 
 func runChatOnce(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, provider Provider) (*events.ModelResponse, error) {
@@ -553,7 +986,7 @@ func runChatOnce(ctx context.Context, client *httpx.Client, url string, headers 
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config: chat completions returned %d: %s", status, bodySnippet(data))
+		return nil, NewAPIError(provider, "config: chat completions", status, nil, data)
 	}
 	var raw struct {
 		ID      string          `json:"id"`
@@ -580,8 +1013,17 @@ func runChatOnce(ctx context.Context, client *httpx.Client, url string, headers 
 				return nil, err
 			}
 		}
-		if c := choice.Message.Content; c != "" {
-			msg := &events.ModelMessage{Content: c}
+		text, reasoning, err := splitWireContent(choice.Message.Content)
+		if err != nil {
+			return nil, err
+		}
+		if reasoning != "" {
+			if err := sendEvent(conv, &events.ModelReasoning{Content: reasoning}); err != nil {
+				return nil, err
+			}
+		}
+		if text != "" {
+			msg := &events.ModelMessage{Content: text}
 			if err := sendEvent(conv, msg); err != nil {
 				return nil, err
 			}
@@ -623,7 +1065,7 @@ type wireChunk struct {
 	Choices []struct {
 		FinishReason *string `json:"finish_reason"`
 		Delta        struct {
-			Content          string          `json:"content"`
+			Content          json.RawMessage `json:"content"`
 			ReasoningContent string          `json:"reasoning_content"`
 			ToolCalls        []wireToolDelta `json:"tool_calls"`
 		} `json:"delta"`
@@ -686,9 +1128,18 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 					return err
 				}
 			}
-			if c := choice.Delta.Content; c != "" {
-				content.WriteString(c)
-				if err := sendEvent(conv, &events.ModelMessageChunk{Content: c}); err != nil {
+			text, reasoning, err := splitWireContent(choice.Delta.Content)
+			if err != nil {
+				return err
+			}
+			if reasoning != "" {
+				if err := sendEvent(conv, &events.ModelReasoning{Content: reasoning}); err != nil {
+					return err
+				}
+			}
+			if text != "" {
+				content.WriteString(text)
+				if err := sendEvent(conv, &events.ModelMessageChunk{Content: text}); err != nil {
 					return err
 				}
 			}
@@ -725,7 +1176,7 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, WrapStatusError(provider, "config: chat completions", err)
 	}
 
 	resp := &events.ModelResponse{
@@ -760,14 +1211,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// bodySnippet renders the first bytes of an error response body.
-func bodySnippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }

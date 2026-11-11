@@ -27,7 +27,7 @@ const wireRoundLimit = 16
 // (parity: the AG2 client absorbing both result shapes, client.py result
 // probing this package's Client.SendMessage mirrors).
 func (c *Client) SendMessageTask(ctx context.Context, msg *Message) (*Task, error) {
-	result, err := c.call(ctx, MethodMessageSend, map[string]any{"message": msg})
+	result, err := c.sendRaw(ctx, msg)
 	if err != nil {
 		return nil, err
 	}

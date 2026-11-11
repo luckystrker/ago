@@ -16,6 +16,7 @@ import (
 	"github.com/luckystrker/ago/hitl"
 	"github.com/luckystrker/ago/knowledge"
 	"github.com/luckystrker/ago/middleware"
+	"github.com/luckystrker/ago/observers"
 	"github.com/luckystrker/ago/plugin"
 	"github.com/luckystrker/ago/response"
 	"github.com/luckystrker/ago/stream"
@@ -51,6 +52,7 @@ type options struct {
 	hitl          hitl.HumanHook
 	tools         []tools.Tool
 	middleware    []middleware.Factory
+	observers     []observers.Observer
 	dependencies  map[string]any
 	variables     map[string]any
 	schema        response.Proto
@@ -72,6 +74,19 @@ func WithMiddleware(fs ...middleware.Factory) Option {
 	return func(o *options) { o.middleware = append(o.middleware, fs...) }
 }
 func WithDependencies(deps map[string]any) Option { return func(o *options) { o.dependencies = deps } }
+
+// WithObservers attaches observers to every turn of this agent (Python parity:
+// the Agent(observers=...) constructor parameter). Each is registered on the
+// turn's conversation stream and bracketed by ObserverStarted /
+// ObserverCompleted events, so an observer can watch its own lifecycle.
+//
+// Registration happens per turn: an observer attached to an agent that runs
+// several turns registers once per turn on that turn's stream. A shared stream
+// (WithStreamBase) therefore accumulates the subscriptions, which is the
+// existing stream-scoped observer lifetime (docs/DECISIONS.md D-025).
+func WithObservers(obs ...observers.Observer) Option {
+	return func(o *options) { o.observers = append(o.observers, obs...) }
+}
 
 // WithVariables seeds the conversation variables. Values may be plain values
 // (ScopeCopied by default: a delegated child gets a deep copy) or
@@ -148,6 +163,12 @@ type Agent struct {
 	// bootstrapped flag + lock).
 	knowledgeMu           sync.Mutex
 	knowledgeBootstrapped bool
+	// taskSlots is the one subtask pool shared by run_subtask and run_subtasks
+	// across concurrent turns (Python parity: Agent._task_slots /
+	// _task_slots_for). Guarded by taskSlotsMu.
+	taskSlotsMu    sync.Mutex
+	taskSlots      chan struct{}
+	taskSlotsLimit int
 }
 
 // New creates an agent. prompt may be empty when fragments/hooks supply the prompt.
@@ -212,10 +233,14 @@ func (a *Agent) Run(ctx stdcontext.Context, msgs ...Sendable) (*AgentRun, error)
 	return a.RunWith(ctx, RunOptions{}, msgs...)
 }
 
-// RunWith is Run with per-invocation task-lifecycle options (Python parity:
-// agent.run(capability=..., ttl_seconds=...)).
+// RunWith is Run with per-invocation options: a supplied Stream replaces the
+// agent's stream base for this call (Python parity: stream=), and the rest of
+// RunOptions override the agent's configuration for this call only.
 func (a *Agent) RunWith(_ stdcontext.Context, opts RunOptions, msgs ...Sendable) (*AgentRun, error) {
-	s := a.opts.streamBase
+	s := opts.Stream
+	if s == nil {
+		s = a.opts.streamBase
+	}
 	if s == nil {
 		s = stream.NewMemoryStream()
 	}
@@ -223,6 +248,8 @@ func (a *Agent) RunWith(_ stdcontext.Context, opts RunOptions, msgs ...Sendable)
 	if err != nil {
 		return nil, err
 	}
+	// The stream override already selected the stream.
+	opts.Stream = nil
 	run.runOpts = opts
 	return run, nil
 }
@@ -297,16 +324,23 @@ func (a *Agent) Resume(ctx stdcontext.Context, evs ...events.Event) (*AgentReply
 	return a.ResumeWith(ctx, RunOptions{}, evs...)
 }
 
-// ResumeWith is Resume with per-invocation task-lifecycle options. Each resume
-// is a fresh task identity (upstream ADR 0035).
+// ResumeWith is Resume with per-invocation options: a supplied Stream replays on
+// that stream (replacing its history) instead of a fresh one (Python parity:
+// resume(stream=)), and each resume is a fresh task identity (upstream ADR 0035).
 func (a *Agent) ResumeWith(ctx stdcontext.Context, opts RunOptions, evs ...events.Event) (*AgentReply, error) {
 	if len(evs) == 0 {
 		return nil, errors.New("agent: resume needs at least one event")
 	}
-	s := stream.NewMemoryStream()
+	s := opts.Stream
+	if s == nil {
+		s = stream.NewMemoryStream()
+	}
 	if err := s.History().Replace(evs[:len(evs)-1]); err != nil {
 		return nil, fmt.Errorf("agent: seed history: %w", err)
 	}
+	// The stream override is consumed here; leaving it in runOpts would have no
+	// meaning for the replay it selects.
+	opts.Stream = nil
 	run, err := a.newRun(s)
 	if err != nil {
 		return nil, err
@@ -345,6 +379,11 @@ func (a *Agent) ResumeWith(ctx stdcontext.Context, opts RunOptions, evs ...event
 // caller as ChildEvent observations. The agent's own stream base
 // (WithStreamBase) stays the delegation's stream — every delegation opens a
 // fresh stream otherwise.
+//
+// WithToolStream pins one stream for every delegation (a stateful sub-agent, the
+// same shape as WithStreamBase), WithToolStreamFactory builds a stream per
+// delegation, and WithToolMiddleware wraps the delegation tool's own execution
+// (Python parity: subagent_tool's stream= and middleware=).
 func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 	var o asToolOptions
 	for _, f := range opts {
@@ -368,7 +407,7 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 		// context (Context.TurnContext), so a parent cancellation reaches the
 		// delegated run and reports PARENT_CANCELLED (upstream run_task's
 		// origin-cancelled path).
-		res, err := runTaskOn(cx.TurnContext(), cx, a, args.Objective, args.Context)
+		res, err := runTaskWith(cx.TurnContext(), cx, a, args.Objective, args.Context, o.streamFactory, "")
 		if err != nil {
 			// hitl: not a tool result — it ends the calling turn (Python parity:
 			// run_task re-raises HumanInputError past the delegating tool).
@@ -385,7 +424,7 @@ func (a *Agent) AsTool(opts ...AsToolOption) tools.Tool {
 		}
 		return res.result, nil
 	}
-	ft, err := tools.NewFunctionTool(name, desc, fn)
+	ft, err := tools.NewFunctionTool(name, desc, fn, tools.WithMiddleware(o.middleware...))
 	if err != nil {
 		return failingTool{err: fmt.Errorf("agent: as_tool: %w", err)}
 	}
@@ -414,12 +453,14 @@ func sanitizeToolName(s string) string {
 	return b.String()
 }
 
-// AsToolOption configures Agent.AsTool.
+// AsToolOption configures Agent.AsTool and Agent.AsBackgroundTool.
 type AsToolOption func(*asToolOptions)
 
 type asToolOptions struct {
-	description string
-	name        string
+	description   string
+	name          string
+	middleware    []middleware.Middleware
+	streamFactory DelegationStreamFactory
 }
 
 // WithToolDescription overrides the delegation tool's description.
@@ -427,3 +468,30 @@ func WithToolDescription(d string) AsToolOption { return func(o *asToolOptions) 
 
 // WithToolName overrides the delegation tool's name.
 func WithToolName(n string) AsToolOption { return func(o *asToolOptions) { o.name = n } }
+
+// WithToolMiddleware adds tool-scoped middleware to the delegation tool. It
+// wraps the delegation's own execution; agent-level middleware still wraps it
+// from outside (Python parity: subagent_tool's middleware=).
+func WithToolMiddleware(mw ...middleware.Middleware) AsToolOption {
+	return func(o *asToolOptions) { o.middleware = append(o.middleware, mw...) }
+}
+
+// WithToolStream pins one stream for every delegation of this tool (Python
+// parity: subagent_tool(stream=<Stream>)). The caller can read or subscribe to
+// it, and the delegation accumulates history across calls, so the sub-agent is
+// stateful. Prefer WithToolStreamFactory when each delegation should start
+// clean; prefer PersistentStream for one stream per agent per conversation.
+func WithToolStream(s stream.Stream) AsToolOption {
+	return WithToolStreamFactory(func(*Agent, *context.Context) stream.Stream { return s })
+}
+
+// DelegationStreamFactory builds the stream of one delegation (Python parity:
+// subagent_tool.StreamFactory). It is called under the parent turn with the
+// delegated agent and the caller's conversation context; a nil result falls back
+// to the child's stream base, then to a fresh stream over the parent's storage.
+type DelegationStreamFactory func(agent *Agent, cx *context.Context) stream.Stream
+
+// WithToolStreamFactory builds a fresh stream per delegation.
+func WithToolStreamFactory(f DelegationStreamFactory) AsToolOption {
+	return func(o *asToolOptions) { o.streamFactory = f }
+}

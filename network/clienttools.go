@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -63,7 +64,7 @@ func ClientTools(hc *HubClient, self *AgentClient) ([]tools.Tool, error) {
 	}
 	peers, err := tools.NewFunctionTool("peers",
 		"Discover and describe peers.\n"+
-			"find:     args query?, capability?, limit → matching peer summaries\n"+
+			"find:     args query?, capability?, sort_by? (name|cost|track_record), limit → matching peer summaries\n"+
 			"describe: args name (or agent_id) → passport + capability claim",
 		self.peersFindDescribe(hc),
 		tools.WithSource("network:peers"))
@@ -126,13 +127,22 @@ type peersArgs struct {
 	Action     string `json:"action"`
 	Query      string `json:"query,omitempty"`
 	Capability string `json:"capability,omitempty"`
+	SortBy     string `json:"sort_by,omitempty"`
 	Name       string `json:"name,omitempty"`
 	Limit      int    `json:"limit,omitempty"`
 }
 
+// peersSortModes are the orderings peers find accepts (Python parity:
+// peers.py sort_by Literal).
+const (
+	PeersSortName        = "name"
+	PeersSortCost        = "cost"
+	PeersSortTrackRecord = "track_record"
+)
+
 func (a *AgentClient) peersFindDescribe(hc *HubClient) func(peersArgs) (any, error) {
 	return func(args peersArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "find":
 			limit := args.Limit
@@ -152,13 +162,18 @@ func (a *AgentClient) peersFindDescribe(hc *HubClient) func(peersArgs) (any, err
 					continue
 				}
 				out = append(out, map[string]any{
-					"name":         p.Name,
-					"agent_id":     p.AgentID,
-					"capabilities": resume.Capabilities,
+					"name":                  p.Name,
+					"agent_id":              p.AgentID,
+					"capabilities":          resume.Capabilities,
+					"observed_success_rate": observedSuccessRate(resume),
+					"cost":                  costSummary(p.Cost),
 				})
 				if len(out) >= limit {
 					break
 				}
+			}
+			if err := sortPeers(out, args.SortBy); err != nil {
+				return "Error: " + err.Error(), nil
 			}
 			if out == nil {
 				out = []map[string]any{}
@@ -178,6 +193,9 @@ func (a *AgentClient) peersFindDescribe(hc *HubClient) func(peersArgs) (any, err
 					"name":     p.Name,
 					"agent_id": p.AgentID,
 					"kind":     string(p.EffectiveKind()),
+					"owner":    p.Owner,
+					"provider": p.Provider,
+					"model":    p.Model,
 				},
 				"resume": map[string]any{
 					"capabilities": resume.Capabilities,
@@ -187,6 +205,87 @@ func (a *AgentClient) peersFindDescribe(hc *HubClient) func(peersArgs) (any, err
 			return fmt.Sprintf("Error: unknown action %q; choose from find, describe", args.Action), nil
 		}
 	}
+}
+
+// observedSuccessRate is the completed fraction of the resume's observed
+// track record, or nil when nothing was observed (Python parity:
+// peers.py _passport_summary — completed / total, None when total is 0).
+func observedSuccessRate(r Resume) any {
+	completed, total := 0, 0
+	for _, stat := range r.Observed {
+		completed += stat.Completed
+		total += stat.N
+	}
+	if total == 0 {
+		return nil
+	}
+	return float64(completed) / float64(total)
+}
+
+// costSummary renders a passport's cost profile in the peers summary shape
+// (nil when the passport carries none).
+func costSummary(c *CostProfile) any {
+	if c == nil {
+		return nil
+	}
+	return map[string]any{
+		"input_per_mtok":  c.InputPerMTok,
+		"output_per_mtok": c.OutputPerMTok,
+		"latency_tier":    c.LatencyTier,
+	}
+}
+
+// sortPeers orders a peers find result. An empty mode keeps hub order (the
+// pre-sort behavior); an unknown mode is an error for the model to read.
+// Sorting is stable, so peers with equal keys keep hub order (Python parity:
+// peers.py's list.sort).
+func sortPeers(peers []map[string]any, mode string) error {
+	switch mode {
+	case "":
+		return nil
+	case PeersSortName:
+		sort.SliceStable(peers, func(i, j int) bool {
+			ni, _ := peers[i]["name"].(string)
+			nj, _ := peers[j]["name"].(string)
+			return ni < nj
+		})
+	case PeersSortCost:
+		// Cheapest input first; a peer with no cost profile sorts last
+		// (Python parity: cost.input_per_mtok or inf).
+		sort.SliceStable(peers, func(i, j int) bool {
+			return inputCost(peers[i]) < inputCost(peers[j])
+		})
+	case PeersSortTrackRecord:
+		// Best observed success rate first; an unobserved peer sorts last
+		// (Python parity: observed_success_rate or 0.0, reverse=True).
+		sort.SliceStable(peers, func(i, j int) bool {
+			return successRate(peers[i]) > successRate(peers[j])
+		})
+	default:
+		return fmt.Errorf("unknown sort_by %q; choose from %s, %s, %s",
+			mode, PeersSortName, PeersSortCost, PeersSortTrackRecord)
+	}
+	return nil
+}
+
+// inputCost is a peer's input price per million tokens, +Inf when it has no
+// cost profile.
+func inputCost(peer map[string]any) float64 {
+	cost, _ := peer["cost"].(map[string]any)
+	if cost == nil {
+		return math.Inf(1)
+	}
+	per, _ := cost["input_per_mtok"].(float64)
+	if per <= 0 {
+		return math.Inf(1)
+	}
+	return per
+}
+
+// successRate is a peer's observed success rate, 0 when nothing was observed.
+func successRate(peer map[string]any) float64 {
+	rate, _ := peer["observed_success_rate"].(float64)
+	return rate
 }
 
 func resumeHasCapability(r Resume, capability string) bool {
@@ -212,7 +311,7 @@ type channelsArgs struct {
 
 func (a *AgentClient) channelsLifecycle(hc *HubClient) func(channelsArgs) (any, error) {
 	return func(args channelsArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "list":
 			includeTerminal := args.State == "all"
@@ -354,7 +453,7 @@ type tasksArgs struct {
 
 func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.Context) (any, error) {
 	return func(args tasksArgs, cx *agocontext.Context) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "progress", "complete":
 			// The active task comes from the context dependency the task
@@ -451,6 +550,7 @@ func (a *AgentClient) tasksLifecycle(hc *HubClient) func(tasksArgs, *agocontext.
 				Audience:  md.OwnerID,
 				EventType: EnvTaskCancelRequest,
 				Payload:   payload,
+				TaskID:    args.TaskID,
 			}
 			if _, err := hub.Send(env); err != nil {
 				return fmt.Sprintf("Error: cancel_request post failed: %v", err), nil
@@ -483,7 +583,7 @@ func taskSummary(md task.Metadata) map[string]any {
 // AGO-DEVIATION: Python's tasks list scope=all passes no owner filter and
 // returns every task the hub mirrors; AGo gates it on ownership or channel
 // participation.
-func participantTasks(hub *Hub, metas []task.Metadata, agentID string) []task.Metadata {
+func participantTasks(hub hubAPI, metas []task.Metadata, agentID string) []task.Metadata {
 	out := make([]task.Metadata, 0, len(metas))
 	for _, md := range metas {
 		if md.OwnerID == agentID {
@@ -516,7 +616,7 @@ const contextExcerptChars = 240
 
 func (a *AgentClient) contextRead(hc *HubClient) func(contextArgs) (any, error) {
 	return func(args contextArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		switch args.Action {
 		case "search":
 			if args.Query == "" {
@@ -654,7 +754,7 @@ func delegateCandidates(target string) []string {
 
 func (a *AgentClient) delegateConsult(hc *HubClient) func(delegateArgs) (any, error) {
 	return func(args delegateArgs) (any, error) {
-		hub := hc.Hub()
+		hub := hc.api
 		if args.Target == "" || args.Prompt == "" {
 			return "Error: delegate requires `target` and `prompt`", nil
 		}

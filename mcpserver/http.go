@@ -15,11 +15,14 @@ import (
 const maxRequestBody = 8 << 20 // 8 MiB
 
 // Handler returns the http.Handler serving MCP over streamable HTTP: every
-// message is a POST; a request is answered application/json, a notification
-// is accepted with 202 and no body (Python parity: the streamable-HTTP
-// session manager). GET opens a server-to-client SSE stream, which this
-// subset keeps open but silent — no server-initiated messages exist in it.
-// Mount it on any HTTP server; the handler serves every path it is mounted on.
+// message is a POST; a request is answered application/json (or, with
+// TransportConfig.StreamResponses, as an SSE stream carrying notifications and
+// server-to-client requests ahead of the response), a notification is accepted
+// with 202 and no body (Python parity: the streamable-HTTP session manager).
+// With the zero TransportConfig, GET opens a server-to-client stream that stays
+// open but silent; a Stateful transport adds sessions (Mcp-Session-Id, DELETE),
+// the standalone GET stream and Last-Event-ID resumption. Mount it on any HTTP
+// server; the handler serves every path it is mounted on.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.serveHTTP)
 }
@@ -39,13 +42,17 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	if s.strictHTTP() {
+		s.serveStrict(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		s.servePost(w, r)
 	case http.MethodGet:
 		s.serveListenStream(w, r)
 	default:
-		// DELETE would be the spec's session teardown hint; the subset is
+		// DELETE is the spec's session teardown hint; this transport is
 		// stateless and issues no sessions to tear down.
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

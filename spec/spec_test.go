@@ -10,6 +10,7 @@ import (
 
 	"github.com/luckystrker/ago/agent"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/response"
 	agotest "github.com/luckystrker/ago/testing"
 	"github.com/luckystrker/ago/tools"
 )
@@ -66,8 +67,7 @@ func TestFromAgent(t *testing.T) {
 	if !reflect.DeepEqual(s.ToolNames, wantTools) {
 		t.Errorf("ToolNames = %v, want %v", s.ToolNames, wantTools)
 	}
-	// AGO-DEVIATION (documented): the agent's response schema is not publicly
-	// readable, so FromAgent always leaves ResponseSchema nil.
+	// The source agent has no response schema, so the spec carries none.
 	if s.ResponseSchema != nil {
 		t.Errorf("ResponseSchema = %+v, want nil", s.ResponseSchema)
 	}
@@ -234,5 +234,124 @@ func TestToAgentRebuiltAgentAsks(t *testing.T) {
 	}
 	if reply.Body() != "rebuilt and answering" {
 		t.Errorf("body = %q", reply.Body())
+	}
+}
+
+// verdict is the structured answer the schema round-trip test captures.
+type verdict struct {
+	OK     bool   `json:"ok" agschema:"required"`
+	Reason string `json:"reason"`
+}
+
+// TestFromAgentCapturesResponseSchema pins that a schema-bearing agent round
+// trips through the spec: FromAgent reads the schema through the agent's public
+// introspection view and ToAgent puts a schema back on the rebuilt agent.
+func TestFromAgentCapturesResponseSchema(t *testing.T) {
+	schema := response.NewSchema[verdict]("Verdict", "a yes/no answer")
+	src := agent.New("judge", "Judge.", agent.WithResponseSchema(schema))
+
+	s, err := FromAgent(src)
+	if err != nil {
+		t.Fatalf("FromAgent: %v", err)
+	}
+	if s.ResponseSchema == nil {
+		t.Fatal("FromAgent dropped the response schema")
+	}
+	if s.ResponseSchema.Name != "Verdict" || s.ResponseSchema.Description != "a yes/no answer" {
+		t.Fatalf("schema spec = %+v", s.ResponseSchema)
+	}
+	if !reflect.DeepEqual(s.ResponseSchema.Schema, schema.JSONSchema()) {
+		t.Fatalf("schema = %v, want %v", s.ResponseSchema.Schema, schema.JSONSchema())
+	}
+
+	// The wire form survives a round trip unchanged.
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded AgentSpec
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	built, err := decoded.ToAgent(nil)
+	if err != nil {
+		t.Fatalf("ToAgent: %v", err)
+	}
+	restored := built.ResponseSchema()
+	if restored == nil {
+		t.Fatal("ToAgent did not restore the response schema")
+	}
+	if restored.Name() != "Verdict" || restored.Description() != "a yes/no answer" {
+		t.Fatalf("restored schema = %q/%q", restored.Name(), restored.Description())
+	}
+	if !reflect.DeepEqual(restored.JSONSchema(), schema.JSONSchema()) {
+		// The wire round trip turns typed slices ([]string) into []any, so compare
+		// the JSON form.
+		got, _ := json.Marshal(restored.JSONSchema())
+		want, _ := json.Marshal(schema.JSONSchema())
+		if string(got) != string(want) {
+			t.Fatalf("restored JSON schema = %s, want %s", got, want)
+		}
+	}
+	// A spec carries data, not code: the restored schema is a RawSchema, so it
+	// passes the text through instead of validating it (Python parity).
+	if v, err := restored.Validate(`{"ok":true}`, nil); err != nil || v != `{"ok":true}` {
+		t.Fatalf("restored Validate = %v, %v; want the raw text", v, err)
+	}
+}
+
+// TestFromAgentIgnoresPromptOnlySchema pins that a schema with no JSON schema
+// (prompt-driven) is not captured: there is nothing to put on a spec.
+func TestFromAgentIgnoresPromptOnlySchema(t *testing.T) {
+	prompted := response.NewPromptedSchema(response.NewSchema[verdict]("Verdict", ""))
+	src := agent.New("judge", "Judge.", agent.WithResponseSchema(prompted))
+	s, err := FromAgent(src)
+	if err != nil {
+		t.Fatalf("FromAgent: %v", err)
+	}
+	if s.ResponseSchema != nil {
+		t.Fatalf("ResponseSchema = %+v, want nil for a prompt-only schema", s.ResponseSchema)
+	}
+}
+
+// TestToAgentExplicitSchemaWins pins the precedence: an explicit
+// WithResponseSchema at reconstruction time overrides the spec's schema
+// (Python parity: explicit response_schema > spec).
+func TestToAgentExplicitSchemaWins(t *testing.T) {
+	s := &AgentSpec{
+		Name: "judge",
+		ResponseSchema: &SchemaSpec{
+			Name: "FromSpec", Schema: map[string]any{"type": "object"},
+		},
+	}
+	explicit := response.NewSchema[verdict]("Explicit", "")
+	built, err := s.ToAgent(nil, agent.WithResponseSchema(explicit))
+	if err != nil {
+		t.Fatalf("ToAgent: %v", err)
+	}
+	if got := built.ResponseSchema(); got != response.Proto(explicit) {
+		t.Fatalf("response schema = %v, want the explicit one", got.Name())
+	}
+
+	// Without an explicit schema the spec's schema is used.
+	built, err = s.ToAgent(nil)
+	if err != nil {
+		t.Fatalf("ToAgent: %v", err)
+	}
+	if got := built.ResponseSchema(); got == nil || got.Name() != "FromSpec" {
+		t.Fatalf("response schema = %v, want the spec's FromSpec", got)
+	}
+}
+
+// TestSchemaSpecResponseProto pins the wire-spec conversion on its own,
+// including the empty-name default and a nil receiver.
+func TestSchemaSpecResponseProto(t *testing.T) {
+	p := (&SchemaSpec{Schema: map[string]any{"type": "string"}}).ResponseProto()
+	if p == nil || p.Name() != "ResponseSchema" {
+		t.Fatalf("ResponseProto = %v, want the default name", p)
+	}
+	var missing *SchemaSpec
+	if missing.ResponseProto() != nil {
+		t.Fatal("a nil SchemaSpec must convert to nil")
 	}
 }

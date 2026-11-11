@@ -2,7 +2,7 @@
 // metadata), list (cursor pagination), delete. Parity with
 // ag2/config/openai/files.py (OpenAIFilesClient), which drives the openai
 // SDK; AGo speaks the wire protocol directly. The transport retries mirror
-// internal/httpx (connection errors and 429/5xx, Retry-After honored) —
+// internal/httpx (connection errors and 408/409/429/5xx, Retry-After honored) —
 // httpx itself only speaks POST+JSON, which cannot carry these
 // multipart/GET/DELETE requests.
 
@@ -28,6 +28,7 @@ import (
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/files"
+	"github.com/luckystrker/ago/internal/httpx"
 )
 
 // ErrFilesAPI marks a non-2xx Files API response. Match with errors.Is.
@@ -54,14 +55,24 @@ type FilesClient struct {
 	defaultHeaders map[string]string
 	timeout        time.Duration // caps each request; 0 = no cap
 	maxRetries     int
+	query          map[string]string
 	http           *http.Client
+}
+
+// httpClientOr returns the caller's client, or a default one capped by
+// timeout.
+func httpClientOr(c *http.Client, timeout time.Duration) *http.Client {
+	if c != nil {
+		return c
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 // CreateFilesClient returns the Files API client for this configuration
 // (Python parity: create_files_client). The API key resolves like Create
 // (config field, then OPENAI_API_KEY); a missing key wraps
-// config.ErrNotProvided. AGO-DEVIATION: Python also forwards default_query
-// and http_client to the SDK; the AGo config has no such fields.
+// config.ErrNotProvided. HTTPClient and DefaultQuery carry over (Python
+// parity: http_client, default_query).
 func (c *OpenAICompletionsConfig) CreateFilesClient() (files.Client, error) {
 	key := c.APIKey
 	if key == "" {
@@ -83,7 +94,8 @@ func (c *OpenAICompletionsConfig) CreateFilesClient() (files.Client, error) {
 		defaultHeaders: c.DefaultHeaders,
 		timeout:        timeout,
 		maxRetries:     c.MaxRetries,
-		http:           &http.Client{Timeout: timeout},
+		query:          c.DefaultQuery,
+		http:           httpClientOr(c.HTTPClient, timeout),
 	}, nil
 }
 
@@ -237,7 +249,7 @@ func (c *FilesClient) readBytes(ctx context.Context, path string) ([]byte, error
 }
 
 // do performs one Files API request with the transport retries: connection
-// errors and 429/5xx are retried up to maxRetries times with exponential
+// errors and retryable statuses (408/409/429/5xx) are retried up to maxRetries times with exponential
 // backoff, honoring a server-sent Retry-After (internal/httpx semantics).
 func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, accept string, body []byte) (*http.Response, error) {
 	client := c.http
@@ -245,7 +257,7 @@ func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, acce
 		client = &http.Client{Timeout: c.timeout}
 	}
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+reqPath, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, method, httpx.WithQuery(c.baseURL+reqPath, c.query), bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("openai: files request: %w", err)
 		}
@@ -294,8 +306,10 @@ func (c *FilesClient) do(ctx context.Context, method, reqPath, contentType, acce
 
 func statusOK(code int) bool { return code >= 200 && code < 300 }
 
+// filesStatusErr wraps a non-2xx answer so both errors.Is(ErrFilesAPI) and
+// errors.As(*config.APIError) work.
 func filesStatusErr(status int, data []byte) error {
-	return fmt.Errorf("%w: returned %d: %s", ErrFilesAPI, status, snippet(data))
+	return fmt.Errorf("%w: %w", ErrFilesAPI, config.NewAPIError(config.ProviderOpenAI, "", status, nil, data))
 }
 
 // readAndClose drains and closes the response body.
@@ -346,9 +360,7 @@ func retryBackoff(attempt int) time.Duration {
 	return d
 }
 
-func retryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code >= 500
-}
+func retryableStatus(code int) bool { return httpx.RetryableStatus(code) }
 
 func retryAfter(h http.Header) (time.Duration, bool) {
 	v := h.Get("Retry-After")

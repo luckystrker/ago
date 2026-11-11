@@ -242,3 +242,91 @@ func TestLocalLinkConcurrentCloseSend(t *testing.T) {
 		}
 	}
 }
+
+func TestPipeIsADuplexConnectionThatIgnoresAddresses(t *testing.T) {
+	a, b := NewPipe(8)
+	// From/To are payload, not routing: whatever the sender writes, the frame
+	// arrives on the other end of THIS pipe and nowhere else.
+	other1, other2 := NewPipe(8)
+	if err := a.Send(Frame{Kind: FramePing, From: "someone-else", To: "elsewhere"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := b.Recv(ctx)
+	if err != nil || got.From != "someone-else" {
+		t.Fatalf("recv: %+v %v", got, err)
+	}
+	short, cancel2 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel2()
+	if _, err := other2.Recv(short); err == nil {
+		t.Fatal("a frame leaked to another pipe")
+	}
+	_ = other1
+	// Both directions, in order.
+	for i := 0; i < 3; i++ {
+		_ = b.Send(Frame{Kind: FramePong, Message: string(rune('a' + i))})
+	}
+	for i := 0; i < 3; i++ {
+		f, err := a.Recv(ctx)
+		if err != nil || f.Message != string(rune('a'+i)) {
+			t.Fatalf("order: %+v %v", f, err)
+		}
+	}
+}
+
+func TestPipeCloseEndsBothEndsAfterDrain(t *testing.T) {
+	a, b := NewPipe(8)
+	_ = a.Send(Frame{Kind: FramePing, Message: "last"})
+	_ = a.Close()
+	if err := a.Send(Frame{Kind: FramePing}); !errors.Is(err, ErrLinkClosed) {
+		t.Fatalf("send on a closed end: %v", err)
+	}
+	if err := b.Send(Frame{Kind: FramePing}); !errors.Is(err, ErrLinkClosed) {
+		t.Fatalf("send to a closed peer: %v", err)
+	}
+	f, err := b.Recv(context.Background())
+	if err != nil || f.Message != "last" {
+		t.Fatalf("frames delivered before the close are still readable: %+v %v", f, err)
+	}
+	if _, err := b.Recv(context.Background()); !errors.Is(err, ErrLinkClosed) {
+		t.Fatalf("after the drain: %v", err)
+	}
+}
+
+func TestPipeOverflow(t *testing.T) {
+	a, _ := NewPipe(1)
+	if err := a.Send(Frame{Kind: FramePing}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Send(Frame{Kind: FramePing}); !errors.Is(err, ErrLinkOverflow) {
+		t.Fatalf("full buffer: %v", err)
+	}
+}
+
+func TestMemListenerDialAccept(t *testing.T) {
+	l := NewMemListener(8)
+	c1, err := l.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, _ := l.Dial()
+	ctx := context.Background()
+	s1, _ := l.Accept(ctx)
+	s2, _ := l.Accept(ctx)
+	_ = c2.Send(Frame{Kind: FramePing, Message: "two"})
+	_ = c1.Send(Frame{Kind: FramePing, Message: "one"})
+	if f, _ := s1.Recv(ctx); f.Message != "one" {
+		t.Fatalf("accept order: first accepted end got %q", f.Message)
+	}
+	if f, _ := s2.Recv(ctx); f.Message != "two" {
+		t.Fatalf("second accepted end got %q", f.Message)
+	}
+	_ = l.Close()
+	if _, err := l.Dial(); !errors.Is(err, ErrNoConnection) {
+		t.Fatalf("dial after close: %v", err)
+	}
+	if _, err := l.Accept(ctx); !errors.Is(err, ErrNoConnection) {
+		t.Fatalf("accept after close: %v", err)
+	}
+}

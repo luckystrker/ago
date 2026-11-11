@@ -16,6 +16,7 @@ package dashscope
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -51,9 +52,23 @@ type DashScopeConfig struct {
 	// BaseURL overrides the endpoint root. Empty → DefaultBaseURL.
 	BaseURL string
 
+	// HTTPClient performs the requests when non-nil (proxy, custom root CAs,
+	// mTLS). It owns its own Timeout and redirect policy.
+	HTTPClient *http.Client
+
 	Temperature *float64 // nil = unset, not sent
 	TopP        *float64 // nil = unset, not sent
 	MaxTokens   *int64   // nil = unset, not sent
+
+	// The knobs below are not sent when unset (Python parity: the
+	// DashScopeConfig fields of the same names).
+	// Stop sequences. AGO-DEVIATION: Python accepts `str | list[str]`; AGo takes
+	// a list, and a single sequence is a one-element slice (the wire value is
+	// always a JSON array, which every provider accepts).
+	Stop             []string
+	Seed             *int64
+	FrequencyPenalty *float64
+	PresencePenalty  *float64
 
 	Streaming bool
 
@@ -113,6 +128,12 @@ func (c *DashScopeConfig) params() (config.CompatParams, error) {
 		TopP:        c.TopP,
 		MaxTokens:   c.MaxTokens,
 		Streaming:   c.Streaming,
+		HTTPClient:  c.HTTPClient,
+
+		Stop:             c.Stop,
+		Seed:             c.Seed,
+		FrequencyPenalty: c.FrequencyPenalty,
+		PresencePenalty:  c.PresencePenalty,
 	}, nil
 }
 
@@ -140,6 +161,16 @@ func (c *DashScopeConfig) Clone(overrides map[string]any) (config.ModelConfig, e
 			err = setI64(&out.MaxTokens, k, v)
 		case "streaming":
 			err = setBool(&out.Streaming, k, v)
+		case "httpclient", "http_client":
+			err = setHTTPClient(&out.HTTPClient, k, v)
+		case "stop":
+			err = setStrings(&out.Stop, k, v)
+		case "seed":
+			err = setI64(&out.Seed, k, v)
+		case "frequencypenalty", "frequency_penalty":
+			err = setF64(&out.FrequencyPenalty, k, v)
+		case "presencepenalty", "presence_penalty":
+			err = setF64(&out.PresencePenalty, k, v)
 		default:
 			err = fmt.Errorf("config/dashscope: unknown config field %q", k)
 		}

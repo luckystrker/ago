@@ -223,14 +223,16 @@ func requestParts(parts []events.Input) ([]map[string]any, error) {
 			}
 			out = append(out, map[string]any{"text": string(b)})
 		case events.BinaryInput:
-			// AGO-DEVIATION: vendor_metadata (media_resolution, video_metadata,
-			// display_name) has no raw-REST mapping in this wave and is dropped.
-			out = append(out, map[string]any{
+			part := map[string]any{
 				"inlineData": map[string]any{
 					"mimeType": p.MediaType,
 					"data":     base64.StdEncoding.EncodeToString(p.Data),
 				},
-			})
+			}
+			if err := applyVendorMetadata(part, p.VendorMetadata); err != nil {
+				return nil, err
+			}
+			out = append(out, part)
 		case events.UrlInput:
 			fd := map[string]any{"fileUri": p.URL}
 			if mt := mimeFromURL(p.URL); mt != "" {
@@ -244,6 +246,92 @@ func requestParts(parts []events.Input) ([]map[string]any, error) {
 		default:
 			return nil, fmt.Errorf("%w: %T for the generateContent API", config.ErrUnsupportedInput, part)
 		}
+	}
+	return out, nil
+}
+
+// applyVendorMetadata copies the Gemini-specific vendor_metadata keys onto one
+// inlineData part (Python parity: _apply_vendor_metadata): media_resolution,
+// video_metadata and display_name. Keys outside that vocabulary fail fast, the
+// way Python's typed Part assignment does.
+func applyVendorMetadata(part map[string]any, metadata map[string]any) error {
+	if len(metadata) == 0 {
+		return nil
+	}
+	if v, ok := metadata["media_resolution"]; ok {
+		res, err := mediaResolutionWire(v)
+		if err != nil {
+			return err
+		}
+		part["mediaResolution"] = res
+	}
+	if v, ok := metadata["video_metadata"]; ok {
+		vm, err := videoMetadataWire(v)
+		if err != nil {
+			return err
+		}
+		part["videoMetadata"] = vm
+	}
+	if v, ok := metadata["display_name"]; ok {
+		name, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("%w: gemini display_name must be a string, got %T", config.ErrUnsupportedInput, v)
+		}
+		inline, ok := part["inlineData"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("%w: gemini display_name applies to inline data only", config.ErrUnsupportedInput)
+		}
+		inline["displayName"] = name
+	}
+	return nil
+}
+
+// mediaResolutionWire wraps a media_resolution level into the PartMediaResolution
+// object the part field expects: a bare level string becomes {"level": ...};
+// an object carries level and numTokens.
+func mediaResolutionWire(v any) (map[string]any, error) {
+	switch m := v.(type) {
+	case string:
+		return map[string]any{"level": m}, nil
+	case map[string]any:
+		out := make(map[string]any, len(m))
+		for k, val := range m {
+			switch k {
+			case "level":
+				out["level"] = val
+			case "num_tokens", "numTokens":
+				out["numTokens"] = val
+			default:
+				return nil, fmt.Errorf("%w: unknown media_resolution key %q", config.ErrUnsupportedInput, k)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%w: media_resolution must be a level string or an object, got %T", config.ErrUnsupportedInput, v)
+	}
+}
+
+// videoMetadataWire maps a video_metadata object onto the REST aliases:
+// startOffset, endOffset and fps.
+func videoMetadataWire(v any) (map[string]any, error) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: video_metadata must be an object, got %T", config.ErrUnsupportedInput, v)
+	}
+	out := make(map[string]any, len(m))
+	for k, val := range m {
+		var key string
+		switch k {
+		case "start_offset", "startOffset":
+			key = "startOffset"
+		case "end_offset", "endOffset":
+			key = "endOffset"
+		case "fps":
+			key = "fps"
+		default:
+			return nil, fmt.Errorf("%w: unknown video_metadata key %q", config.ErrUnsupportedInput, k)
+		}
+		out[key] = val
 	}
 	return out, nil
 }
@@ -272,11 +360,12 @@ func parseCallArguments(arguments string) (map[string]any, error) {
 // one server-side tool block each, after the function declarations (Python
 // parity: build_tools). Everything else fails fast (config.ErrUnsupportedTool).
 //
-// AGO-DEVIATION: Python also builds a ToolConfig for mixed requests
-// (build_tool_config: include_server_side_tool_invocations) and replays the
-// server-side invocations from the response (GeminiServerToolCallEvent); the
-// AGo client does not parse grounding metadata, so no ToolConfig is emitted and
-// grounding travels only as ordinary response text (see docs/DECISIONS.md).
+// AGO-DEVIATION: Python also sets include_server_side_tool_invocations in the
+// ToolConfig of mixed requests and replays the server-side invocations from the
+// response (GeminiServerToolCallEvent); the AGo client does not parse grounding
+// metadata, so that flag is not sent and grounding travels only as ordinary
+// response text (see docs/DECISIONS.md). The only ToolConfig AGo builds is the
+// Google Maps location bias (buildToolConfig).
 func buildTools(schemas []any) ([]map[string]any, error) {
 	declarations := make([]map[string]any, 0, len(schemas))
 	var extras []map[string]any
@@ -355,8 +444,58 @@ func hostedToolsToAPI(t tools.ToolSchema) ([]map[string]any, error) {
 			return nil, err
 		}
 		return []map[string]any{{"fileSearch": w}}, nil
+	case tools.GoogleMapsToolSchema:
+		return []map[string]any{{"googleMaps": googleMaps(s)}}, nil
+	case *tools.GoogleMapsToolSchema:
+		if s == nil {
+			return nil, nilSchemaErr(tools.GoogleMapsToolName)
+		}
+		return []map[string]any{{"googleMaps": googleMaps(*s)}}, nil
 	}
 	return nil, fmt.Errorf("%w: hosted tool %q for the generateContent API", config.ErrUnsupportedTool, t.SchemaType())
+}
+
+// googleMaps maps the Maps-grounding tool: only the widget flag travels in the
+// tool entry, and only when set (Python parity: enable_widget=... or None).
+func googleMaps(t tools.GoogleMapsToolSchema) map[string]any {
+	g := map[string]any{}
+	if t.EnableWidget {
+		g["enableWidget"] = true
+	}
+	return g
+}
+
+// buildToolConfig renders the request's toolConfig, nil when nothing needs one.
+// Maps geo-biasing needs a retrievalConfig: it is emitted only when both
+// latitude and longitude are set, with the language code when present (Python
+// parity: build_tool_config; the last Maps schema wins).
+func buildToolConfig(schemas []any) map[string]any {
+	var retrieval map[string]any
+	for _, schema := range schemas {
+		var t tools.GoogleMapsToolSchema
+		switch v := schema.(type) {
+		case tools.GoogleMapsToolSchema:
+			t = v
+		case *tools.GoogleMapsToolSchema:
+			if v == nil {
+				continue
+			}
+			t = *v
+		default:
+			continue
+		}
+		if t.Latitude == nil || t.Longitude == nil {
+			continue
+		}
+		retrieval = map[string]any{"latLng": map[string]any{"latitude": *t.Latitude, "longitude": *t.Longitude}}
+		if t.LanguageCode != "" {
+			retrieval["languageCode"] = t.LanguageCode
+		}
+	}
+	if retrieval == nil {
+		return nil
+	}
+	return map[string]any{"retrievalConfig": retrieval}
 }
 
 // googleSearch maps the web_search fields Gemini honours: only the blocked

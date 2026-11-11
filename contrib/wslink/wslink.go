@@ -7,10 +7,16 @@
 //
 // Heartbeat is delegated to coder/websocket (protocol-level ping/pong with
 // its default handlers), matching ws.py's reliance on the websockets
-// library control frames. Reconnect is NOT automatic — Python parity:
-// WsLinkClient.open does one connect, callers needing backoff wrap Dial;
-// the reference protocol carries since_envelope_id on the application's
-// Hello frame, not in this transport (AGO-DEVIATION note on Dial).
+// library control frames.
+//
+// Reconnect. Python's ws.py leaves it to the tenant ("callers that need
+// backoff wrap it"): Conn and Dial make one connection. This package supplies
+// the wrapper: Dialer and RemoteConfig plug Dial into network.ConnectHub with
+// a network.ReconnectPolicy (backoff, jitter, attempt limit), and the client
+// itself, after every drop, re-dials, re-attaches each agent with a hello that
+// carries its per-channel high-water marks and re-acknowledges them, so the hub
+// replays exactly what was missed (since is an application-level field of the
+// hello frame, not of this transport).
 //
 // Deployment guards: every link caps inbound message size at
 // DefaultReadLimit, and Handler mounts ServeWS behind an optional bearer
@@ -31,6 +37,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/luckystrker/ago/network"
 	"github.com/luckystrker/ago/network/transport"
 )
 
@@ -82,10 +89,9 @@ var (
 )
 
 // Dial connects to a ws:// or wss:// URL and returns the client-side link.
-// One connect per call — no automatic reconnect. AGO-DEVIATION vs the wire
-// protocol sketch in the spec: replay-after-reconnect (since_envelope_id)
-// is an application-level Hello frame field the hub answers from its WAL;
-// this transport carries frames opaquely and keeps none.
+// One connect per call — reconnecting is the job of the network client (see
+// RemoteConfig); this transport carries frames opaquely and keeps no state
+// between connections.
 func Dial(ctx context.Context, url string, opts *websocket.DialOptions) (*Conn, error) {
 	ws, _, err := websocket.Dial(ctx, url, opts)
 	if err != nil {
@@ -295,3 +301,40 @@ func (c *Conn) Close() error {
 // Done exposes the link's closed channel (server loops select over it to
 // reclaim the endpoint).
 func (c *Conn) Done() <-chan struct{} { return c.done }
+
+// Dialer returns a network.Dialer that opens one WebSocket link to url per
+// call (a fresh connection every time, as a reconnect needs).
+func Dialer(url string, opts *websocket.DialOptions) network.Dialer {
+	return func(ctx context.Context) (transport.Link, error) {
+		c, err := Dial(ctx, url, opts)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+}
+
+// RemoteConfig is the configuration of a network.HubClient that talks to the
+// hub behind url over WebSocket and reconnects by itself after a drop
+// following policy (see network.DefaultReconnectPolicy). onEvent, when not
+// nil, is told about link loss, reconnects and giving up.
+//
+// Pass the result to network.ConnectHub. An agent re-attaches with its
+// credentials (network.WithAgentAuth) and per-channel since marks, so a client
+// picks up where it left off.
+func RemoteConfig(url string, opts *websocket.DialOptions, policy network.ReconnectPolicy, onEvent func(network.ConnectionEvent)) network.RemoteConfig {
+	return network.RemoteConfig{Dial: Dialer(url, opts), Reconnect: &policy, OnEvent: onEvent}
+}
+
+// HubHandler serves hub over WebSocket: every accepted connection is one
+// client of the hub (Hub.ServeLink). It is Handler with Handle bound to the
+// hub; cfg.Handle is ignored. ctx ends every connection when cancelled.
+//
+// A hub whose auth registry still accepts the "none" scheme lets any client
+// take over any agent by name (see network.NoAuth); the hub logs a warning when
+// it is served. Put it behind cfg.Token or a registry with real credentials
+// before exposing it beyond loopback.
+func HubHandler(ctx context.Context, hub *network.Hub, cfg ServerConfig) (http.Handler, error) {
+	cfg.Handle = func(link transport.Link) { _ = hub.ServeLink(ctx, link) }
+	return Handler(cfg)
+}

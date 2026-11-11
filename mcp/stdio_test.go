@@ -30,6 +30,9 @@ const stdioTokenEnv = "MCP_TEST_TOKEN"
 // transport close does not wait out killAfter.
 const stdioSilentEnv = "AGO_MCP_TEST_STDIO_SILENT"
 
+// With the modern flag the stub answers server/discover (see fakeserver_test.go).
+const stdioModernEnv = "AGO_MCP_TEST_STDIO_MODERN"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(stdioServerEnv) == "1" {
 		if os.Getenv(stdioSilentEnv) == "1" {
@@ -54,9 +57,60 @@ func runStdioServer(in io.Reader, out io.Writer) {
 	w := bufio.NewWriter(out)
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), stdioScanBuffer)
+	b := &brain{modern: os.Getenv(stdioModernEnv) == "1"}
+	var (
+		reqSeq       int
+		idleAnswered bool
+	)
+	// ask sends one server-to-client request (string id, like a real server
+	// might use) and reads stdin until its reply shows up.
+	ask := func(method string, params any) (json.RawMessage, *rpcError) {
+		if strings.HasPrefix(method, notifyPrefix) {
+			msg := map[string]any{"jsonrpc": "2.0", "method": strings.TrimPrefix(method, notifyPrefix)}
+			if params != nil {
+				msg["params"] = params
+			}
+			writeStub(w, msg)
+			return json.RawMessage(`{}`), nil
+		}
+		reqSeq++
+		id := fmt.Sprintf("srv-%d", reqSeq)
+		msg := map[string]any{"jsonrpc": "2.0", "id": id, "method": method}
+		if params != nil {
+			msg["params"] = params
+		}
+		writeStub(w, msg)
+		for sc.Scan() {
+			var reply wireMessage
+			if json.Unmarshal(sc.Bytes(), &reply) != nil || reply.Method != "" || !reply.hasID() {
+				continue
+			}
+			if string(reply.ID) == `"idle-1"` {
+				idleAnswered = idleAnswered || reply.Error == nil
+				continue
+			}
+			if string(reply.ID) != `"`+id+`"` {
+				continue
+			}
+			if reply.Error != nil {
+				return nil, reply.Error
+			}
+			return reply.Result, nil
+		}
+		return nil, rpcFail(-1, "stdin closed before the client answered "+method)
+	}
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
+			continue
+		}
+		var probe wireMessage
+		_ = json.Unmarshal([]byte(line), &probe)
+		if probe.Method == "" && probe.hasID() {
+			// A reply to a request this server sent outside of ask (idle ping).
+			if string(probe.ID) == `"idle-1"` {
+				idleAnswered = idleAnswered || probe.Error == nil
+			}
 			continue
 		}
 		var req stubRequest
@@ -68,20 +122,34 @@ func runStdioServer(in io.Reader, out io.Writer) {
 			// An unsolicited notification before the reply: the client must
 			// skip it and still match the response by id.
 			writeStub(w, map[string]any{"jsonrpc": "2.0", "method": "notifications/stub-hello", "params": map[string]any{}})
-			writeStub(w, map[string]any{
-				"jsonrpc": "2.0", "id": req.ID,
-				"result": map[string]any{
-					"protocolVersion": "2024-11-05",
-					"capabilities":    map[string]any{"tools": map[string]any{}},
-					"serverInfo":      map[string]any{"name": "stdio-stub", "version": "2.0"},
-				},
-			})
+			result, _ := b.handle("initialize", req.Params, nil, ask)
+			result.(map[string]any)["serverInfo"] = map[string]any{"name": "stdio-stub", "version": "2.0"}
+			writeStub(w, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
 		case "notifications/initialized":
 			// Nothing to confirm.
+		case "server/discover":
+			result, rpcErr := b.handle(req.Method, req.Params, nil, ask)
+			writeStub(w, stubReply(req.ID, result, rpcErr))
 		case "tools/list":
 			stubListTools(w, req)
 		case "tools/call":
-			stubCallTool(w, req)
+			var c brainCall
+			_ = json.Unmarshal(req.Params, &c)
+			switch c.Name {
+			case "idle_ping":
+				writeStub(w, stubReply(req.ID, textResult("pinging"), nil))
+				// Let the client's call return first: the ping must reach a
+				// session with nobody waiting.
+				time.Sleep(200 * time.Millisecond)
+				writeStub(w, map[string]any{"jsonrpc": "2.0", "id": "idle-1", "method": "ping"})
+			case "idle_report":
+				writeStub(w, stubReply(req.ID, textResult(fmt.Sprint(idleAnswered)), nil))
+			case "notify", "caps", "elicit", "sample", "sample_media", "roots", "ping", "needs_input", "state_only", "resource":
+				result, rpcErr := b.handle("tools/call", req.Params, nil, ask)
+				writeStub(w, stubReply(req.ID, result, rpcErr))
+			default:
+				stubCallTool(w, req)
+			}
 		default:
 			writeStub(w, map[string]any{
 				"jsonrpc": "2.0", "id": req.ID,
@@ -89,6 +157,13 @@ func runStdioServer(in io.Reader, out io.Writer) {
 			})
 		}
 	}
+}
+
+func stubReply(id *int64, result any, rpcErr *rpcError) map[string]any {
+	if rpcErr != nil {
+		return map[string]any{"jsonrpc": "2.0", "id": id, "error": rpcErr}
+	}
+	return map[string]any{"jsonrpc": "2.0", "id": id, "result": result}
 }
 
 func stubListTools(w io.Writer, req stubRequest) {

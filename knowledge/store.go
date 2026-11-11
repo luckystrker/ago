@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -70,6 +71,9 @@ type Store interface {
 	// goroutine and must not call methods on the store it came from (Python parity:
 	// notifications fire inside the locked write there too — a re-entrant call
 	// deadlocks).
+	//
+	// For a per-path subscription with a closable handle, see ChangeSubscriber
+	// (implemented by every store in this package) and SubscribeTo.
 	OnChange(fn func(path string))
 }
 
@@ -94,30 +98,147 @@ func dirPrefix(dir string) string {
 	return strings.TrimSuffix(normalizePath(dir), "/") + "/"
 }
 
-// watchers is the shared in-process change-notification list behind OnChange.
+// watchers is the shared in-process change-notification list behind OnChange and
+// Subscribe: one registry of path-scoped subscriptions per store.
 type watchers struct {
-	mu  sync.Mutex
-	fns []func(path string)
+	mu   sync.Mutex
+	next uint64
+	// subs is a slice, not a map: callbacks must run in registration order, so a
+	// store with two watchers sees them fire in the order they subscribed.
+	subs []*watchEntry
 }
 
+// watchEntry is one subscription: the normalized path it watches and the
+// callback. A "/" path matches every change.
+type watchEntry struct {
+	id   uint64
+	path string
+	fn   func(path string)
+}
+
+// add registers a store-wide callback: the OnChange form.
 func (w *watchers) add(fn func(path string)) {
+	w.subscribe("/", fn)
+}
+
+// subscribe registers fn for changes at path or anywhere under it and returns
+// the closable handle. A nil fn is ignored and yields a handle that closes
+// nothing, so a caller never has to branch on it.
+func (w *watchers) subscribe(path string, fn func(path string)) *ChangeSubscription {
+	sub := &ChangeSubscription{}
 	if fn == nil {
-		return
+		return sub
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.fns = append(w.fns, fn)
+	w.next++
+	id := w.next
+	w.subs = append(w.subs, &watchEntry{id: id, path: normalizePath(path), fn: fn})
+	w.mu.Unlock()
+	sub.ch = w
+	sub.id = id
+	return sub
 }
 
-// notify invokes every watcher with changed. Callbacks run in the caller's
-// goroutine after the caller released its own locks, so a callback may read the
-// store it was registered on (just not a LockedStore wrapping it).
-func (w *watchers) notify(changed string) {
+// remove drops one subscription; later notifications never reach it, and the
+// remaining callbacks keep their relative order.
+func (w *watchers) remove(id uint64) {
 	w.mu.Lock()
-	fns := make([]func(path string), len(w.fns))
-	copy(fns, w.fns)
+	for i, e := range w.subs {
+		if e.id == id {
+			w.subs = append(w.subs[:i:i], w.subs[i+1:]...)
+			break
+		}
+	}
+	w.mu.Unlock()
+}
+
+// notify invokes every matching watcher with changed, in registration order.
+// Callbacks run in the caller's goroutine after the caller released its own
+// locks, so a callback may read the store it was registered on (just not a
+// LockedStore wrapping it).
+func (w *watchers) notify(changed string) {
+	changed = normalizePath(changed)
+	w.mu.Lock()
+	fns := make([]func(string), 0, len(w.subs))
+	for _, e := range w.subs {
+		if watchMatches(e.path, changed) {
+			fns = append(fns, e.fn)
+		}
+	}
 	w.mu.Unlock()
 	for _, fn := range fns {
 		fn(changed)
 	}
+}
+
+// watchMatches reports whether a change at changed belongs to a subscription on
+// path: the path itself or anything under it (Python parity: MemoryKnowledgeStore
+// _notify's equality-or-prefix rule).
+func watchMatches(path, changed string) bool {
+	if path == "/" || path == changed {
+		return true
+	}
+	return strings.HasPrefix(changed, dirPrefix(path))
+}
+
+// ChangeSubscription is the closable handle Subscribe returns (Python parity:
+// knowledge.base.ChangeSubscription). Closing stops delivery and unregisters the
+// callback, so a subscription does not outlive its consumer. Safe for concurrent
+// use; Close is idempotent and nil-safe.
+type ChangeSubscription struct {
+	once   sync.Once
+	closed atomic.Bool
+	ch     *watchers
+	id     uint64
+}
+
+// Close stops receiving change notifications.
+func (s *ChangeSubscription) Close() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.closed.Store(true)
+		if s.ch != nil {
+			s.ch.remove(s.id)
+		}
+	})
+}
+
+// active reports whether the handle still delivers.
+func (s *ChangeSubscription) active() bool { return s != nil && !s.closed.Load() }
+
+// ChangeSubscriber is implemented by stores that scope change notifications to
+// one path and hand back a closable handle (Python parity: KnowledgeStore
+// .on_change). It is an optional extension of Store: a store that only offers
+// the store-wide OnChange still works, callers fall back to filtering it.
+type ChangeSubscriber interface {
+	// Subscribe notifies fn for every change at path or under it. The handle's
+	// Close stops delivery. Callbacks run synchronously in the mutating goroutine
+	// and must not call methods on the store they came from (the same rule as
+	// OnChange).
+	Subscribe(path string, fn func(path string)) *ChangeSubscription
+}
+
+// SubscribeTo is the generic per-path subscription for any Store: it uses the
+// store's own Subscribe when the store implements ChangeSubscriber and
+// otherwise filters the store-wide OnChange callback. Either way the returned
+// handle stops delivery on Close; only the underlying registration may outlive
+// it on a store that cannot unregister.
+func SubscribeTo(s Store, path string, fn func(path string)) *ChangeSubscription {
+	if cs, ok := s.(ChangeSubscriber); ok {
+		return cs.Subscribe(path, fn)
+	}
+	sub := &ChangeSubscription{}
+	if fn == nil {
+		return sub
+	}
+	norm := normalizePath(path)
+	s.OnChange(func(changed string) {
+		if !sub.active() || !watchMatches(norm, changed) {
+			return
+		}
+		fn(changed)
+	})
+	return sub
 }

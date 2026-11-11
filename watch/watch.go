@@ -1,6 +1,7 @@
 // Package watch provides composable "wait until something happens" triggers over
-// conversation events and time: an event match, a periodic tick, a one-shot delay,
-// and the and/or/sequence combinations of watches.
+// conversation events and time: an event match, a periodic tick, a one-shot
+// delay, a size-or-time cadence batch, a cron schedule, and the and/or/sequence
+// combinations of watches.
 //
 // A Watch is a pull primitive: Wait blocks until the watch fires and reports the
 // event that fired it. One Wait call is one armed watch — there is no separate

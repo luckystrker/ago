@@ -45,6 +45,11 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	}
 
 	body := map[string]any{"contents": contents}
+	if c.cfg.cachedContent != "" {
+		// A cached content resource replaces the explicit history cost; the
+		// name is a top-level generateContent field (Python parity).
+		body["cachedContent"] = c.cfg.cachedContent
+	}
 	if si := strings.Join(prompt, "\n"); si != "" {
 		body["systemInstruction"] = map[string]any{
 			"parts": []map[string]any{{"text": si}},
@@ -52,6 +57,9 @@ func (c *client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	}
 	if len(wireTools) > 0 {
 		body["tools"] = wireTools
+	}
+	if tc := buildToolConfig(opts.Tools); tc != nil {
+		body["toolConfig"] = tc
 	}
 	if gen := c.generationConfig(opts.ResponseSchema); len(gen) > 0 {
 		body["generationConfig"] = gen
@@ -93,9 +101,21 @@ func (c *client) generationConfig(schema response.Proto) map[string]any {
 	if c.cfg.seed != nil {
 		gen["seed"] = *c.cfg.seed
 	}
-	// Both thinking knobs resolve into one thinkingConfig object (Python
-	// parity: _resolve_thinking_config — level, budget or both).
-	if c.cfg.thinkingLevel != nil || c.cfg.thinkingBudget != nil {
+	if len(c.cfg.responseModalities) > 0 {
+		gen["responseModalities"] = c.cfg.responseModalities
+	}
+	if c.cfg.imageConfig != nil {
+		// An all-zero block is not a setting: it stays off the wire.
+		if img := c.cfg.imageConfig.wire(); len(img) > 0 {
+			gen["imageConfig"] = img
+		}
+	}
+	// A raw thinkingConfig object wins over the level/budget pair (Python
+	// parity: _resolve_thinking_config returns thinking_config untouched); the
+	// two rooted knobs then resolve into one object.
+	if c.cfg.thinkingConfig != nil {
+		gen["thinkingConfig"] = c.cfg.thinkingConfig
+	} else if c.cfg.thinkingLevel != nil || c.cfg.thinkingBudget != nil {
 		thinking := map[string]any{}
 		if c.cfg.thinkingLevel != nil {
 			thinking["thinkingLevel"] = *c.cfg.thinkingLevel
@@ -138,7 +158,7 @@ func (c *client) generateContent(ctx context.Context, body map[string]any, heade
 			return nil, err
 		}
 		if status < 200 || status >= 300 {
-			return nil, fmt.Errorf("gemini: generateContent returned %d: %s", status, snippet(data))
+			return nil, config.NewAPIError(config.ProviderGemini, "gemini: generateContent", status, nil, data)
 		}
 		var raw genResponse
 		if err := json.Unmarshal(data, &raw); err != nil {
@@ -247,7 +267,7 @@ func (c *client) streamGenerate(ctx context.Context, body map[string]any, header
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, config.WrapStatusError(config.ProviderGemini, "gemini: streamGenerateContent", err)
 		}
 		usage = usage.Add(hopUsage)
 		// The last hop wins even when it carries no finish reason.
@@ -318,14 +338,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// snippet renders the first bytes of an error response body.
-func snippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		return s[:max] + "…"
-	}
-	return s
 }

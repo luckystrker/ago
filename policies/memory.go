@@ -93,12 +93,14 @@ const defaultMaxEpisodes = 5
 // from ConversationsDir as one prompt fragment. A missing directory, or no
 // readable summaries, injects nothing.
 //
-// AGO-DEVIATION: Python's transparency note ("[episodic_memory] Injected N past
-// conversation summaries.") is dropped — the AGo contract names a single
-// fragment.
+// WithEpisodicTransparency adds Python's note ("[episodic_memory] Injected N
+// past conversation summaries."). It is off by default: Python defaults it on,
+// but AGo's existing prompts carry no note and turning it on silently would
+// change every model input (AGO-DEVIATION).
 type EpisodicMemoryPolicy struct {
 	store       knowledge.Store
 	maxEpisodes int
+	transparent bool
 }
 
 // EpisodicOption configures an EpisodicMemoryPolicy.
@@ -108,6 +110,13 @@ type EpisodicOption func(*EpisodicMemoryPolicy)
 // injected (default 5).
 func WithMaxEpisodes(n int) EpisodicOption {
 	return func(p *EpisodicMemoryPolicy) { p.maxEpisodes = n }
+}
+
+// WithEpisodicTransparency injects the summary-count note (Python parity:
+// transparent=True, which is Python's default). The zero value keeps the note
+// off.
+func WithEpisodicTransparency(on bool) EpisodicOption {
+	return func(p *EpisodicMemoryPolicy) { p.transparent = on }
 }
 
 // NewEpisodicMemoryPolicy injects conversation summaries from store.
@@ -159,5 +168,9 @@ func (p EpisodicMemoryPolicy) Apply(prompts []string, evs []events.Event, _ *ago
 		fenced[i] = wrapUntrusted(s)
 	}
 	block := "## Past Conversations\n\n" + strings.Join(fenced, "\n\n---\n\n")
-	return append(prompts, block), evs, nil
+	prompts = append(prompts, block)
+	if p.transparent {
+		prompts = append(prompts, fmt.Sprintf("[episodic_memory] Injected %d past conversation summaries.", len(summaries)))
+	}
+	return prompts, evs, nil
 }

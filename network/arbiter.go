@@ -45,12 +45,10 @@ type HubArbiter interface {
 	// plus delegation depth over the explicit audience (broadcasts skip —
 	// protocol broadcasts address the creator too).
 	AuthorizeSend(env Envelope, sender Passport, senderRule Rule, recipients []Passport) Decision
-	// AuthorizeInbox gates a send per-recipient against inbox capacity.
-	// AGO-DEVIATION: the hub never consults this gate in the current
-	// subset — delivery inboxes live client-side (a bounded channel whose
-	// overflow drops) and the hub keeps no pending counter, so there is no
-	// count to consult with; the AGo Rule carries no inbox block either.
-	// The method exists so tenant arbiters keep the Python surface.
+	// AuthorizeInbox gates a substantive send per recipient against inbox
+	// capacity; currentPending is the hub's count of that recipient's
+	// unacknowledged envelopes (Hub.AckInbox). A Deny fails the whole send,
+	// before anything is recorded — build it with ErrInboxFull.
 	AuthorizeInbox(env Envelope, recipient Passport, recipientRule Rule, currentPending int) Decision
 	// AuthorizeDispatch gates per-recipient dispatch (inbound access). A
 	// Deny silently skips this recipient — the rest of the audience still
@@ -117,10 +115,20 @@ func (RuleBasedArbiter) AuthorizeSend(env Envelope, sender Passport, senderRule 
 	return Allow()
 }
 
-// AuthorizeInbox implements HubArbiter. The AGo Rule shape has no inbox
-// block, so the rule-based gate has nothing to compare against and always
-// allows (see the interface's AGO-DEVIATION note).
-func (RuleBasedArbiter) AuthorizeInbox(Envelope, Passport, Rule, int) Decision { return Allow() }
+// AuthorizeInbox implements HubArbiter: under the reject policy a recipient
+// at Rule.Inbox.MaxPending refuses further envelopes. The drop policies pass
+// — the recipient's queue applies them (see InboxBlock).
+func (RuleBasedArbiter) AuthorizeInbox(_ Envelope, recipient Passport, recipientRule Rule, currentPending int) Decision {
+	inbox := recipientRule.Inbox
+	if inbox.MaxPending <= 0 || inbox.EffectiveOverflow() != OverflowReject {
+		return Allow()
+	}
+	if currentPending >= inbox.MaxPending {
+		return Deny(fmt.Sprintf("recipient %q inbox full (%d/%d pending)",
+			recipient.Name, currentPending, inbox.MaxPending), ErrInboxFull)
+	}
+	return Allow()
+}
 
 // AuthorizeDispatch implements HubArbiter: the recipient's inbound globs
 // over the sender's name.
@@ -134,9 +142,13 @@ func (RuleBasedArbiter) AuthorizeDispatch(_ Envelope, sender Passport, recipient
 // AuthorizeChannelOpen implements HubArbiter: each invitee's inbound globs
 // against the creator's name (a pre-flight for the invite handshake —
 // dispatch silently filters blocked senders, so without it an invite to a
-// blocking invitee would hang until the ack timeout), then the creator's
+// blocking invitee would hang until the ack timeout), each side's
+// channel-type access against the manifest's type, then the creator's
 // channel concurrency cap.
-func (RuleBasedArbiter) AuthorizeChannelOpen(_ ChannelManifest, creator Passport, creatorRule Rule, invitees []Passport, inviteeRules []Rule, activeCreatorChannels int) Decision {
+func (RuleBasedArbiter) AuthorizeChannelOpen(manifest ChannelManifest, creator Passport, creatorRule Rule, invitees []Passport, inviteeRules []Rule, activeCreatorChannels int) Decision {
+	if !creatorRule.MayInitiate(manifest.Type) {
+		return Deny(fmt.Sprintf("creator %q may not initiate channel type %q", creator.Name, manifest.Type))
+	}
 	for i, invitee := range invitees {
 		if invitee.AgentID == creator.AgentID {
 			continue
@@ -147,6 +159,9 @@ func (RuleBasedArbiter) AuthorizeChannelOpen(_ ChannelManifest, creator Passport
 		}
 		if !Match(inviteeRule.InboundGlobs, creator.Name) {
 			return Deny(fmt.Sprintf("invitee %q does not accept inbound from %q", invitee.Name, creator.Name))
+		}
+		if !inviteeRule.MayAccept(manifest.Type) {
+			return Deny(fmt.Sprintf("invitee %q does not accept channel type %q", invitee.Name, manifest.Type))
 		}
 	}
 	if cap := creatorRule.MaxConcurrentChannels; cap > 0 && activeCreatorChannels >= cap {

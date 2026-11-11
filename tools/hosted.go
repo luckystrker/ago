@@ -8,15 +8,26 @@
 // tool_search). The schema fields carry the Python dataclass fields; the
 // constructor options carry the tool kwargs.
 //
-// AGO-DEVIATION: Python resolves Variable-annotated tool kwargs per turn
-// (builtin/_resolve.py resolve_variable). A Go carrier takes concrete values at
-// construction and Schemas ignores the context; a per-turn Variable carrier has
-// no use yet. See docs/DECISIONS.md.
+// Per-turn Variable kwargs (Python: builtin/_resolve.py resolve_variable):
+// every carrier takes its kwargs as concrete values at construction, and a
+// parameter can instead be bound to a Variable with the carrier's
+// With<Carrier>Variable option. Schemas then resolves that parameter from the
+// conversation variables on each turn.
+//
+// AGO-DEVIATION: Python types each kwarg as `value | Variable`; Go's option
+// funcs take concrete values, so the Variable binding is a separate option
+// keyed by the kwarg's wire name (the schema's JSON field name), and an
+// unknown name or a mistyped variable value surfaces as a Schemas error. A
+// Variable's default is its HasDefault value (no default_factory). See
+// docs/DECISIONS.md.
 package tools
 
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
+	"strings"
 
 	agocontext "github.com/luckystrker/ago/context"
 	"github.com/luckystrker/ago/middleware"
@@ -36,6 +47,7 @@ const (
 	MemoryToolName          = "memory"
 	MCPServerToolName       = "mcp_server"
 	ToolSearchToolName      = "tool_search"
+	RetrievalToolName       = "retrieval"
 )
 
 // Version literals the schemas default to (Python parity: the Literal defaults).
@@ -76,6 +88,7 @@ func (WebSearchToolSchema) SchemaType() string { return WebSearchToolName }
 // WebSearchTool is the hosted web_search capability (Python parity:
 // builtin/web_search.py WebSearchTool).
 type WebSearchTool struct {
+	vars              hostedVars
 	searchContextSize *string
 	maxUses           *int
 	userLocation      *UserLocation
@@ -86,6 +99,15 @@ type WebSearchTool struct {
 
 // WebSearchOption configures NewWebSearch.
 type WebSearchOption func(*WebSearchTool)
+
+// WithWebSearchVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithWebSearchVariable(param string, v Variable) WebSearchOption {
+	return func(t *WebSearchTool) { t.vars.bind(param, v) }
+}
 
 // WithSearchContextSize sets the retrieval effort: "low", "medium" or "high".
 func WithSearchContextSize(size string) WebSearchOption {
@@ -134,15 +156,19 @@ func (t *WebSearchTool) Name() string { return WebSearchToolName }
 func (t *WebSearchTool) DeclaredInCode() bool { return true }
 
 // Schemas returns the tool's single schema.
-func (t *WebSearchTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{WebSearchToolSchema{
+func (t *WebSearchTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(WebSearchToolName, cx, WebSearchToolSchema{
 		SearchContextSize: derefString(t.searchContextSize),
 		MaxUses:           t.maxUses,
 		UserLocation:      t.userLocation,
 		AllowedDomains:    copyStrings(t.allowedDomains),
 		BlockedDomains:    copyStrings(t.blockedDomains),
 		WebSearchVersion:  derefString(t.version, DefaultWebSearchVersion),
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the tool runs at the provider. Python enters a
@@ -213,6 +239,7 @@ func (WebFetchToolSchema) SchemaType() string { return WebFetchToolName }
 // WebFetchTool is the hosted web_fetch tool (Python parity: builtin/web_fetch.py
 // WebFetchTool).
 type WebFetchTool struct {
+	vars              hostedVars
 	maxUses           *int
 	allowedDomains    []string
 	blockedDomains    []string
@@ -227,6 +254,15 @@ type WebFetchTool struct {
 
 // WebFetchOption configures NewWebFetch.
 type WebFetchOption func(*WebFetchTool)
+
+// WithWebFetchVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithWebFetchVariable(param string, v Variable) WebFetchOption {
+	return func(t *WebFetchTool) { t.vars.bind(param, v) }
+}
 
 // WithWebFetchMaxUses caps the number of fetches per response.
 func WithWebFetchMaxUses(n int) WebFetchOption {
@@ -296,8 +332,8 @@ func (t *WebFetchTool) Name() string { return WebFetchToolName }
 func (t *WebFetchTool) DeclaredInCode() bool { return true }
 
 // Schemas returns the tool's single schema.
-func (t *WebFetchTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{WebFetchToolSchema{
+func (t *WebFetchTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(WebFetchToolName, cx, WebFetchToolSchema{
 		MaxUses:           t.maxUses,
 		AllowedDomains:    copyStrings(t.allowedDomains),
 		BlockedDomains:    copyStrings(t.blockedDomains),
@@ -308,7 +344,11 @@ func (t *WebFetchTool) Schemas(_ *agocontext.Context) ([]any, error) {
 		ResponseInclusion: derefString(t.responseInclusion),
 		UrlSources:        t.urlSources,
 		WebFetchVersion:   derefString(t.version, DefaultWebFetchVersion),
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the tool runs at the provider (see
@@ -394,6 +434,15 @@ func (FileSearchToolSchema) SchemaType() string { return FileSearchToolName }
 // FileSearchOption configures NewFileSearch.
 type FileSearchOption func(*FileSearchTool)
 
+// WithFileSearchVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithFileSearchVariable(param string, v Variable) FileSearchOption {
+	return func(t *FileSearchTool) { t.vars.bind(param, v) }
+}
+
 // WithVectorStoreIDs names the OpenAI vector stores to search.
 func WithVectorStoreIDs(ids []string) FileSearchOption {
 	return func(t *FileSearchTool) { t.vectorStoreIDs = ids }
@@ -428,6 +477,7 @@ func WithIncludeResults(include bool) FileSearchOption {
 // FileSearchTool is the hosted vector-store retrieval tool (Python parity:
 // builtin/file_search.py FileSearchTool).
 type FileSearchTool struct {
+	vars           hostedVars
 	vectorStoreIDs []string
 	storeNames     []string
 	maxNumResults  *int
@@ -454,15 +504,19 @@ func (t *FileSearchTool) DeclaredInCode() bool { return true }
 // Schemas returns the tool's single schema. VectorStoreIDs and StoreNames keep
 // Python's field(default_factory=list): a store list the tool never received
 // marshals as [] rather than null.
-func (t *FileSearchTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{FileSearchToolSchema{
+func (t *FileSearchTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(FileSearchToolName, cx, FileSearchToolSchema{
 		VectorStoreIDs: stringsOrEmpty(t.vectorStoreIDs),
 		StoreNames:     stringsOrEmpty(t.storeNames),
 		MaxNumResults:  t.maxNumResults,
 		MetadataFilter: t.metadataFilter,
 		Filters:        t.filters,
 		IncludeResults: t.includeResults,
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the tool runs at the provider (see
@@ -489,6 +543,15 @@ func (ImageGenerationToolSchema) SchemaType() string { return ImageGenerationToo
 
 // ImageGenerationOption configures NewImageGeneration.
 type ImageGenerationOption func(*ImageGenerationTool)
+
+// WithImageGenerationVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithImageGenerationVariable(param string, v Variable) ImageGenerationOption {
+	return func(t *ImageGenerationTool) { t.vars.bind(param, v) }
+}
 
 // WithImageQuality sets the image quality: "low", "medium", "high" or "auto".
 func WithImageQuality(quality string) ImageGenerationOption {
@@ -523,6 +586,7 @@ func WithPartialImages(n int) ImageGenerationOption {
 // ImageGenerationTool is the hosted image generation tool (Python parity:
 // builtin/image_generation.py ImageGenerationTool).
 type ImageGenerationTool struct {
+	vars              hostedVars
 	quality           *string
 	size              *string
 	background        *string
@@ -547,15 +611,19 @@ func (t *ImageGenerationTool) Name() string { return ImageGenerationToolName }
 func (t *ImageGenerationTool) DeclaredInCode() bool { return true }
 
 // Schemas returns the tool's single schema.
-func (t *ImageGenerationTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{ImageGenerationToolSchema{
+func (t *ImageGenerationTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(ImageGenerationToolName, cx, ImageGenerationToolSchema{
 		Quality:           derefString(t.quality),
 		Size:              derefString(t.size),
 		Background:        derefString(t.background),
 		OutputFormat:      derefString(t.outputFormat),
 		OutputCompression: t.outputCompression,
 		PartialImages:     t.partialImages,
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the tool runs at the provider (see
@@ -604,6 +672,15 @@ func (ShellToolSchema) SchemaType() string { return ShellToolName }
 // ShellOption configures NewShell.
 type ShellOption func(*ShellTool)
 
+// WithShellVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithShellVariable(param string, v Variable) ShellOption {
+	return func(t *ShellTool) { t.vars.bind(param, v) }
+}
+
 // WithShellEnvironment sets the container the shell runs in.
 func WithShellEnvironment(env ShellEnvironment) ShellOption {
 	return func(t *ShellTool) { t.environment = &env }
@@ -617,6 +694,7 @@ func WithShellVersion(version string) ShellOption {
 // ShellTool is the provider-executed shell tool (Python parity: builtin/shell.py
 // ShellTool).
 type ShellTool struct {
+	vars        hostedVars
 	environment *ShellEnvironment
 	version     *string
 }
@@ -637,11 +715,15 @@ func (t *ShellTool) Name() string { return ShellToolName }
 func (t *ShellTool) DeclaredInCode() bool { return true }
 
 // Schemas returns the tool's single schema.
-func (t *ShellTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{ShellToolSchema{
+func (t *ShellTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(ShellToolName, cx, ShellToolSchema{
 		Version:     derefString(t.version, ShellVersion),
 		Environment: t.environment,
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the tool runs at the provider (see
@@ -757,6 +839,15 @@ func (s MCPServerToolSchema) MarshalJSON() ([]byte, error) {
 // MCPServerOption configures NewMCPServer.
 type MCPServerOption func(*MCPServerTool)
 
+// WithMCPServerVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithMCPServerVariable(param string, v Variable) MCPServerOption {
+	return func(t *MCPServerTool) { t.vars.bind(param, v) }
+}
+
 // WithAuthorizationToken sets the bearer token sent to the server.
 func WithAuthorizationToken(token string) MCPServerOption {
 	return func(t *MCPServerTool) { t.authorizationToken = token }
@@ -785,6 +876,7 @@ func WithMCPServerHeaders(headers map[string]string) MCPServerOption {
 // MCPServerTool is the remote-MCP-server carrier (Python parity:
 // builtin/mcp_server.py MCPServerTool). Server URL and label are required.
 type MCPServerTool struct {
+	vars               hostedVars
 	serverURL          string
 	serverLabel        string
 	authorizationToken string
@@ -797,15 +889,17 @@ type MCPServerTool struct {
 // NewMCPServer builds the MCP server carrier; url and label are required
 // (Python parity: the constructor's required kwargs).
 func NewMCPServer(serverURL, serverLabel string, opts ...MCPServerOption) (*MCPServerTool, error) {
-	if serverURL == "" {
-		return nil, fmt.Errorf("tools: mcp_server tool requires a server url")
-	}
-	if serverLabel == "" {
-		return nil, fmt.Errorf("tools: mcp_server tool requires a server label")
-	}
 	t := &MCPServerTool{serverURL: serverURL, serverLabel: serverLabel}
 	for _, o := range opts {
 		o(t)
+	}
+	// A parameter bound to a Variable is resolved per turn, so it may be empty
+	// here (Python parity: server_url and server_label accept a Variable).
+	if serverURL == "" && !t.vars.has("server_url") {
+		return nil, fmt.Errorf("tools: mcp_server tool requires a server url")
+	}
+	if serverLabel == "" && !t.vars.has("server_label") {
+		return nil, fmt.Errorf("tools: mcp_server tool requires a server label")
 	}
 	return t, nil
 }
@@ -817,8 +911,8 @@ func (t *MCPServerTool) Name() string { return MCPServerToolName }
 func (t *MCPServerTool) DeclaredInCode() bool { return true }
 
 // Schemas returns the tool's single schema.
-func (t *MCPServerTool) Schemas(_ *agocontext.Context) ([]any, error) {
-	return []any{MCPServerToolSchema{
+func (t *MCPServerTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(MCPServerToolName, cx, MCPServerToolSchema{
 		ServerURL:          t.serverURL,
 		ServerLabel:        t.serverLabel,
 		AuthorizationToken: t.authorizationToken,
@@ -826,7 +920,11 @@ func (t *MCPServerTool) Schemas(_ *agocontext.Context) ([]any, error) {
 		AllowedTools:       copyStrings(t.allowedTools),
 		BlockedTools:       copyStrings(t.blockedTools),
 		Headers:            t.headers,
-	}}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
 }
 
 // Register subscribes nothing: the provider connects to the server (see
@@ -939,6 +1037,276 @@ func (t *ToolSearchTool) Register(cx *agocontext.Context, mw []middleware.Middle
 		subs = append(subs, ids...)
 	}
 	return subs, nil
+}
+
+// --- retrieval ---------------------------------------------------------------------
+
+// RetrievalToolSchema is the provider-neutral knowledge-base retrieval
+// capability. Only Z.AI executes it server-side (Python parity: the Z.AI
+// mapper); every other provider rejects the schema.
+type RetrievalToolSchema struct {
+	// KnowledgeID names the Z.AI knowledge base to search.
+	KnowledgeID string `json:"knowledge_id"`
+	// PromptTemplate overrides the template that frames the retrieved
+	// passages; empty is not sent and the API's own default applies.
+	// AGO-DEVIATION: Python's field is `str | None`, which distinguishes
+	// None from ""; the Go string cannot, and an empty template is not
+	// meaningful to the API, so "" means unset.
+	PromptTemplate string `json:"prompt_template,omitempty"`
+}
+
+// SchemaType returns the provider-neutral tool type.
+func (RetrievalToolSchema) SchemaType() string { return RetrievalToolName }
+
+// RetrievalOption configures NewRetrieval.
+type RetrievalOption func(*RetrievalTool)
+
+// WithRetrievalVariable binds one schema parameter, named by its JSON field (the Python kwarg
+// name), to a Variable resolved from the conversation variables on every turn
+// (Python parity: passing a Variable instead of a value). An empty Variable
+// name defaults to the parameter name; the variable's default applies when the
+// conversation has none. An unknown parameter fails Schemas.
+func WithRetrievalVariable(param string, v Variable) RetrievalOption {
+	return func(t *RetrievalTool) { t.vars.bind(param, v) }
+}
+
+// WithRetrievalPromptTemplate sets the template that frames the retrieved
+// passages in the prompt.
+func WithRetrievalPromptTemplate(template string) RetrievalOption {
+	return func(t *RetrievalTool) { t.promptTemplate = template }
+}
+
+// RetrievalTool is the Z.AI knowledge-base retrieval tool (Python parity:
+// builtin/retrieval.py RetrievalTool; Z.AI-specific, unsupported by other
+// providers).
+type RetrievalTool struct {
+	vars           hostedVars
+	knowledgeID    string
+	promptTemplate string
+}
+
+// NewRetrieval builds the hosted retrieval tool for one knowledge base.
+func NewRetrieval(knowledgeID string, opts ...RetrievalOption) *RetrievalTool {
+	t := &RetrievalTool{knowledgeID: knowledgeID}
+	for _, o := range opts {
+		o(t)
+	}
+	return t
+}
+
+// Name returns the tool type name.
+func (t *RetrievalTool) Name() string { return RetrievalToolName }
+
+// DeclaredInCode is always true: hosted tools come from the program.
+func (t *RetrievalTool) DeclaredInCode() bool { return true }
+
+// Schemas returns the tool's single schema.
+func (t *RetrievalTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(RetrievalToolName, cx, RetrievalToolSchema{
+		KnowledgeID:    t.knowledgeID,
+		PromptTemplate: t.promptTemplate,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
+}
+
+// Register subscribes nothing: the tool runs at the provider (see
+// WebSearchTool.Register).
+func (t *RetrievalTool) Register(_ *agocontext.Context, _ []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
+}
+
+// --- google maps ---------------------------------------------------------------------
+
+// GoogleMapsToolName is the provider-neutral tool type of Maps grounding.
+const GoogleMapsToolName = "google_maps"
+
+// GoogleMapsToolSchema is the provider-neutral Google Maps grounding
+// capability. Only Gemini (3 family) executes it server-side: Latitude and
+// Longitude bias results through the request's tool_config.retrieval_config,
+// LanguageCode localises them, EnableWidget requests the interactive Maps
+// widget context token. A nil field is not sent and the API's own default
+// applies; every other provider rejects the schema.
+type GoogleMapsToolSchema struct {
+	Latitude     *float64 `json:"latitude,omitempty"`
+	Longitude    *float64 `json:"longitude,omitempty"`
+	LanguageCode string   `json:"language_code,omitempty"`
+	EnableWidget bool     `json:"enable_widget"`
+}
+
+// SchemaType returns the provider-neutral tool type.
+func (GoogleMapsToolSchema) SchemaType() string { return GoogleMapsToolName }
+
+// GoogleMapsTool is the Gemini Maps-grounding carrier (Python parity:
+// builtin/google_maps.py GoogleMapsTool).
+type GoogleMapsTool struct {
+	vars         hostedVars
+	latitude     *float64
+	longitude    *float64
+	languageCode string
+	enableWidget bool
+}
+
+// GoogleMapsOption configures NewGoogleMaps.
+type GoogleMapsOption func(*GoogleMapsTool)
+
+// WithGoogleMapsLocation biases results to a latitude/longitude. Gemini applies
+// the bias only when both are present.
+func WithGoogleMapsLocation(latitude, longitude float64) GoogleMapsOption {
+	return func(t *GoogleMapsTool) { t.latitude, t.longitude = &latitude, &longitude }
+}
+
+// WithGoogleMapsLanguageCode localises results (an IETF language code).
+func WithGoogleMapsLanguageCode(code string) GoogleMapsOption {
+	return func(t *GoogleMapsTool) { t.languageCode = code }
+}
+
+// WithGoogleMapsWidget requests the interactive Maps widget context token.
+func WithGoogleMapsWidget(enabled bool) GoogleMapsOption {
+	return func(t *GoogleMapsTool) { t.enableWidget = enabled }
+}
+
+// WithGoogleMapsVariable binds one parameter ("latitude", "longitude",
+// "language_code" or "enable_widget") to a Variable resolved on every turn (see
+// WithWebSearchVariable).
+func WithGoogleMapsVariable(param string, v Variable) GoogleMapsOption {
+	return func(t *GoogleMapsTool) { t.vars.bind(param, v) }
+}
+
+// NewGoogleMaps builds the hosted Maps-grounding tool.
+func NewGoogleMaps(opts ...GoogleMapsOption) *GoogleMapsTool {
+	t := &GoogleMapsTool{}
+	for _, o := range opts {
+		o(t)
+	}
+	return t
+}
+
+// Name returns the tool type name.
+func (t *GoogleMapsTool) Name() string { return GoogleMapsToolName }
+
+// DeclaredInCode is always true: hosted tools come from the program.
+func (t *GoogleMapsTool) DeclaredInCode() bool { return true }
+
+// Schemas returns the tool's single schema.
+func (t *GoogleMapsTool) Schemas(cx *agocontext.Context) ([]any, error) {
+	schema, err := t.vars.resolve(GoogleMapsToolName, cx, GoogleMapsToolSchema{
+		Latitude:     copyFloat(t.latitude),
+		Longitude:    copyFloat(t.longitude),
+		LanguageCode: t.languageCode,
+		EnableWidget: t.enableWidget,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []any{schema}, nil
+}
+
+// Register subscribes nothing: the tool runs at the provider (see
+// WebSearchTool.Register).
+func (t *GoogleMapsTool) Register(_ *agocontext.Context, _ []middleware.Middleware) ([]stream.SubID, error) {
+	return nil, nil
+}
+
+// copyFloat clones an optional float so a schema snapshot cannot alias the option.
+func copyFloat(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// --- per-turn Variable kwargs -------------------------------------------------------
+
+// hostedVars binds schema parameters to conversation Variables. The zero value
+// is ready to use; carriers embed it.
+type hostedVars struct {
+	bound map[string]Variable
+}
+
+// bind records that param (the schema's JSON field name, e.g. "max_uses") is
+// resolved from v on every Schemas call.
+func (h *hostedVars) bind(param string, v Variable) {
+	if h.bound == nil {
+		h.bound = map[string]Variable{}
+	}
+	h.bound[param] = v
+}
+
+// has reports whether param is bound to a Variable.
+func (h *hostedVars) has(param string) bool {
+	_, ok := h.bound[param]
+	return ok
+}
+
+// resolve returns schema (a struct value) with every bound parameter replaced
+// by its resolved variable (Python parity: resolve_variable — the variable's
+// name, or the parameter name when the Variable has none; then its default;
+// otherwise an error). A nil context resolves through defaults only.
+func (h *hostedVars) resolve(tool string, cx *agocontext.Context, schema any) (any, error) {
+	if len(h.bound) == 0 {
+		return schema, nil
+	}
+	rv := reflect.ValueOf(schema)
+	out := reflect.New(rv.Type()).Elem()
+	out.Set(rv)
+	params := make([]string, 0, len(h.bound))
+	for p := range h.bound {
+		params = append(params, p)
+	}
+	sort.Strings(params)
+	for _, param := range params {
+		field, ok := fieldByJSONName(out, param)
+		if !ok {
+			return nil, fmt.Errorf("tools: %s: variable bound to unknown parameter %q", tool, param)
+		}
+		v := h.bound[param]
+		key := v.Name
+		if key == "" {
+			key = param
+		}
+		var (
+			val   any
+			found bool
+		)
+		if cx != nil {
+			val, found = cx.Variable(key)
+		}
+		if !found {
+			if !v.HasDefault {
+				return nil, fmt.Errorf("%w: tool %q: variable %q for parameter %q is not provided and has no default",
+					ErrNotFound, tool, key, param)
+			}
+			val = v.Default
+		}
+		// Convert through JSON so a variable holding any equivalent shape (a
+		// decoded map, a plain string) lands in the schema field's own type.
+		b, err := json.Marshal(val)
+		if err != nil {
+			return nil, fmt.Errorf("tools: %s: variable %q for parameter %q: %w", tool, key, param, err)
+		}
+		dst := reflect.New(field.Type())
+		if err := json.Unmarshal(b, dst.Interface()); err != nil {
+			return nil, fmt.Errorf("tools: %s: variable %q for parameter %q has the wrong type: %w", tool, key, param, err)
+		}
+		field.Set(dst.Elem())
+	}
+	return out.Interface(), nil
+}
+
+// fieldByJSONName finds the settable struct field whose JSON name is name.
+func fieldByJSONName(v reflect.Value, name string) (reflect.Value, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		tag, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if tag == name && v.Field(i).CanSet() {
+			return v.Field(i), true
+		}
+	}
+	return reflect.Value{}, false
 }
 
 // --- small helpers ----------------------------------------------------------------

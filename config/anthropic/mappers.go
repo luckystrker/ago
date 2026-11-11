@@ -87,9 +87,23 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 	}
 
 	turns := make([]map[string]any, 0, len(evs))
+	// openAssistant marks an assistant turn opened by a provider replay block,
+	// so the ModelResponse that follows joins it instead of starting a second
+	// assistant turn: the API wants thinking blocks before the turn's tool_use.
+	openAssistant := false
 	for _, ev := range evs {
-		switch e := events.AsValue(ev).(type) {
+		value := events.AsValue(ev)
+		if block, ok := replayBlock(value); ok {
+			turns, openAssistant = appendAssistantBlock(turns, openAssistant, block)
+			continue
+		}
+		// A non-replay event only closes the open turn when it renders one:
+		// telemetry between the blocks and the response (a UsageEvent, say) must
+		// not split the assistant turn in two.
+		open := openAssistant
+		switch e := value.(type) {
 		case events.ModelResponse:
+			openAssistant = false
 			content := make([]map[string]any, 0, 1+len(e.ToolCalls.Calls))
 			if e.Message != nil {
 				content = append(content, textBlock(e.Message.Content))
@@ -112,10 +126,15 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 				})
 			}
 			if len(content) > 0 {
-				turns = append(turns, turn("assistant", content))
+				if blocks, ok := openAssistantContent(turns, open); ok {
+					turns[len(turns)-1]["content"] = append(blocks, content...)
+				} else {
+					turns = append(turns, turn("assistant", content))
+				}
 			}
 
 		case events.ModelRequest:
+			openAssistant = false
 			t, err := userTurn(e.Parts)
 			if err != nil {
 				return nil, err
@@ -125,6 +144,7 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 			}
 
 		case events.DrainedModelRequest:
+			openAssistant = false
 			t, err := userTurn(e.Parts)
 			if err != nil {
 				return nil, err
@@ -134,6 +154,7 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 			}
 
 		case events.ToolResultsEvent:
+			openAssistant = false
 			blocks := make([]map[string]any, 0, len(e.Results))
 			for _, r := range e.Results {
 				// A result with no matching tool_use left in the transcript is
@@ -156,6 +177,7 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 		case events.ToolResultEvent, events.ToolErrorEvent, events.ToolNotFoundEvent:
 			// Fallback: a loose result event without a wrapper (the executor
 			// batch was lost). Renders as its own user turn, Python parity.
+			openAssistant = false
 			var (
 				parent string
 				result events.ToolResult
@@ -183,10 +205,86 @@ func ConvertMessages(evs []events.Event) ([]map[string]any, error) {
 
 		case events.CompactionSummary:
 			// A user turn keeps the summary visible and gives a valid opening turn.
+			openAssistant = false
 			turns = append(turns, turn("user", "[Summary of earlier conversation]\n"+e.Content))
 		}
 	}
 	return turns, nil
+}
+
+// injectCacheBreakpoint marks the end of the last user turn as the end of the
+// cacheable prefix, so every call after the first re-reads the conversation so
+// far from the cache instead of re-billing it (Python parity:
+// inject_cache_breakpoint). A string turn becomes a one-block turn; a block
+// turn marks its last block, except thinking blocks, which cannot carry one.
+//
+// AGO-DEVIATION: a last block that already carries a caller-set cache_control
+// (vendor_metadata, possibly with ttl "1h") keeps it; Python overwrites it with
+// a plain 5-minute breakpoint, silently dropping the caller's choice.
+func injectCacheBreakpoint(turns []map[string]any) {
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i]["role"] != "user" {
+			continue
+		}
+		switch content := turns[i]["content"].(type) {
+		case string:
+			turns[i]["content"] = []map[string]any{{
+				"type": "text", "text": content, "cache_control": map[string]any{"type": "ephemeral"},
+			}}
+		case []map[string]any:
+			if n := len(content); n > 0 {
+				last := content[n-1]
+				_, marked := last["cache_control"]
+				if t := last["type"]; t != "thinking" && t != "redacted_thinking" && !marked {
+					last["cache_control"] = map[string]any{"type": "ephemeral"}
+				}
+			}
+		}
+		return
+	}
+}
+
+// replayBlock renders one provider-native replay event as its assistant-turn
+// block, in the original block order (Python parity: the
+// AnthropicRedactedThinkingEvent / server-tool branch of convert_messages).
+func replayBlock(ev events.Event) (map[string]any, bool) {
+	switch e := ev.(type) {
+	case ThinkingBlockEvent:
+		return e.Block(), true
+	case RedactedThinkingEvent:
+		return e.Block(), true
+	case events.BuiltinToolCallEvent, events.BuiltinToolResultEvent:
+		// A server-tool call or result echoes back as the block the API sent;
+		// the builtin events of another provider carry none and are skipped.
+		if block := serverBlockOf(ev); block != nil {
+			return withoutNulls(block).(map[string]any), true
+		}
+	}
+	return nil, false
+}
+
+// openAssistantContent returns the content of the last turn when it is an
+// assistant turn opened by a replay block.
+func openAssistantContent(turns []map[string]any, open bool) ([]map[string]any, bool) {
+	if !open || len(turns) == 0 {
+		return nil, false
+	}
+	last := turns[len(turns)-1]
+	if last["role"] != "assistant" {
+		return nil, false
+	}
+	blocks, ok := last["content"].([]map[string]any)
+	return blocks, ok
+}
+
+// appendAssistantBlock adds a replay block to the open assistant turn, or opens
+// one. The API refuses a block that carries a cache breakpoint, so none is set.
+func appendAssistantBlock(turns []map[string]any, open bool, block map[string]any) ([]map[string]any, bool) {
+	if blocks, ok := openAssistantContent(turns, open); ok {
+		turns[len(turns)-1]["content"] = append(blocks, block)
+		return turns, true
+	}
+	return append(turns, turn("assistant", []map[string]any{block})), true
 }
 
 // userTurn maps one ModelRequest's parts to a user turn. A single text part
@@ -226,9 +324,30 @@ func contentBlock(part events.Input) (map[string]any, error) {
 	case events.BinaryInput:
 		switch p.Kind {
 		case events.BinaryImage:
-			return imageBlock(p.MediaType, p.Data)
+			b, err := imageBlock(p.MediaType, p.Data)
+			if err != nil {
+				return nil, err
+			}
+			// The API answers `image.citations: Extra inputs are not permitted`.
+			if v, ok := p.VendorMetadata["citations"]; ok && v != nil {
+				return nil, fmt.Errorf("%w: BinaryInput(image, citations) for the messages API", config.ErrUnsupportedInput)
+			}
+			if err := applyCacheControl(b, p.VendorMetadata); err != nil {
+				return nil, err
+			}
+			return b, nil
 		case events.BinaryDocument:
-			return documentBlock(p.MediaType, p.Data)
+			b, err := documentBlock(p.MediaType, p.Data)
+			if err != nil {
+				return nil, err
+			}
+			if err := applyCacheControl(b, p.VendorMetadata); err != nil {
+				return nil, err
+			}
+			if err := applyCitations(b, p.VendorMetadata); err != nil {
+				return nil, err
+			}
+			return b, nil
 		default:
 			return nil, fmt.Errorf("%w: BinaryInput(%s) for the messages API", config.ErrUnsupportedInput, p.Kind)
 		}
@@ -251,12 +370,139 @@ func contentBlock(part events.Input) (map[string]any, error) {
 			return nil, fmt.Errorf("%w: UrlInput(%s) for the messages API", config.ErrUnsupportedInput, p.Kind)
 		}
 	case events.FileIdInput:
-		// AGO-DEVIATION: Python references Files-API uploads (beta header +
-		// files client); AGo has no Files client, so the reference fails fast.
-		return nil, fmt.Errorf("%w: FileIdInput for the messages API", config.ErrUnsupportedInput)
+		// An upload made through the Files API travels by reference. The
+		// request then needs the files beta flag (see hasFileReferences).
+		// AGO-DEVIATION: Python refuses a file uploaded through another
+		// vendor's Files API; AGo's UploadedFile carries no provider tag, so
+		// that check does not exist and the API answers a foreign file id.
+		return fileIDBlock(p.FileID, p.Filename), nil
 	default:
 		return nil, fmt.Errorf("%w: %T for the messages API", config.ErrUnsupportedInput, part)
 	}
+}
+
+// imageExtensions pick the block kind of a file reference: the Files API takes
+// the same id for both, so the filename's extension decides (Python parity:
+// _IMAGE_EXTENSIONS).
+var imageExtensions = map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true}
+
+// fileIDBlock references an uploaded file: an image block when the filename
+// has an image extension, a document block otherwise (Python parity:
+// _file_id_block).
+func fileIDBlock(fileID, filename string) map[string]any {
+	kind := "document"
+	if i := strings.LastIndex(filename, "."); i >= 0 && imageExtensions[strings.ToLower(filename[i:])] {
+		kind = "image"
+	}
+	return map[string]any{
+		"type":   kind,
+		"source": map[string]any{"type": "file", "file_id": fileID},
+	}
+}
+
+// hasFileReferences reports whether any request or tool result of the history
+// references an uploaded file, which is what makes the request need the files
+// beta flag (Python parity: has_file_id_references).
+func hasFileReferences(evs []events.Event) bool {
+	isFile := func(parts []events.Input) bool {
+		for _, part := range parts {
+			if _, ok := events.AsValue(part).(events.FileIdInput); ok {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ev := range evs {
+		switch e := events.AsValue(ev).(type) {
+		case events.ModelRequest:
+			if isFile(e.Parts) {
+				return true
+			}
+		case events.DrainedModelRequest:
+			if isFile(e.Parts) {
+				return true
+			}
+		case events.ToolResultsEvent:
+			for _, r := range e.Results {
+				if isFile(r.Result.Parts) {
+					return true
+				}
+			}
+		case events.ToolResultEvent:
+			if isFile(e.Result.Parts) {
+				return true
+			}
+		case events.ToolErrorEvent:
+			if isFile(e.Result.Parts) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyCacheControl copies the cache_control a caller set in vendor_metadata
+// onto the block, in the shape the API accepts (Python parity: _cache_control).
+// A missing or null value means the caller set none.
+func applyCacheControl(block map[string]any, meta map[string]any) error {
+	v, ok := meta["cache_control"]
+	if !ok || v == nil {
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok || m["type"] != "ephemeral" {
+		return badVendorMetadata("cache_control", v)
+	}
+	out := map[string]any{"type": "ephemeral"}
+	for key := range m {
+		if key != "type" && key != "ttl" {
+			return badVendorMetadata("cache_control", v)
+		}
+	}
+	if ttl, ok := m["ttl"]; ok {
+		s, ok := ttl.(string)
+		if !ok || (s != "5m" && s != "1h") {
+			return badVendorMetadata("cache_control", v)
+		}
+		out["ttl"] = s
+	}
+	block["cache_control"] = out
+	return nil
+}
+
+// applyCitations copies the document citations config a caller set in
+// vendor_metadata onto the block (Python parity: _citations). A missing or null
+// value means the caller set none; an empty object is a value the API accepts.
+func applyCitations(block map[string]any, meta map[string]any) error {
+	v, ok := meta["citations"]
+	if !ok || v == nil {
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return badVendorMetadata("citations", v)
+	}
+	out := map[string]any{}
+	for key := range m {
+		if key != "enabled" {
+			return badVendorMetadata("citations", v)
+		}
+	}
+	if enabled, ok := m["enabled"]; ok {
+		b, ok := enabled.(bool)
+		if !ok {
+			return badVendorMetadata("citations", v)
+		}
+		out["enabled"] = b
+	}
+	block["citations"] = out
+	return nil
+}
+
+// badVendorMetadata refuses a vendor_metadata value the API would answer with a
+// 400, naming the key and value (Python parity: the UnsupportedInputError text).
+func badVendorMetadata(key string, value any) error {
+	return fmt.Errorf("%w: BinaryInput(%s=%v) for the messages API", config.ErrUnsupportedInput, key, value)
 }
 
 // imageMediaTypes are the only inline image media types the API accepts; any
@@ -350,6 +596,63 @@ func decodeCallInput(arguments string) (any, error) {
 		return nil, fmt.Errorf("anthropic: decoding tool call arguments: %w", err)
 	}
 	return v, nil
+}
+
+// outputConfig renders the request's native structured-output block from the
+// response schema's JSON schema: {"format": {"type": "json_schema", "schema":
+// ...}} (Python parity: response_proto_to_output_config). A schema without a
+// JSON schema (a prompt-driven one) yields nil.
+func outputConfig(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return nil
+	}
+	return map[string]any{"format": map[string]any{
+		"type":   "json_schema",
+		"schema": additionalPropertiesFalse(schema),
+	}}
+}
+
+// additionalPropertiesFalse returns a copy of the schema with
+// additionalProperties:false added to every object node that does not set it
+// (the API requires it throughout output_config.format.schema).
+func additionalPropertiesFalse(schema map[string]any) map[string]any {
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		out[k] = v
+	}
+	if out["type"] == "object" {
+		if _, ok := out["additionalProperties"]; !ok {
+			out["additionalProperties"] = false
+		}
+	}
+	for _, key := range []string{"properties", "$defs"} {
+		if m, ok := out[key].(map[string]any); ok {
+			sub := make(map[string]any, len(m))
+			for name, v := range m {
+				if node, ok := v.(map[string]any); ok {
+					v = additionalPropertiesFalse(node)
+				}
+				sub[name] = v
+			}
+			out[key] = sub
+		}
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if items, ok := out[key].([]any); ok {
+			sub := make([]any, len(items))
+			for i, v := range items {
+				if node, ok := v.(map[string]any); ok {
+					v = additionalPropertiesFalse(node)
+				}
+				sub[i] = v
+			}
+			out[key] = sub
+		}
+	}
+	if node, ok := out["items"].(map[string]any); ok {
+		out["items"] = additionalPropertiesFalse(node)
+	}
+	return out
 }
 
 // --- tool schemas --------------------------------------------------------------

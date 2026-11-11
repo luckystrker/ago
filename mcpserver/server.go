@@ -2,19 +2,28 @@
 // JSON-RPC 2.0 over newline-delimited stdio or over streamable HTTP, with the
 // agent exposed as a single conversational "ask" tool — the inverse of the
 // consume-side ago/mcp client. Parity with Python AG2 ag2/mcp/ (server.py,
-// executor.py, tools.py, transport.py).
+// executor.py, tools.py, transport.py, sessions.py, resources.py, prompts.py,
+// elicitation.py, sampling.py) on the mcp 2.x SDK's handshake-era wire.
 //
-// The functional subset covers the core serving surface: initialize (version
-// negotiation), tools/list (the ask tool plus optional deterministic tools),
-// tools/call, ping and notifications/initialized. Everything that binds server
-// state across calls — conversation sessions, paused runs, MCP Apps UI, OAuth
-// resource-server security — is deferred (docs/DECISIONS.md D-056); the server
-// is stateless, and every tools/call runs an independent exchange.
+// Served surface: initialize (version negotiation over the four handshake
+// revisions), tools/list and tools/call (arguments validated against the
+// advertised schema), resources/list, resources/read and
+// resources/templates/list, prompts/list and prompts/get, ping.
 //
-// Deployment gates that carry no server state exist as plain config: an
-// Authorize hook gates the protocol surface (initialize and the tools
-// methods), Host/Origin allowlists gate the HTTP transport, and the stdio
-// loop runs each exchange on its own deadline.
+// The zero TransportConfig is the stateless, JSON-answering transport. With
+// TransportConfig.Stateful the server issues Mcp-Session-Id and keeps per-session
+// state (the client's capabilities, the conversation continuing across calls,
+// the standalone GET stream); with StreamResponses each request is answered as an
+// SSE stream, which carries a served agent's progress and log notifications and
+// its questions to the client (elicitation/create, sampling/createMessage) ahead
+// of the response; an EventStore makes streams resumable with Last-Event-ID.
+//
+// Not served: the modern per-request-envelope era (2026-07-28) and the pause/
+// resume of suspended turns it needs, MCP Apps, and the OAuth 2.1 resource
+// server (docs/DECISIONS.md D-058). Deployment gates that carry no server state
+// exist as plain config: an Authorize hook gates the protocol surface, Host/
+// Origin allowlists gate the HTTP transport, and the stdio loop runs each
+// exchange on its own deadline.
 package mcpserver
 
 import (
@@ -163,6 +172,76 @@ type ServerConfig struct {
 	//
 	// AGO-DEVIATION: as AllowedHosts.
 	AllowedOrigins []string
+
+	// ToolMeta is the presentation metadata advertised per served tool, keyed
+	// by tool name (the conversational tool's included): title, annotations,
+	// outputSchema, _meta (Python parity: mcp_tool(title=, annotations=,
+	// output_schema=, meta=)). A key naming no served tool, or an output
+	// schema that is not an object schema, fails construction with
+	// ErrInvalidToolMeta. A tool whose metadata carries an output schema
+	// answers a result that is one JSON object as structuredContent as well.
+	// Nil advertises nothing extra.
+	//
+	// AGO-DEVIATION: Python carries this metadata on the tool (mcp_tool
+	// arguments); see ToolMeta.
+	ToolMeta map[string]ToolMeta
+
+	// Variables and Dependencies are what each request's tools resolve
+	// tools.Variable and tools.Inject slots against, and ToolMeta.Resolve
+	// reads (Python parity: the variables and dependencies of the request's
+	// MCPExecutionContext). They are snapshotted at NewServer; every request
+	// works on its own copy.
+	Variables    map[string]any
+	Dependencies map[string]any
+
+	// ContextProvider supplies the per-request scope, with the request in hand
+	// (Python parity: AgentExecutor's context_provider, mcp/executor.py:325-345
+	// and server._request_context). It runs on EVERY request: tools/list, and
+	// every tools/call — the conversational ask and deterministic WithTools
+	// tools alike. The scope feeds the agent's RunOptions (Variables,
+	// Dependencies, Tools, Prompt), the deterministic tools' Variables/Inject
+	// slots, and ToolMeta.Resolve. A returned error becomes a JSON-RPC error
+	// and nothing runs. Nil keeps the defaults (ServerConfig.Variables/
+	// Dependencies). Fields left nil in RequestScope keep those defaults;
+	// non-nil maps are merged over them with the provider's value winning.
+	ContextProvider ContextProvider
+
+	// Transport tunes the streamable-HTTP transport: stateful sessions, SSE
+	// answers, resumable streams. The zero value is the stateless JSON transport.
+	Transport TransportConfig
+
+	// Conversations turns on multi-turn history for a served agent (only through
+	// NewServerForAgent): the conversational tool then takes an optional
+	// "conversation" handle. Nil keeps every call independent.
+	Conversations *ConversationConfig
+
+	// Resources, ResourceTemplates and Prompts are served over resources/* and
+	// prompts/* (Python parity: MCPServer resources=, resource_templates=,
+	// prompts=). Each capability is advertised only when something is registered
+	// for it, and the sets are fixed at construction, so no list_changed
+	// notification is ever promised or sent (Python sends none either).
+	Resources         []Resource
+	ResourceTemplates []ResourceTemplate
+	Prompts           []Prompt
+
+	// ElicitationPolicy decides whether a served agent's questions reach the
+	// calling client; the zero value is ElicitationAsk (Python's default). Only a
+	// served agent (NewServerForAgent) asks questions.
+	ElicitationPolicy ElicitationPolicy
+	// ClientModel runs the served agent on the calling client's model through
+	// sampling/createMessage (Python parity: client_model=True). Off by default:
+	// borrowing the caller's model moves cost, capability and reproducibility to
+	// them. A client that advertised no sampling capability is served on the
+	// agent's own model, or refused with -32021 when it has none.
+	ClientModel bool
+	// DisableProgress stops the served agent's stream events being forwarded to
+	// the client as progress and log notifications (Python: stream_progress=False).
+	DisableProgress bool
+
+	// askWithScope is NewServerForAgent's internal ask path: it needs the
+	// provider's RequestScope and the request context, which the public Ask
+	// signature does not carry. NewServer prefers it over Ask.
+	askWithScope func(ctx context.Context, text string, scope *RequestScope, req *RequestContext) (string, error)
 }
 
 // ServerOption overrides ServerConfig fields for NewServerForAgent.
@@ -228,11 +307,12 @@ type toolEntry struct {
 	name        string
 	description string
 	inputSchema map[string]any
+	meta        ToolMeta
 	// call runs one tools/call. The outcome is a tool result even on failure:
 	// an agent/tool failure is isError content (Python parity: the executor's
 	// tool_error arm), while unknown names are refused before dispatch as a
 	// JSON-RPC invalid-params error.
-	call func(ctx context.Context, args map[string]any) toolCallOutcome
+	call func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome
 }
 
 // Server exposes one Ask bridge as an MCP server. The zero flow: Handler()
@@ -249,18 +329,30 @@ type Server struct {
 	ask    *toolEntry
 	extras []*toolEntry // construction order; the ask tool is always first on the wire
 
-	authorize      func(ctx context.Context, method string) error // nil = surface open
-	streams        chan struct{}                                  // GET listener-stream slots
-	callTimeout    time.Duration                                  // stdio exchange bound; < 0 = off
-	allowedHosts   []string
-	allowedOrigins []string
+	authorize       func(ctx context.Context, method string) error // nil = surface open
+	contextProvider ContextProvider
+	streams         chan struct{} // GET listener-stream slots
+	callTimeout     time.Duration // stdio exchange bound; < 0 = off
+	allowedHosts    []string
+	allowedOrigins  []string
+	variables       map[string]any
+	dependencies    map[string]any
 
 	initialized atomic.Bool
+
+	tr          TransportConfig
+	sessions    *sessions // nil on a stateless transport
+	convs       *conversations
+	resources   *resourceProvider
+	prompts     *promptProvider
+	elicitation ElicitationPolicy
+	clientModel bool
+	progress    bool
 }
 
 // NewServer builds a Server from cfg.
 func NewServer(cfg ServerConfig) (*Server, error) {
-	if cfg.Ask == nil {
+	if cfg.Ask == nil && cfg.askWithScope == nil {
 		return nil, fmt.Errorf("%w: ServerConfig.Ask is not set", ErrNotProvided)
 	}
 	if cfg.Name == "" {
@@ -290,21 +382,79 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if ask.description == "" {
 		ask.description = fmt.Sprintf("Send a message to the '%s' agent and receive its reply.", cfg.Name)
 	}
-	askCall := cfg.Ask
-	ask.call = func(ctx context.Context, args map[string]any) toolCallOutcome {
-		return askOutcome(ctx, askCall, args)
+	askInvoke := cfg.askWithScope
+	if askInvoke == nil {
+		askCall := cfg.Ask
+		askInvoke = func(ctx context.Context, text string, _ *RequestScope, _ *RequestContext) (string, error) {
+			return askCall(ctx, text)
+		}
+	}
+	ask.call = func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+		return askOutcome(ctx, askInvoke, args, scope, req, cfg.Conversations != nil)
 	}
 
+	if cc := cfg.Conversations; cc != nil && (cc.MaxConversations < 0 || cc.TTL < 0) {
+		return nil, fmt.Errorf("%w: ConversationConfig.MaxConversations and TTL must not be negative", ErrNotProvided)
+	}
+	if cfg.Conversations != nil && cfg.askWithScope == nil {
+		return nil, fmt.Errorf("%w: ServerConfig.Conversations needs a served agent (NewServerForAgent)", ErrNotProvided)
+	}
+	switch cfg.ElicitationPolicy {
+	case "", ElicitationAsk, ElicitationDecline:
+	default:
+		return nil, fmt.Errorf("%w: unknown elicitation policy %q", ErrNotProvided, cfg.ElicitationPolicy)
+	}
 	s := &Server{
-		name:           cfg.Name,
-		version:        cfg.Version,
-		instructions:   cfg.Instructions,
-		ask:            ask,
-		authorize:      cfg.Authorize,
-		streams:        make(chan struct{}, maxStreams),
-		callTimeout:    callTimeout,
-		allowedHosts:   cfg.AllowedHosts,
-		allowedOrigins: cfg.AllowedOrigins,
+		tr:              cfg.Transport,
+		elicitation:     cfg.ElicitationPolicy,
+		clientModel:     cfg.ClientModel,
+		progress:        !cfg.DisableProgress,
+		name:            cfg.Name,
+		version:         cfg.Version,
+		instructions:    cfg.Instructions,
+		ask:             ask,
+		authorize:       cfg.Authorize,
+		contextProvider: cfg.ContextProvider,
+		streams:         make(chan struct{}, maxStreams),
+		callTimeout:     callTimeout,
+		allowedHosts:    cfg.AllowedHosts,
+		allowedOrigins:  cfg.AllowedOrigins,
+		variables:       copyAnyMap(cfg.Variables),
+		dependencies:    copyAnyMap(cfg.Dependencies),
+	}
+	if cfg.Transport.Stateful {
+		idle := cfg.Transport.SessionIdleTimeout
+		if idle == 0 {
+			idle = defaultSessionIdleTimeout
+		}
+		maxSessions := cfg.Transport.MaxSessions
+		if maxSessions == 0 {
+			maxSessions = defaultMaxSessions
+		}
+		s.sessions = newSessions(idle, maxSessions)
+		if f, ok := cfg.Transport.EventStore.(StreamForgetter); ok {
+			s.sessions.onEnd = func(id string) func() {
+				return func() { f.ForgetStreams(context.Background(), id+"/") }
+			}
+		}
+	}
+	if cfg.Conversations != nil {
+		s.convs = newConversations(*cfg.Conversations)
+		ask.inputSchema = askInputSchemaWithConversation(s.convs.describeBounds())
+	}
+	if len(cfg.Resources) > 0 || len(cfg.ResourceTemplates) > 0 {
+		rp, err := newResourceProvider(cfg.Resources, cfg.ResourceTemplates)
+		if err != nil {
+			return nil, err
+		}
+		s.resources = rp
+	}
+	if len(cfg.Prompts) > 0 {
+		pp, err := newPromptProvider(cfg.Prompts)
+		if err != nil {
+			return nil, err
+		}
+		s.prompts = pp
 	}
 	seen := map[string]bool{toolName: true}
 	// The scratch context exists because the Tool contract hands Schemas a
@@ -335,11 +485,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 				name:        schema.Name,
 				description: schema.Description,
 				inputSchema: normalizeInputSchema(schema.Parameters),
-				call: func(ctx context.Context, args map[string]any) toolCallOutcome {
-					return registeredToolOutcome(t, served.Name, args)
+				call: func(ctx context.Context, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+					return s.registeredToolOutcome(ctx, t, served.Name, args, scope, req)
 				},
 			})
 		}
+	}
+	if err := validateToolMeta(cfg.ToolMeta, seen); err != nil {
+		return nil, err
+	}
+	s.ask.meta = cfg.ToolMeta[toolName]
+	for _, e := range s.extras {
+		e.meta = cfg.ToolMeta[e.name]
 	}
 	return s, nil
 }
@@ -361,22 +518,133 @@ func NewServerForAgent(a *agent.Agent, opts ...ServerOption) (*Server, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	cfg.Ask = func(ctx context.Context, userText string) (string, error) {
-		run, err := a.Run(ctx, userText)
-		if err != nil {
-			return "", fmt.Errorf("mcpserver: start turn: %w", err)
+	// Snapshot the configured maps: the server's per-request copies must not
+	// follow later writes to the caller's map (Python parity: the provider, not
+	// a live map, is the per-request seam).
+	cfg.Variables = copyAnyMap(cfg.Variables)
+	cfg.Dependencies = copyAnyMap(cfg.Dependencies)
+	var srv *Server // the closure below reads the conversation store NewServer builds
+	cfg.askWithScope = func(ctx context.Context, userText string, scope *RequestScope, req *RequestContext) (string, error) {
+		// Python parity: executor.py:325-345 hands ask() the provider's
+		// variables, dependencies, tools and prompt; nil fields keep the ask
+		// defaults. The request context travels too, under RequestDependency,
+		// so a served agent's tool resolves the same Inject slot a
+		// deterministic tool does.
+		vars := copyAnyMap(cfg.Variables)
+		deps := copyAnyMap(cfg.Dependencies)
+		var extraTools []tools.Tool
+		var prompt []string
+		if scope != nil {
+			for k, v := range scope.Variables {
+				vars[k] = v
+			}
+			for k, v := range scope.Dependencies {
+				deps[k] = v
+			}
+			extraTools = scope.Tools
+			prompt = scope.Prompt
 		}
-		defer run.Close()
-		if err := run.Start(ctx); err != nil {
-			return "", err
+		if req == nil {
+			toolName := cfg.ToolName
+			if toolName == "" {
+				toolName = defaultToolName
+			}
+			req = &RequestContext{Method: "tools/call", Tool: toolName, HTTP: RequestFromContext(ctx)}
 		}
-		reply, err := run.Result(ctx)
-		if err != nil {
-			return "", err
+		deps[RequestDependency] = req
+		opts := agent.RunOptions{
+			Variables:    vars,
+			Dependencies: deps,
+			Tools:        extraTools,
+			Prompt:       prompt,
 		}
-		return reply.Body(), nil
+		env, ex, sess := callEnvFrom(ctx), exchangeFrom(ctx), sessionFrom(ctx)
+
+		// The calling client's model, when the operator asked for it and the
+		// client can lend one; otherwise the agent's own, or a refusal naming the
+		// missing capability (Python parity: executor._client_model_config).
+		if cfg.ClientModel {
+			switch {
+			case ex != nil && ex.canRequest && sess != nil && sess.clientCapabilities().sampling:
+				opts.Config = clientModelConfig{ex: ex}
+			case a.Config() != nil:
+			default:
+				if env != nil {
+					env.protocolErr = samplingUnavailableError()
+				}
+				return "", ErrSamplingUnavailable
+			}
+		}
+		// The client's human answers the agent's questions, when it declared it
+		// can; otherwise the agent's own hook does (Python parity: the elicitor
+		// registered ahead of the agent's hook, falling through when the channel is
+		// unusable).
+		if canElicit(cfg.ElicitationPolicy, ex, sess) {
+			opts.HitlHook = elicitationHook(ex)
+		}
+
+		exec := func(st stream.Stream) (string, error) {
+			runOpts := opts
+			runOpts.Stream = st
+			run, err := a.RunWith(ctx, runOpts, userText)
+			if err != nil {
+				return "", fmt.Errorf("mcpserver: start turn: %w", err)
+			}
+			defer run.Close()
+			if !cfg.DisableProgress {
+				sub := run.Stream().Subscribe(newProgressForwarder(ctx, ex, env).handle, stream.SubscribeOptions{})
+				defer run.Stream().Unsubscribe(sub)
+			}
+			if err := run.Start(ctx); err != nil {
+				return "", err
+			}
+			reply, err := run.Result(ctx)
+			if err != nil {
+				return "", err
+			}
+			return reply.Body(), nil
+		}
+		if srv == nil || srv.convs == nil {
+			return exec(nil)
+		}
+		// Conversations: the named handle wins; otherwise the MCP session's own
+		// conversation (stdio's one shared session included); otherwise a new one
+		// under a fresh handle (Python parity: executor._conversation_cm).
+		var out string
+		turn := func(c conversation) error {
+			if env != nil {
+				env.handle = c.handle
+			}
+			var err error
+			out, err = exec(c.stream)
+			return err
+		}
+		var err error
+		switch handle := ""; {
+		case env != nil && strings.TrimSpace(env.conversation) != "":
+			handle = strings.TrimSpace(env.conversation)
+			err = srv.convs.byHandleRun(handle, turn)
+		case sess != nil:
+			err = srv.convs.session(sess.id, turn)
+		case isStdio(ctx):
+			err = srv.convs.session(stdioSession, turn)
+		default:
+			err = srv.convs.fresh(turn)
+		}
+		return out, err
 	}
-	return NewServer(cfg)
+	var err error
+	srv, err = NewServer(cfg)
+	return srv, err
+}
+
+// copyAnyMap copies a string-keyed map, treating nil as empty.
+func copyAnyMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // normalizeInputSchema guarantees the object schema MCP requires (Python
@@ -406,6 +674,20 @@ func askInputSchema() map[string]any {
 		},
 		"required": []string{"message"},
 	}
+}
+
+// askInputSchemaWithConversation adds the optional "conversation" argument, which
+// exists only when a conversation store is configured (Python parity:
+// info.build_ask_tool(conversation_bounds=...)).
+func askInputSchemaWithConversation(lifetime string) map[string]any {
+	schema := askInputSchema()
+	props := schema["properties"].(map[string]any)
+	props["conversation"] = map[string]any{
+		"type": "string",
+		"description": "Opaque handle naming the conversation to continue, as returned by an earlier " +
+			"call to this tool. Omit it to start a new conversation; the handle for it comes back with the reply. " + lifetime,
+	}
+	return schema
 }
 
 // --- JSON-RPC wire shapes ------------------------------------------------------
@@ -443,8 +725,9 @@ type rpcResponse struct {
 }
 
 type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 func rpcErr(code int, format string, args ...any) *rpcError {
@@ -476,53 +759,92 @@ func (s *Server) handle(ctx context.Context, req *rpcRequest) *rpcResponse {
 				Error: rpcErr(codeUnauthorized, "unauthorized")}
 		}
 	}
+	sess := sessionFrom(ctx)
 	if req.ID == nil || isNullID(req.ID) {
 		// A notification: only the initialized confirmation carries meaning.
 		if req.Method == "notifications/initialized" {
-			s.initialized.Store(true)
+			s.markInitialized(sess)
 		}
 		return nil
 	}
+	fail := func(e *rpcError) *rpcResponse { return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: e} }
 	reply := func(result any) *rpcResponse {
 		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 	}
+	notReady := rpcErr(codeInvalidRequest, "Call initialize before listing or calling tools.")
 	switch req.Method {
 	case "initialize":
 		// The handshake request itself opens the gate (the confirmation
-		// notification sets it too); the tools methods refuse until one ran.
-		s.initialized.Store(true)
-		return reply(s.initializeResult(req.Params))
+		// notification sets it too); the other methods refuse until one ran.
+		return reply(s.initialize(sess, req.Params))
 	case "notifications/initialized":
 		// Sent as a request rather than a notification: confirm with an empty
 		// result so the caller is not left waiting.
-		s.initialized.Store(true)
+		s.markInitialized(sess)
 		return reply(map[string]any{})
 	case "ping":
 		return reply(map[string]any{})
 	case "tools/list":
-		if !s.initialized.Load() {
-			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
-				Error: rpcErr(codeInvalidRequest, "Call initialize before listing or calling tools.")}
+		if !s.ready(sess) {
+			return fail(notReady)
 		}
-		return reply(s.listTools())
+		reqCtx, scope, err := s.resolveRequestScope(ctx, "tools/list", "")
+		if err != nil {
+			return fail(rpcErr(codeInternalError, "context provider: %v", err))
+		}
+		return reply(s.listTools(ctx, reqCtx, scope))
 	case "tools/call":
-		if !s.initialized.Load() {
-			return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
-				Error: rpcErr(codeInvalidRequest, "Call initialize before listing or calling tools.")}
+		if !s.ready(sess) {
+			return fail(notReady)
 		}
 		return s.callTool(ctx, req.ID, req.Params)
+	case "resources/list", "resources/read", "resources/templates/list":
+		if s.resources == nil || (req.Method == "resources/templates/list" && !s.resources.hasTemplates()) {
+			return fail(rpcErr(codeMethodNotFound, "method %q is not supported", req.Method))
+		}
+		if !s.ready(sess) {
+			return fail(notReady)
+		}
+		return s.serveResources(ctx, req)
+	case "prompts/list", "prompts/get":
+		if s.prompts == nil {
+			return fail(rpcErr(codeMethodNotFound, "method %q is not supported", req.Method))
+		}
+		if !s.ready(sess) {
+			return fail(notReady)
+		}
+		return s.servePrompts(ctx, req)
 	default:
-		return &rpcResponse{JSONRPC: "2.0", ID: req.ID,
-			Error: rpcErr(codeMethodNotFound, "method %q is not supported", req.Method)}
+		return fail(rpcErr(codeMethodNotFound, "method %q is not supported", req.Method))
 	}
 }
 
+// ready reports whether the handshake ran: on this session when the transport is
+// stateful, on the server otherwise.
+func (s *Server) ready(sess *mcpSession) bool {
+	if sess != nil {
+		return sess.isInitialized()
+	}
+	return s.initialized.Load()
+}
+
+func (s *Server) markInitialized(sess *mcpSession) {
+	if sess != nil {
+		sess.mu.Lock()
+		sess.initialized = true
+		sess.mu.Unlock()
+		return
+	}
+	s.initialized.Store(true)
+}
+
 // gatedMethod reports whether ServerConfig.Authorize runs for a method:
-// initialize and the tools methods are everything an unauthenticated caller
+// initialize and the data methods are everything an unauthenticated caller
 // could learn from or drive. ping and the notifications answer nothing about
 // the served agent, so they stay open.
 func gatedMethod(method string) bool {
-	return method == "initialize" || strings.HasPrefix(method, "tools/")
+	return method == "initialize" || strings.HasPrefix(method, "tools/") ||
+		strings.HasPrefix(method, "resources/") || strings.HasPrefix(method, "prompts/")
 }
 
 // callCtx bounds one stdio exchange (ServerConfig.CallTimeout; negative
@@ -535,26 +857,44 @@ func (s *Server) callCtx() (context.Context, context.CancelFunc) {
 	return context.Background(), func() {}
 }
 
-// initializeResult builds the handshake answer. The requested revision is
-// echoed when this subset speaks it and answered with its own (latest)
-// revision otherwise (Python parity: the SDK's version negotiation over a
-// single-element support set).
-func (s *Server) initializeResult(params json.RawMessage) map[string]any {
+// initialize answers the handshake: the requested revision is echoed when the
+// server speaks it and answered with its latest otherwise (the SDK's version
+// negotiation over the handshake revisions), the client's declared capabilities
+// are recorded on the session, and only the capabilities actually served are
+// advertised.
+func (s *Server) initialize(sess *mcpSession, params json.RawMessage) map[string]any {
 	var p struct {
-		ProtocolVersion string `json:"protocolVersion"`
+		ProtocolVersion string          `json:"protocolVersion"`
+		Capabilities    json.RawMessage `json:"capabilities"`
 	}
 	_ = json.Unmarshal(params, &p)
-	version := protocolVersion
-	if p.ProtocolVersion == protocolVersion {
+	version := latestHandshakeVersion
+	if supportedHandshake(p.ProtocolVersion) {
 		version = p.ProtocolVersion
+	}
+	if sess != nil {
+		sess.mu.Lock()
+		sess.initialized = true
+		sess.protocolVersion = version
+		sess.caps = parseClientCaps(p.Capabilities)
+		sess.mu.Unlock()
+	} else {
+		s.initialized.Store(true)
+	}
+	caps := map[string]any{
+		// Truthful advertisement: the served set is fixed at construction, so
+		// there is never a list-changed notification to promise.
+		"tools": map[string]any{"listChanged": false},
+	}
+	if s.resources != nil {
+		caps["resources"] = map[string]any{"subscribe": false, "listChanged": false}
+	}
+	if s.prompts != nil {
+		caps["prompts"] = map[string]any{"listChanged": false}
 	}
 	result := map[string]any{
 		"protocolVersion": version,
-		"capabilities": map[string]any{
-			// Truthful advertisement: the served set is fixed at construction,
-			// so there is never a list-changed notification to promise.
-			"tools": map[string]any{"listChanged": false},
-		},
+		"capabilities":    caps,
 		"serverInfo": map[string]any{
 			"name":    s.name,
 			"version": s.version,
@@ -568,27 +908,117 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]any {
 
 // listTools serves the registry in construction order: the conversational
 // tool first (Python parity: executor.list_tools plus the provider's
-// entries). The set is small and fixed, so there is no cursor to hand back.
-func (s *Server) listTools() map[string]any {
+// entries). The request's scope is resolved once by the caller and supplies
+// ToolMeta.Resolve with its variables/dependencies.
+func (s *Server) listTools(ctx context.Context, req *RequestContext, scope *RequestScope) map[string]any {
 	all := append([]*toolEntry{s.ask}, s.extras...)
 	out := make([]map[string]any, 0, len(all))
+	cx, err := s.requestContextFor(ctx, req, scope)
+	if err != nil {
+		cx = nil // static metadata is still truthful
+	}
 	for _, t := range all {
-		out = append(out, map[string]any{
-			"name":        t.name,
-			"description": t.description,
-			"inputSchema": t.inputSchema,
-		})
+		out = append(out, s.advertise(ctx, t, cx))
 	}
 	return map[string]any{"tools": out}
 }
 
+// serveResources answers resources/list, resources/templates/list and
+// resources/read. A read of an unmatched URI is invalid params (-32602) carrying
+// the URI; any other failure of the reader is an internal error.
+func (s *Server) serveResources(ctx context.Context, req *rpcRequest) *rpcResponse {
+	fail := func(e *rpcError) *rpcResponse { return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: e} }
+	switch req.Method {
+	case "resources/list":
+		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.resources.list()}
+	case "resources/templates/list":
+		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.resources.listTemplates()}
+	}
+	var p struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.URI == "" {
+		return fail(rpcErr(codeInvalidParams, "resources/read params.uri is required"))
+	}
+	rc, scope, err := s.resolveRequestScope(ctx, "resources/read", "")
+	if err != nil {
+		return fail(rpcErr(codeInternalError, "context provider: %v", err))
+	}
+	cx, err := s.requestContextFor(ctx, rc, scope)
+	if err != nil {
+		return fail(rpcErr(codeInternalError, "%v", err))
+	}
+	res, err := s.resources.read(ctx, cx, p.URI)
+	switch {
+	case errors.Is(err, ErrResourceNotFound):
+		e := rpcErr(codeInvalidParams, "No resource matches URI '%s'.", p.URI)
+		e.Data, _ = json.Marshal(map[string]any{"uri": p.URI})
+		return fail(e)
+	case err != nil:
+		return fail(rpcErr(codeInternalError, "%v", err))
+	}
+	return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res}
+}
+
+// servePrompts answers prompts/list and prompts/get.
+func (s *Server) servePrompts(ctx context.Context, req *rpcRequest) *rpcResponse {
+	fail := func(e *rpcError) *rpcResponse { return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: e} }
+	if req.Method == "prompts/list" {
+		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.prompts.list()}
+	}
+	var p struct {
+		Name      string            `json:"name"`
+		Arguments map[string]string `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.Name == "" {
+		return fail(rpcErr(codeInvalidParams, "prompts/get params.name is required"))
+	}
+	res, err := s.prompts.get(ctx, p.Name, p.Arguments)
+	var missing *errMissingPromptArgs
+	switch {
+	case errors.Is(err, ErrPromptNotFound):
+		return fail(rpcErr(codeInvalidParams, "No prompt named '%s'.", p.Name))
+	case errors.As(err, &missing):
+		return fail(rpcErr(codeInvalidParams, "%s", missing.Error()))
+	case err != nil:
+		return fail(rpcErr(codeInternalError, "%v", err))
+	}
+	return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res}
+}
+
+// callEnv is what one tools/call hands down to the ask path besides its text:
+// the call's conversation handle argument, the progress token it asked for, and
+// where the ask path reports the conversation it ran in.
+type callEnv struct {
+	progressToken any
+	conversation  string
+	handle        string // set by the ask path: the conversation this call ran in
+	protocolErr   *rpcError
+}
+
+type callEnvKey struct{}
+
+func withCallEnv(ctx context.Context, e *callEnv) context.Context {
+	return context.WithValue(ctx, callEnvKey{}, e)
+}
+
+func callEnvFrom(ctx context.Context) *callEnv {
+	e, _ := ctx.Value(callEnvKey{}).(*callEnv)
+	return e
+}
+
 // callTool serves tools/call: the registry lookup (unknown names are a
-// JSON-RPC invalid-params error, Python parity: the executor's MCPError) and
-// the entry's call, whose outcome is always a tool result.
+// JSON-RPC invalid-params error, Python parity: the executor's MCPError),
+// argument validation against the advertised schema (a violation is a
+// tool-level error, as in Python) and the entry's call, whose outcome is always
+// a tool result.
 func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.RawMessage) *rpcResponse {
 	var p struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
+		Meta      struct {
+			ProgressToken any `json:"progressToken"`
+		} `json:"_meta"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
 		return &rpcResponse{JSONRPC: "2.0", ID: id,
@@ -597,6 +1027,14 @@ func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.R
 	if p.Name == "" {
 		return &rpcResponse{JSONRPC: "2.0", ID: id,
 			Error: rpcErr(codeInvalidParams, "tools/call params.name is required")}
+	}
+	req, scope, err := s.resolveRequestScope(ctx, "tools/call", p.Name)
+	if err != nil {
+		// Python parity: the provider runs per request before dispatch; a
+		// failure refuses the call and nothing (agent or deterministic tool)
+		// runs.
+		return &rpcResponse{JSONRPC: "2.0", ID: id,
+			Error: rpcErr(codeInternalError, "context provider: %v", err)}
 	}
 	entry := s.entry(p.Name)
 	if entry == nil {
@@ -609,10 +1047,35 @@ func (s *Server) callTool(ctx context.Context, id json.RawMessage, params json.R
 	if p.Arguments == nil {
 		p.Arguments = map[string]any{}
 	}
-	outcome := entry.call(ctx, p.Arguments)
+	// Python parity (server._on_call_tool): the arguments are validated against
+	// the advertised inputSchema before anything runs, and a violation is a
+	// tool-level error result — the model can fix its arguments and retry.
+	if msg := validateArguments(p.Arguments, entry.inputSchema); msg != "" {
+		return &rpcResponse{JSONRPC: "2.0", ID: id, Result: map[string]any{
+			"content": []contentBlock{textBlock("Input validation error: " + msg)},
+			"isError": true,
+		}}
+	}
+	env := &callEnv{progressToken: p.Meta.ProgressToken}
+	if convo, ok := p.Arguments["conversation"].(string); ok {
+		env.conversation = convo
+	}
+	ctx = withCallEnv(ctx, env)
+	outcome := entry.call(ctx, p.Arguments, scope, req)
+	if env.protocolErr != nil {
+		// A refusal the model cannot reword its way out of stays a JSON-RPC error.
+		return &rpcResponse{JSONRPC: "2.0", ID: id, Error: env.protocolErr}
+	}
 	result := map[string]any{"content": outcome.content}
 	if outcome.isError {
 		result["isError"] = true
+	} else if outcome.structured != nil && s.declaresOutputSchema(ctx, entry, req, scope) {
+		// AGO-DEVIATION: only a tool advertising an output schema answers
+		// structuredContent (Python: any Mapping result); see structuredOf.
+		result["structuredContent"] = outcome.structured
+	}
+	if env.handle != "" {
+		result["_meta"] = map[string]any{ConversationMetaKey: env.handle}
 	}
 	return &rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
 }
@@ -637,6 +1100,10 @@ func (s *Server) entry(name string) *toolEntry {
 type toolCallOutcome struct {
 	content []contentBlock
 	isError bool
+	// structured is the result as one JSON object when it has that form; it is
+	// answered as structuredContent only for a tool advertising an output
+	// schema.
+	structured map[string]any
 }
 
 // contentBlock is one tools/call content block. The MCP block variants share
@@ -673,33 +1140,61 @@ func textBlock(text string) contentBlock { return contentBlock{Type: "text", Tex
 // _build_inputs — a "Context:\n…" input ahead of the message; the two inputs
 // collapse into the one string the bridge takes, joined with a newline), the
 // reply body as text content.
-func askOutcome(ctx context.Context, ask func(context.Context, string) (string, error), args map[string]any) toolCallOutcome {
+func askOutcome(ctx context.Context, ask func(context.Context, string, *RequestScope, *RequestContext) (string, error), args map[string]any, scope *RequestScope, req *RequestContext, conversationsOn bool) toolCallOutcome {
 	message, _ := args["message"].(string)
 	if message == "" {
-		// Argument validation against the advertised schema is deferred
-		// (D-056), so the executor's own guard stands in (Python parity:
-		// executor.call "Missing required 'message' argument.").
+		// The schema check passes an empty string, so the executor's own guard
+		// stands in (Python parity: executor.call "Missing required 'message'
+		// argument.").
 		return toolErrorOutcome("Missing required 'message' argument.")
 	}
-	if convo, _ := args["conversation"].(string); convo != "" {
+	env := callEnvFrom(ctx)
+	// A blank handle names no conversation, so it reads as none rather than as an
+	// unknown one: a model given an optional string argument routinely sends ""
+	// instead of omitting the key (Python parity).
+	if convo, _ := args["conversation"].(string); strings.TrimSpace(convo) != "" && !conversationsOn {
 		// An unadvertised argument carrying a handle: refused rather than
 		// dropped (Python parity: the sessions=False arm of executor.call).
 		return toolErrorOutcome("This server does not maintain conversations, so the 'conversation' argument is " +
 			"not supported; omit it. Each call is independent.")
 	}
+	if env != nil && strings.TrimSpace(env.conversation) == "" {
+		env.conversation = ""
+	}
 	userText := message
 	if context, _ := args["context"].(string); context != "" {
 		userText = "Context:\n" + context + "\n" + message
 	}
-	reply, err := ask(ctx, userText)
+	reply, err := ask(ctx, userText, scope, req)
 	if err != nil {
+		if errors.Is(err, ErrUnknownConversation) {
+			// A tool-level error, never a JSON-RPC one, so the model can start a
+			// new conversation rather than fail the turn.
+			return toolErrorOutcome("Unknown or expired conversation handle. Omit the 'conversation' argument to start a new conversation.")
+		}
 		// The wire carries the message only (Python parity: the executor's
 		// exception arm flattening a failure into a tool result).
 		return toolErrorOutcome(err.Error())
 	}
 	// MCP requires at least one content block; an empty reply maps to ""
 	// (Python parity: reply_to_content).
-	return toolCallOutcome{content: []contentBlock{textBlock(reply)}}
+	//
+	// AGO-DEVIATION: Python validates the reply against the agent's response
+	// schema and answers the validated object as structuredContent
+	// (mcp/executor.py:370-384). AGo has no response-schema binding on the
+	// Ask bridge, so a reply that looks like one JSON object is parsed and
+	// carried as structuredContent; a non-object or invalid reply stays text.
+	var structured map[string]any
+	if strings.HasPrefix(strings.TrimSpace(reply), "{") {
+		_ = json.Unmarshal([]byte(reply), &structured)
+	}
+	content := []contentBlock{textBlock(reply)}
+	if env != nil && env.handle != "" {
+		// A text block for the model, which does not read protocol metadata; the
+		// handle rides _meta too, for clients threading it programmatically.
+		content = append(content, textBlock(handleText(env.handle)))
+	}
+	return toolCallOutcome{content: content, structured: structured}
 }
 
 // registeredToolOutcome runs one deterministic tool through the tools.Tool
@@ -711,9 +1206,12 @@ func askOutcome(ctx context.Context, ask func(context.Context, string) (string, 
 // interface has no direct call, and the scratch-stream round trip is the
 // machinery every Tool implementation (function tools included) already
 // answers through (D-056).
-func registeredToolOutcome(t tools.Tool, name string, args map[string]any) toolCallOutcome {
-	ms := stream.NewMemoryStream()
-	cx := agocontext.New(ms)
+func (s *Server) registeredToolOutcome(ctx context.Context, t tools.Tool, name string, args map[string]any, scope *RequestScope, req *RequestContext) toolCallOutcome {
+	cx, err := s.requestContextFor(ctx, req, scope)
+	if err != nil {
+		return toolErrorOutcome(err.Error())
+	}
+	ms := cx.Stream
 	subs, err := t.Register(cx, nil)
 	if err != nil {
 		return toolErrorOutcome(err.Error())
@@ -765,8 +1263,20 @@ func registeredToolOutcome(t tools.Tool, name string, args map[string]any) toolC
 		// on an empty reply.
 		return toolErrorOutcome(fmt.Sprintf("tool %q returned no result", name))
 	default:
-		return toolCallOutcome{content: resultContent(result.Parts, name)}
+		return toolCallOutcome{content: resultContent(result.Parts, name), structured: structuredOf(result.Parts)}
 	}
+}
+
+// declaresOutputSchema reports whether the entry advertises an output schema
+// for this request, its per-request resolution included.
+func (s *Server) declaresOutputSchema(ctx context.Context, t *toolEntry, req *RequestContext, scope *RequestScope) bool {
+	meta := t.meta
+	if meta.Resolve != nil {
+		if cx, err := s.requestContextFor(ctx, req, scope); err == nil {
+			meta = meta.merged(cx)
+		}
+	}
+	return meta.OutputSchema != nil
 }
 
 // resultContent maps tool result parts onto MCP content blocks (Python parity:
@@ -841,3 +1351,44 @@ func compactJSON(v any) string {
 	}
 	return buf.String()
 }
+
+// WithTransport tunes the streamable-HTTP transport; see TransportConfig.
+func WithTransport(tr TransportConfig) ServerOption {
+	return func(c *ServerConfig) { c.Transport = tr }
+}
+
+// WithConversations turns on multi-turn history for the served agent; see
+// ServerConfig.Conversations.
+func WithConversations(cc ConversationConfig) ServerOption {
+	return func(c *ServerConfig) { c.Conversations = &cc }
+}
+
+// WithResources registers static resources; see ServerConfig.Resources.
+func WithResources(rs ...Resource) ServerOption {
+	return func(c *ServerConfig) { c.Resources = append(c.Resources, rs...) }
+}
+
+// WithResourceTemplates registers URI-template resources; see
+// ServerConfig.ResourceTemplates.
+func WithResourceTemplates(ts ...ResourceTemplate) ServerOption {
+	return func(c *ServerConfig) { c.ResourceTemplates = append(c.ResourceTemplates, ts...) }
+}
+
+// WithPrompts registers prompts; see ServerConfig.Prompts.
+func WithPrompts(ps ...Prompt) ServerOption {
+	return func(c *ServerConfig) { c.Prompts = append(c.Prompts, ps...) }
+}
+
+// WithElicitationPolicy sets whether the served agent's questions reach the
+// calling client; see ServerConfig.ElicitationPolicy.
+func WithElicitationPolicy(p ElicitationPolicy) ServerOption {
+	return func(c *ServerConfig) { c.ElicitationPolicy = p }
+}
+
+// WithClientModel runs the served agent on the calling client's model; see
+// ServerConfig.ClientModel.
+func WithClientModel() ServerOption { return func(c *ServerConfig) { c.ClientModel = true } }
+
+// WithoutProgress stops forwarding the agent's stream events to the client as
+// progress and log notifications; see ServerConfig.DisableProgress.
+func WithoutProgress() ServerOption { return func(c *ServerConfig) { c.DisableProgress = true } }

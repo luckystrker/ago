@@ -38,7 +38,9 @@ type RoundFunc func(env Envelope) (Round, error)
 // humans and owns their delivery plumbing (one connection per process,
 // in-process dispatch).
 type HubClient struct {
-	hub *Hub
+	hub    *Hub   // nil on a remote client (ConnectHub)
+	api    hubAPI // what agents and humans talk to: the hub itself or its remote proxy
+	remote *remoteClient
 
 	mu     sync.Mutex
 	agents map[string]*AgentClient
@@ -49,26 +51,36 @@ type HubClient struct {
 func NewHubClient(hub *Hub) *HubClient {
 	return &HubClient{
 		hub:    hub,
+		api:    hub,
 		agents: make(map[string]*AgentClient),
 		humans: make(map[string]*HumanClient),
 	}
 }
 
-// Hub exposes the underlying hub (for channel/WAL access).
+// Hub exposes the underlying hub (for channel/WAL access). It is nil on a
+// remote client (ConnectHub): the hub is on the other end of the link.
 func (c *HubClient) Hub() *Hub { return c.hub }
 
 // AgentOption configures Register.
 type AgentOption func(*agentOptions)
 
 type agentOptions struct {
-	rule    *Rule
-	resume  *Resume
-	kind    PassportKind
-	env     EnvelopeFunc
-	msg     MessageFunc
-	round   RoundFunc
-	inbox   int
-	autoAck bool
+	authScheme string
+	authClaim  map[string]any
+	rule       *Rule
+	resume     *Resume
+	kind       PassportKind
+	env        EnvelopeFunc
+	msg        MessageFunc
+	round      RoundFunc
+	inbox      int
+	autoAck    bool
+}
+
+// WithAgentAuth sets the credentials of the identity: the scheme and claim the
+// hub validates at registration and at every re-attach (hello).
+func WithAgentAuth(scheme string, claim map[string]any) AgentOption {
+	return func(o *agentOptions) { o.authScheme, o.authClaim = scheme, claim }
 }
 
 // WithAgentRule sets the registration rule (nil → DefaultRule).
@@ -90,7 +102,12 @@ func WithAgentFunc(fn MessageFunc) AgentOption { return func(o *agentOptions) { 
 // the other handlers).
 func WithRoundFunc(fn RoundFunc) AgentOption { return func(o *agentOptions) { o.round = fn } }
 
-// WithAgentInbox sets the delivery buffer (default 64; overflow drops).
+// WithAgentInbox sets the delivery buffer (default 64). A full buffer applies
+// the rule's inbox overflow policy (drop_oldest evicts, anything else drops
+// the incoming envelope); every drop is counted (Dropped). Only a rule with an
+// Inbox block (explicit opt-in) also reports drops through Err as
+// ErrInboxFull; without one an overflow stays silent in Err, as before. A
+// rule with Inbox.MaxPending > 0 sizes the buffer itself and overrides n.
 func WithAgentInbox(n int) AgentOption { return func(o *agentOptions) { o.inbox = n } }
 
 // WithAutoAck toggles invite auto-ack (default on).
@@ -100,15 +117,24 @@ func WithAutoAck(on bool) AgentOption { return func(o *agentOptions) { o.autoAck
 // configured handler for substantive envelopes, posting the round result
 // back into the channel.
 type AgentClient struct {
-	hub      *Hub
+	hub      hubAPI
 	Passport Passport
+	ruleMu   sync.RWMutex
 	rule     Rule
 	opts     agentOptions
+	feeds    channelFeeds
 
 	inbox     chan Envelope
 	done      chan struct{}
 	closeOnce sync.Once
-	busy      int32
+	// pending counts envelopes the pump has taken responsibility for and not
+	// finished: incremented before the envelope is queued (so a delivery in
+	// flight is visible), decremented after the handler returns or the
+	// envelope is discarded. It is WaitIdle's signal: the queue length alone
+	// leaves a window in which a pump that has just taken an envelope off the
+	// queue looks idle.
+	pending int64
+	dropped int64 // atomic: envelopes discarded by the inbox overflow policy
 
 	errMu   sync.Mutex
 	lastErr error
@@ -148,30 +174,44 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 	for _, opt := range opts {
 		opt(&o)
 	}
-	passport, err := c.hub.Register(Passport{Name: name, Kind: o.kind}, o.rule)
+	p := Passport{Name: name, Kind: o.kind}
+	if o.authScheme != "" {
+		p.Auth = map[string]any{"scheme": o.authScheme, "claim": o.authClaim}
+	}
+	passport, err := c.api.Register(p, o.rule)
 	if err != nil {
 		return nil, err
 	}
-	a := &AgentClient{
-		hub:      c.hub,
-		Passport: passport,
-		rule:     DefaultRule(),
-		opts:     o,
-		inbox:    make(chan Envelope, o.inbox),
-		done:     make(chan struct{}),
-	}
+	rule := DefaultRule()
 	if o.rule != nil {
-		a.rule = o.rule.Clone()
+		rule = o.rule.Clone()
+	}
+	return c.newAgent(passport, rule, o)
+}
+
+// newAgent builds the client for a registered identity: the optional resume,
+// delivery binding and pump.
+func (c *HubClient) newAgent(passport Passport, rule Rule, o agentOptions) (*AgentClient, error) {
+	a := &AgentClient{
+		hub:      c.api,
+		Passport: passport,
+		rule:     rule,
+		opts:     o,
+		inbox:    make(chan Envelope, inboxCapacity(rule, o.inbox)),
+		done:     make(chan struct{}),
 	}
 	if o.resume != nil {
 		r := *o.resume
 		r.AgentID = passport.AgentID
-		if err := c.hub.SetResume(r); err != nil {
+		if err := c.api.SetResume(r); err != nil {
 			return nil, err
 		}
 	}
-	if err := c.hub.Attach(passport.AgentID, a.deliver); err != nil {
+	if err := c.api.Attach(passport.AgentID, a.deliver); err != nil {
 		return nil, err
+	}
+	if c.remote != nil {
+		c.remote.setHello(passport.AgentID, HelloBody{Name: passport.Name, AuthScheme: o.authScheme, AuthClaim: o.authClaim})
 	}
 	go a.pump()
 	c.mu.Lock()
@@ -184,10 +224,20 @@ func (c *HubClient) Register(name string, opts ...AgentOption) (*AgentClient, er
 func (a *AgentClient) AgentID() string { return a.Passport.AgentID }
 
 // Rule is the agent's stored rule.
-func (a *AgentClient) Rule() Rule { return a.rule }
+func (a *AgentClient) Rule() Rule {
+	a.ruleMu.RLock()
+	defer a.ruleMu.RUnlock()
+	return a.rule.Clone()
+}
+
+// Dropped is the number of delivered envelopes a full inbox buffer has
+// discarded. With an Inbox rule each drop is also surfaced through Err as
+// ErrInboxFull; without one Dropped is the only signal.
+func (a *AgentClient) Dropped() int64 { return atomic.LoadInt64(&a.dropped) }
 
 // Err returns the last handler error, if any (the pump never abandons the
-// client on a failed round).
+// client on a failed round) or, for an agent whose rule has an Inbox block,
+// the last inbox overflow (ErrInboxFull).
 func (a *AgentClient) Err() error {
 	a.errMu.Lock()
 	defer a.errMu.Unlock()
@@ -201,6 +251,8 @@ func (a *AgentClient) Send(env Envelope) (Envelope, error) {
 
 // CreateChannel opens a channel with this agent as creator.
 func (a *AgentClient) CreateChannel(manifest ChannelManifest, invitees ...string) (*ChannelHandle, error) {
+	// The queue for ch exists once the opened envelope reaches us (every
+	// delivery creates it), so open → say → wait loses no fast reply.
 	return a.hub.CreateChannel(manifest, append([]string{a.AgentID()}, invitees...))
 }
 
@@ -228,11 +280,14 @@ func (a *AgentClient) Ask(channelID string, msg string) (string, error) {
 	return round.Text, nil
 }
 
-// WaitIdle blocks until the pump has drained its inbox and no handler is
-// running (test affordance for asynchronous dispatch).
+// WaitIdle blocks until every envelope delivered to this client has been
+// handled: nothing queued, nothing in flight (test affordance for asynchronous
+// dispatch). An envelope is counted from the moment the hub hands it to the
+// pump until the handler returns, so there is no window in which a delivery is
+// neither queued nor running and the wait would return early.
 func (a *AgentClient) WaitIdle(ctx context.Context) error {
 	for {
-		if len(a.inbox) == 0 && atomic.LoadInt32(&a.busy) == 0 {
+		if atomic.LoadInt64(&a.pending) == 0 {
 			return nil
 		}
 		select {
@@ -263,6 +318,7 @@ func (a *AgentClient) deliver(env Envelope) {
 		return
 	default:
 	}
+	a.feeds.push(env)
 	if isProtocolEvent(env.EventType) {
 		if env.EventType == EnvChannelInvite && a.opts.autoAck && env.SenderID != a.AgentID() {
 			// An ack failure must not crash the agent: the hub times the
@@ -275,12 +331,55 @@ func (a *AgentClient) deliver(env Envelope) {
 		return
 	}
 	if a.suppressed(env.ChannelID) {
+		a.hub.AckInbox(a.AgentID(), 1) // counted at dispatch, never queued
 		return
 	}
-	select {
-	case a.inbox <- env:
-	default:
-		// Overflow drops (documented buffer semantics).
+	atomic.AddInt64(&a.pending, 1)
+	enqueueWithPolicy(a.inbox, env, a.Rule().Inbox.EffectiveOverflow(), a.discard)
+}
+
+// discard records an envelope the overflow policy threw away and frees its
+// inbox slot at the hub.
+func (a *AgentClient) discard(env Envelope) {
+	atomic.AddInt64(&a.dropped, 1)
+	atomic.AddInt64(&a.pending, -1)
+	if a.Rule().Inbox != (InboxBlock{}) { // explicit opt-in; no Inbox rule keeps the old silent drop
+		a.errMu.Lock()
+		a.lastErr = fmt.Errorf("%w: agent %s discarded envelope %s on channel %s",
+			ErrInboxFull, a.AgentID(), env.ID, env.ChannelID)
+		a.errMu.Unlock()
+	}
+	a.hub.AckInbox(a.AgentID(), 1)
+}
+
+// inboxCapacity sizes a delivery queue: the rule's MaxPending when set (the
+// rule is the capacity policy), else the client option.
+func inboxCapacity(rule Rule, fallback int) int {
+	if rule.Inbox.MaxPending > 0 {
+		return rule.Inbox.MaxPending
+	}
+	return fallback
+}
+
+// enqueueWithPolicy pushes env onto q. A full queue applies overflow:
+// drop_oldest evicts the head and retries, every other policy drops env
+// itself; discard sees each dropped envelope.
+func enqueueWithPolicy(q chan Envelope, env Envelope, overflow string, discard func(Envelope)) {
+	for {
+		select {
+		case q <- env:
+			return
+		default:
+		}
+		if overflow != OverflowDropOldest {
+			discard(env)
+			return
+		}
+		select {
+		case old := <-q:
+			discard(old)
+		default:
+		}
 	}
 }
 
@@ -288,9 +387,9 @@ func (a *AgentClient) pump() {
 	for {
 		select {
 		case env := <-a.inbox:
-			atomic.AddInt32(&a.busy, 1)
 			a.process(env)
-			atomic.AddInt32(&a.busy, -1)
+			a.hub.AckInbox(a.AgentID(), 1)
+			atomic.AddInt64(&a.pending, -1)
 		case <-a.done:
 			return
 		}
@@ -302,21 +401,34 @@ func (a *AgentClient) pump() {
 // hub's adapter gates and channel state machine reject stale replies
 // deterministically (a rejected reply surfaces through Err).
 func (a *AgentClient) process(env Envelope) {
+	// Idempotent under at-least-once redelivery: a reply to this very
+	// envelope already landed, so the turn is not run (and posted) twice.
+	if env.ID != "" {
+		if _, done := a.hub.FindEnvelopeByCausation(env.ChannelID, a.AgentID(), env.ID); done {
+			return
+		}
+	}
 	round, err := a.runHandlers(env)
 	if err != nil {
-		a.errMu.Lock()
-		a.lastErr = err
-		a.errMu.Unlock()
+		a.failTurn(env, err)
 		return
 	}
 	if round.Empty() {
 		return
 	}
 	if err := a.postRound(env.ChannelID, round, env); err != nil {
-		a.errMu.Lock()
-		a.lastErr = err
-		a.errMu.Unlock()
+		a.failTurn(env, err)
 	}
+}
+
+// failTurn records a failed turn: Err() keeps the last error and the hub
+// fans OnTurnFailed out to its listeners. The channel stays alive and no
+// reply is posted.
+func (a *AgentClient) failTurn(env Envelope, err error) {
+	a.errMu.Lock()
+	a.lastErr = err
+	a.errMu.Unlock()
+	a.hub.ReportTurnFailure(env.ChannelID, a.AgentID(), env.ID, err)
 }
 
 // runHandlers resolves the handler precedence (round > envelope > message)
@@ -424,20 +536,27 @@ func WithHumanRule(r Rule) HumanOption { return func(o *humanOptions) { o.rule =
 // channel opened to a human stalls until the UI acks).
 func WithHumanAutoAck(on bool) HumanOption { return func(o *humanOptions) { o.autoAck = on } }
 
-// WithHumanInbox sets the pull-queue capacity (default 128; overflow drops).
+// WithHumanInbox sets the pull-queue capacity (default 128). The queue also
+// holds protocol envelopes, which the rule's inbox cap does not count, so it
+// is never smaller than Inbox.MaxPending; a full queue applies the rule's
+// overflow policy.
 func WithHumanInbox(n int) HumanOption { return func(o *humanOptions) { o.inbox = n } }
 
 // HumanClient is a registered non-LLM participant: every inbound envelope is
 // pushed to the inbox (pull via Recv / Inbox) and invites are auto-acked by
 // default.
 type HumanClient struct {
-	hub      *Hub
+	hub      hubAPI
 	Passport Passport
 	rule     Rule
 
 	inbox     chan Envelope
 	done      chan struct{}
 	closeOnce sync.Once
+
+	feeds     channelFeeds
+	cbMu      sync.Mutex
+	callbacks []*envelopeCallback
 }
 
 // RegisterHuman stamps a passport and binds human delivery.
@@ -446,22 +565,26 @@ func (c *HubClient) RegisterHuman(name string, opts ...HumanOption) (*HumanClien
 	for _, opt := range opts {
 		opt(&o)
 	}
-	passport, err := c.hub.Register(Passport{Name: name, Kind: KindHuman}, o.rule)
+	passport, err := c.api.Register(Passport{Name: name, Kind: KindHuman}, o.rule)
 	if err != nil {
 		return nil, err
 	}
+	rule := DefaultRule()
+	if o.rule != nil {
+		rule = o.rule.Clone()
+	}
 	h := &HumanClient{
-		hub:      c.hub,
+		hub:      c.api,
 		Passport: passport,
-		rule:     DefaultRule(),
-		inbox:    make(chan Envelope, o.inbox),
+		rule:     rule,
+		inbox:    make(chan Envelope, max(o.inbox, rule.Inbox.MaxPending)),
 		done:     make(chan struct{}),
 	}
-	if o.rule != nil {
-		h.rule = o.rule.Clone()
-	}
-	if err := c.hub.Attach(passport.AgentID, h.deliver); err != nil {
+	if err := c.api.Attach(passport.AgentID, h.deliver); err != nil {
 		return nil, err
+	}
+	if c.remote != nil {
+		c.remote.setHello(passport.AgentID, HelloBody{Name: passport.Name})
 	}
 	c.mu.Lock()
 	c.humans[passport.AgentID] = h
@@ -472,14 +595,19 @@ func (c *HubClient) RegisterHuman(name string, opts ...HumanOption) (*HumanClien
 // AgentID is the hub-stamped registration id.
 func (h *HumanClient) AgentID() string { return h.Passport.AgentID }
 
-// Inbox exposes the pull queue (every inbound envelope, unfiltered).
+// Inbox exposes the pull queue (every inbound envelope, unfiltered). Reading
+// it directly bypasses inbox accounting: when the rule sets Inbox.MaxPending,
+// consume through Recv (or call Hub.AckInbox yourself) so capacity frees up.
 func (h *HumanClient) Inbox() <-chan Envelope { return h.inbox }
 
 // Recv waits for the next inbound envelope; fails with ErrClosed once the
-// client is closed.
+// client is closed. A received substantive envelope frees its inbox slot.
 func (h *HumanClient) Recv(ctx context.Context) (Envelope, error) {
 	select {
 	case env := <-h.inbox:
+		if substantive(env) {
+			h.hub.AckInbox(h.AgentID(), 1)
+		}
 		return env, nil
 	case <-ctx.Done():
 		return Envelope{}, ctx.Err()
@@ -527,11 +655,21 @@ func (h *HumanClient) deliver(env Envelope) {
 		return
 	default:
 	}
+	h.feeds.push(env)
+	h.runCallbacks(env)
 	if env.EventType == EnvChannelInvite && env.SenderID != h.AgentID() {
 		_, _ = h.hub.Send(NewChannelAck(env, h.AgentID(), false, ""))
 	}
-	select {
-	case h.inbox <- env:
-	default:
-	}
+	enqueueWithPolicy(h.inbox, env, h.rule.Inbox.EffectiveOverflow(), func(dropped Envelope) {
+		if substantive(dropped) {
+			h.hub.AckInbox(h.AgentID(), 1)
+		}
+	})
+}
+
+// AddExample appends an example task to this agent's resume. The hub does the
+// read-modify-write atomically, so concurrent SetResume or observation
+// updates are not clobbered.
+func (a *AgentClient) AddExample(ex ResumeExample) error {
+	return a.hub.AddResumeExample(a.AgentID(), ex)
 }

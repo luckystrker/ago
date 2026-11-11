@@ -137,6 +137,65 @@ func TestCodeRunnerLanguageRestriction(t *testing.T) {
 	}
 }
 
+// TestCodeRunnerCustomRunners covers WithCodeRunners: a new inline language and
+// a new file-based language, both enabled through WithCodeLanguages.
+func TestCodeRunnerCustomRunners(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the custom runners use POSIX binaries")
+	}
+	r, err := NewLocalCodeRunner(
+		WithCodeRunners(map[string]LanguageRunner{
+			"greet":    {InlineArgv: []string{"echo"}},
+			"textfile": {FileExtension: "txt", FileRunnerArgv: []string{"cat"}},
+		}),
+		WithCodeLanguages("greet", "textfile"),
+	)
+	if err != nil {
+		t.Fatalf("NewLocalCodeRunner: %v", err)
+	}
+	defer r.Close()
+	_, cx := newTestContext()
+	ev := callTool(t, r, cx, r.Name(), `{"code":"custom_ok","language":"greet"}`)
+	if got := resultPartText(t, ev); got != "custom_ok" {
+		t.Fatalf("custom inline output = %q", got)
+	}
+	ev = callTool(t, r, cx, r.Name(), `{"code":"file_runner_ok","language":"textfile"}`)
+	if got := resultPartText(t, ev); got != "file_runner_ok" {
+		t.Fatalf("custom file runner output = %q", got)
+	}
+}
+
+// TestCodeRunnerRunnerValidation: a malformed runner or a language without a
+// runner is rejected at construction.
+func TestCodeRunnerRunnerValidation(t *testing.T) {
+	if _, err := NewLocalCodeRunner(WithCodeRunners(map[string]LanguageRunner{
+		"bad": {InlineArgv: []string{"echo"}, FileExtension: "txt", FileRunnerArgv: []string{"cat"}},
+	})); err == nil {
+		t.Fatal("a runner with both modes must be rejected")
+	}
+	if _, err := NewLocalCodeRunner(WithCodeRunners(map[string]LanguageRunner{
+		"bad": {FileExtension: "txt"},
+	})); err == nil {
+		t.Fatal("a file runner without FileRunnerArgv must be rejected")
+	}
+	if _, err := NewLocalCodeRunner(WithCodeLanguages("cobol")); err == nil {
+		t.Fatal("a language without a runner must be rejected")
+	}
+	// TypeScript is a recorded deferral (D-062): no built-in runner, but the
+	// runner mechanism lets a caller register one.
+	if _, err := NewLocalCodeRunner(WithCodeLanguages("typescript")); err == nil {
+		t.Fatal("typescript must have no built-in runner")
+	}
+	if _, err := NewLocalCodeRunner(
+		WithCodeRunners(map[string]LanguageRunner{
+			"typescript": {FileExtension: "ts", FileRunnerArgv: []string{"tsx"}},
+		}),
+		WithCodeLanguages("typescript"),
+	); err != nil {
+		t.Fatalf("a caller-registered typescript runner must be selectable: %v", err)
+	}
+}
+
 func TestCodeRunnerDescriptionStatesNoIsolation(t *testing.T) {
 	// The description is the model's contract (security audit 2026-10-31,
 	// C-2): the local backend has no sandbox, so claiming one invites the

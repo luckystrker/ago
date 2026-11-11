@@ -8,8 +8,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luckystrker/ago/config"
@@ -37,6 +39,21 @@ type Client struct {
 	timeout       time.Duration // caps non-streaming requests; 0 = no cap
 	maxRetries    int
 	promptCaching bool
+	nativeOutput  bool // send the response schema as output_config
+
+	defaultHeaders   map[string]string
+	metadata         map[string]string
+	serviceTier      string
+	speed            string
+	thinking         *ThinkingConfig
+	cacheDiagnostics bool
+	extraBody        map[string]any // merged into the body last
+	httpClient       *http.Client   // nil = default client
+
+	// mu guards the cache-diagnostics chain: the id of the last answered
+	// message, which the next request names as its comparison.
+	mu            sync.Mutex
+	lastMessageID string
 }
 
 // Call performs one model call over the full event history. conv carries the
@@ -48,11 +65,14 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	if conv != nil { // a nil conv is a headless call
 		prompt = conv.PromptLines()
 	}
+	var structured map[string]any
 	if opts.ResponseSchema != nil {
-		// Structured output is prompt-driven on this provider (Python sends a
-		// native output_config; the brief scopes the port to the prompt): the
-		// schema's own system prompt carries the JSON requirement, validation
-		// happens above via response.Proto.
+		// The schema's own system prompt carries the JSON requirement and
+		// validation happens above via response.Proto; with NativeStructuredOutput
+		// the API also constrains the answer to the schema (output_config).
+		if c.nativeOutput {
+			structured = outputConfig(opts.ResponseSchema.JSONSchema())
+		}
 		if sp := opts.ResponseSchema.SystemPrompt(); sp != "" {
 			prompt = append(prompt, sp)
 		}
@@ -61,6 +81,12 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 	turns, err := ConvertMessages(messages)
 	if err != nil {
 		return nil, err
+	}
+
+	if c.promptCaching {
+		// The breakpoint on the last user turn extends the cached prefix over
+		// the whole history (system and the last tool carry the other two).
+		injectCacheBreakpoint(turns)
 	}
 
 	body := map[string]any{
@@ -101,74 +127,267 @@ func (c *Client) Call(ctx context.Context, messages []events.Event, conv *agocon
 		// flag, so the body field and the header travel together.
 		betas = append(betas, mcpClientBeta)
 	}
+	if structured != nil {
+		body["output_config"] = structured
+	}
+	if hasFileReferences(messages) {
+		betas = append(betas, filesBeta)
+	}
 	if len(c.stopSequences) > 0 {
 		body["stop_sequences"] = c.stopSequences
 	}
-	if c.temperature != nil {
-		body["temperature"] = *c.temperature
+	if c.thinking != nil {
+		body["thinking"] = c.thinking.body()
 	}
-	if c.topP != nil {
-		body["top_p"] = *c.topP
+	// Extended thinking samples at temperature 1: a caller-set temperature or
+	// top_p would be refused by the API. AG2 sends neither (its API version
+	// rejects the sampling parameters), so the port drops them here too.
+	// AGO-DEVIATION: Python reaches thinking through extra_body and never
+	// combines the two itself; see docs/DECISIONS.md.
+	if c.thinking == nil || c.thinking.Type == ThinkingDisabled {
+		if c.temperature != nil {
+			body["temperature"] = *c.temperature
+		}
+		if c.topP != nil {
+			body["top_p"] = *c.topP
+		}
+	}
+	if c.metadata != nil {
+		body["metadata"] = c.metadata
+	}
+	if c.serviceTier != "" {
+		body["service_tier"] = c.serviceTier
+	}
+	if c.speed != "" {
+		body["speed"] = c.speed
 	}
 	if c.streaming {
 		body["stream"] = true
 	}
-
-	headers := map[string]string{
-		"x-api-key":         c.apiKey,
-		"anthropic-version": APIVersion,
+	headers := make(map[string]string, len(c.defaultHeaders)+2)
+	for name, value := range c.defaultHeaders {
+		headers[name] = value
 	}
+	headers["x-api-key"] = c.apiKey
+	headers["anthropic-version"] = APIVersion
 	if len(betas) > 0 {
-		// Python joins sorted(betas | user-set default betas); the AGo config
-		// has no default_headers field to fold in (AGO-DEVIATION, files.go),
-		// so the framework-set flags go out alone.
+		// Python joins sorted(framework betas | user-set default betas). The SDK
+		// replaces a same-named default header case-insensitively, so this one
+		// header carries both and a caller's flag is never dropped.
+		betas = append(betas, defaultBetas(c.defaultHeaders)...)
 		slices.Sort(betas)
+		betas = slices.Compact(betas)
+		for name := range headers {
+			if strings.EqualFold(name, "anthropic-beta") {
+				delete(headers, name)
+			}
+		}
 		headers["anthropic-beta"] = strings.Join(betas, ",")
 	}
-	client := &httpx.Client{MaxRetries: c.maxRetries, Timeout: c.timeout}
+	client := &httpx.Client{HTTP: c.httpClient, MaxRetries: c.maxRetries, Timeout: c.timeout}
 	url := c.baseURL + messagesPath
 
-	if c.streaming {
-		return c.stream(ctx, client, url, headers, body, conv)
+	// A turn paused mid-way by a server-side tool (stop_reason pause_turn) is
+	// resumed by sending its content back as an assistant turn, up to
+	// maxPauseContinuations times; the answer is the last hop's, with every
+	// hop's usage summed (Python parity).
+	var carried events.Usage
+	for hop := 0; ; hop++ {
+		// The diagnostics chain names the message this request is compared
+		// against; null on the first call (Python parity: AnthropicCacheDiagnostics
+		// chaining). Every hop re-chains to the message the previous one answered.
+		var previousMessageID string
+		if c.cacheDiagnostics {
+			previousMessageID = c.previousMessageID()
+			var previous any
+			if previousMessageID != "" {
+				previous = previousMessageID
+			}
+			body["diagnostics"] = map[string]any{"previous_message_id": previous}
+		}
+		// extra_body merges last, as the SDK does: an unmapped field (thinking,
+		// a vendor flag) reaches the wire without a typed config slot, and a key
+		// it repeats replaces the derived value.
+		// AGO-DEVIATION: on a continuation hop `messages` is not replaced again.
+		// Python's SDK merge would overwrite it, so a caller's extra_body
+		// messages would resend the paused request unchanged and the turn
+		// could never resume.
+		for k, v := range c.extraBody {
+			if k == "messages" && hop > 0 {
+				continue
+			}
+			body[k] = v
+		}
+
+		var (
+			res *roundResult
+			err error
+		)
+		if c.streaming {
+			res, err = c.stream(ctx, client, url, headers, body, conv, previousMessageID)
+		} else {
+			res, err = c.once(ctx, client, url, headers, body, conv, previousMessageID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// AGO-DEVIATION: a paused answer without content is returned as is;
+		// Python would resend an empty assistant turn, which the API refuses.
+		if res.stopReason != "pause_turn" || hop >= maxPauseContinuations || len(res.content) == 0 {
+			res.resp.Usage = carried.Add(res.resp.Usage)
+			return res.resp, nil
+		}
+		// The paused content joins the messages the hop actually sent (an
+		// extra_body override included).
+		paused := turn("assistant", res.content)
+		switch sent := body["messages"].(type) {
+		case []map[string]any:
+			body["messages"] = append(sent, paused)
+		case []any:
+			body["messages"] = append(sent, paused)
+		default:
+			res.resp.Usage = carried.Add(res.resp.Usage)
+			return res.resp, nil
+		}
+		carried = carried.Add(res.resp.Usage)
 	}
-	return c.once(ctx, client, url, headers, body, conv)
+}
+
+// maxPauseContinuations bounds the follow-up calls a pause_turn answer may
+// trigger (Python parity: max_continuations).
+const maxPauseContinuations = 5
+
+// roundResult is one Messages-API round: the durable response plus what a
+// pause_turn continuation needs to resume the turn.
+type roundResult struct {
+	resp       *events.ModelResponse
+	content    []map[string]any // the response's content blocks, verbatim
+	stopReason string           // the raw stop_reason
+}
+
+// defaultBetas collects the anthropic-beta values a caller set as defaults.
+// Header names match case-insensitively; every spelling contributes, so two
+// spellings of one name cannot silently drop a flag the caller asked for.
+func defaultBetas(headers map[string]string) []string {
+	var out []string
+	for name, value := range headers {
+		if !strings.EqualFold(name, "anthropic-beta") {
+			continue
+		}
+		for _, part := range strings.Split(value, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// previousMessageID returns the id of the last answered message ("" before the
+// first answer).
+func (c *Client) previousMessageID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastMessageID
+}
+
+// setLastMessageID records the answer a following request compares against.
+// A message without an id leaves the previous one standing: a stale comparison
+// still names a real message, where clearing it would stop diagnosing.
+func (c *Client) setLastMessageID(id string) {
+	if id == "" {
+		return
+	}
+	c.mu.Lock()
+	c.lastMessageID = id
+	c.mu.Unlock()
+}
+
+// reportCacheDiagnostics emits the API's explanation of a cache miss, if it
+// reported one. A pending comparison (no reason) produces no event.
+func (c *Client) reportCacheDiagnostics(conv *agocontext.Context, d *wireDiagnostics, previousID string) error {
+	if !c.cacheDiagnostics || d == nil || d.CacheMissReason == nil || d.CacheMissReason.Type == "" {
+		return nil
+	}
+	ev := &CacheDiagnostics{Reason: d.CacheMissReason.Type, PreviousMessageID: previousID}
+	switch d.CacheMissReason.Type {
+	case "previous_message_not_found", "unavailable":
+		// Nothing was compared, so there is no estimate to report.
+	default:
+		ev.CacheMissedInputTokens = d.CacheMissReason.CacheMissedInputTokens
+	}
+	return sendEvent(conv, ev)
 }
 
 // --- non-streaming ----------------------------------------------------------------
 
 // wireBlock is one content block of a response; only the fields the mapped
-// block kinds (text / tool_use / thinking) carry are decoded.
+// block kinds (text / tool_use / thinking / redacted_thinking) carry are
+// decoded.
 type wireBlock struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text"`
-	Thinking string          `json:"thinking"`
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	Input    json.RawMessage `json:"input"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
+	Data      string          `json:"data"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+
+	// raw is the block exactly as the API sent it: server-tool blocks are
+	// replayed from it, and a paused turn is resumed with it.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON decodes the typed fields and keeps the verbatim block.
+func (b *wireBlock) UnmarshalJSON(data []byte) error {
+	type plain wireBlock // no methods: avoids recursing into this one
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*b = wireBlock(p)
+	b.raw = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+// object decodes the verbatim block into a generic JSON object.
+func (b wireBlock) object() (map[string]any, error) {
+	var m map[string]any
+	if err := json.Unmarshal(b.raw, &m); err != nil {
+		return nil, fmt.Errorf("anthropic: decoding %s block: %w", b.Type, err)
+	}
+	return m, nil
 }
 
 type wireMessage struct {
-	ID         string      `json:"id"`
-	Model      string      `json:"model"`
-	Content    []wireBlock `json:"content"`
-	StopReason string      `json:"stop_reason"`
-	Usage      *wireUsage  `json:"usage"`
+	ID          string           `json:"id"`
+	Model       string           `json:"model"`
+	Content     []wireBlock      `json:"content"`
+	StopReason  string           `json:"stop_reason"`
+	Usage       *wireUsage       `json:"usage"`
+	Diagnostics *wireDiagnostics `json:"diagnostics"`
 }
 
-type wireError struct {
-	Error struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
+// wireDiagnostics is the API's explanation of why the prompt cache missed.
+type wireDiagnostics struct {
+	CacheMissReason *wireCacheMissReason `json:"cache_miss_reason"`
 }
 
-func (c *Client) once(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context) (*events.ModelResponse, error) {
+// wireCacheMissReason is one cache-miss report. The token estimate is absent
+// for the reasons that had nothing to compare.
+type wireCacheMissReason struct {
+	Type                   string `json:"type"`
+	CacheMissedInputTokens *int64 `json:"cache_missed_input_tokens"`
+}
+
+func (c *Client) once(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*roundResult, error) {
 	status, data, err := client.PostJSON(ctx, url, headers, body)
 	if err != nil {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("anthropic: messages API returned %d: %s", status, apiErrorSnippet(data))
+		return nil, config.NewAPIError(config.ProviderAnthropic, "anthropic: messages API", status, nil, data)
 	}
 	var raw wireMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -181,13 +400,30 @@ func (c *Client) once(ctx context.Context, client *httpx.Client, url string, hea
 		FinishReason: MapStopReason(raw.StopReason),
 		ResponseID:   raw.ID,
 	}
+	content := make([]map[string]any, 0, len(raw.Content))
 	for _, block := range raw.Content {
+		obj, err := block.object()
+		if err != nil {
+			return nil, err
+		}
+		content = append(content, obj)
 		switch block.Type {
 		case "thinking":
 			if block.Thinking != "" {
 				if err := sendEvent(conv, &events.ModelReasoning{Content: block.Thinking}); err != nil {
 					return nil, err
 				}
+			}
+			// The durable copy keeps the signature, so the block can be echoed
+			// back on the tool-use turn the API demands it on.
+			if block.Thinking != "" || block.Signature != "" {
+				if err := sendEvent(conv, &ThinkingBlockEvent{Thinking: block.Thinking, Signature: block.Signature}); err != nil {
+					return nil, err
+				}
+			}
+		case "redacted_thinking":
+			if err := sendEvent(conv, &RedactedThinkingEvent{Data: block.Data}); err != nil {
+				return nil, err
 			}
 		case "text":
 			// Python parity: every text block is announced, the last one stays
@@ -207,17 +443,32 @@ func (c *Client) once(ctx context.Context, client *httpx.Client, url string, hea
 				Name:      block.Name,
 				Arguments: args,
 			})
+		case "server_tool_use", "mcp_tool_use":
+			if ev := serverToolCallEvent(obj); ev != nil {
+				if err := sendEvent(conv, ev); err != nil {
+					return nil, err
+				}
+			}
 		default:
-			// Unknown block kinds (server_tool_use, redacted_thinking,
-			// container_upload, ...) have no AGo replay event yet: dropped.
-			// AGO-DEVIATION: Python re-emits them as provider-specific replay
-			// events; the AGo vocabulary has no carrier for them.
+			if ev := serverToolResultEvent(obj); ev != nil {
+				if err := sendEvent(conv, ev); err != nil {
+					return nil, err
+				}
+			}
+			// Other unknown block kinds (container_upload, ...) have no AGo
+			// replay event yet: dropped.
+			// AGO-DEVIATION: Python re-emits container_upload as a
+			// provider-specific event; AGo records only the server-tool kinds.
 		}
 	}
 	if raw.Usage != nil {
 		resp.Usage = NormalizeUsage(*raw.Usage)
 	}
-	return resp, nil
+	if err := c.reportCacheDiagnostics(conv, raw.Diagnostics, previousMessageID); err != nil {
+		return nil, err
+	}
+	c.setLastMessageID(raw.ID)
+	return &roundResult{resp: resp, content: content, stopReason: raw.StopReason}, nil
 }
 
 // --- streaming ---------------------------------------------------------------------
@@ -235,12 +486,16 @@ type streamEvent struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
+		// Citation is one citations_delta entry, kept verbatim.
+		Citation json.RawMessage `json:"citation"`
 	} `json:"delta"`
 
 	// message_delta
-	Usage *wireUsage `json:"usage"`
+	Usage       *wireUsage       `json:"usage"`
+	Diagnostics *wireDiagnostics `json:"diagnostics"`
 
 	// error (in-band: e.g. an overloaded_error delivered mid-stream)
 	Error *struct {
@@ -255,13 +510,37 @@ type toolAcc struct {
 	id, name, arguments string
 }
 
-func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context) (*events.ModelResponse, error) {
+// thinkingAcc accumulates one streamed thinking block: its deltas arrive as
+// thinking_delta, and the signature only at the end as signature_delta.
+type thinkingAcc struct {
+	text, signature string
+}
+
+// streamBlock rebuilds one streamed content block as the API would have sent
+// it whole: the start block, with deltas folded in and tool input assembled at
+// the stop.
+type streamBlock struct {
+	obj     map[string]any
+	partial strings.Builder // input_json_delta fragments
+}
+
+// appendString folds a text-like delta into the block's string field.
+func (b *streamBlock) appendString(field, delta string) {
+	cur, _ := b.obj[field].(string)
+	b.obj[field] = cur + delta
+}
+
+func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, headers map[string]string, body map[string]any, conv *agocontext.Context, previousMessageID string) (*roundResult, error) {
 	var (
+		blocks       = map[int]*streamBlock{}
+		rawStop      string
 		content      strings.Builder
 		calls        []events.ToolCallEvent
 		accs         = map[int]*toolAcc{}
+		thoughts     = map[int]*thinkingAcc{}
 		startUsage   *wireUsage // message_start: input side + an output_tokens placeholder
 		deltaUsage   *wireUsage // message_delta: the final output side
+		diagnostics  *wireDiagnostics
 		finishReason string
 		responseID   string
 		resolved     string
@@ -280,13 +559,63 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 					u := *ev.Message.Usage
 					startUsage = &u
 				}
+				if ev.Message.Diagnostics != nil {
+					diagnostics = ev.Message.Diagnostics
+				}
 			}
 		case "content_block_start":
-			if ev.ContentBlock.Type == "tool_use" {
-				accs[ev.Index] = &toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+			var started *streamBlock
+			if len(ev.ContentBlock.raw) > 0 {
+				obj, err := ev.ContentBlock.object()
+				if err != nil {
+					return err
+				}
+				started = &streamBlock{obj: obj}
+				blocks[ev.Index] = started
 			}
-			// text / thinking blocks carry no state to open.
+			switch ev.ContentBlock.Type {
+			case "tool_use":
+				accs[ev.Index] = &toolAcc{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+			case "thinking":
+				thoughts[ev.Index] = &thinkingAcc{}
+			case "redacted_thinking":
+				// The whole opaque block arrives here; the API wants it back
+				// unchanged, so it is recorded before the tools of the turn.
+				if err := sendEvent(conv, &RedactedThinkingEvent{Data: ev.ContentBlock.Data}); err != nil {
+					return err
+				}
+			case "server_tool_use", "mcp_tool_use":
+				// The input arrives as input_json_delta; the event is built at
+				// content_block_stop so it carries the whole of it.
+			default:
+				// A server-tool result arrives whole in its start block.
+				if started != nil {
+					if rev := serverToolResultEvent(started.obj); rev != nil {
+						if err := sendEvent(conv, rev); err != nil {
+							return err
+						}
+					}
+				}
+			}
 		case "content_block_delta":
+			if b, ok := blocks[ev.Index]; ok {
+				switch ev.Delta.Type {
+				case "text_delta":
+					b.appendString("text", ev.Delta.Text)
+				case "thinking_delta":
+					b.appendString("thinking", ev.Delta.Thinking)
+				case "signature_delta":
+					b.obj["signature"] = ev.Delta.Signature
+				case "input_json_delta":
+					b.partial.WriteString(ev.Delta.PartialJSON)
+				case "citations_delta":
+					var cite any
+					if err := json.Unmarshal(ev.Delta.Citation, &cite); err == nil {
+						list, _ := b.obj["citations"].([]any)
+						b.obj["citations"] = append(list, cite)
+					}
+				}
+			}
 			switch ev.Delta.Type {
 			case "text_delta":
 				content.WriteString(ev.Delta.Text)
@@ -294,8 +623,15 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 					return err
 				}
 			case "thinking_delta":
+				if acc, ok := thoughts[ev.Index]; ok {
+					acc.text += ev.Delta.Thinking
+				}
 				if err := sendEvent(conv, &events.ModelReasoning{Content: ev.Delta.Thinking}); err != nil {
 					return err
+				}
+			case "signature_delta":
+				if acc, ok := thoughts[ev.Index]; ok {
+					acc.signature = ev.Delta.Signature
 				}
 			case "input_json_delta":
 				if acc, ok := accs[ev.Index]; ok {
@@ -303,6 +639,23 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				}
 			}
 		case "content_block_stop":
+			if b, ok := blocks[ev.Index]; ok && b.partial.Len() > 0 {
+				// max_tokens can cut a block mid-JSON: the block is kept with
+				// its start input rather than failing the turn.
+				var input any
+				if err := json.Unmarshal([]byte(b.partial.String()), &input); err == nil {
+					b.obj["input"] = input
+				}
+			}
+			if b, ok := blocks[ev.Index]; ok {
+				if t, _ := b.obj["type"].(string); t == "server_tool_use" || t == "mcp_tool_use" {
+					if cev := serverToolCallEvent(b.obj); cev != nil {
+						if err := sendEvent(conv, cev); err != nil {
+							return err
+						}
+					}
+				}
+			}
 			if acc, ok := accs[ev.Index]; ok {
 				args := acc.arguments
 				if strings.TrimSpace(args) == "" {
@@ -315,8 +668,17 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				})
 				delete(accs, ev.Index)
 			}
+			if acc, ok := thoughts[ev.Index]; ok {
+				if acc.text != "" || acc.signature != "" {
+					if err := sendEvent(conv, &ThinkingBlockEvent{Thinking: acc.text, Signature: acc.signature}); err != nil {
+						return err
+					}
+				}
+				delete(thoughts, ev.Index)
+			}
 		case "message_delta":
 			if ev.Delta.StopReason != "" {
+				rawStop = ev.Delta.StopReason
 				finishReason = MapStopReason(ev.Delta.StopReason)
 			}
 			if ev.Usage != nil {
@@ -325,6 +687,9 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 				// not accumulate) — the merge happens once, after the stream.
 				u := *ev.Usage
 				deltaUsage = &u
+			}
+			if ev.Diagnostics != nil {
+				diagnostics = ev.Diagnostics
 			}
 		case "error":
 			// An in-band error fails the call — Python parity: the SDK's
@@ -343,7 +708,7 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, config.WrapStatusError(config.ProviderAnthropic, "anthropic: messages API", err)
 	}
 
 	resp := &events.ModelResponse{
@@ -361,7 +726,21 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 		resp.Message = msg
 	}
 	resp.ToolCalls = events.ToolCallsEvent{Calls: calls}
-	return resp, nil
+	if err := c.reportCacheDiagnostics(conv, diagnostics, previousMessageID); err != nil {
+		return nil, err
+	}
+	c.setLastMessageID(responseID)
+
+	indexes := make([]int, 0, len(blocks))
+	for i := range blocks {
+		indexes = append(indexes, i)
+	}
+	slices.Sort(indexes)
+	assembled := make([]map[string]any, 0, len(indexes))
+	for _, i := range indexes {
+		assembled = append(assembled, blocks[i].obj)
+	}
+	return &roundResult{resp: resp, content: assembled, stopReason: rawStop}, nil
 }
 
 // mergeStreamUsage assembles the call's usage the way the final message of a
@@ -420,22 +799,4 @@ func sendEvent(conv *agocontext.Context, ev events.Event) error {
 		return nil
 	}
 	return conv.Send(ev)
-}
-
-// apiErrorSnippet renders an API error body, preferring the Anthropic error
-// envelope's message over the raw bytes.
-func apiErrorSnippet(data []byte) string {
-	var env wireError
-	if err := json.Unmarshal(data, &env); err == nil && env.Error.Message != "" {
-		if env.Error.Type != "" {
-			return env.Error.Type + ": " + env.Error.Message
-		}
-		return env.Error.Message
-	}
-	const max = 512
-	s := strings.TrimSpace(string(data))
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }

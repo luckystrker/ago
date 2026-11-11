@@ -100,7 +100,7 @@ type OpenAIResponsesConfig struct {
 	// Timeout caps a non-streaming request (0 = no cap; streams rely on the
 	// call's context for cancellation).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures (SDK default, applied by NewOpenAIResponses).
 	MaxRetries int
 
@@ -117,6 +117,14 @@ type OpenAIResponsesConfig struct {
 	// config derived (SDK parity: extra_body).
 	ExtraBody map[string]any
 
+	// HTTPClient performs the requests of Create and CreateFilesClient when
+	// non-nil (proxy, custom root CAs, mTLS). It owns its own Timeout and
+	// redirect policy; Timeout above applies only to the default client.
+	HTTPClient *http.Client
+	// DefaultQuery is appended to every request URL (SDK parity:
+	// default_query).
+	DefaultQuery map[string]string
+
 	model string
 }
 
@@ -129,6 +137,12 @@ func NewOpenAIResponses(model string) *OpenAIResponsesConfig {
 
 // Provider reports the vendor (ModelConfig contract).
 func (c *OpenAIResponsesConfig) Provider() config.Provider { return config.ProviderOpenAI }
+
+// InputDialect implements config.InputDialectConfig: the Responses API carries
+// documents and file ids in tool results too, unlike Chat Completions.
+func (c *OpenAIResponsesConfig) InputDialect() config.InputDialect {
+	return config.DialectOpenAIResponses
+}
 
 // Model returns the model identifier sent with every call (ModelConfig
 // contract).
@@ -197,7 +211,8 @@ func (c *OpenAIResponsesConfig) CreateFilesClient() (files.Client, error) {
 		defaultHeaders: headers,
 		timeout:        c.Timeout,
 		maxRetries:     c.MaxRetries,
-		http:           &http.Client{Timeout: c.Timeout},
+		query:          c.DefaultQuery,
+		http:           httpClientOr(c.HTTPClient, c.Timeout),
 	}, nil
 }
 
@@ -356,6 +371,10 @@ func (c *OpenAIResponsesConfig) set(key string, v any) error {
 			return overrideTypeErr(key, v, "bool")
 		}
 		c.Streaming = bv
+	case "HTTPClient", "http_client":
+		return setPtr(key, v, &c.HTTPClient, "*http.Client")
+	case "DefaultQuery", "default_query":
+		return strMap(&c.DefaultQuery)
 	case "Timeout", "timeout":
 		d, ok := v.(time.Duration)
 		if !ok {
@@ -510,8 +529,8 @@ func (c *ResponsesClient) Call(ctx context.Context, messages []events.Event, con
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
-	url := joinURL(c.baseURL, responsesPath)
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	url := httpx.WithQuery(joinURL(c.baseURL, responsesPath), p.DefaultQuery)
 
 	var resp *events.ModelResponse
 	if p.Streaming {
@@ -534,7 +553,7 @@ func runResponsesOnce(ctx context.Context, client *httpx.Client, url string, hea
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config/openai: responses returned %d: %s", status, bodySnippet(data))
+		return nil, config.NewAPIError(config.ProviderOpenAI, "config/openai: responses", status, nil, data)
 	}
 	var raw struct {
 		ID     string           `json:"id"`
@@ -573,23 +592,54 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 	acc := newTurnAcc()
 	err := client.PostJSONStream(ctx, url, headers, body, func(data []byte) error {
 		var ev struct {
-			Type    string          `json:"type"`
-			Delta   string          `json:"delta"`
-			Item    map[string]any  `json:"item"`
-			Resp    *streamResponse `json:"response"`
-			Message string          `json:"message"`
+			Type string `json:"type"`
+			// Delta is a string for text and command deltas but an object
+			// for shell output deltas, so it decodes per event type.
+			Delta        json.RawMessage `json:"delta"`
+			CommandIndex int             `json:"command_index"`
+			OutputIndex  int             `json:"output_index"`
+			ItemID       string          `json:"item_id"`
+			Item         map[string]any  `json:"item"`
+			Resp         *streamResponse `json:"response"`
+			Message      string          `json:"message"`
 		}
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("config/openai: decoding stream event: %w", err)
 		}
 		switch ev.Type {
 		case "response.output_text.delta":
-			if ev.Delta != "" {
-				acc.content.WriteString(ev.Delta)
-				if err := sendEvent(conv, &events.ModelMessageChunk{Content: ev.Delta}); err != nil {
+			delta, err := stringDelta(ev.Delta)
+			if err != nil {
+				return fmt.Errorf("config/openai: decoding text delta: %w", err)
+			}
+			if delta != "" {
+				acc.content.WriteString(delta)
+				if err := sendEvent(conv, &events.ModelMessageChunk{Content: delta}); err != nil {
 					return err
 				}
 			}
+		case "response.shell_call_command.delta":
+			delta, err := stringDelta(ev.Delta)
+			if err != nil {
+				return fmt.Errorf("config/openai: decoding shell command delta: %w", err)
+			}
+			return sendEvent(conv, &ShellCommandChunk{
+				Content: delta, CommandIndex: ev.CommandIndex, OutputIndex: ev.OutputIndex,
+			})
+		case "response.shell_call_output_content.delta":
+			var delta struct {
+				Stdout *string `json:"stdout"`
+				Stderr *string `json:"stderr"`
+			}
+			if len(ev.Delta) > 0 {
+				if err := json.Unmarshal(ev.Delta, &delta); err != nil {
+					return fmt.Errorf("config/openai: decoding shell output delta: %w", err)
+				}
+			}
+			return sendEvent(conv, &ShellOutputChunk{
+				CommandIndex: ev.CommandIndex, OutputIndex: ev.OutputIndex, ItemID: ev.ItemID,
+				Stdout: delta.Stdout, Stderr: delta.Stderr,
+			})
 		case "response.output_item.done":
 			// Builtin and reasoning events are emitted on Done so the item is
 			// fully populated (Added fires before a server-side tool ran).
@@ -626,7 +676,7 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, config.WrapStatusError(config.ProviderOpenAI, "config/openai: responses", err)
 	}
 
 	resp := acc.response(acc.model, acc.finish, acc.respID)
@@ -638,6 +688,16 @@ func runResponsesStream(ctx context.Context, client *httpx.Client, url string, h
 		resp.Message = msg
 	}
 	return resp, nil
+}
+
+// stringDelta decodes a string-valued delta; an absent delta is empty.
+func stringDelta(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var s string
+	err := json.Unmarshal(raw, &s)
+	return s, err
 }
 
 type streamResponse struct {
@@ -1675,16 +1735,6 @@ func joinURL(base, path string) string {
 		path = "/" + path
 	}
 	return strings.TrimSuffix(base, "/") + path
-}
-
-// bodySnippet renders the first bytes of an error response body.
-func bodySnippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	const max = 512
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
 }
 
 // dataURL renders inline bytes as a data: URL.

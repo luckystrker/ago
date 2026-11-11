@@ -5,14 +5,31 @@
 // shapes, stdlib only.
 //
 // Scope: protocol types, agent-card discovery, message/send,
-// message/stream (server SSE), tasks/get, tasks/cancel, an in-memory task
-// store (D-049); push-notification configs with server dispatch and a
-// webhook receiver, the urn:ag2:client-tools:v1 extension with client-side
-// execution drivers, context-variable sync and HITL-over-the-wire on
-// Message.metadata, the REST transport routes, and the declarative security
-// schemes of security.py (D-056). Still deferred: the conversational A2AClient
-// turn machinery (full history shipping, reconnect/resubscribe), gRPC and
-// card JWS signing/verification (D-056).
+// message/stream (server SSE) with artifact streaming (TaskArtifactUpdateEvent
+// chunks through ServerConfig.HandleStream), tasks/get, tasks/list,
+// tasks/cancel, tasks/resubscribe (the live stream of a running task, opened
+// with the task's current state — wave-4 invariant 7), an in-memory task store
+// (D-049); push-notification configs with server dispatch and a webhook
+// receiver, the urn:ag2:client-tools:v1 extension with client-side execution
+// drivers, context-variable sync and HITL-over-the-wire on Message.metadata,
+// the REST transport routes (including /message:stream and
+// /tasks/{id}:subscribe), and the declarative security schemes of security.py
+// (D-056). The client speaks both bindings (JSON-RPC SSE and HTTP+JSON),
+// consumes a task stream with resubscribe-and-backoff (ErrReconnect) and a
+// polling fallback, selects the card interface (with the 1.0 protocol-version
+// check), takes a preset card and request interceptors (clientconn.go,
+// clientrest.go, streamclient.go), and the server rewrites the served card per
+// request (ServerConfig.CardModifier, CardCacheControl) and serves the
+// authenticated extended card (ServerConfig.ExtendedCard,
+// agent/getAuthenticatedExtendedCard and /extendedAgentCard), with optional
+// input-mode validation (ServerConfig.ValidateInputModes), full AG2 history
+// shipping with the server restore hook (history.go,
+// ServerConfig.RestoreHistory), tenants — the claim on the wire plus the
+// request-aware authorization of it (tenant.go,
+// ServerConfig.TenantResolver/StoreForTenant, AuthorizeIdentity) — and
+// agent-card JWS signing/verification over the same canonical payload the
+// a2a-sdk signs (jws.go). Still deferred: the conversational A2AClient turn
+// machinery (the LLMClient adapter; D-049) and gRPC (D-071).
 package a2a
 
 import (
@@ -83,6 +100,27 @@ type AgentCard struct {
 	Skills              []AgentSkill               `json:"skills,omitempty"`
 	SecuritySchemes     map[string]*SecurityScheme `json:"securitySchemes,omitempty"`
 	Security            []SecurityRequirement      `json:"securityRequirements,omitempty"`
+	// Provider is the producing organization (parity: a2a-sdk AgentProvider).
+	// Modelled even though nothing in this package fills it: a card served by
+	// another implementation may carry it, and every field of the signed card
+	// has to survive the round trip through this struct or the signature would
+	// be computed over a different payload.
+	Provider *AgentProvider `json:"provider,omitempty"`
+	// DocumentationURL and IconURL are card metadata (parity: a2a-sdk
+	// documentation_url / icon_url).
+	DocumentationURL string `json:"documentationUrl,omitempty"`
+	IconURL          string `json:"iconUrl,omitempty"`
+	// Signatures are the card's JWS signatures, verified by a client that was
+	// configured with a CardVerifier and produced by a server configured with
+	// a CardSigner (jws.go). Empty serves an unsigned card.
+	Signatures []CardSignature `json:"signatures,omitempty"`
+}
+
+// AgentProvider names the organization behind an agent (parity: a2a-sdk
+// AgentProvider — url, organization).
+type AgentProvider struct {
+	URL          string `json:"url,omitempty"`
+	Organization string `json:"organization,omitempty"`
 }
 
 // AgentCapabilities declares what the served endpoints support. Extensions
@@ -90,11 +128,102 @@ type AgentCard struct {
 // a2a-sdk AgentCapabilities.extensions / AgentExtension); a server card
 // advertising urn:ag2:client-tools:v1 must list it here, and
 // ValidateExtensionActivation checks both directions against it.
+//
+// The three flags are proto3 `optional` fields in the a2a-sdk descriptor
+// (synthetic oneofs _streaming / _push_notifications / _extended_agent_card),
+// i.e. they have explicit presence: MessageToDict writes an explicitly set
+// `false` and omits an unset field, and _clean_empty never touches a boolean.
+// Presence therefore changes the signed payload, and the card has to carry it:
+// a served card that says nothing about push support signs differently from one
+// that says "false".
+//
+// The plain bool fields keep the old API. A true value is always present
+// (nothing else can be meant by setting it); false is present only when the
+// Set* method marked it, or when the card came from JSON that spelled the key
+// out (UnmarshalJSON records presence). The wire form follows the same rule, so
+// a card round-trips through JSON with its presence intact.
 type AgentCapabilities struct {
-	Streaming         bool             `json:"streaming"`
-	PushNotifications bool             `json:"pushNotifications"`
+	Streaming         bool             `json:"streaming,omitempty"`
+	PushNotifications bool             `json:"pushNotifications,omitempty"`
 	ExtendedAgentCard bool             `json:"extendedAgentCard,omitempty"`
 	Extensions        []AgentExtension `json:"extensions,omitempty"`
+
+	// presence bits (proto3 optional); unexported so the bool API stays.
+	streamingPresent         bool
+	pushNotificationsPresent bool
+	extendedAgentCardPresent bool
+}
+
+// SetStreaming sets the streaming capability and marks it present, so an
+// explicit false reaches the signed payload. Returns c for chaining.
+func (c *AgentCapabilities) SetStreaming(v bool) *AgentCapabilities {
+	c.Streaming, c.streamingPresent = v, true
+	return c
+}
+
+// SetPushNotifications sets the push-notification capability and marks it
+// present (parity: server.py always passes push_notifications=<bool> to
+// build_card, so AG2 signs an explicit false too).
+func (c *AgentCapabilities) SetPushNotifications(v bool) *AgentCapabilities {
+	c.PushNotifications, c.pushNotificationsPresent = v, true
+	return c
+}
+
+// SetExtendedAgentCard sets the extended-card capability and marks it present.
+func (c *AgentCapabilities) SetExtendedAgentCard(v bool) *AgentCapabilities {
+	c.ExtendedAgentCard, c.extendedAgentCardPresent = v, true
+	return c
+}
+
+// MarshalJSON writes each flag when it is present — set to true, or explicitly
+// marked by a Set* call or by a previous decode (parity: protobuf JSON omits an
+// unset optional field and keeps a set false).
+func (c AgentCapabilities) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Streaming         *bool            `json:"streaming,omitempty"`
+		PushNotifications *bool            `json:"pushNotifications,omitempty"`
+		ExtendedAgentCard *bool            `json:"extendedAgentCard,omitempty"`
+		Extensions        []AgentExtension `json:"extensions,omitempty"`
+	}
+	out := wire{Extensions: c.Extensions}
+	if c.streamingPresent || c.Streaming {
+		v := c.Streaming
+		out.Streaming = &v
+	}
+	if c.pushNotificationsPresent || c.PushNotifications {
+		v := c.PushNotifications
+		out.PushNotifications = &v
+	}
+	if c.extendedAgentCardPresent || c.ExtendedAgentCard {
+		v := c.ExtendedAgentCard
+		out.ExtendedAgentCard = &v
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON decodes the flags and records which ones the card spelled out,
+// so presence survives the wire (a JSON false is present, an absent key is not).
+func (c *AgentCapabilities) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Streaming         *bool            `json:"streaming"`
+		PushNotifications *bool            `json:"pushNotifications"`
+		ExtendedAgentCard *bool            `json:"extendedAgentCard"`
+		Extensions        []AgentExtension `json:"extensions"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*c = AgentCapabilities{Extensions: wire.Extensions}
+	if wire.Streaming != nil {
+		c.Streaming, c.streamingPresent = *wire.Streaming, true
+	}
+	if wire.PushNotifications != nil {
+		c.PushNotifications, c.pushNotificationsPresent = *wire.PushNotifications, true
+	}
+	if wire.ExtendedAgentCard != nil {
+		c.ExtendedAgentCard, c.extendedAgentCardPresent = *wire.ExtendedAgentCard, true
+	}
+	return nil
 }
 
 // AgentExtension is one protocol extension advertised on the card
@@ -113,6 +242,16 @@ type AgentSkill struct {
 	Description string   `json:"description,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 	Examples    []string `json:"examples,omitempty"`
+	// InputModes narrows the card's defaultInputModes for this skill (parity:
+	// a2a-sdk AgentSkill.inputModes). ValidateInputModes reads them as part of
+	// the card's declared set.
+	InputModes []string `json:"inputModes,omitempty"`
+	// OutputModes narrows defaultOutputModes for this skill, and
+	// SecurityRequirements narrows the card's requirements (parity: a2a-sdk
+	// AgentSkill.output_modes / security_requirements). Modelled for signature
+	// round-trip fidelity like Provider above.
+	OutputModes          []string              `json:"outputModes,omitempty"`
+	SecurityRequirements []SecurityRequirement `json:"securityRequirements,omitempty"`
 }
 
 // Part is one typed payload inside a Message. The concrete type is selected by
@@ -281,12 +420,12 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // TaskState enumerates the task lifecycle states of this subset.
 //
-// AGO-DEVIATION: the richer A2A state machine still omits auth-required,
-// rejected and unknown (D-049); input-required joined in the second wave
-// because the urn:ag2:client-tools:v1 extension and HITL-over-the-wire are
-// meaningless without a state that says "answer pending on the caller" —
-// Python transitions to TASK_STATE_INPUT_REQUIRED for exactly that
-// (executor.py updater.requires_input).
+// AGO-DEVIATION: "unknown" exists as a constant for a client decoding a state
+// it does not know, but the server never stores it — it has no server-side
+// meaning. input-required came in the second wave because the
+// urn:ag2:client-tools:v1 extension and HITL-over-the-wire are meaningless
+// without a state that says "answer pending on the caller" (executor.py
+// updater.requires_input); auth-required and rejected came with the third.
 type TaskState string
 
 // Task states.
@@ -294,16 +433,43 @@ const (
 	TaskStateSubmitted     TaskState = "submitted"
 	TaskStateWorking       TaskState = "working"
 	TaskStateInputRequired TaskState = "input-required"
-	TaskStateCompleted     TaskState = "completed"
-	TaskStateFailed        TaskState = "failed"
-	TaskStateCanceled      TaskState = "canceled"
+	// TaskStateAuthRequired parks a task until the caller presents
+	// credentials (A2A spec §4.5). Like input-required it is interrupted, not
+	// terminal: a continuation with the same task id resumes it.
+	TaskStateAuthRequired TaskState = "auth-required"
+	TaskStateCompleted    TaskState = "completed"
+	TaskStateFailed       TaskState = "failed"
+	TaskStateCanceled     TaskState = "canceled"
+	// TaskStateRejected is a terminal refusal: the agent would not take the
+	// task at all (parity: a2a TASK_STATE_REJECTED, A2ATaskRejectedError).
+	TaskStateRejected TaskState = "rejected"
+	// TaskStateUnknown is the forward-compatibility state: a client that
+	// receives a state it does not know treats the task as unreadable. The
+	// server never stores it; it exists so a decoder has a constant to map to.
+	TaskStateUnknown TaskState = "unknown"
 )
 
 // terminalTaskState reports whether state closes the task: a terminal task
 // cannot be canceled (parity: a2a TaskNotCancelableError on terminal states).
+// rejected is terminal; auth-required and input-required are interruptions and
+// stay resumable.
 func terminalTaskState(state TaskState) bool {
 	switch state {
-	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled:
+	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled, TaskStateRejected:
+		return true
+	}
+	return false
+}
+
+// settledTaskState reports whether nothing more arrives for the current turn:
+// the task is terminal, or it was interrupted and hands control back to the
+// caller (parity: a2a/_states.py SETTLED_STATES = TERMINAL | INTERRUPTED).
+func settledTaskState(state TaskState) bool {
+	if terminalTaskState(state) {
+		return true
+	}
+	switch state {
+	case TaskStateInputRequired, TaskStateAuthRequired:
 		return true
 	}
 	return false
@@ -369,3 +535,57 @@ type StatusUpdate struct {
 
 // KindStatusUpdate is the wire discriminator of StatusUpdate.
 const KindStatusUpdate = "status-update"
+
+// ArtifactUpdate is one chunk of a running task's output (the A2A
+// TaskArtifactUpdateEvent): the client folds it into the artifact it names.
+// Append says the chunk's parts extend the artifact with the same ArtifactID
+// instead of replacing its parts; LastChunk marks the final chunk of that
+// artifact. Both the server's stored record and the client's view fold chunks
+// with ApplyArtifactUpdate, so a stream and tasks/get agree on the content.
+type ArtifactUpdate struct {
+	Kind      string         `json:"kind"`
+	TaskID    string         `json:"taskId"`
+	ContextID string         `json:"contextId"`
+	Artifact  Artifact       `json:"artifact"`
+	Append    bool           `json:"append,omitempty"`
+	LastChunk bool           `json:"lastChunk,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// KindArtifactUpdate is the wire discriminator of ArtifactUpdate.
+const KindArtifactUpdate = "artifact-update"
+
+// ApplyArtifactUpdate folds one artifact chunk into task.Artifacts under the
+// A2A append rules: Append extends the parts of the artifact with the same id
+// (creating it when absent), no Append replaces them. A non-empty name on the
+// chunk updates the artifact's name. It is the one rule the server writes the
+// task record with and the client builds its view with, so the two cannot
+// drift.
+func ApplyArtifactUpdate(task *Task, update *ArtifactUpdate) {
+	if task == nil || update == nil {
+		return
+	}
+	chunk := update.Artifact
+	if chunk.ArtifactID == "" {
+		return
+	}
+	for i := range task.Artifacts {
+		if task.Artifacts[i].ArtifactID != chunk.ArtifactID {
+			continue
+		}
+		if update.Append {
+			task.Artifacts[i].Parts = append(task.Artifacts[i].Parts, chunk.Parts...)
+		} else {
+			task.Artifacts[i].Parts = chunk.Parts
+		}
+		if chunk.Name != "" {
+			task.Artifacts[i].Name = chunk.Name
+		}
+		return
+	}
+	task.Artifacts = append(task.Artifacts, Artifact{
+		ArtifactID: chunk.ArtifactID,
+		Name:       chunk.Name,
+		Parts:      chunk.Parts,
+	})
+}

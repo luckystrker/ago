@@ -399,6 +399,7 @@ func (h *Hub) sweepChannel(channelID string, now time.Time) {
 	type pendingFire struct {
 		idx    int
 		key    string
+		exp    Expectation
 		v      *Violation
 		action ViolationHandler
 	}
@@ -427,21 +428,18 @@ func (h *Hub) sweepChannel(channelID string, now time.Time) {
 				h.firedViolations[channelID] = fired
 			}
 			fired[key] = true
-			// Every fire reaches the audit sink before the handler —
-			// Python fans on_expectation_fired out to AuditLog the same
-			// way. A sink failure is swallowed (auditing never breaks the
-			// flow it observes).
-			violators := append([]string(nil), v.ViolatorIDs...)
-			h.auditEntry(AuditExpectationViolated, channelID, func(e *AuditEntry) {
-				e.Expectation = exp.Kind
-				e.Violators = violators
-				e.Detail = v.Detail
-			})
-			fires = append(fires, pendingFire{idx: idx, key: key, v: v, action: handler})
+			// Every fire reaches the listeners (the audit log among them)
+			// before the handler — Python fans on_expectation_fired out
+			// the same way. They run after the hub lock is released.
+			fires = append(fires, pendingFire{idx: idx, key: key, exp: exp, v: v, action: handler})
 		}
 	}
 	h.mu.Unlock()
 
+	for _, f := range fires {
+		f := f
+		h.fanOut(func(l HubListener) { l.OnExpectationFired(channelID, f.exp, *f.v) })
+	}
 	for _, f := range fires {
 		func() {
 			// A panicking handler must not kill the sweeper (Python

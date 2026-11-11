@@ -33,6 +33,9 @@ const (
 	EventReasoningMessageEnd     EventType = "REASONING_MESSAGE_END"
 	EventReasoningMessageContent EventType = "REASONING_MESSAGE_CONTENT"
 	EventReasoningEnd            EventType = "REASONING_END"
+	// EventReasoningEncryptedValue carries opaque provider data tied to an
+	// entity — a Gemini tool call's thought signature (thought_signature.go).
+	EventReasoningEncryptedValue EventType = "REASONING_ENCRYPTED_VALUE"
 	EventStateSnapshot           EventType = "STATE_SNAPSHOT"
 	EventCustom                  EventType = "CUSTOM"
 )
@@ -366,6 +369,23 @@ type ReasoningEndEvent struct {
 
 func (ReasoningEndEvent) eventType() EventType { return EventReasoningEnd }
 
+// EncryptedSubtypeToolCall is the subtype of a value that belongs to a tool
+// call: EntityID is then the call id.
+const EncryptedSubtypeToolCall = "tool-call"
+
+// ReasoningEncryptedValueEvent is an opaque provider value the client must
+// keep and hand back with the entity it belongs to (parity: the AG-UI core
+// ReasoningEncryptedValueEvent). Subtype names the entity kind, EntityID the
+// entity, EncryptedValue the base64 payload.
+type ReasoningEncryptedValueEvent struct {
+	baseEvent
+	Subtype        string `json:"subtype"`
+	EntityID       string `json:"entityId"`
+	EncryptedValue string `json:"encryptedValue"`
+}
+
+func (ReasoningEncryptedValueEvent) eventType() EventType { return EventReasoningEncryptedValue }
+
 // --- state, custom, subagents --------------------------------------------------
 
 // StateSnapshotEvent replaces the agent state wholesale.
@@ -496,6 +516,8 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return decodeOne[ReasoningMessageEndEvent](data)
 	case EventReasoningEnd:
 		return decodeOne[ReasoningEndEvent](data)
+	case EventReasoningEncryptedValue:
+		return decodeOne[ReasoningEncryptedValueEvent](data)
 	case EventStateSnapshot:
 		return decodeOne[StateSnapshotEvent](data)
 	case EventCustom:

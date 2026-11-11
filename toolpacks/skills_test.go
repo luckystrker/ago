@@ -11,8 +11,9 @@ import (
 	"github.com/luckystrker/ago/tools"
 )
 
-// newSkillsFixture writes a skills directory with two skills (one frontmatter
-// named, one falling back to its directory name) and one non-skill entry.
+// newSkillsFixture writes a skills directory with two valid skills (one named
+// in frontmatter, one falling back to its directory name), one skill missing
+// the required description (skipped), and one non-skill entry.
 func newSkillsFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -28,6 +29,12 @@ func newSkillsFixture(t *testing.T) string {
 	write("alpha/SKILL.md", `---
 name: alpha
 description: Alpha skill for testing.
+version: "1.2.0"
+license: Apache-2.0
+compatibility: ago>=1
+allowed-tools: read_file
+metadata:
+  owner: core
 ---
 
 # Alpha
@@ -35,7 +42,20 @@ description: Alpha skill for testing.
 Follow the alpha procedure.
 `)
 	write("alpha/references/guide.md", "# Guide\n\nStep one.")
-	write("beta/SKILL.md", "no frontmatter here, just a body")
+	write("beta/SKILL.md", `---
+description: Beta skill loaded by directory-name fallback.
+---
+
+# Beta
+`)
+	write("gamma/SKILL.md", `---
+name: gamma
+---
+
+# Gamma
+
+No description, so discovery skips it.
+`)
 	write("notaskill/notes.txt", "not a skill")
 	return root
 }

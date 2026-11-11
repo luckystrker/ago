@@ -9,6 +9,7 @@ import (
 
 	"github.com/luckystrker/ago/config"
 	"github.com/luckystrker/ago/events"
+	"github.com/luckystrker/ago/response"
 )
 
 // LLMJudge grades the trace's FinalResponse against a rubric with one model
@@ -20,42 +21,96 @@ import (
 // Passed is score >= 0.5, the midpoint of the judge's scale; use Threshold for
 // a different gate (Python parity: the judge's optional threshold shorthand).
 //
-// AGO-DEVIATION: the Python judge is an Agent with a locked response_schema
-// (native structured output + validation retries); AGo calls the client once
-// headless and parses JSON, so a non-JSON verdict is an error (and a fail via
-// ScoreWith) rather than a re-ask — D-051.
+// StructuredOutput asks the provider to constrain the answer to the verdict
+// schema (the typed Verdict of the Python judge); Retries re-asks a judge whose
+// answer does not validate, telling it what was wrong. Both default off, which
+// is the pre-existing single-call wire shape.
+//
+// AGO-DEVIATION: the Python judge is an Agent with a locked response_schema and
+// validation retries by default; AGo calls the client headless, so the schema
+// is an opt-in request field and a failed verdict is an error (and a fail via
+// ScoreWith) once the retries are spent.
 type LLMJudge struct {
 	Client config.LLMClient
 	Rubric string
+	// StructuredOutput sends the verdict JSON schema as the call's
+	// ResponseSchema, so a provider that supports structured output
+	// constrains the answer instead of hoping for well-formed JSON.
+	StructuredOutput bool
+	// Retries is how many times a verdict that fails parsing or validation is
+	// re-asked (Python parity: retries=1 means one re-ask). 0 keeps the single
+	// call.
+	Retries int
+}
+
+// judgeVerdictSchema is the verdict shape the structured-output request pins
+// and every parsed answer is checked against: both fields are required, as the
+// Python Verdict declares them (a required-only schema is what OpenAI's strict
+// structured-output mode accepts).
+var judgeVerdictSchema = response.NewSchema[judgeVerdict]("Verdict",
+	"A single judge's structured grade on one criterion.")
+
+// judgeVerdict is one parsed judge answer.
+type judgeVerdict struct {
+	Score  *float64 `json:"score"`
+	Reason string   `json:"reason"`
 }
 
 func (j LLMJudge) Name() string { return "llm_judge" }
 
+// Score asks the judge for a verdict, re-asking a failed one up to Retries
+// times with the validation error appended (Python parity: agent.py
+// reply.content's retry loop).
 func (j LLMJudge) Score(ctx context.Context, t *Trace) (Score, error) {
 	if j.Client == nil {
 		return Score{}, errors.New("eval: LLMJudge needs a client")
 	}
-	resp, err := callHeadless(ctx, j.Client, judgePrompt(j.Rubric, answerText(t)))
-	if err != nil {
-		return Score{}, fmt.Errorf("eval: judge call: %w", err)
+	prompt := judgePrompt(j.Rubric, answerText(t))
+	attempts := max(j.Retries, 0) + 1
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		resp, err := callHeadless(ctx, j.Client, prompt, j.callOptions())
+		if err != nil {
+			return Score{}, fmt.Errorf("eval: judge call: %w", err)
+		}
+		var v judgeVerdict
+		if err := unmarshalVerdict(resp.Content(), &v); err != nil {
+			lastErr = err
+		} else if v.Score == nil {
+			lastErr = errors.New("eval: judge verdict has no score")
+		} else {
+			return j.verdictScore(*v.Score, v.Reason), nil
+		}
+		prompt = retryPrompt(prompt, lastErr)
 	}
-	var v struct {
-		Score  *float64 `json:"score"`
-		Reason string   `json:"reason"`
-	}
-	if err := unmarshalVerdict(resp.Content(), &v); err != nil {
-		return Score{}, err
-	}
-	if v.Score == nil {
-		return Score{}, errors.New("eval: judge verdict has no score")
-	}
-	score := clamp01(*v.Score)
-	details := map[string]any{"reason": v.Reason}
-	if score != *v.Score {
+	return Score{}, lastErr
+}
+
+// verdictScore turns a parsed score into the scorer's verdict, noting a clamp.
+func (j LLMJudge) verdictScore(raw float64, reason string) Score {
+	score := clamp01(raw)
+	details := map[string]any{"reason": reason}
+	if score != raw {
 		details["clamped"] = true
-		details["raw_score"] = *v.Score
+		details["raw_score"] = raw
 	}
-	return Score{Name: j.Name(), Value: score, Passed: score >= 0.5, Details: details}, nil
+	return Score{Name: j.Name(), Value: score, Passed: score >= 0.5, Details: details}
+}
+
+// callOptions is the structured-output request, or an empty option set when it
+// is off (the old wire shape).
+func (j LLMJudge) callOptions() config.CallOptions {
+	if !j.StructuredOutput {
+		return config.CallOptions{}
+	}
+	return config.CallOptions{ResponseSchema: judgeVerdictSchema}
+}
+
+// retryPrompt is the re-ask: the original prompt plus what failed (Python
+// parity: reply.content's "could not be validated by schema" continuation).
+func retryPrompt(prompt string, err error) string {
+	return prompt + "\n\nYour previous response could not be validated.\n" +
+		"Please answer again with ONLY the JSON object.\n\n== Validation Error ==\n" + err.Error()
 }
 
 func judgePrompt(rubric, answer string) string {
@@ -78,9 +133,9 @@ func answerText(t *Trace) string {
 // callHeadless performs one client call over a single synthetic request with no
 // conversation (a nil conv is the documented headless mode —
 // config/openaicompat.go:61).
-func callHeadless(ctx context.Context, c config.LLMClient, prompt string) (*events.ModelResponse, error) {
+func callHeadless(ctx context.Context, c config.LLMClient, prompt string, opts config.CallOptions) (*events.ModelResponse, error) {
 	req := &events.ModelRequest{Parts: []events.Input{&events.TextInput{Content: prompt}}}
-	return c.Call(ctx, []events.Event{req}, nil, config.CallOptions{})
+	return c.Call(ctx, []events.Event{req}, nil, opts)
 }
 
 // unmarshalVerdict parses a JSON verdict, tolerating markdown fences and prose

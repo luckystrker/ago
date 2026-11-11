@@ -58,22 +58,12 @@ func (ConsultingAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, e
 	if !ok {
 		return Routing{}, fmt.Errorf("%w: consulting channel %s has no folded state", ErrProtocol, ch.ID)
 	}
-	initiator := ch.Participants[0].AgentID
-	respondent := ch.Participants[1].AgentID
-	switch {
-	case st.InitiatorSent && st.RespondentReplied:
-		return Routing{}, fmt.Errorf("%w: consulting channel %s already complete", ErrProtocol, ch.ID)
-	case !st.InitiatorSent:
-		if env.SenderID != initiator {
-			return Routing{}, fmt.Errorf("%w: consulting channel %s expects the first send from %s, got %s",
-				ErrProtocol, ch.ID, initiator, env.SenderID)
-		}
+	if err := consultingGate(ch, st, env.SenderID); err != nil {
+		return Routing{}, err
+	}
+	if !st.InitiatorSent {
 		st.InitiatorSent = true
-	default:
-		if env.SenderID != respondent {
-			return Routing{}, fmt.Errorf("%w: consulting channel %s expects the reply from %s, got %s",
-				ErrProtocol, ch.ID, respondent, env.SenderID)
-		}
+	} else {
 		st.RespondentReplied = true
 	}
 	st.LastEnvelopeID = env.ID
@@ -81,6 +71,28 @@ func (ConsultingAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, e
 		return Routing{Close: true, CloseReason: "consulting_complete"}, nil
 	}
 	return Routing{}, nil
+}
+
+// consultingGate validates that sender holds the floor of the 1Q1R cycle:
+// the initiator before the question, the respondent before the reply.
+func consultingGate(ch *ChannelHandle, st *consultingState, sender string) error {
+	initiator := ch.Participants[0].AgentID
+	respondent := ch.Participants[1].AgentID
+	switch {
+	case st.InitiatorSent && st.RespondentReplied:
+		return fmt.Errorf("%w: consulting channel %s already complete", ErrProtocol, ch.ID)
+	case !st.InitiatorSent:
+		if sender != initiator {
+			return fmt.Errorf("%w: consulting channel %s expects the first send from %s, got %s",
+				ErrProtocol, ch.ID, initiator, sender)
+		}
+	default:
+		if sender != respondent {
+			return fmt.Errorf("%w: consulting channel %s expects the reply from %s, got %s",
+				ErrProtocol, ch.ID, respondent, sender)
+		}
+	}
+	return nil
 }
 
 // --- ConversationAdapter -----------------------------------------------------
@@ -193,9 +205,8 @@ func (DiscussionAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, e
 	if !ok {
 		return Routing{}, fmt.Errorf("%w: discussion channel %s has no folded state", ErrProtocol, ch.ID)
 	}
-	if env.SenderID != st.Expected {
-		return Routing{}, fmt.Errorf("%w: discussion channel %s expects %s to speak, got %s",
-			ErrProtocol, ch.ID, st.Expected, env.SenderID)
+	if err := discussionGate(ch, st, env.SenderID); err != nil {
+		return Routing{}, err
 	}
 	idx := 0
 	for i, id := range st.Order {
@@ -209,6 +220,15 @@ func (DiscussionAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, e
 	st.LastEnvelopeID = env.ID
 	st.TurnCount++
 	return Routing{NextSender: st.Expected}, nil
+}
+
+// discussionGate validates that sender is the speaker the rotation expects.
+func discussionGate(ch *ChannelHandle, st *discussionState, sender string) error {
+	if sender != st.Expected {
+		return fmt.Errorf("%w: discussion channel %s expects %s to speak, got %s",
+			ErrProtocol, ch.ID, st.Expected, sender)
+	}
+	return nil
 }
 
 // --- WorkflowAdapter ---------------------------------------------------------
@@ -297,6 +317,18 @@ func workflowGraph(manifest ChannelManifest) (TransitionGraph, error) {
 	return graph, nil
 }
 
+// workflowTurnGate validates that sender owns the next substantive envelope.
+func workflowTurnGate(ch *ChannelHandle, st *workflowState, sender string) error {
+	if st.Expected != "" && sender != st.Expected {
+		return fmt.Errorf("%w: workflow %s expects %s to speak, got %s",
+			ErrProtocol, ch.ID, st.Expected, sender)
+	}
+	if st.Expected == "" && st.TurnCount > 0 {
+		return fmt.Errorf("%w: workflow %s has terminated", ErrProtocol, ch.ID)
+	}
+	return nil
+}
+
 // OnEnvelope implements ChannelAdapter.
 func (WorkflowAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, error) {
 	st, ok := ch.AdapterState.(*workflowState)
@@ -323,12 +355,8 @@ func (WorkflowAdapter) OnEnvelope(ch *ChannelHandle, env Envelope) (Routing, err
 	// Turn gate: the expected speaker owns the next substantive envelope.
 	// After a termination (expected == "" with turns folded) nothing more
 	// travels — the close envelope is in flight.
-	if st.Expected != "" && env.SenderID != st.Expected {
-		return Routing{}, fmt.Errorf("%w: workflow %s expects %s to speak, got %s",
-			ErrProtocol, ch.ID, st.Expected, env.SenderID)
-	}
-	if st.Expected == "" && st.TurnCount > 0 {
-		return Routing{}, fmt.Errorf("%w: workflow %s has terminated", ErrProtocol, ch.ID)
+	if err := workflowTurnGate(ch, st, env.SenderID); err != nil {
+		return Routing{}, err
 	}
 
 	// A pre-resolved handoff target must be a channel member: the hub
@@ -421,3 +449,65 @@ func applyContextSet(vars map[string]any, env Envelope) {
 		vars[k] = v
 	}
 }
+
+// --- default manifests -------------------------------------------------------
+
+// DefaultManifest implements ManifestProvider: exactly two participants
+// (initiator + respondent), full transcript view, and auto-close when the
+// invite is unanswered for 30s or the question for 600s.
+func (ConsultingAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeConsulting,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Max: 2, Roles: []string{string(RoleInitiator), string(RoleRespondent)}},
+		DefaultViewPolicy: ViewFullTranscript,
+		Expectations: []Expectation{
+			{Kind: "acks_within", OnViolation: "auto_close", Params: map[string]any{"seconds": 30}},
+			{Kind: "reply_within", OnViolation: "auto_close", Params: map[string]any{"seconds": 600}},
+		},
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two participants, windowed
+// summary view, and an audit entry after an hour of silence.
+func (ConversationAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeConversation,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Max: 2, Roles: []string{string(RoleInitiator), string(RoleRespondent)}},
+		DefaultViewPolicy: ViewWindowedSummary,
+		Expectations: []Expectation{
+			{Kind: "max_silence", OnViolation: "audit", Params: map[string]any{"seconds": 3600}},
+		},
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two or more participants,
+// named windowed summary view. AGO-DEVIATION: Python also declares two
+// turn_within expectations; no evaluator exists for that kind (in Python
+// either), so they are not carried.
+func (DiscussionAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeDiscussion,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
+		KnobsSchema:       map[string]string{"ordering": "str"},
+		DefaultViewPolicy: ViewNamedWindowedSummary,
+	}
+}
+
+// DefaultManifest implements ManifestProvider: two or more participants and
+// a required transition graph in knobs["graph"]. AGO-DEVIATION: Python's
+// turn_within expectations are not carried (see DiscussionAdapter).
+func (WorkflowAdapter) DefaultManifest() ChannelManifest {
+	return ChannelManifest{
+		Type:              TypeWorkflow,
+		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
+		KnobsSchema:       map[string]string{"graph": "TransitionGraph"},
+		DefaultViewPolicy: ViewNamedWindowedSummary,
+	}
+}
+
+var (
+	_ ManifestProvider = ConsultingAdapter{}
+	_ ManifestProvider = ConversationAdapter{}
+	_ ManifestProvider = DiscussionAdapter{}
+	_ ManifestProvider = WorkflowAdapter{}
+)

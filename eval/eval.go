@@ -15,5 +15,7 @@
 // (docs/DECISIONS.md D-051). Since D-061 the package also carries the failure
 // attribution scorer, the scorer registry (the @scorer DI stand-in), Suite
 // JSONL loading, RunDiff regression diffing, Wilson/kappa stats and parallel
-// case execution.
+// case execution, the NoToolErrors scorer, run progress reporters
+// (ConsoleReporter) and the run result store directory (WithStoreDir,
+// StoreRun, LoadRun).
 package eval

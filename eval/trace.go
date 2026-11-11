@@ -226,3 +226,31 @@ func (t *Trace) UnmarshalJSON(data []byte) error {
 	}
 	return nil
 }
+
+// Duration is the wall-clock span of the trace — first event to last (Python
+// parity: Trace.duration_ms). A trace with no events measures zero.
+func (t *Trace) Duration() time.Duration {
+	if t == nil || t.StartedAt.IsZero() || t.FinishedAt.Before(t.StartedAt) {
+		return 0
+	}
+	return t.FinishedAt.Sub(t.StartedAt)
+}
+
+// TotalTokens is the input-plus-output token count of every model call in the
+// trace — what a per-task token budget measures (Python parity:
+// trace.tokens.total; cache and thinking tokens are reported separately and
+// are not part of it).
+func (t *Trace) TotalTokens() int {
+	if t == nil {
+		return 0
+	}
+	u := t.Tokens()
+	var n int64
+	if u.PromptTokens != nil {
+		n += *u.PromptTokens
+	}
+	if u.CompletionTokens != nil {
+		n += *u.CompletionTokens
+	}
+	return int(n)
+}

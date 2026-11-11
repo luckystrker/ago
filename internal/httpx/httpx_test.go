@@ -183,6 +183,56 @@ func TestPostJSONRetriesOnNetworkError(t *testing.T) {
 	}
 }
 
+// TestPostJSONRetriesOnTruncatedBody: a body that ends before its
+// Content-Length is a read failure, and the attempt is retried (the read path
+// is separate from the transport path).
+func TestPostJSONRetriesOnTruncatedBody(t *testing.T) {
+	shortBackoff(t)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			fmt.Fprint(buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"partial\":")
+			_ = buf.Flush()
+			_ = conn.Close()
+			return
+		}
+		fmt.Fprint(w, `{}`)
+	}))
+	defer srv.Close()
+
+	c := &Client{MaxRetries: 1}
+	status, body, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{})
+	if err != nil || status != http.StatusOK || string(body) != "{}" || calls != 2 {
+		t.Fatalf("a truncated body must be retried: status=%d body=%q calls=%d err=%v", status, body, calls, err)
+	}
+}
+
+// TestPostJSONTransportFailureCountsAttempts: the exhausted-retries error
+// names the real number of attempts (MaxRetries+1) and stops there.
+func TestPostJSONTransportFailureCountsAttempts(t *testing.T) {
+	shortBackoff(t)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	c := &Client{MaxRetries: 1}
+	if _, _, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{}); err == nil ||
+		!strings.Contains(err.Error(), "after 2 attempt(s)") {
+		t.Fatalf("want the attempt count in the message, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 attempts (1 + 1 retry), got %d", calls)
+	}
+}
+
 func TestPostJSONContextCanceled(t *testing.T) {
 	shortBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -540,5 +590,70 @@ func TestPostJSONTooLargeIsNotRetried(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("an oversized answer must not be retried, got %d calls", calls)
+	}
+}
+
+// TestRetryableStatusSet pins the retry set to the OpenAI/Anthropic SDKs:
+// 408, 409, 429 and 5xx retry; other 4xx do not.
+func TestRetryableStatusSet(t *testing.T) {
+	for code, want := range map[int]bool{
+		200: false, 400: false, 401: false, 403: false, 404: false, 422: false,
+		408: true, 409: true, 429: true, 500: true, 502: true, 503: true, 529: true,
+	} {
+		if got := RetryableStatus(code); got != want {
+			t.Errorf("RetryableStatus(%d) = %v, want %v", code, got, want)
+		}
+	}
+}
+
+func TestPostJSONRetriesOn408And409(t *testing.T) {
+	shortBackoff(t)
+	for _, code := range []int{http.StatusRequestTimeout, http.StatusConflict} {
+		var calls int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				w.WriteHeader(code)
+				return
+			}
+			fmt.Fprint(w, `{}`)
+		}))
+		c := &Client{MaxRetries: 1}
+		status, _, err := c.PostJSON(context.Background(), srv.URL, nil, map[string]any{})
+		srv.Close()
+		if err != nil || status != http.StatusOK || calls != 2 {
+			t.Fatalf("status %d: got (%d, %v) after %d calls, want a retry to 200", code, status, err, calls)
+		}
+	}
+}
+
+func TestPostJSONStreamStatusErrorIsTyped(t *testing.T) {
+	shortBackoff(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `slow down`)
+	}))
+	defer srv.Close()
+
+	c := &Client{MaxRetries: 1}
+	err := c.PostJSONStream(context.Background(), srv.URL, nil, map[string]any{}, func([]byte) error { return nil })
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *StatusError, got %T: %v", err, err)
+	}
+	if se.StatusCode != http.StatusTooManyRequests || string(se.Body) != "slow down" || se.Header.Get("Retry-After") != "0" {
+		t.Fatalf("StatusError fields wrong: %+v", se)
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("message lost the status: %v", err)
+	}
+}
+
+func TestWithQueryKeepsExistingKeys(t *testing.T) {
+	if got := WithQuery("http://h/p?a=1", map[string]string{"a": "2", "b": "3"}); got != "http://h/p?a=1&b=3" {
+		t.Fatalf("WithQuery = %q", got)
+	}
+	if WithQuery("http://h/p", nil) != "http://h/p" {
+		t.Fatal("no query must leave the URL alone")
 	}
 }

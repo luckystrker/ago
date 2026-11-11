@@ -135,14 +135,17 @@ func (t *remoteTool) Register(cx *agocontext.Context, mw []middleware.Middleware
 }
 
 // exec invokes the server: the call's JSON arguments go out under the remote
-// name; a failure becomes a ToolErrorEvent, a success a ToolResultEvent whose
+// name (with the conversation attached so the server's own requests can be
+// answered, see AnswerPolicy); a failure becomes a ToolErrorEvent, a success a ToolResultEvent whose
 // parts are the mapped content blocks.
-func (t *remoteTool) exec(ev *events.ToolCallEvent, _ *agocontext.Context) (events.Event, error) {
+func (t *remoteTool) exec(ev *events.ToolCallEvent, cx *agocontext.Context) (events.Event, error) {
 	args, err := ev.SerializedArguments()
 	if err != nil {
 		return events.FromErrorCall(*ev, err), nil
 	}
-	outcome, err := t.cl.CallTool(t.remoteName, args)
+	// The call runs on the turn's context and conversation, so a server asking
+	// mid-call (elicitation, sampling) is answered from this very turn.
+	outcome, err := t.cl.CallToolWith(cx.TurnContext(), cx, t.remoteName, args)
 	if err != nil {
 		return events.FromErrorCall(*ev, err), nil
 	}

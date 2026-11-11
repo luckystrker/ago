@@ -1,9 +1,11 @@
 package acp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"sync"
 
 	"github.com/luckystrker/ago/mcp"
@@ -28,6 +30,94 @@ type MCPServer struct {
 	// Env adds environment variables for the stdio subprocess (on top of the
 	// inherited environment).
 	Env map[string]string `json:"env,omitempty"`
+}
+
+// mcpWire is MCPServer's wire form (Python parity: the acp schema
+// HttpMcpServer / McpServerStdio): headers and env travel as lists of
+// {name, value} pairs, an HTTP entry carries type "http". Both fields also
+// decode from the map shape this package spoke before, so an older peer of
+// this package keeps working.
+type mcpWire struct {
+	Type    string          `json:"type,omitempty"`
+	Name    string          `json:"name"`
+	URL     string          `json:"url,omitempty"`
+	Headers json.RawMessage `json:"headers,omitempty"`
+	Command string          `json:"command,omitempty"`
+	Args    []string        `json:"args,omitempty"`
+	Env     json.RawMessage `json:"env,omitempty"`
+}
+
+type nameValue struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// MarshalJSON renders the ACP wire shape.
+func (m MCPServer) MarshalJSON() ([]byte, error) {
+	w := mcpWire{Name: m.Name, URL: m.URL, Command: m.Command, Args: m.Args}
+	if m.URL != "" {
+		w.Type = "http"
+		w.Headers = pairsJSON(m.Headers) // always present, even when empty
+	} else {
+		w.Env = pairsJSON(m.Env)
+	}
+	return json.Marshal(w)
+}
+
+// pairsJSON renders a map as a name-sorted list of {name, value} pairs.
+func pairsJSON(m map[string]string) json.RawMessage {
+	pairs := make([]nameValue, 0, len(m))
+	for k, v := range m {
+		pairs = append(pairs, nameValue{Name: k, Value: v})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].Name < pairs[j].Name })
+	b, _ := json.Marshal(pairs) // a slice of plain strings cannot fail
+	return b
+}
+
+// UnmarshalJSON accepts both the ACP list shape and the earlier map shape for
+// headers and env.
+func (m *MCPServer) UnmarshalJSON(data []byte) error {
+	var w mcpWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	headers, err := pairsFromJSON(w.Headers)
+	if err != nil {
+		return fmt.Errorf("headers: %w", err)
+	}
+	env, err := pairsFromJSON(w.Env)
+	if err != nil {
+		return fmt.Errorf("env: %w", err)
+	}
+	*m = MCPServer{Name: w.Name, URL: w.URL, Headers: headers, Command: w.Command, Args: w.Args, Env: env}
+	return nil
+}
+
+// pairsFromJSON decodes a {name, value} list or a plain map; empty → nil.
+func pairsFromJSON(raw json.RawMessage) (map[string]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var pairs []nameValue
+	if err := json.Unmarshal(raw, &pairs); err == nil {
+		if len(pairs) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]string, len(pairs))
+		for _, p := range pairs {
+			out[p.Name] = p.Value
+		}
+		return out, nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	if len(m) == 0 {
+		return nil, nil
+	}
+	return m, nil
 }
 
 // ErrServerNotFound reports a tool call naming an MCP server the peer never
@@ -231,6 +321,7 @@ func declarable(s MCPServer) error {
 
 // declaredServers is SessionNewWithServers' params shape.
 type declaredServersParams struct {
-	CWD        string      `json:"cwd"`
-	MCPServers []MCPServer `json:"mcpServers,omitempty"`
+	CWD                   string      `json:"cwd"`
+	AdditionalDirectories []string    `json:"additionalDirectories,omitempty"`
+	MCPServers            []MCPServer `json:"mcpServers,omitempty"`
 }

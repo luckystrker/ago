@@ -139,6 +139,12 @@ func (s *Stream) Handle(ev events.Event) {
 			ToolCallID:   e.ID,
 			ToolCallName: e.Name,
 		})
+		// A provider value the call carries (a Gemini thought signature) goes
+		// out right after the call starts, so the client has an entity to
+		// attach it to (Python parity: _send_signature after ToolCallStart).
+		if signature, ok := EncryptedSignatureOf(e); ok {
+			s.emit(SignatureEvent(e.ID, signature, TimestampMs()))
+		}
 		s.emit(ToolCallArgsEvent{
 			baseEvent:  baseEvent{Type: EventToolCallArgs, Timestamp: TimestampMs()},
 			ToolCallID: e.ID,

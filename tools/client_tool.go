@@ -14,13 +14,28 @@ import (
 // call is answered with a ClientToolCallEvent the executor forwards to the client.
 type ClientTool struct {
 	schema Schema
+	mw     []middleware.Middleware
+}
+
+// ClientToolOption configures NewClientTool.
+type ClientToolOption func(*clientToolOptions)
+
+type clientToolOptions struct {
+	mw []middleware.Middleware
+}
+
+// WithClientToolMiddleware adds tool-scoped middleware to a client tool. It
+// wraps the conversion to ClientToolCallEvent; agent middleware still wraps it
+// from outside (Python parity: the Tool base's middleware= on client tools).
+func WithClientToolMiddleware(mw ...middleware.Middleware) ClientToolOption {
+	return func(o *clientToolOptions) { o.mw = append(o.mw, mw...) }
 }
 
 // NewClientTool builds a client tool from its wire schema — a flat map with the
 // "name" (required), "description", "parameters" and "defer_loading" keys (Python
 // parity: FunctionToolSchema.from_dict, flattened to the AGo Schema shape; a
 // top-level "title" is stripped).
-func NewClientTool(schema map[string]any) (*ClientTool, error) {
+func NewClientTool(schema map[string]any, opts ...ClientToolOption) (*ClientTool, error) {
 	name, _ := schema["name"].(string)
 	if name == "" {
 		return nil, fmt.Errorf("%w: client tool schema requires a name", ErrResolution)
@@ -30,12 +45,16 @@ func NewClientTool(schema map[string]any) (*ClientTool, error) {
 	deferLoading, _ := schema["defer_loading"].(bool)
 	params = deepCopySchema(params)
 	stripTitle(params)
+	var o clientToolOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return &ClientTool{schema: Schema{
 		Name:         name,
 		Description:  description,
 		Parameters:   params,
 		DeferLoading: deferLoading,
-	}}, nil
+	}, mw: o.mw}, nil
 }
 
 func (t *ClientTool) Name() string         { return t.schema.Name }
@@ -46,13 +65,19 @@ func (t *ClientTool) Schemas(_ *agocontext.Context) ([]any, error) {
 }
 
 // Register subscribes the tool for calls matching its name; the agent middleware
-// wraps the conversion to ClientToolCallEvent (no tool middleware, no timeout: the
-// tool runs on the client). The subscription id is returned for the turn scope's
-// teardown.
+// and the tool's own middleware wrap the conversion to ClientToolCallEvent (no
+// timeout: the tool runs on the client). The subscription id is returned for the
+// turn scope's teardown.
 func (t *ClientTool) Register(cx *agocontext.Context, mw []middleware.Middleware) ([]stream.SubID, error) {
 	exec := middleware.ToolExecFunc(func(ev *events.ToolCallEvent, _ *agocontext.Context) (events.Event, error) {
 		return events.ClientToolCallEvent{ID: ev.ID, Name: ev.Name, Arguments: ev.Arguments}, nil
 	})
+	for i := len(t.mw) - 1; i >= 0; i-- {
+		m, inner := t.mw[i], exec
+		exec = func(ev *events.ToolCallEvent, cx *agocontext.Context) (events.Event, error) {
+			return m.OnToolExecution(inner, ev, cx)
+		}
+	}
 	for i := len(mw) - 1; i >= 0; i-- {
 		m, inner := mw[i], exec
 		exec = func(ev *events.ToolCallEvent, cx *agocontext.Context) (events.Event, error) {

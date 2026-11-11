@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -69,9 +70,9 @@ const unsupportedDecisionSchemaMsg = "the OpenAI Decisions API is decision-only:
 //
 // AGO-DEVIATION: the model travels behind the Model() accessor like on
 // OpenAICompletionsConfig (the config.ModelConfig contract owns the name);
-// question_instructions carries strings only — the Python sequence form
-// (Input parts / SDK parts, e.g. an image inside the question) is deferred
-// (D-060).
+// question_instructions has two Go slots (QuestionInstructions for the string
+// form, QuestionInstructionParts for the sequence form) because Go has no
+// str-or-sequence union.
 type OpenAIDecisionsConfig struct {
 	// APIKey authenticates requests. Empty falls back to OPENAI_API_KEY at
 	// Create() time; neither set → Create() wraps config.ErrNotProvided.
@@ -86,7 +87,7 @@ type OpenAIDecisionsConfig struct {
 
 	// Timeout caps a request (0 = no cap).
 	Timeout time.Duration
-	// MaxRetries is the transport retry count for 429/5xx and connection
+	// MaxRetries is the transport retry count for 408/409/429/5xx and connection
 	// failures (SDK default, applied by NewOpenAIDecisions).
 	MaxRetries int
 
@@ -109,9 +110,24 @@ type OpenAIDecisionsConfig struct {
 	// QuestionInstructions is what the question carries after the agent
 	// prompt; the schema's question text is appended last.
 	QuestionInstructions string
+	// QuestionInstructionParts is the sequence form of question_instructions:
+	// each item is a string (text), an events.Input (an image or JSON next to
+	// the text; a hosted image URL is accepted here, unlike in the
+	// conversation input) or a ready map[string]any wire part, which is sent
+	// as given — the only way to send input_json. When non-empty the question
+	// travels as a parts array: the agent prompt leads as a text part, then
+	// QuestionInstructions (if set), then these items, and the schema's
+	// question text closes as a trailing input_text part. Empty keeps the
+	// string form.
+	QuestionInstructionParts []any
 
 	// ExtraBody merges into the request body last (SDK parity: extra_body).
 	ExtraBody map[string]any
+
+	// HTTPClient performs the requests when non-nil (proxy, custom root CAs,
+	// mTLS). It owns its own Timeout and redirect policy; Timeout above
+	// applies only to the default client.
+	HTTPClient *http.Client
 
 	model string
 }
@@ -207,6 +223,8 @@ func (c *OpenAIDecisionsConfig) set(key string, v any) error {
 		return str(&c.Organization)
 	case "Project", "project":
 		return str(&c.Project)
+	case "HTTPClient", "http_client":
+		return setPtr(key, v, &c.HTTPClient, "*http.Client")
 	case "Timeout", "timeout":
 		d, ok := v.(time.Duration)
 		if !ok {
@@ -241,6 +259,16 @@ func (c *OpenAIDecisionsConfig) set(key string, v any) error {
 		return strMap(&c.Descriptions)
 	case "QuestionInstructions", "question_instructions":
 		return str(&c.QuestionInstructions)
+	case "QuestionInstructionParts", "question_instruction_parts":
+		if v == nil {
+			c.QuestionInstructionParts = nil
+			return nil
+		}
+		parts, ok := v.([]any)
+		if !ok {
+			return overrideTypeErr(key, v, "[]any")
+		}
+		c.QuestionInstructionParts = parts
 	case "ExtraBody", "extra_body":
 		if v == nil {
 			c.ExtraBody = nil
@@ -291,12 +319,15 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 	if conv != nil { // a nil conv is a headless call
 		prompt = conv.PromptLines()
 	}
-	instructions := decisionInstructions(p.QuestionInstructions, prompt, spec.Question)
-	if instructions == "" {
+	instructions, err := questionInstructions(p, prompt, spec.Question)
+	if err != nil {
+		return nil, err
+	}
+	if instructions == nil {
 		// Every question type requires instructions; fail before the request
 		// with a way out (Python parity).
 		return nil, fmt.Errorf("config/openai: a decision needs a question: set the agent prompt, " +
-			"set QuestionInstructions, or give the response schema a description")
+			"set QuestionInstructions or QuestionInstructionParts, or give the response schema a description")
 	}
 
 	question, err := decisionQuestion(spec, instructions, p.Descriptions)
@@ -326,13 +357,13 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 		headers[k] = v
 	}
 
-	client := &httpx.Client{MaxRetries: p.MaxRetries, Timeout: p.Timeout}
+	client := &httpx.Client{HTTP: p.HTTPClient, MaxRetries: p.MaxRetries, Timeout: p.Timeout}
 	status, data, err := client.PostJSON(ctx, joinURL(c.baseURL, decisionsPath), headers, body)
 	if err != nil {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("config/openai: decisions returned %d: %s", status, bodySnippet(data))
+		return nil, config.NewAPIError(config.ProviderOpenAI, "config/openai: decisions", status, nil, data)
 	}
 
 	var raw struct {
@@ -479,14 +510,7 @@ func answerMetadata(answer *answerValue) map[string]any {
 // (Python parity: with_prompt + the string form of _question_instructions).
 // Empty pieces drop out; an empty result means there is no question at all.
 func decisionInstructions(configured string, prompt []string, question string) string {
-	// Python parity: "\n".join(s for s in context.prompt if s).
-	var lines []string
-	for _, s := range prompt {
-		if s != "" {
-			lines = append(lines, s)
-		}
-	}
-	agentPrompt := strings.Join(lines, "\n")
+	agentPrompt := agentPromptText(prompt)
 
 	pieces := make([]string, 0, 3)
 	for _, s := range []string{agentPrompt, configured, question} {
@@ -497,9 +521,79 @@ func decisionInstructions(configured string, prompt []string, question string) s
 	return strings.Join(pieces, "\n\n")
 }
 
+// agentPromptText joins the non-empty prompt lines (Python parity:
+// "\n".join(s for s in context.prompt if s)).
+func agentPromptText(prompt []string) string {
+	var lines []string
+	for _, s := range prompt {
+		if s != "" {
+			lines = append(lines, s)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// questionInstructions resolves the question's instructions: the joined string
+// form, or — when QuestionInstructionParts is set — the parts array (Python
+// parity: with_prompt + _question_instructions). nil means there is no
+// question at all.
+func questionInstructions(p *OpenAIDecisionsConfig, prompt []string, question string) (any, error) {
+	if len(p.QuestionInstructionParts) == 0 {
+		if s := decisionInstructions(p.QuestionInstructions, prompt, question); s != "" {
+			return s, nil
+		}
+		return nil, nil
+	}
+	items := make([]any, 0, len(p.QuestionInstructionParts)+2)
+	if agentPrompt := agentPromptText(prompt); agentPrompt != "" {
+		items = append(items, agentPrompt)
+	}
+	if p.QuestionInstructions != "" {
+		items = append(items, p.QuestionInstructions)
+	}
+	items = append(items, p.QuestionInstructionParts...)
+
+	parts := make([]any, 0, len(items)+1)
+	for _, item := range items {
+		part, err := decisionInstructionPart(item)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, part)
+	}
+	if question != "" {
+		parts = append(parts, decisionText(question))
+	}
+	return parts, nil
+}
+
+// decisionInstructionPart maps one QuestionInstructionParts item to its wire
+// part: a string is text, an events.Input follows the conversation's own input
+// mapping (except that a hosted image URL is accepted — question instructions,
+// unlike input, take one), and a map is an SDK-shaped part passed through.
+func decisionInstructionPart(item any) (any, error) {
+	switch v := item.(type) {
+	case string:
+		return decisionText(v), nil
+	case map[string]any:
+		return v, nil
+	case events.Input:
+		if u, ok := events.AsValue(v).(events.UrlInput); ok && u.Kind == events.BinaryImage {
+			return map[string]any{"type": "input_image", "image_url": u.URL}, nil
+		}
+		parts, err := decisionParts([]events.Input{v})
+		if err != nil {
+			return nil, err
+		}
+		return parts[0], nil
+	default:
+		return nil, fmt.Errorf("%w: %T as a question instruction part for the %s API", config.ErrUnsupportedInput, item, decisionsProvider)
+	}
+}
+
 // decisionQuestion converts the spec into the single wire question: predicate,
 // choice or score (Python parity: response_proto_to_question).
-func decisionQuestion(spec *response.DecisionSpec, instructions string, descriptions map[string]string) (map[string]any, error) {
+func decisionQuestion(spec *response.DecisionSpec, instructions any, descriptions map[string]string) (map[string]any, error) {
 	question := map[string]any{
 		"name":         decisionAnswerKey,
 		"instructions": instructions,

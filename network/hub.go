@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -92,12 +93,13 @@ func (ch *ChannelHandle) AdapterType() string { return ch.Manifest.Type }
 // travel as DataInput events); MemoryWAL/FileWAL keep in-process and
 // file-only use dependency-light.
 
-// WALRecord is one WAL entry: a channel lifecycle snapshot or an accepted
-// envelope.
+// WALRecord is one WAL entry: a channel lifecycle snapshot, an accepted
+// envelope or a task checkpoint.
 type WALRecord struct {
-	Kind     string           `json:"kind"` // "channel" | "envelope"
-	Channel  *ChannelSnapshot `json:"channel,omitempty"`
-	Envelope *Envelope        `json:"envelope,omitempty"`
+	Kind       string            `json:"kind"` // "channel" | "envelope" | "checkpoint"
+	Channel    *ChannelSnapshot  `json:"channel,omitempty"`
+	Envelope   *Envelope         `json:"envelope,omitempty"`
+	Checkpoint *CheckpointRecord `json:"checkpoint,omitempty"`
 }
 
 // ChannelSnapshot is the persisted channel metadata (manifest snapshot,
@@ -307,15 +309,16 @@ type Hub struct {
 	logs             map[string][]Envelope // per-channel accepted envelopes (in-memory WAL mirror)
 	waiters          map[string]chan *ChannelHandle
 	arbiter          HubArbiter
-	audit            AuditSink
 	tasks            map[string]task.Metadata // observed tasks (task_mirror forwards agent-side Task* events)
 	expectEvaluators map[string]ExpectationEvaluator
 	expectHandlers   map[string]ViolationHandler
 	firedViolations  map[string]map[string]bool // channel → "(idx|kind|violator)" fires (in-memory dedup)
 	wal              WAL
+	store            knowledge.Store // durable registry (WithHubStore); nil = in-memory only
 	now              func() time.Time
 	ids              *idMinter
 	ackWait          time.Duration
+	ext              hubExt // auth, capability index, inbox/rate accounting, hooks (hubext.go)
 }
 
 // HubOption configures a Hub.
@@ -324,6 +327,13 @@ type HubOption func(*Hub)
 // WithHubWAL attaches the write-ahead log (every accepted envelope and
 // channel transition is appended).
 func WithHubWAL(w WAL) HubOption { return func(h *Hub) { h.wal = w } }
+
+// WithHubAdapter registers a channel adapter at construction, so OpenHub's
+// Hydrate can fold channels of that type from the WAL (adapters referenced by
+// the WAL must be registered before it is replayed). version "" is "1".
+func WithHubAdapter(a ChannelAdapter, version string) HubOption {
+	return func(h *Hub) { h.RegisterAdapter(a, version) }
+}
 
 // WithHubClock overrides the hub clock (tests).
 func WithHubClock(now func() time.Time) HubOption { return func(h *Hub) { h.now = now } }
@@ -342,11 +352,6 @@ func WithHubArbiter(a HubArbiter) HubOption {
 		}
 	}
 }
-
-// WithAuditSink attaches the audit sink: the hub appends one entry per
-// expectation-violation fire (and other hub-crossing events as they gain
-// audit coverage). Nil disables auditing.
-func WithAuditSink(sink AuditSink) HubOption { return func(h *Hub) { h.audit = sink } }
 
 // NewHub creates an empty hub. Register adapters before creating channels.
 func NewHub(opts ...HubOption) *Hub {
@@ -369,6 +374,7 @@ func NewHub(opts ...HubOption) *Hub {
 		ids:              &idMinter{},
 		ackWait:          30 * time.Second,
 	}
+	h.ext.init()
 	for _, e := range DefaultExpectationEvaluators() {
 		h.expectEvaluators[e.Name()] = e
 	}
@@ -377,6 +383,15 @@ func NewHub(opts ...HubOption) *Hub {
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.store != nil && h.wal == nil {
+		h.wal = NewStoreWAL(h.store)
+	}
+	if log := h.ext.audit; log != nil {
+		if !log.clockSet {
+			log.now = h.now // entries without an event time follow the hub clock
+		}
+		h.registerListenerFirst(log)
 	}
 	return h
 }
@@ -412,35 +427,73 @@ func (h *Hub) Register(p Passport, r *Rule) (Passport, error) {
 		def := DefaultRule()
 		r = &def
 	}
+	if err := r.Validate(); err != nil {
+		return Passport{}, err
+	}
+	// The claim proves the identity once, at registration; the hub keeps only
+	// the scheme (a remote agent's claim is routing data for its proxy).
+	// AGO-DEVIATION: the returned passport is the stored, claim-free one;
+	// Python's register returns the stamped original with its claim.
+	_, claim := authSchemeAndClaim(p)
+	if err := h.Authenticate(context.Background(), p, claim); err != nil {
+		return Passport{}, err
+	}
 	stamped := p
+	if p.Kind != KindRemoteAgent {
+		stamped = withoutClaim(p)
+	}
 	stamped.Kind = p.Kind.Effective()
 	stamped.AgentID = uuid.New()
+	if stamped.Version == 0 {
+		stamped.Version = 1
+	}
 
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, taken := h.byName[stamped.Name]; taken {
 		return Passport{}, fmt.Errorf("%w: %q", ErrNameTaken, stamped.Name)
 	}
+	stamped.CreatedAt = h.now()
+	if err := h.persistRegistrationLocked(stamped, *r); err != nil {
+		return Passport{}, err
+	}
 	h.passports[stamped.AgentID] = stamped
 	h.byName[stamped.Name] = stamped.AgentID
 	h.rules[stamped.AgentID] = r.Clone()
+	h.ext.regSeq[stamped.AgentID] = h.ext.nextSeq
+	h.ext.nextSeq++
+	evs.add(func(l HubListener) {
+		l.OnAgentEvent(stamped.AgentID, AgentEventRegistered, map[string]any{"passport": stamped, "name": stamped.Name, "at": stamped.CreatedAt})
+	})
 	return stamped, nil
 }
 
 // Unregister removes a registration; delivery to it stops (unknown
 // recipients are dropped silently at dispatch).
 func (h *Hub) Unregister(agentID string) error {
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	p, ok := h.passports[agentID]
 	if !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
+	if err := h.deleteRegistrationLocked(agentID); err != nil {
+		return err
+	}
+	h.forgetLocked(agentID, h.resumes[agentID])
+	h.persistCapIndexLocked()
 	delete(h.passports, agentID)
 	delete(h.byName, p.Name)
 	delete(h.rules, agentID)
 	delete(h.resumes, agentID)
 	delete(h.notifiers, agentID)
+	evs.add(func(l HubListener) {
+		l.OnAgentEvent(agentID, AgentEventUnregistered, map[string]any{"name": p.Name, "at": h.at()})
+	})
 	return nil
 }
 
@@ -500,14 +553,37 @@ func (h *Hub) RuleOf(agentID string) (Rule, error) {
 	return h.rules[agentID].Clone(), nil
 }
 
-// SetResume stores or replaces the capability claim for an agent.
+// SetResume stores or replaces the capability claim for an agent. The hub
+// stamps LastUpdated and bumps Version past the stored resume's (a first
+// resume keeps the caller's Version, 1 when unset) and re-indexes the
+// capabilities. The whole resume is replaced, Observed included (Python
+// parity): start from ResumeOf to keep the track record.
 func (h *Hub) SetResume(r Resume) error {
+	var evs hubEvents
+	defer h.flushEvents(&evs) // runs after the unlock below
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.passports[r.AgentID]; !ok {
 		return fmt.Errorf("%w: agent %s", ErrNotFound, r.AgentID)
 	}
-	h.resumes[r.AgentID] = r
+	old, had := h.resumes[r.AgentID]
+	cur := r.Clone()
+	cur.LastUpdated = h.now()
+	switch {
+	case had:
+		cur.Version = old.Version + 1
+	case cur.Version == 0:
+		cur.Version = 1
+	}
+	if err := h.persistResumeLocked(r.AgentID, cur); err != nil {
+		return err
+	}
+	h.resumes[r.AgentID] = cur
+	h.reindexLocked(r.AgentID, old, cur)
+	h.persistCapIndexLocked()
+	evs.add(func(l HubListener) {
+		l.OnAgentEvent(r.AgentID, AgentEventResumeSet, map[string]any{"version": cur.Version, "at": cur.LastUpdated})
+	})
 	return nil
 }
 
@@ -518,7 +594,7 @@ func (h *Hub) ResumeOf(agentID string) (Resume, error) {
 	if _, ok := h.passports[agentID]; !ok {
 		return Resume{}, fmt.Errorf("%w: agent %s", ErrNotFound, agentID)
 	}
-	return h.resumes[agentID], nil
+	return h.resumes[agentID].Clone(), nil
 }
 
 // agentNameLocked resolves a participant id to its passport name ("" when
@@ -533,7 +609,8 @@ func (h *Hub) agentNameLocked(agentID string) string {
 // CreateChannel allocates a channel, posts invites and blocks until every
 // invitee acks (state pending → active) or the ack timeout hits. The first
 // participant is the creator (initiator); the rest are invitees. TTL comes
-// from manifest.Knobs["ttl_seconds"] (seconds; absent = no expiry).
+// from manifest.Knobs["ttl_seconds"] (seconds; 0 = no expiry), else from the
+// creator's Rule.ChannelTTLDefault.
 func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*ChannelHandle, error) {
 	if len(participants) == 0 {
 		return nil, fmt.Errorf("%w: channel requires at least one participant", ErrProtocol)
@@ -566,6 +643,9 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 		h.mu.Unlock()
 		return nil, fmt.Errorf("%w: no adapter registered for manifest %q@%s", ErrNotFound, manifest.Type, manifest.Version)
 	}
+	if mp, ok := adapter.(ManifestProvider); ok {
+		manifest = manifest.applyDefaults(mp.DefaultManifest())
+	}
 
 	// Pre-flight gate (arbiter): concurrency cap on the creator plus the
 	// invitees' inbound access. The dispatch path silently filters
@@ -596,8 +676,12 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 	fullManifest.Participants = append([]string(nil), participants...)
 
 	var expiresAt time.Time
-	if ttl, ok := toInt(manifest.Knobs["ttl_seconds"]); ok && ttl > 0 {
-		expiresAt = now.Add(time.Duration(ttl) * time.Second)
+	if ttl, ok := toInt(manifest.Knobs["ttl_seconds"]); ok {
+		if ttl > 0 {
+			expiresAt = now.Add(time.Duration(ttl) * time.Second)
+		}
+	} else if d, err := ParseDuration(creatorRule.ChannelTTLDefault); err == nil && d > 0 {
+		expiresAt = now.Add(d) // the creator's default lifetime (swept by SweepTTL)
 	}
 
 	roles := make([]Participant, len(participants))
@@ -635,7 +719,14 @@ func (h *Hub) CreateChannel(manifest ChannelManifest, participants []string) (*C
 	// Lifecycle snapshot: a WAL failure here must not fail the create (see
 	// recordLocked).
 	_ = h.recordLocked(channelSnapshot(ch))
+	createdAt, manifestType, manifestVersion := ch.CreatedAt, fullManifest.Type, fullManifest.Version
 	h.mu.Unlock()
+	h.fanOut(func(l HubListener) {
+		l.OnChannelEvent(channelID, ChannelEventCreated, map[string]any{
+			"manifest_type": manifestType, "manifest_version": manifestVersion, "creator_id": creatorID,
+			"participants": append([]string(nil), participants...), "at": createdAt,
+		})
+	})
 
 	invites := participants[1:]
 	if len(invites) == 0 {
@@ -695,6 +786,9 @@ func (h *Hub) activate(channelID string) error {
 	// recordLocked).
 	_ = h.recordLocked(channelSnapshot(ch))
 	h.mu.Unlock()
+	h.fanOut(func(l HubListener) {
+		l.OnChannelEvent(channelID, ChannelEventOpened, map[string]any{"at": h.at()})
+	})
 
 	opened := Envelope{
 		ChannelID: channelID,
@@ -711,6 +805,7 @@ func (h *Hub) activate(channelID string) error {
 	if w, ok := h.waiters[channelID]; ok {
 		delete(h.waiters, channelID)
 		snapshot := *ch
+		snapshot.Manifest.cloneExtras()
 		w <- &snapshot
 	}
 	h.mu.Unlock()
@@ -777,6 +872,11 @@ type postAction struct {
 	// closeReason is set when the adapter requested a channel close; it
 	// runs after dispatch, outside the lock.
 	closeReason string
+	// pressure lists inbox high-water crossings to report before dispatch.
+	pressure []pressureEvent
+	// snapshot is the channel after the fold, set when listeners are
+	// registered (OnEnvelopePosted).
+	snapshot *ChannelHandle
 }
 
 // dispatchTarget is one resolved recipient (captured under the lock so
@@ -802,13 +902,18 @@ func (h *Hub) post(env Envelope) (Envelope, error) {
 		action.kind = ""
 	}
 	if err != nil {
+		h.fanOut(func(l HubListener) { l.OnEnvelopeRejected(env, err) })
 		return stamped, err
 	}
 	// Outside the lock, in order: dispatch → adapter-requested close →
 	// handshake follow-ups (activate posts the opened envelope; a reject
 	// closes the channel and fails the create waiter).
 	if action.kind == "dispatch" {
+		h.firePressure(action.pressure)
 		h.dispatch(action.env, action.targets)
+	}
+	if action.snapshot != nil {
+		h.fanOut(func(l HubListener) { l.OnEnvelopePosted(stamped, action.snapshot) })
 	}
 	if action.closeReason != "" {
 		h.closeChannel(action.channel, action.closeReason, nil)
@@ -864,13 +969,34 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	if !protocol && ch.State != ChannelActive {
 		return Envelope{}, fmt.Errorf("%w: channel %s not active (state=%s)", ErrProtocol, ch.ID, ch.State)
 	}
+	// Only participants send — except a well-formed cancel request for a live
+	// task riding this channel, which any registered peer may send once per
+	// task.
+	peerCancel := false
 	if !ch.hasParticipant(env.SenderID) {
-		return Envelope{}, fmt.Errorf("%w: channel %s only accepts sends from participants, got %s",
-			ErrProtocol, ch.ID, env.SenderID)
+		if !h.isPeerCancelRequestLocked(env, ch) || h.ext.peerCancel[env.TaskID][env.SenderID] {
+			return Envelope{}, fmt.Errorf("%w: channel %s only accepts sends from participants, got %s",
+				ErrProtocol, ch.ID, env.SenderID)
+		}
+		peerCancel = true
 	}
 	if ch.adapter == nil {
 		return Envelope{}, fmt.Errorf("%w: channel %s has no registered adapter (manifest %q@%s)",
 			ErrProtocol, ch.ID, ch.Manifest.Type, ch.Manifest.Version)
+	}
+
+	// Idempotent post. AGO-DEVIATION: Python's hub only exposes
+	// find_envelope_by_causation to handlers; here a post under the
+	// (channel, sender, causation_id) key of an accepted envelope returns that
+	// envelope and appends nothing, dispatches nothing — a retried post (client
+	// restart, lost reply, hub restart in between) is accepted once. The index
+	// is rebuilt from the WAL by Replay and pruned when the channel ends.
+	if env.CausationID != "" {
+		if pos, dup := h.ext.causation[ch.ID][causeKey{env.SenderID, env.CausationID}]; dup {
+			if log := h.logs[ch.ID]; pos >= 0 && pos < len(log) {
+				return log[pos], nil
+			}
+		}
 	}
 
 	// Per-envelope TTL (sender-asserted: only meaningful when the sender
@@ -890,6 +1016,15 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	if d := h.arbiter.AuthorizeSend(env, sender, senderRule, recipients); !d.Allowed {
 		return Envelope{}, denyErr(d)
 	}
+	// Rate limit and inbox capacity (substantive envelopes only).
+	if err := h.admitLocked(env, ch, sender, senderRule); err != nil {
+		return Envelope{}, err
+	}
+
+	// Stamp before the fold so adapter state can reference the envelope's id
+	// (the pending-turn trigger); a rejected envelope just wastes an id.
+	env.ID = h.ids.Next()
+	env.CreatedAt = h.now()
 
 	// Adapter validate+fold. On error the state stays untouched and the
 	// envelope never reaches the WAL.
@@ -903,12 +1038,14 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 	// fold): when the backend fails, the send fails and the envelope never
 	// enters the in-memory log — ReadWAL only ever shows accepted envelopes
 	// and Replay only ever sees persisted ones.
-	env.ID = h.ids.Next()
-	env.CreatedAt = h.now()
 	if err := h.recordLocked(WALRecord{Kind: "envelope", Envelope: &env}); err != nil {
 		return Envelope{}, fmt.Errorf("network: append envelope %s to wal: %w", env.ID, err)
 	}
-	h.logs[ch.ID] = append(h.logs[ch.ID], env)
+	h.appendLogLocked(ch.ID, env)
+	h.indexCausationLocked(env, len(h.logs[ch.ID])-1)
+	if peerCancel {
+		h.markPeerCancelLocked(env)
+	}
 
 	if protocol {
 		switch env.EventType {
@@ -928,7 +1065,13 @@ func (h *Hub) postLocked(env Envelope, action *postAction) (Envelope, error) {
 
 	action.kind = "dispatch"
 	action.env = env
+	// Acks and rejects are absorbed above and never reach the posted
+	// fan-out (Python returns before it); everything else does.
+	if h.ListenerCount() > 0 {
+		action.snapshot = snapshotHandle(ch)
+	}
 	action.targets = h.resolveTargetsLocked(ch, env)
+	action.pressure = h.countDispatchLocked(env, action.targets)
 
 	// Adapter-requested close runs after dispatch (Python parity): the
 	// closing envelope itself is appended directly by closeChannel.
@@ -993,10 +1136,41 @@ func isLifecycleEvent(eventType string) bool {
 
 func (h *Hub) dispatch(env Envelope, targets []dispatchTarget) {
 	for _, t := range targets {
-		if t.notify != nil {
-			t.notify(env)
+		if t.notify == nil {
+			continue
 		}
+		t := t
+		func() {
+			// AGO-DEVIATION: a panicking Notifier is contained and reported
+			// as OnDispatchFailed (Python's per-recipient send failure); the
+			// rest of the audience still receives and the sender still sees
+			// success because the envelope is already recorded.
+			defer func() {
+				if r := recover(); r != nil {
+					err := fmt.Errorf("network: notifier for %s panicked: %v", t.id, r)
+					h.fanOut(func(l HubListener) { l.OnDispatchFailed(env, t.id, err) })
+				}
+			}()
+			t.notify(env)
+		}()
 	}
+}
+
+// snapshotHandle copies a channel handle for listeners: slices and manifest
+// maps are cloned, AdapterState is shared and read-only by convention.
+func snapshotHandle(ch *ChannelHandle) *ChannelHandle {
+	cp := *ch
+	cp.Participants = append([]Participant(nil), ch.Participants...)
+	cp.PendingAcks = append([]string(nil), ch.PendingAcks...)
+	cp.RejectedBy = append([]string(nil), ch.RejectedBy...)
+	cp.Manifest.cloneExtras()
+	if ch.Manifest.Participants != nil {
+		cp.Manifest.Participants = append([]string(nil), ch.Manifest.Participants...)
+	}
+	if ch.Manifest.Knobs != nil {
+		cp.Manifest.Knobs = cloneKnobs(ch.Manifest.Knobs)
+	}
+	return &cp
 }
 
 // CloseChannel transitions a channel to closed and broadcasts
@@ -1038,11 +1212,17 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 		h.mu.Unlock()
 		return
 	}
+	// Cascade the channel's live tasks to expired before the channel itself
+	// flips, so observers see the task events first (Python parity).
+	var taskEvents hubEvents
+	h.cascadeTasksLocked(channelID, reason, &taskEvents)
 	ch.State = target
 	ch.ClosedAt = h.now()
 	ch.CloseReason = reason
-	// Terminal channel: the fired-violation dedup cache is dead weight.
+	// Terminal channel: the fired-violation dedup cache and the causation
+	// index are dead weight.
 	delete(h.firedViolations, channelID)
+	delete(h.ext.causation, channelID)
 	// Lifecycle snapshot: swallowed (see recordLocked).
 	_ = h.recordLocked(channelSnapshot(ch))
 
@@ -1058,7 +1238,7 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 	}
 	closeEnv.ID = h.ids.Next()
 	closeEnv.CreatedAt = h.now()
-	h.logs[channelID] = append(h.logs[channelID], closeEnv)
+	h.appendLogLocked(channelID, closeEnv)
 	// AGO-DEVIATION: Python surfaces the close envelope's WAL append failure
 	// through close_channel; AGo's closeChannel is void and also runs as a
 	// post-send follow-up where no caller could receive the error, so the
@@ -1071,14 +1251,24 @@ func (h *Hub) closeChannel(channelID string, reason string, waiterErr error, sta
 		delete(h.waiters, channelID)
 		if waiterErr == nil {
 			snapshot := *ch
+			snapshot.Manifest.cloneExtras()
 			w <- &snapshot
 		} else {
 			w <- nil
 		}
 	}
+	closedAt := ch.ClosedAt
 	h.mu.Unlock()
 
+	h.flushEvents(&taskEvents)
 	h.dispatch(closeEnv, targets)
+	channelKind := ChannelEventClosed
+	if target == ChannelExpired {
+		channelKind = ChannelEventExpired
+	}
+	h.fanOut(func(l HubListener) {
+		l.OnChannelEvent(channelID, channelKind, map[string]any{"reason": reason, "at": closedAt})
+	})
 }
 
 // Channel returns a snapshot copy of the channel record.
@@ -1099,6 +1289,7 @@ func (h *Hub) Channel(channelID string) (*ChannelHandle, error) {
 	if ch.Manifest.Knobs != nil {
 		out.Manifest.Knobs = cloneKnobs(ch.Manifest.Knobs)
 	}
+	out.Manifest.cloneExtras()
 	return &out, nil
 }
 
@@ -1112,6 +1303,7 @@ func (h *Hub) ListChannels() []*ChannelHandle {
 		cp.Participants = append([]Participant(nil), ch.Participants...)
 		cp.PendingAcks = append([]string(nil), ch.PendingAcks...)
 		cp.RejectedBy = append([]string(nil), ch.RejectedBy...)
+		cp.Manifest.cloneExtras()
 		out = append(out, &cp)
 	}
 	return out
@@ -1145,6 +1337,16 @@ func (h *Hub) Replay() error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Rebuild from scratch: Replay (and Hydrate) is idempotent, running it
+	// again on a live hub folds the same WAL into the same state instead of
+	// appending the envelopes a second time.
+	h.channels = make(map[string]*ChannelHandle)
+	h.logs = make(map[string][]Envelope)
+	h.ext.envIndex = make(map[string]envRef)
+	h.ext.causation = make(map[string]map[causeKey]int)
+	h.ext.peerCancel = make(map[string]map[string]bool)
+	h.ext.checkpoints = make(map[string]taskCheckpoint)
+	peerMarks := make(map[string]string) // task id → channel it was cancelled on
 	for _, rec := range recs {
 		switch rec.Kind {
 		case "channel":
@@ -1205,15 +1407,43 @@ func (h *Hub) Replay() error {
 			case EnvChannelClosed, EnvChannelExpired:
 				// State arrives via the channel snapshot; nothing to fold.
 			default:
-				if ch.adapter != nil && !ch.State.Terminal() {
+				// The fold runs for every other envelope, also on a channel
+				// whose (latest) snapshot is terminal: a store-backed WAL keeps
+				// only the final snapshot.
+				if ch.adapter != nil {
 					if _, err := ch.adapter.OnEnvelope(ch, env); err != nil {
 						return fmt.Errorf("replay fold failed on channel %s: %w", ch.ID, err)
 					}
 				}
 			}
-			h.logs[ch.ID] = append(h.logs[ch.ID], env)
+			h.appendLogLocked(ch.ID, env)
+			h.indexCausationLocked(env, len(h.logs[ch.ID])-1)
+			// Rebuild the one-cancel-per-sender limit from the log (Python
+			// parity: hydrate does the same for active channels).
+			if env.EventType == EnvTaskCancelRequest && env.TaskID != "" && !ch.hasParticipant(env.SenderID) {
+				h.markPeerCancelLocked(env)
+				peerMarks[env.TaskID] = ch.ID
+			}
+		case "checkpoint":
+			if rec.Checkpoint == nil {
+				return fmt.Errorf("%w: checkpoint record missing payload", ErrProtocol)
+			}
+			cp := rec.Checkpoint
+			h.ext.checkpoints[cp.TaskID] = taskCheckpoint{state: cloneBytes(cp.State), writer: cp.Writer}
 		default:
 			return fmt.Errorf("%w: unknown WAL record kind %q", ErrProtocol, rec.Kind)
+		}
+	}
+	// A channel that ended terminal keeps no causation index and no
+	// peer-cancel bookkeeping (live closeChannel prunes both).
+	for id, ch := range h.channels {
+		if ch.State.Terminal() {
+			delete(h.ext.causation, id)
+		}
+	}
+	for taskID, chID := range peerMarks {
+		if ch, ok := h.channels[chID]; ok && ch.State.Terminal() {
+			delete(h.ext.peerCancel, taskID)
 		}
 	}
 	return nil

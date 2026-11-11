@@ -2,6 +2,7 @@ package network
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -207,5 +208,236 @@ func TestGraphFromDictErrors(t *testing.T) {
 		"transitions": []any{map[string]any{"when": map[string]any{}, "to": map[string]any{"name": "wat"}}},
 	}); err == nil {
 		t.Fatal("unknown target must error")
+	}
+}
+
+func TestNewRoundRobinGraph(t *testing.T) {
+	if _, err := NewRoundRobinGraph(nil, 0); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("empty participants: %v", err)
+	}
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob", "carol")
+	graph, err := NewRoundRobinGraph(ids, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Initial != ids[0] || graph.MaxTurns != 5 {
+		t.Fatalf("graph: %+v", graph)
+	}
+	// The builder output must survive the knob round trip.
+	if _, err := GraphFromDict(graph.ToDict()); err != nil {
+		t.Fatalf("ToDict/GraphFromDict: %v", err)
+	}
+
+	ch := openWorkflow(t, h, graph, ids)
+	// Speaking order follows the join order, wrapping around, until MaxTurns.
+	for turn, speaker := range []string{ids[0], ids[1], ids[2], ids[0], ids[1]} {
+		if _, err := h.Send(NewTextEnvelope(ch, speaker, "", "turn")); err != nil {
+			t.Fatalf("turn %d by %s: %v", turn, speaker, err)
+		}
+	}
+	got, _ := h.Channel(ch)
+	if got.State != ChannelClosed || got.CloseReason != "max_turns" {
+		t.Fatalf("after 5 turns: %s %q", got.State, got.CloseReason)
+	}
+}
+
+func TestNewRoundRobinGraphRejectsOutOfTurn(t *testing.T) {
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob")
+	graph, _ := NewRoundRobinGraph(ids, 0)
+	ch := openWorkflow(t, h, graph, ids)
+	if _, err := h.Send(NewTextEnvelope(ch, ids[1], "", "jumping the queue")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("only the initial speaker may open: %v", err)
+	}
+}
+
+func TestNewSequenceGraph(t *testing.T) {
+	if _, err := NewSequenceGraph(nil); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("empty steps: %v", err)
+	}
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob", "carol")
+	graph, err := NewSequenceGraph(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Initial != ids[0] || graph.MaxTurns != 3 {
+		t.Fatalf("graph: %+v", graph)
+	}
+	if _, err := GraphFromDict(graph.ToDict()); err != nil {
+		t.Fatalf("ToDict/GraphFromDict: %v", err)
+	}
+
+	ch := openWorkflow(t, h, graph, ids)
+	// The pipeline runs strictly in step order...
+	if _, err := h.Send(NewTextEnvelope(ch, ids[2], "", "skip ahead")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("step 3 before step 1: %v", err)
+	}
+	for _, speaker := range ids {
+		if got, _ := h.Channel(ch); got.State != ChannelActive {
+			t.Fatalf("closed before %s spoke: %s", speaker, got.State)
+		}
+		if _, err := h.Send(NewTextEnvelope(ch, speaker, "", "done")); err != nil {
+			t.Fatalf("%s: %v", speaker, err)
+		}
+	}
+	// ...and ends with its own close reason after the last step.
+	got, _ := h.Channel(ch)
+	if got.State != ChannelClosed || got.CloseReason != "sequence_complete" {
+		t.Fatalf("after the last step: %s %q", got.State, got.CloseReason)
+	}
+}
+
+func TestNewSequenceGraphSingleStep(t *testing.T) {
+	h := newTestHub(t)
+	ids := registerAgents(t, h, "alice", "bob")
+	graph, _ := NewSequenceGraph(ids[:1])
+	ch := openWorkflow(t, h, graph, ids)
+	if _, err := h.Send(NewTextEnvelope(ch, ids[0], "", "only step")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.Channel(ch); got.State != ChannelClosed || got.CloseReason != "sequence_complete" {
+		t.Fatalf("single step: %s %q", got.State, got.CloseReason)
+	}
+}
+
+// registerAgents registers one auto-acking raw-notifier agent per name and
+// returns their ids in order.
+func registerAgents(t *testing.T, h *Hub, names ...string) []string {
+	t.Helper()
+	rec := newRecorder()
+	ids := make([]string, len(names))
+	for i, name := range names {
+		p, err := h.Register(Passport{Name: name}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.attach(h, p.AgentID, true)
+		ids[i] = p.AgentID
+	}
+	return ids
+}
+
+func openWorkflow(t *testing.T, h *Hub, graph TransitionGraph, ids []string) string {
+	t.Helper()
+	ch, err := h.CreateChannel(ChannelManifest{Type: TypeWorkflow, Knobs: map[string]any{"graph": graph.ToDict()}}, ids)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	return ch.ID
+}
+
+// --- priority and fall-through target ---------------------------------------
+
+// A transition with a lower priority is evaluated first, whatever its place in
+// the list; equal priorities keep list order (the pre-priority behavior).
+func TestTransitionPriorityDecidesOrder(t *testing.T) {
+	ctx := &TurnContext{Envelope: Envelope{SenderID: "alice"}}
+	graph := TransitionGraph{
+		Initial: "alice",
+		Transitions: []Transition{
+			{When: Always{}, To: AgentTarget{AgentID: "fallback"}, Priority: 5},
+			{When: FromSpeaker{AgentID: "alice"}, To: AgentTarget{AgentID: "first"}, Priority: -1},
+			{When: Always{}, To: AgentTarget{AgentID: "tie"}, Priority: 5},
+		},
+	}
+	if got := graph.Select(ctx); got.NextSender != "first" {
+		t.Fatalf("lowest priority first: %+v", got)
+	}
+	// Neutralize the winning rule: the two priority-5 rules then resolve in
+	// list order, so "fallback" (listed first) wins.
+	graph.Transitions[1].When = FromSpeaker{AgentID: "nobody"}
+	if got := graph.Select(ctx); got.NextSender != "fallback" {
+		t.Fatalf("tie keeps list order: %+v", got)
+	}
+	// Without any priority the list order alone decides (the old behavior).
+	graph.Transitions[0].Priority, graph.Transitions[2].Priority = 0, 0
+	if got := graph.Select(ctx); got.NextSender != "fallback" {
+		t.Fatalf("zero priorities keep list order: %+v", got)
+	}
+}
+
+// With no matching transition the graph falls through to DefaultTarget; a nil
+// default keeps the old terminate-with-no_transition behavior.
+func TestTransitionDefaultTarget(t *testing.T) {
+	ctx := &TurnContext{Envelope: Envelope{SenderID: "alice"}}
+	graph := TransitionGraph{
+		Initial:       "alice",
+		Transitions:   []Transition{{When: FromSpeaker{AgentID: "bob"}, To: AgentTarget{AgentID: "bob"}}},
+		DefaultTarget: RevertToInitiatorTarget{},
+	}
+	if got := graph.Select(ctx); got.NextSender != "" || !got.Close || got.CloseReason != "workflow_terminated" {
+		// RevertToInitiatorTarget resolves to CreatorID, which is empty here:
+		// the target returns "" and the graph reports its termination.
+		t.Fatalf("default target: %+v", got)
+	}
+	ctx.CreatorID = "carol"
+	if got := graph.Select(ctx); got.NextSender != "carol" || got.Close {
+		t.Fatalf("default target must route to the initiator: %+v", got)
+	}
+
+	graph.DefaultTarget = nil
+	if got := graph.Select(ctx); !got.Close || got.CloseReason != "no_transition" {
+		t.Fatalf("no default target: %+v", got)
+	}
+}
+
+// Priority and the default target survive the channel-knob round trip.
+func TestTransitionGraphDictRoundTripsPriorityAndDefault(t *testing.T) {
+	graph := TransitionGraph{
+		Initial: "alice",
+		Transitions: []Transition{
+			{When: ContextEquals{Key: "phase", Value: "review"}, To: AgentTarget{AgentID: "bob"}, Priority: 2},
+			{When: Always{}, To: &RoundRobinTarget{}},
+		},
+		DefaultTarget: TerminateTarget{Reason: "done"},
+		MaxTurns:      4,
+	}
+	restored, err := GraphFromDict(graph.ToDict())
+	if err != nil {
+		t.Fatalf("GraphFromDict: %v", err)
+	}
+	if len(restored.Transitions) != 2 || restored.Transitions[0].Priority != 2 || restored.Transitions[1].Priority != 0 {
+		t.Fatalf("priorities: %+v", restored.Transitions)
+	}
+	if _, ok := restored.Transitions[0].When.(ContextEquals); !ok {
+		t.Fatalf("condition: %T", restored.Transitions[0].When)
+	}
+	term, ok := restored.DefaultTarget.(TerminateTarget)
+	if !ok || term.Reason != "done" {
+		t.Fatalf("default target: %#v", restored.DefaultTarget)
+	}
+	// A graph built without either keeps the exact old dict shape.
+	old := TransitionGraph{Initial: "a", Transitions: []Transition{{When: Always{}, To: AgentTarget{AgentID: "b"}}}}
+	dict := old.ToDict()
+	if _, has := dict["default_target"]; has {
+		t.Fatal("a nil default target must not appear in the dict")
+	}
+	entry := dict["transitions"].([]any)[0].(map[string]any)
+	if _, has := entry["priority"]; has {
+		t.Fatal("a zero priority must not appear in the dict")
+	}
+}
+
+// ContextEquals routes on a channel-scoped context variable; a missing key
+// compares as nil, so an unset variable can be matched on purpose.
+func TestContextEqualsCondition(t *testing.T) {
+	vars := map[string]any{"phase": "review"}
+	ctx := &TurnContext{ContextVars: vars}
+	if !(ContextEquals{Key: "phase", Value: "review"}).Match(ctx) {
+		t.Fatal("matching value must fire")
+	}
+	if (ContextEquals{Key: "phase", Value: "build"}).Match(ctx) {
+		t.Fatal("another value must not fire")
+	}
+	if !(ContextEquals{Key: "missing"}).Match(ctx) {
+		t.Fatal("an unset key compares as nil and must match a nil value")
+	}
+	if (ContextEquals{Key: "missing", Value: "x"}).Match(ctx) {
+		t.Fatal("an unset key must not match a non-nil value")
+	}
+	if (ContextEquals{Key: "phase", Value: "review"}).Match(&TurnContext{}) {
+		t.Fatal("nil context vars must not panic or match a set value")
 	}
 }

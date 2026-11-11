@@ -82,10 +82,8 @@ func filterWhitelistedEnv(parent []string) []string {
 
 // execResult is the outcome of one local subprocess (Python parity:
 // sandbox.base.ExecResult): the combined stdout+stderr output and the exit code.
-type execResult struct {
-	Output   string
-	ExitCode int
-}
+// It is the exported ExecResult of the Sandbox seam.
+type execResult = ExecResult
 
 // ErrCommandInterrupted reports a command whose context was canceled while the
 // child was still running: the tree kill stopped it, so no result exists

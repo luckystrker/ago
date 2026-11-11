@@ -33,7 +33,13 @@ type CompactionMiddleware struct {
 	middleware.Base
 	trigger  Trigger
 	strategy Strategy
-	agent    string
+	// tail, when set, replaces the summarizing strategy with the zero-cost
+	// TailWindowCompact rewrite (NewTailWindow).
+	tail  *TailWindowCompact
+	agent string
+	// keep overrides KeepRecent: how many trailing conversational events a
+	// summarizing compaction retains verbatim (0 = KeepRecent).
+	keep int
 }
 
 var _ middleware.Middleware = (*CompactionMiddleware)(nil)
@@ -47,11 +53,35 @@ func WithAgent(name string) Option {
 	return func(m *CompactionMiddleware) { m.agent = name }
 }
 
+// WithKeepRecent sets how many trailing conversational events a summarizing
+// compaction retains verbatim (Python parity: SummarizeCompact(target)). The
+// window is aligned to a tool-round boundary afterwards — see snapCut — so the
+// retained range may be shorter than n. n <= 0 keeps KeepRecent.
+func WithKeepRecent(n int) Option {
+	return func(m *CompactionMiddleware) { m.keep = n }
+}
+
 // New builds the middleware Factory: one CompactionMiddleware per turn.
 // A nil trigger or nil strategy yields a pass-through middleware.
 func New(trigger Trigger, strategy Strategy, opts ...Option) middleware.Factory {
 	return func() middleware.Middleware {
 		m := &CompactionMiddleware{trigger: trigger, strategy: strategy}
+		for _, o := range opts {
+			o(m)
+		}
+		return m
+	}
+}
+
+// NewTailWindow builds the Factory for the zero-LLM-cost rewrite: when the
+// trigger fires, the history keeps only the last target conversational events
+// and everything after them (Python parity: CompactTrigger + TailWindowCompact).
+// No CompactionSummary is produced, so the turn pays nothing for compaction.
+// A nil trigger yields a pass-through middleware.
+func NewTailWindow(trigger Trigger, target int, opts ...Option) middleware.Factory {
+	return func() middleware.Middleware {
+		window := NewTailWindowCompact(target)
+		m := &CompactionMiddleware{trigger: trigger, tail: &window}
 		for _, o := range opts {
 			o(m)
 		}
@@ -76,7 +106,7 @@ func (m *CompactionMiddleware) OnTurn(next middleware.TurnFunc, ev *events.Model
 // maybeCompact snapshots the history, consults the trigger, and on fire replaces
 // the old conversational span with one CompactionSummary plus the fresh range.
 func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
-	if m.trigger == nil || m.strategy == nil {
+	if m.trigger == nil || (m.strategy == nil && m.tail == nil) {
 		return nil
 	}
 	evs, err := ctx.Stream.History().GetEvents()
@@ -86,11 +116,19 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 	if !m.trigger.ShouldTrigger(evs, historyUsage(evs)) {
 		return nil
 	}
-	cut := cutIndex(evs, KeepRecent)
-	if cut <= 0 {
-		// Fewer than KeepRecent+1 conversational events, or nothing before the
-		// fresh range: there is no old span worth a summary (Python parity:
-		// _cut_for_target returning 0 is a no-op).
+	if m.tail != nil {
+		return m.tailCompact(ctx, evs)
+	}
+	keep := m.keep
+	if keep <= 0 {
+		keep = KeepRecent
+	}
+	cut := snapCut(evs, cutIndex(evs, keep))
+	if cut <= 0 || cut >= len(evs) {
+		// Fewer than keep conversational events, nothing before the fresh range,
+		// or no replayable boundary left to cut at: there is no old span worth a
+		// summary (Python parity: _cut_for_target returning 0, or an empty
+		// retained range, is a no-op).
 		return nil
 	}
 	old := conversational(evs[:cut])
@@ -138,19 +176,7 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 	// retained tail contributes its non-usage events below, so a usage record is
 	// never present twice; the ids make the report idempotent even if it is.
 	seenUsage := map[string]struct{}{}
-	for _, ev := range evs {
-		u, ok := usage.EventFrom(ev)
-		if !ok {
-			continue
-		}
-		if u.EventID != "" {
-			if _, dup := seenUsage[u.EventID]; dup {
-				continue
-			}
-			seenUsage[u.EventID] = struct{}{}
-		}
-		replacement = append(replacement, ev)
-	}
+	replacement = retainUsage(replacement, evs, seenUsage)
 	replacement = append(replacement, &events.CompactionSummary{Content: summary})
 	for _, ev := range evs[cut:] {
 		if _, isUsage := usage.EventFrom(ev); isUsage {
@@ -185,6 +211,68 @@ func (m *CompactionMiddleware) maybeCompact(ctx *agocontext.Context) error {
 		return fmt.Errorf("compact: send CompactionCompleted: %w", err)
 	}
 	return nil
+}
+
+// tailCompact applies the zero-cost window: the old span disappears, the last
+// Target conversational events and everything after them stay. Source usage
+// records from before the cut are preserved so reporting stays whole (the same
+// rule as the summarizing path). No summary event is produced.
+//
+// AGO-DEVIATION: Python's TailWindowCompact returns the retained tail alone, so
+// source accounting records before the cut disappear with it. AGo keeps them
+// because the event log is the usage report's source of truth (see usage.FromEvents).
+func (m *CompactionMiddleware) tailCompact(ctx *agocontext.Context, evs []events.Event) error {
+	retained := m.tail.Compact(evs)
+	if len(retained) == len(evs) {
+		// The window already covers the history: nothing to drop.
+		return nil
+	}
+	name := typeLabel(*m.tail)
+	if err := ctx.Send(&events.CompactionStarted{Agent: m.agent, Strategy: name, EventCount: len(evs)}); err != nil {
+		return fmt.Errorf("compact: send CompactionStarted: %w", err)
+	}
+	seenUsage := map[string]struct{}{}
+	replacement := retainUsage(make([]events.Event, 0, len(evs)), evs, seenUsage)
+	for _, ev := range retained {
+		if _, isUsage := usage.EventFrom(ev); isUsage {
+			continue
+		}
+		replacement = append(replacement, ev)
+	}
+	if err := ctx.Stream.History().Replace(replacement); err != nil {
+		return fmt.Errorf("compact: replace history: %w", err)
+	}
+	done := &events.CompactionCompleted{
+		Agent:        m.agent,
+		Strategy:     name,
+		EventsBefore: len(evs),
+		EventsAfter:  len(replacement),
+		LLMCalls:     0,
+	}
+	if err := ctx.Send(done); err != nil {
+		return fmt.Errorf("compact: send CompactionCompleted: %w", err)
+	}
+	return nil
+}
+
+// retainUsage appends every source accounting record in evs to dst, skipping
+// duplicates by source event id, and records the seen ids so a later tail append
+// cannot repeat one.
+func retainUsage(dst []events.Event, evs []events.Event, seen map[string]struct{}) []events.Event {
+	for _, ev := range evs {
+		u, ok := usage.EventFrom(ev)
+		if !ok {
+			continue
+		}
+		if u.EventID != "" {
+			if _, dup := seen[u.EventID]; dup {
+				continue
+			}
+			seen[u.EventID] = struct{}{}
+		}
+		dst = append(dst, ev)
+	}
+	return dst
 }
 
 // cutIndex returns the index of the first of the last keep conversational
