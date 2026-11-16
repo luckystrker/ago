@@ -25,13 +25,24 @@
 
 ## Актуальная версия (бейслайн)
 
-**v1.3.0** — <https://github.com/ag2ai/ag2/releases/tag/v1.3.0> (релиз 2026-11-04,
-тег = `1229064a23a1e39a4c3c089bb4643a637117c8a9`).
-Последняя проверка: **2026-11-09**.
-Последний просмотренный SHA main: `5125cb5dfcc99aa3c31ca248cb734c63628a99dd`
-(12 коммитов после v1.3.0, разобраны ниже — без нового релиза).
+**v1.3.2** — <https://github.com/ag2ai/ag2/releases/tag/v1.3.2> (релиз 2026-11-15,
+тег = `bf76b9cb6607936a7c240b1efc1811d8bd422de6`).
+Последняя проверка: **2026-11-16**.
+Последний просмотренный SHA main: `bf76b9cb6607936a7c240b1efc1811d8bd422de6`
+(тег v1.3.2 совпадает с верхушкой main — коммитов после релиза нет).
+Предыдущий бейслайн: v1.3.0 (`1229064a23`, 2026-11-04).
 
 ## Новые версии
+
+**v1.3.2** (2026-11-15) — очередной релиз, накрывающий 46 коммитов после v1.3.0
+(из них 12 разобраны в синке v1.3.0, 34 новых — ниже). Две главные темы: единая
+семантика `Usage.prompt_tokens` (весь вход, включая prompt-cache — ADR 0036,
+**breaking** для Anthropic/Bedrock) и ответ на несколько решений в одном запросе
+(`DecisionSet`, ADR 0038). Плюс: миграция ACP на SDK 1.0.0, ответ хода на forced-
+ответе больше не «съедается» очередью ввода, отдача upstream ext-apps документов
+как есть в MCP Apps, строгий mypy по 5 крупным подсистемам, две новые песочницы
+в `extensions/` (E2B, boxd). Тега v1.3.1 в релизах нет — версия в `pyproject.toml`
+бампалась (80c4de8f9c), но опубликован сразу v1.3.2.
 
 **v1.3.0** (2026-11-04) — новый релиз, первый после бейслайна v1.2.2. Крупный:
 наблюдение за деревом делегирования (`ChildEvent`, `origin`), явные области
@@ -43,6 +54,283 @@
 
 Затем main ушёл на 12 коммитов вперёд (до `5125cb5dfc`, 2026-11-09) — они разобраны
 в разделе «main после v1.3.0».
+
+## Синк v1.3.2 (2026-11-16)
+
+**Дата проверки:** 2026-11-16. **Диапазон:** `v1.3.0...v1.3.2` — 46 коммитов, тег
+`bf76b9cb66` = верхушка main (коммитов после релиза нет). 12 коммитов
+(`472627dccd`…`5125cb5dfc`) уже разобраны в синке v1.3.0 и повторно не
+разбираются; ниже — **34 новых**. Для каждого: id / автор / вид правки / что и
+зачем / вердикт «утягивать».
+
+### Usage: единая семантика `prompt_tokens`
+
+**`8464369e40`** — [`fix(usage)!: count prompt-cache tokens in prompt_tokens for Anthropic and Bedrock`](https://github.com/ag2ai/ag2/commit/8464369e40)
+- **Автор:** Semen Frolov (@vvlrff).
+- **Вид:** багфикс + breaking-правка логики (ADR 0036).
+- **Что изменено:** `Usage.prompt_tokens` теперь означает весь вход на любом
+  провайдере, включая чтения и записи prompt-cache. `normalize_usage` у Anthropic
+  прибавляет `cache_read_input_tokens` + `cache_creation_input_tokens` к
+  `input_tokens`, у Bedrock — `cacheReadInputTokens`/`cacheWriteInputTokens` к
+  `inputTokens` (и не верит `totalTokens` меньше «весь вход + выход», а
+  `cache_*` различает по присутствию, не по истинности — измеренный 0 сохраняется).
+  Убрана пер-провайдерная поправка в `ag_ui/usage.py`, ACP-маппер считает так же,
+  `TokenMonitor`/`eval TokenUsage`/метрики/телеметрия перестали исключать кэш из
+  подсчёта. Затронуты `config/{anthropic,bedrock}/mappers.py`, `ag_ui/usage.py`,
+  `acp/mappers.py`, `events/types.py`, `observers/token_monitor.py`, `eval/`.
+- **Утягивать:** **ДА**, и в первую очередь — у нас ровно тот же дефект:
+  `config/anthropic/mappers.go` (`NormalizeUsage`, стр. 1122) кладёт
+  `PromptTokens = InputTokens` без кэша, а `agui/stream.go` держит
+  пер-провайдерную поправку `cacheOutsidePrompt = {anthropic, bedrock}`
+  (прямо отмечена в `docs/PORT_STATUS.md` как «anthropic/bedrock cache
+  correction»). Правка ломает цифры: на кэшированном турне `prompt_tokens`
+  вырастет, а значит сдвинутся пороги `TokenMonitor`, суммы `UsageReport` и
+  атрибуты спанов в `contrib/otelx`. Нужны: правка `NormalizeUsage`, снятие
+  поправки в `agui`, свёртка thinking в `completion_tokens` у батчевого
+  `config/gemini` (см. `367119e83a`, D-022), запись в `docs/DECISIONS.md`
+  (аналог ADR 0036) и пункт в
+  `docs/MIGRATION.md`. Bedrock у нас заглушка (`Create()` → `ErrNotImplemented`),
+  его половина — вместе с портом провайдера.
+
+**`367119e83a`** — [`fix(live): include Gemini Live thinking tokens in completion usage`](https://github.com/ag2ai/ag2/commit/367119e83a)
+- **Автор:** Yang Hao. **Вид:** багфикс (Gemini Live usage).
+- **Что изменено:** Live API отдаёт «мысли» рядом с ответом, из-за чего
+  `completion_tokens` их не учитывал; теперь они входят в `completion_tokens`
+  (с сохранением breakdown в `thinking_tokens`, как в батчевом Gemini-маппере),
+  а `total` меньше «вход + выход» не принимается — та же ADR 0036.
+- **Утягивать:** **НЕТ** — Gemini Live в AGo не портирован (`live/` — только
+  HTTP-каскад OpenAI, D-057), поверхности для правки нет. Но коммит полезен как
+  напоминание: наш **батчевый** `config/gemini` (`normalizeUsage`) кладёт
+  `CandidatesTokenCount` в `CompletionTokens`, а `thoughtsTokenCount` — только в
+  `ThinkingTokens` (сознательное отступление, D-022), из-за чего у thinking-моделей
+  нарушается инвариант `total >= prompt + completion` — ровно то, что чинит ADR
+  0036. В волне `8464369e40` это второе место правки: свернуть thinking в
+  `completion_tokens` и переписать D-022.
+
+**`fb3061e061`** — [`fix(live): keep Gemini Live thought summaries out of the reply text`](https://github.com/ag2ai/ag2/commit/fb3061e061)
+- **Автор:** Yang Hao. **Вид:** багфикс (Gemini Live).
+- **Что изменено:** текстовый part с `thought=True` больше не уходит как
+  `ModelMessageChunk` и не попадает в `ModelResponse.message` — он публикуется
+  как `ModelReasoning`, как в батчевом клиенте; тесты переведены на реальную
+  раскладку `gemini-2.5-flash-native-audio`.
+- **Утягивать:** **НЕТ** — поверхности нет (Gemini Live не портирован).
+
+### Ход агента
+
+**`3bee17b3c6`** — [`fix(agent): end the turn on a forced response even with input queued`](https://github.com/ag2ai/ag2/commit/3bee17b3c6)
+- **Автор:** coder-abu. **Вид:** багфикс (турн-луп).
+- **Что изменено:** финальный tool-результат или вызовы, отданные клиентскому
+  инструменту, завершают ход `ModelResponse(response_force=True)`;
+  `_execute_turn` пропускал для него tool-луп, но затем, как после любого ответа,
+  вычитывал inbox — из-за чего отложенный ввод вызывал ещё один вызов модели,
+  который перезаписывал финальный ответ (или терял клиентские вызовы), причём
+  без ответа на уже отданный вызов в истории. Теперь forced-ответ возвращается до
+  вычитки, ввод ждёт следующего хода; докстринги `enqueue`/`spawn_background`
+  уточнены, добавлен тест на возобновление клиентского вызова.
+- **Утягивать:** **ДА** — тот же дефект в `agent/turn.go` (`turnBody`): после
+  tool-лупа блок «leftover mid-turn input gets one extra model call»
+  (`agent/turn.go:123`) вычитывает очередь независимо от `resp.ResponseForce`.
+  Правка минимальна (ранний
+  `return resp` при `ResponseForce` перед вычиткой) + тест «final tool result с
+  отложенным вводом: ответ не перезаписан, ввод ждёт следующего хода». Стоит
+  проверить и HITL/клиентский путь (`agui` client hand-off), где тот же инвариант.
+
+### Решения (decision-провайдеры)
+
+**`1c3e0c52f8`** — [`feat(response): ask several decision questions in one request`](https://github.com/ag2ai/ag2/commit/1c3e0c52f8)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** фича (ADR 0038, дополняет ADR 0018/0023).
+- **Что изменено:** плоский класс в `response_schema` у `TypeSafeConfig` /
+  `OpenAIDecisionsConfig` теперь означает «по вопросу на поле» и уходит одним
+  запросом (общий вход считается и оплачивается один раз). Новый `DecisionSet` в
+  `ag2/response/decision.py`: скаляр — по-прежнему один вопрос `"answer"`;
+  вопрос поля берётся из `Annotated[..., Question(...)]`, `Field(description=)`
+  или докстринга Enum; вложенные поля, `Optional`, списки, значения по умолчанию,
+  пустой класс, вопрос на самом классе и коллизии ключей валидации (алиасы)
+  отклоняются до запроса; `metadata` = `{поле: ответ}`, отказ любого поля →
+  `DecisionRefusedError(field)`; лимит 400 полей у OpenAI. Затронуты
+  `response/`, `config/{openai,typesafe}`, доки.
+- **Утягивать:** **ДА** — наш `response/decision.go` умеет только один вопрос
+  (`QuestionSchema` + `DecisionSpec.FromResponse` с конвертом `{"data": ...}`), а
+  `config/typesafe`/`config/openai` (decisions) на этом построены. В Go
+  интроспекция уже есть — `response/schema.go` строит JSON Schema из struct, так
+  что «одно поле — один вопрос» реализуется на stdlib: поля struct + теги
+  `json`/`description` как вопрос, отказ на вложенных/указателях/срезах/пустом
+  struct, `render` собирает `{field: value}` в порядке полей. Отдельная волна с
+  ADR-записью (аналог 0038) и тестами на отказы.
+
+### AG-UI
+
+**`27d2dcafcc`** — [`fix(ag-ui): send the reply a model call leaves only in its ModelResponse`](https://github.com/ag2ai/ag2/commit/27d2dcafcc)
+- **Автор:** coder-abu. **Вид:** багфикс (AG-UI поток).
+- **Что изменено:** текст ответа уходил на провод только из `ModelMessageChunk`
+  и `ModelMessage`; но `ToolResult(final=True)` и middleware, отвечающая вместо
+  модели, заканчивают вызов одним `ModelResponse` — клиент получал
+  `RUN_FINISHED` без текста, хотя `ask()` ответ возвращал. Теперь `ModelResponse`
+  отдаёт текст, если вызов не публиковал `ModelMessage`, и закрывает
+  отстримленное сообщение; добавлен пер-вызовый флаг `message_sent` (инвариант:
+  каждый `ModelMessage` сопровождается `ModelResponse` своего вызова).
+- **Утягивать:** **НЕТ** — дефекта нет: в `agui/stream.go` ветка
+  `case events.ModelResponse` уже отдаёт текст, когда чанков не было
+  (`streamingMsgID == ""` → одиночный `TEXT_MESSAGE_CHUNK`), а события
+  `ModelMessage` провайдеры AGo вообще не публикуют (оно живёт только как поле
+  `ModelResponse.Message`), так что и двойной отправки нет.
+
+**`056d3e0c23`** — [`fix(ag-ui): reject invalid Base64 characters in inline media`](https://github.com/ag2ai/ag2/commit/056d3e0c23)
+- **Автор:** BlueLi. **Вид:** багфикс (валидация входа).
+- **Что изменено:** нестрогий `b64decode` молча выбрасывал символы вне алфавита,
+  поэтому испорченное значение проходило проверку (и `encryptedValue` вида
+  `"aG!k="` переигрывалось как подпись `b"hi"`); теперь декодирование во всех
+  четырёх точках идёт с `validate=True`.
+- **Утягивать:** **НЕТ** — Go-стандарт уже строгий: `agui/run_input.go:349,358`
+  вызывает `base64.StdEncoding.DecodeString`, который отвергает символы вне
+  алфавита и битую набивку (паритет с `validate=True`). Единственное расхождение
+  — Go игнорирует `\r`/`\n`; оно не даёт «тихого искажения» из примера, поэтому
+  достаточно регрессионного теста, код менять не нужно.
+
+**`ddf8c6e3fa`** — [`docs(ag-ui): add assistant-ui quickstart`](https://github.com/ag2ai/ag2/commit/ddf8c6e3fa)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** документы (+ пример).
+- **Что изменено:** quickstart «AG2-агент через AG-UI в assistant-ui»: стриминг,
+  серверный инструмент, подтверждение tool-call через interrupt, общее состояние;
+  ссылка с обзора AG-UI.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — документация; сценарии полезны как источник
+  тестов для `agui/server.go`, кода не требует.
+
+### ACP
+
+**`3b5bd7d122`** — [`chore(acp): migrate to agent-client-protocol 1.0.0`](https://github.com/ag2ai/ag2/commit/3b5bd7d122)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** зависимости + правка логики (крупная).
+- **Что изменено:** пин `agent-client-protocol >=1.0.0,<2`, замена удалённых в 1.0
+  SDK-хелперов на схемные модели, новые варианты `SessionUpdate`,
+  `EnvVarAuthMethod` убран, новые MCP-методы клиента отвечаются
+  `method_not_found`, `httpx2.HTTPError` ловится как транспортная ошибка; новый
+  `StdioConnection` для подпроцессов; в `session/new` `cwd` и дополнительные
+  каталоги обязаны быть абсолютными; `BridgeState` собирает чанки в целые
+  сообщения по `message_id` и закрывает сообщение перед следующим; uri-only
+  изображения читаются ссылкой, пустой текст tool-результата не скрывает статус,
+  пустое аудио не превращается в файл/вход.
+- **Утягивать:** **ПОЗЖЕ** — сама миграция неприменима: у нас нет SDK, `acp/*.go`
+  реализован на stdlib (нулевые зависимости — правило репозитория). Поведенческие
+  пункты стоит сверить отдельным аудитом, а не переносить коммитом: (1) требование
+  абсолютных путей в `session/new` (`acp/serve.go` принимает `CWD` как есть);
+  (2) группировка `agent_message_chunk` по `message_id` — у нас границы сообщений
+  заданы естественно (один чанк на `ModelMessage`), проверить на клиентской
+  стороне `Bridge`; (3) uri-only изображения и пустые блоки в `blockToInput`
+  /`blockToFiles`. Взять в волну вместе с ревизией ACP-поверхности.
+
+### MCP Apps
+
+**`3399e3ef2e`** — [`feat(mcp): serve upstream ext-apps App documents as written; mark MCP-UI legacy`](https://github.com/ag2ai/ag2/commit/3399e3ef2e)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** фича + правка логики (ADR 0037).
+- **Что изменено:** документ, написанный под `App` из
+  `@modelcontextprotocol/ext-apps`, сам делает handshake `ui/initialize`, поэтому
+  инъекция ag2ui давала хосту два. Новый `ag2/mcp/_document_scripts.py` (381
+  строка) ищет import/`import()`/`src` этого пакета или литерал `"ui/initialize"`
+  **только внутри `<script>`** и в таком случае отдаёт тело как есть (упоминание
+  в прозе по-прежнему получает ag2ui; пропуск с вызовом ag2ui логируется
+  предупреждением). `appInfo.name` стал человеческим (title → явное имя → путь
+  URI); `mcp_ui.mdx` переименован в «MCP-UI (legacy embedded resources)».
+- **Утягивать:** **ПОЗЖЕ** — MCP Apps UI (SEP-2133) в `mcpserver` не портирован,
+  `mcpui` — только конструкторы ресурсов (PORT_STATUS, D-045/D-058). Детектор
+  скриптов переносить вместе с Apps-слоем; в Go его роль сводится к разбору HTML
+  на `<script>` (stdlib `golang.org/x/net/html` недоступен, значит потоковый
+  скан тегов) — это отдельное решение, записать в DECISIONS при порте.
+
+### Расширения: новые песочницы
+
+**`5f471318ad`** — [`feat(extensions): add E2B sandbox integration`](https://github.com/ag2ai/ag2/commit/5f471318ad)
+- **Автор:** Maksim Obukhov. **Вид:** фича (новая песочница).
+- **Что изменено:** `E2BEnvironment` — `SandboxFactory` над облачными песочницами
+  E2B (для `SandboxShellTool`/`SandboxCodeTool`), плюс `E2BSandbox`; создание,
+  продление жизни и закрытие сериализованы одним локом на event loop (иначе
+  параллельные вызовы сокращали жизнь команды, работали до появления workdir или
+  гонялись с close), неудачный kill остаётся повторяемым, таймаут с
+  непроверяемым состоянием сообщается как таковой; offline-тесты с мок-SDK, гайд.
+- **Утягивать:** **ДА** (по умолчанию для новых фич), низкий приоритет —
+  укладывается в наш шов: `toolpacks.SandboxFactory` + `contrib/sandboxdocker` и
+  `contrib/sandboxdaytona` (D-113…D-115). E2B — REST поверх HTTP, значит
+  отдельный contrib-модуль на stdlib и тесты на `httptest`; проверить на живом
+  аккаунте перед продом (как с Daytona). Отметить в PORT_STATUS, что волна
+  contrib-песочниц расширяется, а Tenki по-прежнему отложен решением владельца.
+
+**`7c35ee3ab4`** — [`feat(extensions): add boxd sandbox integration`](https://github.com/ag2ai/ag2/commit/7c35ee3ab4)
+- **Автор:** MichielMAnalytics. **Вид:** фича (новая песочница).
+- **Что изменено:** `ag2.extensions.boxd` — `BoxdEnvironment` (SandboxFactory +
+  WorkdirAware) и `BoxdSandbox` по образцу Tenki: песочница = KVM-microVM,
+  создаётся лениво, кэшируется по разрешённым параметрам, удаляется на `aclose`
+  (плюс `atexit`-фолбэк и серверный `delete_after`); машины изолированы по
+  умолчанию (код модели не достаёт до аккаунта boxd), `env_vars` уходят с каждой
+  командой, таймаут exec → код 124; правки по итогам ревью — неудачный `open()`
+  не закрывает общую песочницу, неудачный delete оставляет машину для `aclose`.
+- **Утягивать:** **ДА** (низкий приоритет, та же contrib-волна, что E2B) — API
+  песочницы и WorkdirAware у нас уже есть в `toolpacks`.
+
+**`a8195adf81`** — [`fix(types): check ag2/extensions with strict mypy`](https://github.com/ag2ai/ag2/commit/a8195adf81)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** типы + багфикс.
+- **Что изменено:** `ag2/extensions` в allow-list mypy, типы NLIP/Exa/mi4afa;
+  попутно настоящий багфикс TealTiger: замороженный агент в режиме ENFORCE падал
+  с `AttributeError`, теперь получает отказ.
+- **Утягивать:** **ПОЗЖЕ** — tealtiger не портирован (PORT_STATUS: «owner has not
+  chosen it»), NLIP/mi4afa/Exa-обёртки тоже. Багфикс учесть при порте tealtiger.
+
+### Строгий mypy по подсистемам (служебное)
+
+**`73f859f3d3`**, **`b9f3757325`**, **`d8a8502dbf`**, **`2596cb1aac`** —
+strict-mypy по `ag2.eval`, `events/knowledge/streams/middleware/observers/files`,
+`ag2.response` + корневые модули, `ag2/agent.py` + `ag2/extensions`. Автор
+Semen Frolov (@vvlrff), вид — типы/CI.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — это Python-типизация; переносить нечего.
+  Проверенные поведенческие детали в Go не воспроизводятся: `upload(str)` →
+  `TypeError` невозможен (`files.API.Upload(ctx, data []byte, ...)` типизирован);
+  `last_usage`/`Completed.usage` как `dict` (вместо объекта) — деталь pydantic;
+  «падение `ResponseSchema` на NamedTuple/tuple/list» — тоже pydantic; `add_tool`
+  возвращает `Self` — в Go возврат значения не нужен.
+
+### Документы
+
+`5e7cbc6d9f` (протокол кастомного expectation-evaluator'а в Hub),
+`0294b0ae7a` (URL ресурса Arize), `b013c4b101` (Perplexity: совместимость answer
+и Sonar EOL), `b371fe35bb` (вложенные поля policy в примере `Rule` + пометка, что
+`channel_types`/`rate` hub не применяет), `f8c57aacd7` (`vendor_metadata` для
+input-фабрик), `3348cc4af7` (ручное подтверждение приглашения человека),
+`d7e91250e0` (проекция `views` по фактическому API), `e027ff3cfa` (примеры
+восстановления сети), `54bb6c02b5` (аутентификация Hub и идентичность),
+`9c75ef1cd3` (карточка в примере a2a-сервера строится из `url`).
+- **Утягивать:** **НЕ ПРИМЕНИМО** — документация и один пример. Полезно как
+  сверка при порте network/views и hub-аутентификации, но кода не требует.
+
+### CI, зависимости, релизы
+
+- `e1a63487a9` — bump `astral-sh/setup-uv` 10.3.2→10.3.3 (Actions).
+- `10809bf298` — live-тесты Anthropic переведены на Haiku 5.5.
+- `4356a5ee64` — Python 3.15 в матрицах тестов и type-check.
+- `b799a0f6ba`, `e785b6c67c` — opentelemetry-api 1.45.2, dnspython 2.9.2.
+- `80c4de8f9c` — bump версии до 1.3.1 (тега/релиза нет).
+- `bf76b9cb66` — bump до 1.3.2 + `uv.lock` (это и есть тег v1.3.2).
+- **Утягивать:** **НЕ ПРИМЕНИМО** — Go-репозиторий без внешних зависимостей,
+  Python-матрицы и GitHub Actions upstream не используются.
+
+### Итог синка v1.3.2
+
+- Разобрано **34** новых коммита (в диапазоне `v1.3.0...v1.3.2` — 46, из них 12
+  уже были разобраны в синке v1.3.0).
+- **Утянуть: 5** — `8464369e40` (usage: prompt_tokens включает кэш, breaking),
+  `3bee17b3c6` (forced-ответ не вычитывает inbox), `1c3e0c52f8` (`DecisionSet`:
+  несколько вопросов одним запросом), `5f471318ad` (E2B), `7c35ee3ab4` (boxd).
+- **Отложено: 3** — `3399e3ef2e` (MCP Apps не портированы), `3b5bd7d122`
+  (ACP-миграция SDK + аудит поведения), `a8195adf81` (tealtiger не портирован).
+- **Не тянем: 4** — `27d2dcafcc`, `056d3e0c23` (дефектов в Go-реализации нет),
+  `367119e83a`, `fb3061e061` (Gemini Live не портирован).
+- **Неприменимо: 22** — документация, пример, строгий mypy, CI, зависимости,
+  релизные бампы.
+
+Приоритет ближайшей волны по «ценность / риск»: (1) `8464369e40` +
+`3bee17b3c6` — обе правки маленькие, но первая меняет числа во всех отчётах и
+требует записи в DECISIONS/MIGRATION, вторая лечит перезапись финального ответа;
+(2) `1c3e0c52f8` — фича среднего размера с чётким контрактом (DecisionSet) и
+отказами до запроса; (3) E2B/boxd — отдельная contrib-волна, стартовать после
+решения владельца (как с Tenki/Docker/Daytona) и с проверкой на живом аккаунте.
+Отложенные MCP Apps и ACP-поведение логично объединить в одну волну «ревизия
+serving-поверхности».
 
 ## Синк v1.3.0 (2026-11-09)
 
@@ -533,4 +821,9 @@ v0.8.0»; коммиты релиза: `ddc845f` (волна 1), `b09565e` (во
   2 не тянем, 11 неприменимо — см. раздел «Синк v1.3.0».
 - 2026-11-09 (вечер): все 10 коммитов «утянуть» перенесены в ветку `sync/ag2-v1.3.0`
   (9 задач, T1–T9) — см. «Статус портирования». Ветка влита в main, релиз **v0.9.0**.
+- 2026-11-16: проверка нашла новый релиз **v1.3.2** (2026-11-15, тег `bf76b9cb66`,
+  он же верхушка main — коммитов после релиза нет). Разобраны 34 новых коммита
+  диапазона `v1.3.0...v1.3.2` (12 разобраны ранее); бейслайн переведён на v1.3.2.
+  Итог: 5 «утянуть», 3 отложено, 4 не тянем, 22 неприменимо — см. раздел
+  «Синк v1.3.2». Тега v1.3.1 в релизах нет (бамп версии без публикации).
 
