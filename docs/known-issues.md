@@ -124,6 +124,16 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   `TestNormalizeUsageCountsCacheInPrompt` pins the values, including the reported-zeros case
   next to a present `input_tokens`.
 
+- **`network` property tests under host load (v1.3.2 wave A check, 2026-11-20, risk 2 × 3 = 6).**
+  On a host with load average 31 (6 cores), the full `go test ./...` failed once in
+  `TestRemoteRPCProperty` ("hub request timed out: echo", seed 20261112722), and a rerun of
+  `TestRemoteRPCProperty`/`TestDeliveryProperty` failed again with another seed (20261112000) —
+  both after the wave merged, though neither commit touches `network/`. The ticket-002 verifier
+  saw the same shape (`TestDeliveryProperty`) earlier. Not proven to be a load flake, so the
+  score stays above the threshold and the item is open: reproduce on an idle host before the
+  0.11.0 release (`AGO_PROP_SEED=<seed> go test ./network -run TestRemoteRPCProperty`), and if it
+  reproduces, treat it as a real hub defect next to D-124 instead of a flake.
+
 ## Cleanup follow-ups
 
 - `a2a/jws.go:40-45`: the `AGO-DEVIATION` comment still says AGo cards "always spell out
