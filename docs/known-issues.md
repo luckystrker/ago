@@ -49,6 +49,16 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
 - **`network` wire boundaries (W4-N2, risk 2):** the surviving mutants are boundary cases with
   no exact-edge test — the channel sort comparator, `len == limit`, a value of exactly 500
   characters.
+- **Forced response, slow signal (D-127, ticket 002, risk 1×3 = 3).** The mutant that removes
+  `if resp.ResponseForce { return resp, nil }` (`agent/turn.go:112`) is caught, but
+  `TestForcedClientHandoffWithQueuedInputWaitsForClientResult` (`agent/forced_turn_test.go:122`)
+  hangs until the `go test` timeout instead of failing fast: the loop re-sends the
+  `ToolCallsEvent`. A per-test deadline would turn it into a quick failure.
+- **Forced response, AG-UI tests (D-127, ticket 002, risk 1×2 = 2).**
+  `TestForcedClientHandoffEndsRunWithQueuedInput` (`agui/forced_turn_test.go:67`) and
+  `TestForcedFinalToolEndsRunWithQueuedInput` (`agui/forced_turn_test.go:93`) assert the event
+  sequence, the reply text and the model-call count; a mutant that drops the calls handed off to
+  the client still passes them, and only the `agent` test above catches it.
 
 ## Behavior notes
 
