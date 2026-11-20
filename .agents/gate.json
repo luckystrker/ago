@@ -1,0 +1,6 @@
+{
+  "gates": [
+    { "name": "tlc", "run": "nice -n 19 node /home/piagent/.agent-toolkit/bin/tlc.mjs" }
+  ],
+  "timeoutSec": 1800
+}

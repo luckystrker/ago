@@ -14,7 +14,7 @@ verifier_model: claude-sonnet-5-5
 ---
 ## Что сделать
 Upstream `8464369e40` (ADR 0036, **breaking**): `Usage.prompt_tokens` = весь вход на любом провайдере,
-включая чтения и записи prompt-cache; `total` не меньше «вход + выход». Python поправил мапперы, снял
+включая чтения и записи prompt-cache; Anthropic/Bedrock/ACP зажимают `total` снизу суммой «вход + выход». Python поправил мапперы, снял
 пер-провайдерную поправку AG-UI и перестал исключать кэш в TokenMonitor/eval/метриках/телеметрии
 (`git -C <ag2> show 8464369e40 --stat`, затем по файлам). Делать в таком порядке — каждый шаг отдельным тестом:
 
@@ -25,8 +25,10 @@ Upstream `8464369e40` (ADR 0036, **breaking**): `Usage.prompt_tokens` = весь
 Bedrock — заглушка (`Create()` → `ErrNotImplemented`), его половину не делаем.
 
 **2. Gemini (батч).** `config/gemini/mappers.go` → `normalizeUsage` (~стр. 638): `CompletionTokens = candidates + thoughts`
-(thinking остаётся в `ThinkingTokens`), `TotalTokens` меньше «вход + выход» не принимается (точное правило —
-`git -C <ag2> show v1.3.2:ag2/config/gemini/mappers.py`; Live-вариант того же — `367119e83a`). Старое отступление D-022
+(thinking остаётся в `ThinkingTokens`). `TotalTokens` — **из API как есть, без зажима** (паритет с
+`git -C <ag2> show v1.3.2:ag2/config/gemini/mappers.py`, `normalize_usage` стр. 434–442: `totalTokenCount` уже включает thoughts и
+tool-use prompt); нет total в ответе — `nil`, сумму не выдумывать. Зажим есть только в Live-варианте `367119e83a` — не переносить на батч
+(решение тимлида 2026-11-19; разница политик записана в D-126). Старое отступление D-022
 в коде снять. Проверить, что стрим Gemini идёт через ту же функцию.
 
 **3. Потребители — убрать досчёт кэша поверх prompt** (после шага 1 он станет двойным):
@@ -43,12 +45,12 @@ Bedrock — заглушка (`Create()` → `ErrNotImplemented`), его пол
 «следующий релиз — минорный (0.11.0)». `docs/PORT_STATUS.md` — убрать «anthropic/bedrock cache correction».
 
 ## Финишная черта тикета
-- [ ] Таблицы тестов: Anthropic (нет кэша / read / creation / оба / присланные нули / стрим start+delta), Gemini (без thinking / с thinking / `toolUsePromptTokenCount` / total от API меньше суммы / nil остаётся nil). — артефакт: вывод `go test -run Usage -v ./config/anthropic/ ./config/gemini/`.
+- [ ] Таблицы тестов: Anthropic (нет кэша / read / creation / оба / присланные нули / стрим start+delta), Gemini (без thinking / с thinking / `toolUsePromptTokenCount` / total от API проходит без изменений / нет total → nil / nil остаётся nil). — артефакт: вывод `go test -run Usage -v ./config/anthropic/ ./config/gemini/`.
 - [ ] Таблица всех потребителей «изменён / уже верно — почему». — артефакт: в отчёте приёмки.
 - [ ] **Р — сквозной прогон до/после.** Программа в `$BB_THREAD_STORAGE` (не в репозитории): `httptest`-фейк Anthropic отвечает
   `{input_tokens:100, cache_read_input_tokens:900, cache_creation_input_tokens:50, output_tokens:20}`; агент с `TokenMonitor`, отчётом `usage`,
   AG-UI потоком и `otelx` (in-memory экспортёр). Печатает: `UsageEvent` prompt/total (батч и стрим), TokenMonitor, UsageReport, AG-UI `input`,
-  атрибут спана. На базовом коммите и после: **после — prompt 1050 / total 1070 везде, нигде 1950**. Второй прогон — Gemini-фейк
+  атрибут спана. На базовом коммите и после: **после — prompt 1050 / total 1070 везде, нигде 2000**. Второй прогон — Gemini-фейк
   `prompt 100, candidates 20, thoughts 30, total 150`: до `completion=20`, после `completion=50 thinking=30 total=150`. — артефакт: обе таблицы до/после.
 - [ ] **Р — документы:** каждое число и имя функции в D-126/MIGRATION сверено с кодом (таблица «утверждение → файл:строка»); сниппет миграции запускается (`go run`, вывод в отчёте).
 
