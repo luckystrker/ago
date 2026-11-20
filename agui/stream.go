@@ -476,7 +476,7 @@ func tokenUsageFromEvents(evs []events.UsageEvent) []TokenUsage {
 			groups[k] = g
 			order = append(order, k)
 		}
-		g.InputTokens = addPresent(g.InputTokens, inputTotal(ev.Provider, ev.Usage))
+		g.InputTokens = addPresent(g.InputTokens, countOf(ev.Usage.PromptTokens))
 		g.OutputTokens = addPresent(g.OutputTokens, countOf(ev.Usage.CompletionTokens))
 		g.ReasoningTokens = addPresent(g.ReasoningTokens, countOf(ev.Usage.ThinkingTokens))
 		g.CachedInputTokens = addPresent(g.CachedInputTokens, countOf(ev.Usage.CacheReadInputTokens))
@@ -495,25 +495,6 @@ func tokenUsageFromEvents(evs []events.UsageEvent) []TokenUsage {
 		out = append(out, *g)
 	}
 	return out
-}
-
-// cacheOutsidePrompt are the providers whose prompt count leaves out the tokens
-// read from and written to the cache; AG-UI's input is a total, so the cache
-// counts are added in before the entry leaves (Python parity:
-// usage.py _CACHE_OUTSIDE_PROMPT).
-var cacheOutsidePrompt = map[string]bool{"anthropic": true, "bedrock": true}
-
-func inputTotal(provider string, usage events.Usage) *int64 {
-	if usage.PromptTokens == nil || !cacheOutsidePrompt[provider] {
-		return countOf(usage.PromptTokens)
-	}
-	total := *usage.PromptTokens
-	for _, v := range []*int64{usage.CacheReadInputTokens, usage.CacheCreationInputTokens} {
-		if v != nil && *v > 0 {
-			total += *v
-		}
-	}
-	return &total
 }
 
 // countOf admits only non-negative counts; the wire type allows nothing else,

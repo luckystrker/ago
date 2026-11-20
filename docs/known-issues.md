@@ -113,6 +113,16 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   backend supports no TLS or ssh daemon endpoint.
 - **`policies` transparency (D-106).** Episodic transparency is off by default where Python
   turns it on; use `WithEpisodicTransparency(true)` for parity.
+- **`config/anthropic` cache sum with a measured-zero cache (ticket 001 / D-126, risk 3; found by
+  the ticket-001 review, 2026-11-19).** The surviving mutant replaces the presence check inside
+  `NormalizeUsage`'s cache sum with `> 0`. Its only observable difference is a payload with both
+  cache counters reported as `0` and no `input_tokens`: the mutant then reports no prompt at all
+  (`PromptTokens == nil`) where the code reports a measured `0` — the summed value is `0` either
+  way, and the Messages API does not send a usage object without `input_tokens`, so the case does
+  not occur in practice. Frequency 1 × harm 3 = 3, **below the threshold, not fixed**: the code
+  keeps presence semantics (a reported `0` is a measured cache miss) and
+  `TestNormalizeUsageCountsCacheInPrompt` pins the values, including the reported-zeros case
+  next to a present `input_tokens`.
 
 ## Cleanup follow-ups
 

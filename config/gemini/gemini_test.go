@@ -563,10 +563,10 @@ func TestGeminiUsageToolUsePromptTokenCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
-	// toolUsePromptTokenCount folds into the prompt; thoughts stay separate
-	// (brief mapping — see normalizeUsage).
+	// toolUsePromptTokenCount folds into the prompt; thoughts fold into
+	// completion and stay reported as the breakdown (see normalizeUsage).
 	want := events.Usage{
-		PromptTokens: i64(17), CompletionTokens: i64(5), TotalTokens: i64(22), ThinkingTokens: i64(2),
+		PromptTokens: i64(17), CompletionTokens: i64(7), TotalTokens: i64(22), ThinkingTokens: i64(2),
 	}
 	if !reflect.DeepEqual(resp.Usage, want) {
 		t.Fatalf("usage: %+v", resp.Usage)
@@ -775,7 +775,7 @@ func TestGeminiStreamResponse(t *testing.T) {
 	if resp.FinishReason != "stop" || resp.ResponseID != "rid-1" {
 		t.Fatalf("finish=%q responseID=%q", resp.FinishReason, resp.ResponseID)
 	}
-	want := events.Usage{PromptTokens: i64(10), CompletionTokens: i64(5), TotalTokens: i64(15), ThinkingTokens: i64(3)}
+	want := events.Usage{PromptTokens: i64(10), CompletionTokens: i64(8), TotalTokens: i64(15), ThinkingTokens: i64(3)}
 	if !reflect.DeepEqual(resp.Usage, want) {
 		t.Fatalf("usage: %+v", resp.Usage)
 	}

@@ -1112,22 +1112,41 @@ type wireCacheCreation struct {
 	Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
 }
 
-// NormalizeUsage maps the native usage keys onto events.Usage:
-// input_tokens → PromptTokens, output_tokens → CompletionTokens, the cache
+// NormalizeUsage maps the native usage keys onto events.Usage: the cache
 // counters as-is, cache_creation.ephemeral_1h_input_tokens →
 // CacheCreationExtendedInputTokens (the extended-retention subset of the cache
-// writes), and output_tokens_details.thinking_tokens → ThinkingTokens (a
-// decomposition of output_tokens, not an addition — Python mapper parity).
-// TotalTokens is the input+output sum when either was reported.
+// writes), output_tokens → CompletionTokens, and
+// output_tokens_details.thinking_tokens → ThinkingTokens (a decomposition of
+// output_tokens, not an addition — Python mapper parity).
+//
+// Anthropic's input_tokens counts only the input after the last cache
+// breakpoint; reads from and writes to the cache are reported beside it.
+// PromptTokens is the whole input the model read (D-126, ADR 0036), so both
+// cache counts are added in here and the cache fields stay as its breakdown.
+// TotalTokens is prompt+completion when either side was reported.
 func NormalizeUsage(w wireUsage) events.Usage {
 	var u events.Usage
-	u.PromptTokens = w.InputTokens
+	var prompt int64
+	havePrompt := false
+	if w.InputTokens != nil {
+		prompt += *w.InputTokens
+		havePrompt = true
+	}
+	// Presence, not truthiness, decides: a reported 0 is a measured cache miss.
+	if w.CacheReadInputTokens != nil {
+		prompt += *w.CacheReadInputTokens
+		havePrompt = true
+	}
+	if w.CacheCreationInputTokens != nil {
+		prompt += *w.CacheCreationInputTokens
+		havePrompt = true
+	}
+	if havePrompt {
+		u.PromptTokens = &prompt
+	}
 	u.CompletionTokens = w.OutputTokens
-	if w.InputTokens != nil || w.OutputTokens != nil {
-		total := int64(0)
-		if w.InputTokens != nil {
-			total += *w.InputTokens
-		}
+	if havePrompt || w.OutputTokens != nil {
+		total := prompt
 		if w.OutputTokens != nil {
 			total += *w.OutputTokens
 		}

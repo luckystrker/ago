@@ -627,14 +627,14 @@ type genResponse struct {
 	ResponseID    string    `json:"responseId"`
 }
 
-// normalizeUsage maps Gemini usageMetadata onto events.Usage.
+// normalizeUsage maps Gemini usageMetadata onto events.Usage (Python parity:
+// config/gemini/mappers.normalize_usage).
 //
-// AGO-DEVIATION: the porting brief maps candidatesTokenCount straight to
-// CompletionTokens and keeps thoughtsTokenCount as ThinkingTokens only; the
-// Python mapper additionally folds thinking into completion_tokens so that
-// prompt + completion == total. Tool-use prompt tokens are added into the
-// prompt (Python parity), and cachedContentTokenCount lands on
-// CacheReadInputTokens (Python parity).
+// Gemini reports thoughts beside the candidates, so CompletionTokens carries
+// both with ThinkingTokens kept as the reasoning breakdown (D-126, ADR 0036);
+// the API's totalTokenCount already includes them and is reported as is.
+// Tool-use prompt tokens are added into the prompt, and
+// cachedContentTokenCount lands on CacheReadInputTokens.
 func normalizeUsage(m *genUsage) events.Usage {
 	var u events.Usage
 	if m == nil {
@@ -653,6 +653,14 @@ func normalizeUsage(m *genUsage) events.Usage {
 		u.PromptTokens = &p
 	}
 	u.CompletionTokens = m.CandidatesTokenCount
+	if m.ThoughtsTokenCount != nil {
+		c := int64(0)
+		if m.CandidatesTokenCount != nil {
+			c = *m.CandidatesTokenCount
+		}
+		c += *m.ThoughtsTokenCount
+		u.CompletionTokens = &c
+	}
 	u.TotalTokens = m.TotalTokenCount
 	u.ThinkingTokens = m.ThoughtsTokenCount
 	u.CacheReadInputTokens = m.CachedContentTokenCount

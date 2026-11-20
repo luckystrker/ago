@@ -747,8 +747,9 @@ func (c *Client) stream(ctx context.Context, client *httpx.Client, url string, h
 // Messages-API stream reports it: message_start carries the input side with an
 // output_tokens placeholder, message_delta the final output side. The delta's
 // output fields replace the start's (never add to them); the input side comes
-// from the start, with a delta-reported field filling a gap. TotalTokens is
-// recomputed from the merged sides.
+// from the start, with a delta-reported field filling a gap. The raw sides are
+// merged first and normalized once, so the cache counts land in the prompt total
+// exactly as they do in the batch shape.
 func mergeStreamUsage(start, delta *wireUsage) events.Usage {
 	switch {
 	case start == nil && delta == nil:
@@ -758,38 +759,29 @@ func mergeStreamUsage(start, delta *wireUsage) events.Usage {
 	case delta == nil:
 		return NormalizeUsage(*start)
 	}
-	u := NormalizeUsage(*start)
-	d := NormalizeUsage(*delta)
-	if d.CompletionTokens != nil {
-		u.CompletionTokens = d.CompletionTokens
+	merged := *start
+	if delta.OutputTokens != nil {
+		merged.OutputTokens = delta.OutputTokens
 	}
-	if d.ThinkingTokens != nil {
-		u.ThinkingTokens = d.ThinkingTokens
+	if delta.OutputTokensDetails != nil {
+		merged.OutputTokensDetails = delta.OutputTokensDetails
 	}
-	if u.PromptTokens == nil {
-		u.PromptTokens = d.PromptTokens
+	if merged.InputTokens == nil {
+		merged.InputTokens = delta.InputTokens
 	}
-	if u.CacheReadInputTokens == nil {
-		u.CacheReadInputTokens = d.CacheReadInputTokens
+	if merged.CacheReadInputTokens == nil {
+		merged.CacheReadInputTokens = delta.CacheReadInputTokens
 	}
-	if u.CacheCreationInputTokens == nil {
-		u.CacheCreationInputTokens = d.CacheCreationInputTokens
+	if merged.CacheCreationInputTokens == nil {
+		merged.CacheCreationInputTokens = delta.CacheCreationInputTokens
 	}
-	if u.CacheCreationExtendedInputTokens == nil {
-		u.CacheCreationExtendedInputTokens = d.CacheCreationExtendedInputTokens
+	switch {
+	case merged.CacheCreation == nil:
+		merged.CacheCreation = delta.CacheCreation
+	case merged.CacheCreation.Ephemeral1hInputTokens == nil && delta.CacheCreation != nil:
+		merged.CacheCreation = &wireCacheCreation{Ephemeral1hInputTokens: delta.CacheCreation.Ephemeral1hInputTokens}
 	}
-	u.TotalTokens = nil
-	if u.PromptTokens != nil || u.CompletionTokens != nil {
-		total := int64(0)
-		if u.PromptTokens != nil {
-			total += *u.PromptTokens
-		}
-		if u.CompletionTokens != nil {
-			total += *u.CompletionTokens
-		}
-		u.TotalTokens = &total
-	}
-	return u
+	return NormalizeUsage(merged)
 }
 
 // sendEvent publishes a progress event on the conversation stream; a nil conv

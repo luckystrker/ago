@@ -238,8 +238,8 @@ func (t *Trace) Duration() time.Duration {
 
 // TotalTokens is the input-plus-output token count of every model call in the
 // trace — what a per-task token budget measures (Python parity:
-// trace.tokens.total; cache and thinking tokens are reported separately and
-// are not part of it).
+// trace.tokens.total). Cache reads and writes count once, inside the input;
+// their split and the thinking tokens are reported separately on Usage.
 func (t *Trace) TotalTokens() int {
 	if t == nil {
 		return 0

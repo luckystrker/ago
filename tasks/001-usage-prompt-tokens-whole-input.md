@@ -1,7 +1,7 @@
 ---
 id: 001
 title: Единая семантика usage — prompt_tokens = весь вход (кэш), thinking в completion, без двойного счёта у потребителей
-status: open
+status: done
 priority: 1
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 8464369e40
 decisions: D-126
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek-001
 ---
 ## Что сделать
 Upstream `8464369e40` (ADR 0036, **breaking**): `Usage.prompt_tokens` = весь вход на любом провайдере,

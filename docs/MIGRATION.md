@@ -654,3 +654,64 @@ behind the `network` changes are in `docs/acceptance/wave4-invariants.md`.
   `Hub.ServeLink` outside a trusted boundary must register agents with `ApiKeyAuth`/an
   `AuthAdapter` — the boundary no longer has to invent a "link → allowed AgentID" map
   (that is now built in), but it must not run unauthenticated agents.
+
+## 11. AG2 v1.3.2 sync
+
+### Breaking: `prompt_tokens` includes the prompt cache
+
+Upstream `8464369e40` (ADR 0036), carried as D-126. `Usage.prompt_tokens` now means the whole input the model
+read — prompt-cache reads and writes included — on every provider, and `total_tokens` never falls below
+prompt + completion. The cache counters (`cache_read_input_tokens`, `cache_creation_input_tokens`) stay on
+`Usage` as the breakdown of that number, and the uncached input is `prompt_tokens` minus both.
+
+Before this sync Anthropic's mapper reported `input_tokens` verbatim, which leaves the cache out, and AG-UI's
+per-provider correction (`agui/stream.go`) added the cache counts back only on the wire. Both are gone: the
+mapper reports the whole input and every consumer reads the same number.
+
+**What grows.** On a prompt-cached turn, everything derived from `prompt_tokens` moves up by the cache counts:
+`TokenMonitor` totals (and therefore its thresholds), `UsageReport` sums (`Report.Total`, `ByModel`,
+`ByProvider`, `ByKind`), the `ag2_llm_tokens_total{token_type="input"}` metric, `otelx`'s
+`gen_ai.usage.input_tokens`, and the AG-UI usage entry's input. Gemini completions also grow by the thinking
+tokens. A threshold or a budget tuned on AG2 older than v1.3.2 now trips earlier.
+
+Measured on an Anthropic fake answering `input_tokens: 100, cache_read_input_tokens: 900,
+cache_creation_input_tokens: 50, output_tokens: 20` (batch and stream), and a Gemini fake answering
+`promptTokenCount: 100, candidatesTokenCount: 20, thoughtsTokenCount: 30, totalTokenCount: 150`:
+
+| Surface | before | after |
+|---|---|---|
+| `ModelResponse.Usage` prompt / total (Anthropic, batch and stream) | 100 / 120 | 1050 / 1070 |
+| `TokenMonitor.Total()` | 120 | 1070 |
+| `UsageReport.Total` prompt / total | 100 / 120 | 1050 / 1070 |
+| AG-UI usage entry input | 1050 | 1050 (the removed correction would have added the 900 and 50 again, for 2000) |
+| `gen_ai.usage.input_tokens` span attribute | 100 | 1050 |
+| Gemini `completion_tokens` / `thinking_tokens` / `total_tokens` | 20 / 30 / 150 | 50 / 30 / 150 |
+
+**Getting the old number back.** Subtract both cache counts; a nil count is zero:
+
+```go
+// uncachedInput is the input the prompt itself carried, without the cache —
+// the figure prompt_tokens reported before the v1.3.2 sync.
+func uncachedInput(u events.Usage) int64 {
+	n := int64(0)
+	if u.PromptTokens != nil {
+		n = *u.PromptTokens
+	}
+	for _, v := range []*int64{u.CacheReadInputTokens, u.CacheCreationInputTokens} {
+		if v != nil {
+			n -= *v
+		}
+	}
+	return n
+}
+```
+
+For a cost figure, price the three parts separately instead of netting them: cache reads are usually charged
+far below fresh input.
+
+**Not affected.** OpenAI Chat Completions, OpenAI Responses and Ollama already reported the whole input
+(`prompt_tokens` / `input_tokens` include `cached_tokens`; Ollama has no cache counters), so their numbers do
+not move. Bedrock is not ported yet (`Create()` → `ErrNotImplemented`); its mappers will follow the same rule
+when the provider lands.
+
+**Release.** The next release is a minor bump, 0.11.0 — this is a breaking accounting change, not a patch.

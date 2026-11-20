@@ -157,19 +157,43 @@ func newPromptText(messages []events.Event, sent int) (string, int, error) {
 }
 
 // mapUsage maps the prompt response's token accounting onto AGo's Usage
-// (Python parity: mappers.map_usage).
+// (Python parity: acp/mappers.map_usage). ACP's inputTokens leaves out the
+// cache — its totalTokens sums input, output and both cache counts — so both
+// cache counts go into PromptTokens (D-126, ADR 0036) and a reported total
+// below the whole input plus output is not believed.
 func mapUsage(u *PromptUsage) events.Usage {
 	if u == nil {
 		return events.Usage{}
 	}
-	return events.Usage{
-		PromptTokens:             u.InputTokens,
+	var prompt int64
+	havePrompt := false
+	for _, v := range []*int64{u.InputTokens, u.CachedReadTokens, u.CachedWriteTokens} {
+		if v != nil {
+			prompt += *v
+			havePrompt = true
+		}
+	}
+	total := u.TotalTokens
+	if havePrompt || u.OutputTokens != nil {
+		sum := prompt
+		if u.OutputTokens != nil {
+			sum += *u.OutputTokens
+		}
+		if total == nil || *total < sum {
+			total = &sum
+		}
+	}
+	out := events.Usage{
 		CompletionTokens:         u.OutputTokens,
-		TotalTokens:              u.TotalTokens,
+		TotalTokens:              total,
 		CacheReadInputTokens:     u.CachedReadTokens,
 		CacheCreationInputTokens: u.CachedWriteTokens,
 		ThinkingTokens:           u.ThoughtTokens,
 	}
+	if havePrompt {
+		out.PromptTokens = &prompt
+	}
+	return out
 }
 
 // isTransportErr reports whether err says the connection to the agent broke

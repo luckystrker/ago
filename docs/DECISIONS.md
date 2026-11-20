@@ -466,6 +466,8 @@ stubs exist as configs only. Deviations, marked `// AGO-DEVIATION` in code:
 ## D-022 — 2026-10-29 — config/gemini & config/ollama: raw-REST providers, field visibility, usage mapping
 
 > **Reduced by D-111** — Ollama streaming and the Gemini cached-content/modalities/image/thinking/input-metadata knobs are ported; Vertex AI stays deferred.
+>
+> **Superseded by D-126** — the gemini usage mapping below (thoughts outside `completion_tokens`) no longer applies: thinking is part of the completion, and `prompt_tokens` is the whole input on every provider.
 
 Wave-1 provider brief for gemini + ollama implemented over raw HTTP (`config/gemini/`,
 `config/ollama/`), on `internal/httpx`. Deviations, marked `// AGO-DEVIATION` in code:
@@ -5306,3 +5308,51 @@ candidate in all four scenarios (plain_chat, tool_roundtrip, streaming, concurre
 2.6–7.6 % with the wider configuration structs. **Owner decision:** release v0.10.0 on this allocation evidence;
 the report is `docs/releases/2026-11-11-v0.10.0.md`. Next time, measure timing on a quiet machine before the
 release candidate is cut.
+
+## D-126 — 2026-11-19 — Usage: `prompt_tokens` is the whole input on every provider (AG2 v1.3.2 sync, breaking)
+
+Carried from upstream `8464369e40` (ADR 0036). Every provider mapper fills `Usage.prompt_tokens` with the whole
+input the model read, prompt-cache reads and writes included; the cache counters stay on their own fields as the
+breakdown of that number, so a consumer never needs to know which provider reported them.
+
+- **Anthropic** (`config/anthropic/mappers.go`, `NormalizeUsage`): `input_tokens` counts only the input after the
+  last cache breakpoint, with reads and writes reported beside it, so `PromptTokens = input + cache_read +
+  cache_creation` and `TotalTokens = PromptTokens + output`. The stream merge (`config/anthropic/client.go`,
+  `mergeStreamUsage`) merges the raw `message_start`/`message_delta` sides first and normalizes once, so a stream
+  produces exactly the batch numbers. Cache counts are distinguished by presence, not truthiness: a reported `0`
+  is a measured miss, an absent field stays `nil` (same rule the Bedrock mapper applies upstream).
+- **ACP** (`acp/provider_client.go`, `mapUsage`): ACP's `inputTokens` leaves the cache out while its `totalTokens`
+  sums input, output and both cache counts; both cache counts are added to `PromptTokens`, and a reported total
+  below whole input + output is raised to it (Python: `max(usage.total_tokens, prompt + output)`).
+- **Gemini** (`config/gemini/mappers.go`, `normalizeUsage`): `CompletionTokens = candidates + thoughts`, with
+  `ThinkingTokens` kept as the reasoning breakdown; `totalTokenCount` from the API already includes the thoughts
+  and is reported as is (batch Python parity — unlike ACP and Bedrock it is not clamped). This supersedes the
+  usage half of D-022's deviation: the porting brief's "thoughts stay out of completion" mapping is gone.
+- **Bedrock**: still a stub in AGo (`Create()` → `ErrNotImplemented`); its half of `8464369e40` (prompt = input +
+  cache read + cache write, total not below the sum) lands together with the provider port.
+- **`total_tokens`: three policies, by what the provider's wire actually offers.**
+  Anthropic reports no total, so the mapper computes it from the whole input — `TotalTokens = PromptTokens
+  (input + cache read + cache write) + completion`. ACP reports a `totalTokens` that sums input, output and both
+  cache counts but its `inputTokens` leaves the cache out, so the mapper adds the cache into `PromptTokens` and
+  raises a reported total from below to `PromptTokens + completion` (`max(usage.total_tokens, prompt + output)`);
+  Bedrock takes the same shape when it is ported. Gemini reports a `totalTokenCount` that already includes the
+  thoughts (`thoughtsTokenCount`) and the tool-use prompt tokens (`toolUsePromptTokenCount`) — both of which the
+  mapper moves into `completion_tokens` and `prompt_tokens` — so the batch mapper reports the API's total
+  verbatim and never recomputes it; only the unported Live mapper clamps it.
+- **Removed: the AG-UI per-provider correction.** `agui/stream.go` carried `cacheOutsidePrompt = {anthropic,
+  bedrock}` and added both cache counts to the entry's input total. The mappers now do that, so the correction
+  would count the cache twice (100 + 900 + 50 became 1050; the correction would have counted the 900 and 50 again, for 2000). AG-UI's input total
+  is now `Usage.PromptTokens` verbatim.
+- **Consumers that already count the whole input** and were only re-checked, not changed: `TokenMonitor`
+  (`observers/token_monitor.go`, billable = `TotalTokens`, else prompt+completion), `UsageReport`
+  (`usage/usage.go`, field-wise `Usage.Add`, cache fields stay a breakdown), `TokenBudget` and `Trace.TotalTokens`
+  (`eval/scorers.go`, `eval/trace.go`, prompt+completion), metrics (`middleware/metrics.go`, one counter per token
+  type) and `otelx` (`contrib/otelx/otelx.go`, `gen_ai.usage.input_tokens` from `PromptTokens`). Their doc
+  comments said the cache was excluded per provider and now say it is counted once, inside the input.
+- **Provider mappers confirmed already inclusive:** OpenAI Chat Completions / `openaicompat` (`prompt_tokens`
+  includes `prompt_tokens_details.cached_tokens`), OpenAI Responses (`input_tokens` includes
+  `input_tokens_details.cached_tokens`) and Ollama (`prompt_eval_count` is the whole input; no cache counters).
+
+Breaking: on a cached turn `prompt_tokens`, and therefore `TokenMonitor` totals, `UsageReport` sums, metric
+counters and span input attributes, all grow by the cache counts. `docs/MIGRATION.md` §11 carries the before/after
+numbers and the recipe for the old uncached figure. The next release is a minor bump (0.11.0).

@@ -348,8 +348,8 @@ func TestProviderEndToEnd(t *testing.T) {
 	if plan == nil || len(plan.Entries) != 1 || plan.Entries[0].Content != "read the file" {
 		t.Errorf("plan event = %+v", plan)
 	}
-	if usage == nil || *usage.Usage.PromptTokens != 11 || *usage.Usage.CompletionTokens != 7 ||
-		*usage.Usage.TotalTokens != 18 || *usage.Usage.ThinkingTokens != 2 || *usage.Usage.CacheReadInputTokens != 5 ||
+	if usage == nil || *usage.Usage.PromptTokens != 16 || *usage.Usage.CompletionTokens != 7 ||
+		*usage.Usage.TotalTokens != 23 || *usage.Usage.ThinkingTokens != 2 || *usage.Usage.CacheReadInputTokens != 5 ||
 		usage.Provider != "acp" || usage.Kind != events.UsageKindModelCall {
 		t.Errorf("usage event = %+v", usage)
 	}

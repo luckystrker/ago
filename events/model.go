@@ -8,12 +8,24 @@ import (
 )
 
 // Usage is the normalized token record (Python parity: field-wise add, nil = not reported).
+//
+// Every provider mapper fills the fields with the same meaning (D-126, ADR 0036),
+// so a consumer never needs to know which provider reported them.
+//
 // AGO-DEVIATION: Python uses float|None; token counts are integers, so AGo uses *int64 (D-006).
 type Usage struct {
-	PromptTokens             *int64 `json:"prompt_tokens,omitempty"`
-	CompletionTokens         *int64 `json:"completion_tokens,omitempty"`
-	TotalTokens              *int64 `json:"total_tokens,omitempty"`
-	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
+	// PromptTokens is the whole input the model read, including tokens read
+	// from or written to the prompt cache. The uncached input is PromptTokens
+	// minus both cache counts.
+	PromptTokens *int64 `json:"prompt_tokens,omitempty"`
+	// CompletionTokens is the whole output, including ThinkingTokens.
+	CompletionTokens *int64 `json:"completion_tokens,omitempty"`
+	TotalTokens      *int64 `json:"total_tokens,omitempty"`
+	// CacheReadInputTokens is the part of PromptTokens read from the
+	// provider's prompt cache.
+	CacheReadInputTokens *int64 `json:"cache_read_input_tokens,omitempty"`
+	// CacheCreationInputTokens is the part of PromptTokens written to the
+	// provider's prompt cache.
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
 	// CacheCreationExtendedInputTokens is the part of CacheCreationInputTokens
 	// written with the provider's extended cache retention: OpenAI's 12-hour

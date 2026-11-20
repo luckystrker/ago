@@ -289,16 +289,16 @@ func TestStreamUsageMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("cache counts outside the prompt are added in", func(t *testing.T) {
+	t.Run("cache counts arrive inside the prompt", func(t *testing.T) {
 		s, _ := collect()
 		s.Handle(&events.UsageEvent{Usage: events.Usage{
-			PromptTokens:             i64(10),
+			PromptTokens:             i64(16),
 			CacheReadInputTokens:     i64(4),
 			CacheCreationInputTokens: i64(2),
 		}, Provider: "anthropic", Model: "claude"})
 		got := s.TakeUsage()
 		if *got[0].InputTokens != 16 {
-			t.Fatalf("input = %d, want 10 + 4 + 2", *got[0].InputTokens)
+			t.Fatalf("input = %d, want the prompt as reported (the mapper already includes the cache)", *got[0].InputTokens)
 		}
 		if *got[0].CachedInputTokens != 4 || *got[0].CacheWriteInputTokens != 2 {
 			t.Fatalf("cache breakdown = %+v", got[0])

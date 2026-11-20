@@ -46,7 +46,9 @@ func (c Correctness) Score(_ context.Context, t *Trace) (Score, error) {
 
 // TokenBudget passes iff the trace's total input+output tokens (Trace.Tokens)
 // stay at or under Max, per trace (Python parity: scorers/cost.py token_budget —
-// the Python cost scorer is this token budget; cache tokens are excluded).
+// the Python cost scorer is this token budget). Cache reads and writes count
+// once, as part of the input; their split is reported on Usage because most
+// providers price them differently.
 type TokenBudget struct {
 	Max int64
 }

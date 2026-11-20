@@ -576,10 +576,10 @@ func TestCallStreamUsageFinalShape(t *testing.T) {
 		t.Fatalf("Call: %v", err)
 	}
 	u := resp.Usage
-	if u.PromptTokens == nil || *u.PromptTokens != 100 ||
+	if u.PromptTokens == nil || *u.PromptTokens != 1100 ||
 		u.CompletionTokens == nil || *u.CompletionTokens != 300 ||
-		u.TotalTokens == nil || *u.TotalTokens != 400 {
-		t.Fatalf("usage = %+v, want 100/300/400", u)
+		u.TotalTokens == nil || *u.TotalTokens != 1400 {
+		t.Fatalf("usage = %+v, want 1100/300/1400 (prompt is the whole input: 100 + 1000 cache writes)", u)
 	}
 	if u.ThinkingTokens == nil || *u.ThinkingTokens != 50 {
 		t.Fatalf("thinking tokens = %v, want 50 (the delta replaces the start's placeholder)", u.ThinkingTokens)
@@ -701,8 +701,8 @@ func TestNormalizeUsage(t *testing.T) {
 		CacheReadInputTokens:     i64ptr(80),
 		CacheCreationInputTokens: i64ptr(5),
 	})
-	if *u.PromptTokens != 100 || *u.CompletionTokens != 20 || *u.TotalTokens != 120 {
-		t.Fatalf("basic counts = %+v", u)
+	if *u.PromptTokens != 185 || *u.CompletionTokens != 20 || *u.TotalTokens != 205 {
+		t.Fatalf("basic counts = %+v (prompt is the whole input: 100 + 80 + 5)", u)
 	}
 	if *u.CacheReadInputTokens != 80 || *u.CacheCreationInputTokens != 5 {
 		t.Fatalf("cache counts = %+v", u)
@@ -719,6 +719,101 @@ func TestNormalizeUsage(t *testing.T) {
 	}{ThinkingTokens: i64ptr(3)}})
 	if withThinking.ThinkingTokens == nil || *withThinking.ThinkingTokens != 3 {
 		t.Fatalf("thinking_tokens = %v", withThinking.ThinkingTokens)
+	}
+}
+
+// TestNormalizeUsageCountsCacheInPrompt pins the shared usage semantics (D-126,
+// ADR 0036): prompt_tokens is the whole input, cache reads and writes included,
+// while the cache counters stay as its breakdown. Presence, not truthiness,
+// decides whether a cache count was reported.
+func TestNormalizeUsageCountsCacheInPrompt(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         wireUsage
+		wantPrompt int64
+		wantTotal  int64
+		wantRead   *int64
+		wantWrite  *int64
+	}{
+		{
+			name:       "no cache",
+			in:         wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(20)},
+			wantPrompt: 100, wantTotal: 120,
+		},
+		{
+			name:       "cache read",
+			in:         wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(20), CacheReadInputTokens: i64ptr(900)},
+			wantPrompt: 1000, wantTotal: 1020, wantRead: i64ptr(900),
+		},
+		{
+			name:       "cache creation",
+			in:         wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(20), CacheCreationInputTokens: i64ptr(50)},
+			wantPrompt: 150, wantTotal: 170, wantWrite: i64ptr(50),
+		},
+		{
+			name: "read and creation",
+			in: wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(20),
+				CacheReadInputTokens: i64ptr(900), CacheCreationInputTokens: i64ptr(50)},
+			wantPrompt: 1050, wantTotal: 1070, wantRead: i64ptr(900), wantWrite: i64ptr(50),
+		},
+		{
+			// A reported zero is a measured cache miss, not an absent field.
+			name: "reported zeros",
+			in: wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(20),
+				CacheReadInputTokens: i64ptr(0), CacheCreationInputTokens: i64ptr(0)},
+			wantPrompt: 100, wantTotal: 120, wantRead: i64ptr(0), wantWrite: i64ptr(0),
+		},
+		{
+			// The cache side alone still describes input the model read.
+			name: "cache without input_tokens",
+			in: wireUsage{OutputTokens: i64ptr(20),
+				CacheReadInputTokens: i64ptr(900), CacheCreationInputTokens: i64ptr(50)},
+			wantPrompt: 950, wantTotal: 970, wantRead: i64ptr(900), wantWrite: i64ptr(50),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := NormalizeUsage(tc.in)
+			if u.PromptTokens == nil || *u.PromptTokens != tc.wantPrompt {
+				t.Fatalf("prompt = %v, want %d (whole input)", u.PromptTokens, tc.wantPrompt)
+			}
+			if u.TotalTokens == nil || *u.TotalTokens != tc.wantTotal {
+				t.Fatalf("total = %v, want %d", u.TotalTokens, tc.wantTotal)
+			}
+			if !reflect.DeepEqual(u.CacheReadInputTokens, tc.wantRead) {
+				t.Fatalf("cache read = %v, want %v", u.CacheReadInputTokens, tc.wantRead)
+			}
+			if !reflect.DeepEqual(u.CacheCreationInputTokens, tc.wantWrite) {
+				t.Fatalf("cache write = %v, want %v", u.CacheCreationInputTokens, tc.wantWrite)
+			}
+		})
+	}
+}
+
+// TestMergeStreamUsageCountsCacheInPrompt pins that message_start + message_delta
+// merge to exactly what the batch shape reports for the same call.
+func TestMergeStreamUsageCountsCacheInPrompt(t *testing.T) {
+	want := NormalizeUsage(wireUsage{
+		InputTokens: i64ptr(100), OutputTokens: i64ptr(20),
+		CacheReadInputTokens: i64ptr(900), CacheCreationInputTokens: i64ptr(50),
+	})
+	got := mergeStreamUsage(
+		&wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(1),
+			CacheReadInputTokens: i64ptr(900), CacheCreationInputTokens: i64ptr(50)},
+		&wireUsage{OutputTokens: i64ptr(20)},
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream usage = %+v, want the batch usage %+v", got, want)
+	}
+	// A lost cache count on the start side is filled from the delta and still
+	// lands inside the prompt total.
+	filled := mergeStreamUsage(
+		&wireUsage{InputTokens: i64ptr(100), OutputTokens: i64ptr(1)},
+		&wireUsage{OutputTokens: i64ptr(20), CacheReadInputTokens: i64ptr(900)},
+	)
+	if filled.PromptTokens == nil || *filled.PromptTokens != 1000 ||
+		filled.TotalTokens == nil || *filled.TotalTokens != 1020 {
+		t.Fatalf("gap-filled usage = %+v, want prompt 1000 total 1020", filled)
 	}
 }
 
