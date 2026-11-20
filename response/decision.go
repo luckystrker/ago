@@ -142,6 +142,15 @@ func FromResponse(p Proto) (*DecisionSpec, error) {
 		question, _ = node["description"].(string)
 	}
 
+	if spec := classifyDecision(node, question, embedded); spec != nil {
+		return spec, nil
+	}
+	return nil, fmt.Errorf("%w: schema %q is not a predicate, choice or score", ErrNotADecision, p.Name())
+}
+
+// classifyDecision reads one schema node as a predicate, choice or score; nil when the
+// node is none of them.
+func classifyDecision(node map[string]any, question string, embedded bool) *DecisionSpec {
 	values := enumAny(node["enum"])
 	typ, _ := node["type"].(string)
 	isBool := typ == "boolean" && (values == nil || isBoolPair(values))
@@ -154,7 +163,7 @@ func FromResponse(p Proto) (*DecisionSpec, error) {
 			Question: question,
 			Boolean:  isBool,
 			Embedded: embedded,
-		}, nil
+		}
 	}
 	if len(values) > 0 && allStrings(values) {
 		return &DecisionSpec{
@@ -162,7 +171,7 @@ func FromResponse(p Proto) (*DecisionSpec, error) {
 			Question: question,
 			Embedded: embedded,
 			Options:  optionsFromValues(values),
-		}, nil
+		}
 	}
 	if ints, ok := allInts(values); ok && len(ints) > 0 {
 		sort.Slice(ints, func(i, j int) bool { return ints[i] < ints[j] })
@@ -171,9 +180,9 @@ func FromResponse(p Proto) (*DecisionSpec, error) {
 			Question: question,
 			Embedded: embedded,
 			Options:  optionsFromInts(ints),
-		}, nil
+		}
 	}
-	return nil, fmt.Errorf("%w: schema %q is not a predicate, choice or score", ErrNotADecision, p.Name())
+	return nil
 }
 
 // decisionNode locates the schema node the decision is about and whether it sat in the

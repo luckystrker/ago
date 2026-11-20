@@ -1,5 +1,6 @@
-// The OpenAI Decisions API: one typed question per call, taken from the
-// agent's response schema. Parity with
+// The OpenAI Decisions API: typed questions taken from the agent's response
+// schema, all in one request — a scalar schema is one question named "answer", a
+// flat struct is one question per field. Parity with
 // ag2/ag2/config/openai/{openai_decisions_client,decisions_mappers}.py and the
 // OpenAIDecisionsConfig dataclass in config.py.
 //
@@ -41,16 +42,21 @@ const decisionsPath = "/decisions"
 // parity: PROVIDER = "openai-decisions").
 const decisionsProvider = config.Provider("openai-decisions")
 
-// decisionAnswerKey is the name of the single question sent per request.
-const decisionAnswerKey = "answer"
+// decisionAnswerKey is the name of the question a scalar schema is sent under.
+const decisionAnswerKey = response.AnswerKey
+
+// maxDecisionQuestions is the API's limit on questions per request.
+const maxDecisionQuestions = 400
 
 // DefaultDecisionsModel is the model the decisions config defaults to
 // (Python parity: the dataclass default).
 const DefaultDecisionsModel = "gpt-6-luna"
 
-// DecisionRefusedError reports the Decisions API declining to answer the
+// DecisionRefusedError reports the Decisions API declining to answer a
 // question (Python parity: DecisionRefusedError). The Name field carries the
-// refused question's name.
+// refused question's name: "answer" for a scalar schema, the JSON key of the
+// struct field otherwise. A refusal of any one field fails the whole reply — a
+// partial object would look like a complete one.
 type DecisionRefusedError struct {
 	Name string
 }
@@ -62,7 +68,8 @@ func (e *DecisionRefusedError) Error() string {
 // unsupportedDecisionSchemaMsg is the guidance carried by every
 // not-a-decision error (Python parity: UnsupportedResponseSchemaError).
 const unsupportedDecisionSchemaMsg = "the OpenAI Decisions API is decision-only: use bool, " +
-	"a string enum, an int enum numbered from 0, or a 0..1 number schema as the response schema"
+	"a string enum, an int enum numbered from 0, a 0..1 number schema, or a flat struct whose " +
+	"required fields are each one of those as the response schema"
 
 // OpenAIDecisionsConfig configures the Decisions API. Construct it with
 // NewOpenAIDecisions (which applies the defaults) and assign the exported
@@ -310,29 +317,47 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 		}
 	}
 
-	spec, err := response.FromResponse(opts.ResponseSchema)
+	set, err := response.NewDecisionSet(opts.ResponseSchema)
 	if err != nil {
 		return nil, fmt.Errorf("config/openai: %w: %s", err, unsupportedDecisionSchemaMsg)
+	}
+	if !set.IsScalar() {
+		// Option descriptions are keyed by option value, which two fields may share.
+		if len(p.Descriptions) > 0 {
+			return nil, fmt.Errorf("config/openai: Descriptions are keyed by option value, so they only apply " +
+				"to a single-question response schema; a struct schema asks one question per field")
+		}
+		if set.Len() > maxDecisionQuestions {
+			return nil, fmt.Errorf("config/openai: %w: the response schema has %d fields; one request takes at most %d questions",
+				response.ErrInvalidDecisionSet, set.Len(), maxDecisionQuestions)
+		}
 	}
 
 	var prompt []string
 	if conv != nil { // a nil conv is a headless call
 		prompt = conv.PromptLines()
 	}
-	instructions, err := questionInstructions(p, prompt, spec.Question)
-	if err != nil {
-		return nil, err
-	}
-	if instructions == nil {
-		// Every question type requires instructions; fail before the request
-		// with a way out (Python parity).
-		return nil, fmt.Errorf("config/openai: a decision needs a question: set the agent prompt, " +
-			"set QuestionInstructions or QuestionInstructionParts, or give the response schema a description")
-	}
-
-	question, err := decisionQuestion(spec, instructions, p.Descriptions)
-	if err != nil {
-		return nil, err
+	named := set.Questions()
+	questions := make([]any, 0, len(named))
+	for _, nd := range named {
+		instructions, err := questionInstructions(p, prompt, nd.Spec.Question)
+		if err != nil {
+			return nil, err
+		}
+		if instructions == nil {
+			// Every question type requires instructions; fail before the request
+			// with a way out (Python parity).
+			return nil, fmt.Errorf("config/openai: a decision needs a question: set the agent prompt, " +
+				"set QuestionInstructions or QuestionInstructionParts, or give the response schema a description")
+		}
+		question, err := decisionQuestion(&nd.Spec, nd.Name, instructions, p.Descriptions)
+		if err != nil {
+			if !set.IsScalar() {
+				err = fmt.Errorf("config/openai: question %q: %w", nd.Name, err)
+			}
+			return nil, err
+		}
+		questions = append(questions, question)
 	}
 
 	input, err := decisionsInput(messages)
@@ -343,7 +368,7 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 	body := map[string]any{
 		"model":     p.model,
 		"input":     input,
-		"questions": []any{question},
+		"questions": questions,
 	}
 	if p.SafetyIdentifier != nil {
 		body["safety_identifier"] = *p.SafetyIdentifier
@@ -381,21 +406,12 @@ func (c *DecisionsClient) Call(ctx context.Context, messages []events.Event, con
 		return nil, fmt.Errorf("%w: %s", config.ErrStreamError, raw.Error.Message)
 	}
 
-	answer, err := findAnswer(raw.Answers)
+	content, metadata, err := decisionReply(set, raw.Answers, p.BooleanThreshold)
 	if err != nil {
 		return nil, err
 	}
 
-	value, err := decisionAnswerValue(spec, answer, p.BooleanThreshold)
-	if err != nil {
-		return nil, err
-	}
-	content, err := spec.Render(value)
-	if err != nil {
-		return nil, fmt.Errorf("config/openai: rendering decision answer: %w", err)
-	}
-
-	msg := &events.ModelMessage{Content: content, Metadata: answerMetadata(answer)}
+	msg := &events.ModelMessage{Content: content, Metadata: metadata}
 	if err := sendEvent(conv, msg); err != nil {
 		return nil, err
 	}
@@ -468,6 +484,61 @@ func findAnswer(answers []answerValue) (*answerValue, error) {
 		return nil, &DecisionRefusedError{Name: answer.Name}
 	}
 	return answer, nil
+}
+
+// decisionReply renders the answers to every question as the JSON the schema
+// validates, with the ModelMessage metadata: the answer's own fields for a
+// scalar schema, {field: answer} for a struct (Python parity: answers_to_reply).
+// A refusal of any question fails the whole reply, whatever else is missing.
+func decisionReply(set *response.DecisionSet, answers []answerValue, threshold float64) (string, map[string]any, error) {
+	if set.IsScalar() {
+		answer, err := findAnswer(answers)
+		if err != nil {
+			return "", nil, err
+		}
+		spec, _ := set.Spec(decisionAnswerKey)
+		value, err := decisionAnswerValue(&spec, answer, threshold)
+		if err != nil {
+			return "", nil, err
+		}
+		content, err := set.Render(map[string]any{decisionAnswerKey: value})
+		if err != nil {
+			return "", nil, fmt.Errorf("config/openai: rendering decision answer: %w", err)
+		}
+		return content, answerMetadata(answer), nil
+	}
+
+	byName := make(map[string]*answerValue, len(answers))
+	for i := range answers {
+		a := &answers[i]
+		if _, asked := set.Spec(a.Name); !asked {
+			continue
+		}
+		if a.Type == "refusal" {
+			return "", nil, &DecisionRefusedError{Name: a.Name}
+		}
+		byName[a.Name] = a
+	}
+
+	values := make(map[string]any, set.Len())
+	metadata := make(map[string]any, set.Len())
+	for _, nd := range set.Questions() {
+		answer, ok := byName[nd.Name]
+		if !ok {
+			return "", nil, fmt.Errorf("config/openai: OpenAI Decisions returned no answer for question %q", nd.Name)
+		}
+		value, err := decisionAnswerValue(&nd.Spec, answer, threshold)
+		if err != nil {
+			return "", nil, fmt.Errorf("config/openai: question %q: %w", nd.Name, err)
+		}
+		values[nd.Name] = value
+		metadata[nd.Name] = answerMetadata(answer)
+	}
+	content, err := set.Render(values)
+	if err != nil {
+		return "", nil, fmt.Errorf("config/openai: rendering decision answers: %w", err)
+	}
+	return content, metadata, nil
 }
 
 // decisionAnswerValue maps an answer onto the schema's value: the thresholded
@@ -591,11 +662,11 @@ func decisionInstructionPart(item any) (any, error) {
 	}
 }
 
-// decisionQuestion converts the spec into the single wire question: predicate,
-// choice or score (Python parity: response_proto_to_question).
-func decisionQuestion(spec *response.DecisionSpec, instructions any, descriptions map[string]string) (map[string]any, error) {
+// decisionQuestion converts the spec into one wire question named name:
+// predicate, choice or score (Python parity: _spec_to_question).
+func decisionQuestion(spec *response.DecisionSpec, name string, instructions any, descriptions map[string]string) (map[string]any, error) {
 	question := map[string]any{
-		"name":         decisionAnswerKey,
+		"name":         name,
 		"instructions": instructions,
 	}
 	switch spec.Kind {

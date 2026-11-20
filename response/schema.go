@@ -115,6 +115,9 @@ func newSchemaFromMap[T any](name, description string, schema map[string]any) *S
 	}
 }
 
+// goType is the Go type the schema was built for; NewDecisionSet reads struct fields from it.
+func (s *Schema[T]) goType() reflect.Type { return reflect.TypeOf((*T)(nil)).Elem() }
+
 func (s *Schema[T]) Name() string        { return s.name }
 func (s *Schema[T]) Description() string { return s.description }
 

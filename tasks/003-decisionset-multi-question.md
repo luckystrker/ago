@@ -1,7 +1,7 @@
 ---
 id: 003
 title: DecisionSet — несколько вопросов одним запросом (ядро response + OpenAI Decisions)
-status: open
+status: done
 priority: 2
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 1c3e0c52f8
 decisions: D-128
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet-003
 ---
 ## Что сделать
 Upstream `1c3e0c52f8` (ADR 0038, дополняет 0018/0023): плоский класс в `response_schema` = «по вопросу на поле»,

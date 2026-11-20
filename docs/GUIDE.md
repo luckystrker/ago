@@ -575,6 +575,36 @@ var verdict bool
 _ = json.Unmarshal([]byte(rep.Body()), &verdict)
 ```
 
+**Several questions at once.** A flat struct as the response schema is one question per field,
+all sent in **one** request, so the shared input is paid for once. The field's `json` name is
+the question's name, its `question:"..."` tag is the question text (fallback: the
+`description=` directive of `agschema`); a `bool` is a yes/no, a string with
+`agschema:"enum=a|b"` a choice, an integer with `agschema:"enum=0|1|2"` a score (levels
+numbered from 0), a float with `agschema:"min=0,max=1"` a raw probability. The reply is the JSON
+of the struct in field order, and the message `Metadata` is `{field: answer}`:
+
+```go
+type Triage struct {
+	IsSpam     bool   `json:"is_spam" question:"Is this message spam?"`
+	Department string `json:"department" question:"Which team should handle this ticket?" agschema:"enum=billing|technical"`
+	Urgency    int    `json:"urgency" question:"How urgent is this ticket?" agschema:"enum=0|1|2"`
+}
+
+triage := agent.New("triage", "You triage support tickets.",
+	agent.WithConfig(openai.NewOpenAIDecisions()),
+	agent.WithResponseSchema(response.NewSchema[Triage]("triage", ""))) // no schema description
+rep, err := triage.Ask(ctx, events.TextInput{Content: "I was charged twice for my order."})
+var t Triage
+_ = json.Unmarshal([]byte(rep.Body()), &t) // {"is_spam":false,"department":"billing","urgency":2}
+```
+
+A refusal of any field fails the whole reply: `errors.As(err, &refused)` with `*openai.DecisionRefusedError`
+gives the field's name in `refused.Name`. Before the request, a struct is refused with
+`response.ErrInvalidDecisionSet` (the message names the field) when it has a nested struct, a pointer,
+a slice/array/map, no fields, two fields under one JSON key, a field without a question, a
+description on the schema itself, or more than 400 fields; `Descriptions` apply to a single-question
+schema only. See D-128.
+
 ## Files API
 
 `github.com/luckystrker/ago/files` is the provider-agnostic Files API (Python parity: `FilesAPI`).

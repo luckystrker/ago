@@ -5384,3 +5384,62 @@ Other places the invariant was checked, no code change needed:
 
 Doc comments of `AgentRun.Enqueue`, `Context.SpawnBackground` and `MemoryStream.SpawnBackground` now state the
 exception, as the Python docstrings do. Not a deviation from Python.
+
+## D-128 — 2026-11-20 — response/OpenAI Decisions: a flat struct is several questions in one request (AG2 v1.3.2 sync)
+
+**Rule (ADR 0038, amends ADR 0018/0023).** The shape of the response schema decides; there is no new config or flag.
+A scalar schema (bool, string enum, int enum numbered from 0, a 0..1 number) is still one question named `answer`. A
+**flat struct** is one question per field, in field order, all sent in **one** HTTP request, so the shared input is
+paid for once. A refusal of **any** field fails the whole reply (`*DecisionRefusedError{Name: <field>}`): a partial
+object would look like a complete one. Option descriptions (`OpenAIDecisionsConfig.Descriptions`) stay scalar-only —
+they are keyed by option value, which two fields may share; a struct schema with `Descriptions` set fails before the
+request. Dependent questions still need separate calls.
+
+**API** (`response/decisionset.go`). `NewDecisionSet(Proto)` returns an immutable, concurrency-safe `*DecisionSet`
+(`IsScalar`, `Len`, `Names`, `Questions`, `Spec`, `Render`). A scalar schema yields exactly what `FromResponse` reads
+(same sentinel `ErrNotADecision`); `FromResponse` itself is unchanged. `Render(values)` marshals the answers in field
+order (`{"is_spam":false,"department":"billing","urgency":1}`); the provider's `metadata` is `{field: answer}` in the
+API's own shape minus `type`/`name`. `ErrMissingAnswer` reports a question without a value.
+
+**Where the question text comes from.** The struct tag `question:"..."` (new; may contain commas), fallback the
+`description=` directive of the `agschema` tag — the text `SchemaOf` already puts on the field's node. A blank text is
+a rejection: OpenAI requires instructions on every question and the agent prompt is shared by all fields. The key is
+the field's `json` name (the Go field name when untagged). Field types: `bool` → predicate, `string` with
+`agschema:"enum=a|b"` → choice, an integer with `agschema:"enum=0|1|2"` → score (the existing "numbered from 0, at
+least two levels" rule of the provider, now reported with the field name), a float with `agschema:"min=0,max=1"` →
+raw probability.
+
+**Rejections before the request** (`ErrInvalidDecisionSet`, which wraps `ErrNotADecision`; the message names the
+field): nested struct (including `time.Time`), pointer (the analogue of Python's `Optional`; an embedded pointer too),
+slice, array, map, interface and other non-scalar kinds, a field that is not a decision (a plain string, a plain
+integer, a float without 0..1 bounds), a field without a question, a struct without fields (or with only skipped
+ones), two fields under one JSON key (a repeated `json` name, or a name promoted by an embedded struct — `encoding/json`
+would let one silently shadow the other), and a description on the schema itself (the question about the struct as a
+whole has nowhere to go; Python rejects `ResponseSchema(Cls, description=...)` the same way). Embedded untagged structs
+are flattened the way `encoding/json` promotes them, so Go embedding stands in for Python dataclass/Pydantic
+inheritance; an embedded struct that carries a `json` name is a nested struct and is rejected. `json:"-"` and
+unexported fields are skipped.
+
+**More than 400 fields** fail before the request (`ErrInvalidDecisionSet`): the API takes at most 400 questions
+(`maxDecisionQuestions`); exactly 400 is sent.
+
+**Deviations from Python** (`// AGO-DEVIATION` where code differs):
+
+| Python rejection / feature | Go | Decision |
+|---|---|---|
+| `Question(...)`, `Field(description=)`, `Enum` docstring as question source | `question` tag, fallback `agschema` `description=` | no introspection of docstrings in Go |
+| `Question(options={...})`, member docstrings → option descriptions | none for struct fields; `Descriptions` stays scalar-only | accepted; option text for a field would need a new tag syntax — add on demand |
+| default value / `NotRequired` field is rejected | no analogue: Go has no declared defaults. `omitempty` is ignored (every key is always rendered); a pointer is the only "optional" and is rejected | accepted |
+| question on the class (`Annotated[Cls, Question]`, `description=`) | `Schema.Description() != ""` on a struct is rejected; no class-level `Question` exists in Go | same outcome |
+| class docstring is not a question | n/a (Go does not read doc comments) | — |
+| nested `AliasPath` (`validation_alias`), alias chains, `validate_by_name` | no analogue: the `json` tag is the only key and has no paths | the collision rule stays, on the `json` key |
+| `extra="allow"` class (additional properties) | struct schemas are closed; a `map` field is rejected | — |
+| object `ResponseSchema.from_schema` without a class | an object schema not built by `NewSchema[T]` with a struct `T` has no field order and no tags: `NewDecisionSet` returns `ErrNotADecision` instead of guessing (Go maps have no order) | accepted |
+| errors are `UnsupportedResponseSchemaError` / `ValueError` | `ErrInvalidDecisionSet` for all of them (wraps `ErrNotADecision`) | one sentinel, field named in the message |
+
+**TypeSafe.** `config/typesafe` is a stub (`ErrNotImplemented`) and is not touched; Python ported the same rule to
+`TypeSafeConfig` (criteria/legend per question, scalar-only `criteria`). When the client is ported it reads
+`response.NewDecisionSet` and follows this rule — a struct is one request with one question per field.
+
+Not a break: a scalar request is byte-for-byte what it was (checked against the previous tree, see
+`docs/acceptance/v1.3.2-003.md`); struct schemas were refused before. Upstream: ag2 `1c3e0c52f8` (#3656, closes #3648).

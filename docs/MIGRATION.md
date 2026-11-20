@@ -721,3 +721,11 @@ when the provider lands.
 | Python | Go | Differences |
 |---|---|---|
 | `_execute_turn` returns a `response_force` response before draining the inbox (ag2 `3bee17b3c6`) | `agent.turnBody` checks `ResponseForce` first in the tool loop and returns before the leftover-input flush | None. After a `final=true` tool result or a client-tool hand-off the turn makes no further model call; input enqueued meanwhile (`AgentRun.Enqueue`, `Context.Enqueue`, `SpawnBackground` results) waits for the next turn on the same stream, and reaches the model right after the client's tool results on a resume |
+
+### Decisions: a struct is several questions in one request (D-128)
+
+New, does not break anything: a scalar response schema is sent exactly as before (byte-for-byte), and a struct schema used to be refused by the Decisions client.
+
+| Python | Go | Differences |
+|---|---|---|
+| a flat class as `response_schema` is one question per field, one request (ag2 `1c3e0c52f8`, ADR 0038); `DecisionSet` | `response.NewDecisionSet(schema)` → `*DecisionSet`; `openai.DecisionsClient` sends a flat struct from `response.NewSchema[T]` as one request | The question is the `question:"..."` tag (fallback `agschema:"description=..."`) instead of `Question(...)`/`Field(description=)`/`Enum` docstring; the key is the `json` name; field types: `bool`, string `agschema:"enum=a\|b"`, integer `agschema:"enum=0\|1\|2"`, float `agschema:"min=0,max=1"`. Refused before the request (`response.ErrInvalidDecisionSet`, wraps `ErrNotADecision`): nested struct, pointer, slice/array/map, empty struct, shared `json` key, field without a question, a description on the schema, more than 400 fields. A refusal of any field is `*openai.DecisionRefusedError{Name: <field>}`; `metadata` is `{field: answer}`; `Descriptions` stay scalar-only. Python-only features (defaults, `AliasPath`, option docstrings) have no Go analogue — table in D-128 |
