@@ -21,15 +21,6 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   reruns (found by a reviewer; the listener/audit code is from the D-104 wave). Cause unknown.
 - **`network/TestWorkflowRoundRobinMaxTurns`** is flaky under load (found by a reviewer).
   Cause unknown.
-- **`agui/TestServerRetentionExpiresUnansweredQuestion` (risk 1×3 = 3, a test defect, not a
-  product one).** The test (`agui/server_test.go:383`) sets `Retention{TTL: 40 * time.Millisecond}`
-  and then checks after a fixed `time.Sleep(120 * time.Millisecond)`. Under load the expiry is
-  not reached in that window, so the gate gets noise that can hide real failures (seen in the
-  ticket-005 full run, green in isolation and in three package reruns). Cheap fix for a follow-up
-  ticket, without lengthening the window: drive the time instead. The server already has
-  `WithClock` (`agui/server.go:77`), and the held-turn timer reads the configured clock's
-  remaining share (`agui/interrupts.go:692`). Alternatively, poll `holds` until a deadline
-  instead of a single fixed sleep.
 
 ## Flakes already fixed (kept for the record)
 
@@ -37,6 +28,12 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   under full-run load): fixed in W1-E3, commit `0d0b11a` (D-100).
 - `acp/TestServeAgentStreamsAndContinues` (`chunks=[Hey] want [He y]` under load): fixed in
   W2-ACP, commit `476ade8` (D-105).
+- `agui/TestServerRetentionExpiresUnansweredQuestion` (fixed `40 ms` retention and a
+  `time.Sleep(120 ms)`): fixed in the wave-E ticket 007. The test now drives the retention
+  clock (`WithClock`) past the deadline instead of outlasting it, and the "the expired
+  question is dropped" check moved to `agui/TestServedTurnsDropExpiredQuestion`; the HTTP test
+  keeps the wire-level claim (a late answer does not resume the turn). 20/20 under `-p 1` in
+  0.14 s, against 2.8 s before.
 
 ## Test coverage gaps in new code
 

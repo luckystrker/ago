@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,31 @@ func askingServer(t *testing.T, opts ...ServerOption) (*Server, *agotest.TestCon
 	base := append([]agent.Option{agent.WithTools(askingTool())}, srv.Options()...)
 	h := srv.Handler(agent.New("served", "You are served.", append(base, agent.WithConfig(cfg))...))
 	return srv, cfg, h
+}
+
+// drivenClock is a clock the test moves by hand: retention deadlines are
+// stamped off it and the held-turn sweep reads it, so a retention bound is
+// reached without waiting for it. Safe for concurrent use — the server reads it
+// from the turn's own goroutine while the test advances it.
+type drivenClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newDrivenClock() *drivenClock {
+	return &drivenClock{now: time.Unix(1763683200, 0)}
+}
+
+func (c *drivenClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *drivenClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
 }
 
 // soleInterrupt is the one interrupt a paused run's RUN_FINISHED carries.
@@ -381,7 +407,10 @@ func TestServerCancelledResumeAbandons(t *testing.T) {
 }
 
 func TestServerRetentionExpiresUnansweredQuestion(t *testing.T) {
-	srv, _, h := askingServer(t, WithRetention(Retention{TTL: 40 * time.Millisecond, MaxHeld: 4}))
+	clock := newDrivenClock()
+	srv, _, h := askingServer(t,
+		WithRetention(Retention{TTL: time.Minute, MaxHeld: 4}),
+		WithClock(clock.Now))
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 
@@ -390,10 +419,10 @@ func TestServerRetentionExpiresUnansweredQuestion(t *testing.T) {
 	if !srv.turns.holds("t1") {
 		t.Fatal("the question is not held")
 	}
-	time.Sleep(120 * time.Millisecond)
-	if srv.turns.holds("t1") {
-		t.Fatal("the expired question is still held")
-	}
+	// Driven past the bound rather than slept through: the deadline is stamped
+	// off this clock, so the answer below meets a question already past it
+	// while its turn is still parked — a state the sleep left to the scheduler.
+	clock.Advance(time.Minute)
 
 	// A late answer answers nothing this server holds: an ordinary run starts.
 	evs, _ := postRunURL(t, ts.URL, resumeBody("t1", "r2", interrupt.ID, "blue"))
@@ -407,6 +436,34 @@ func TestServerRetentionExpiresUnansweredQuestion(t *testing.T) {
 				t.Fatal("the expired turn was resumed by the late answer")
 			}
 		}
+	}
+}
+
+// TestServedTurnsDropExpiredQuestion pins the registry side of the same bound:
+// once the configured clock passes a question's deadline the sweep stops
+// holding it. Kept at the registry because releasing a turn waits for its run to
+// wind down, and that winding down needs the registry's own lock — a live parked
+// turn cannot be swept from a test without wedging the server.
+func TestServedTurnsDropExpiredQuestion(t *testing.T) {
+	clock := newDrivenClock()
+	turns := newServedTurns(serverConfig{
+		retention: Retention{TTL: time.Minute, MaxHeld: 4},
+		now:       clock.Now,
+	})
+	turn := &servedTurn{threadID: "t1"}
+	turns.hold(turn, clock.Now().Add(time.Minute))
+	if !turns.holds("t1") {
+		t.Fatal("the question is not held")
+	}
+
+	clock.Advance(time.Minute - time.Nanosecond)
+	if !turns.holds("t1") {
+		t.Fatal("the question was released before its deadline")
+	}
+
+	clock.Advance(time.Nanosecond)
+	if turns.holds("t1") {
+		t.Fatal("the expired question is still held")
 	}
 }
 

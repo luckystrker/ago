@@ -1,7 +1,7 @@
 ---
 id: 007
 title: agui — тест истечения retention на управляемых часах вместо 40-мс окна
-status: open
+status: done
 priority: 3
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: none
 decisions: none
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek
 ---
 ## Что сделать
 Флейк из `docs/known-issues.md` («Flaky tests», риск 1×3): `TestServerRetentionExpiresUnansweredQuestion`
