@@ -1,7 +1,7 @@
 ---
 id: 005
 title: Аудит отложенного — поведение ACP 1.0, MCP Apps, багфикс tealtiger (без переноса кода)
-status: claimed
+status: done
 priority: 3
 mode: parallel
 depends_on: []
