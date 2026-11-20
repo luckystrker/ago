@@ -1,7 +1,7 @@
 ---
 id: 005
 title: Аудит отложенного — поведение ACP 1.0, MCP Apps, багфикс tealtiger (без переноса кода)
-status: open
+status: claimed
 priority: 3
 mode: parallel
 depends_on: []
@@ -10,6 +10,7 @@ human: none
 upstream: 3b5bd7d122, 3399e3ef2e, a8195adf81
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek
 ---
 ## Что сделать
 Исследование, **продакшн-код не меняется**. Результат — один файл `docs/audits/2026-11-19-v1.3.2-deferred.md`

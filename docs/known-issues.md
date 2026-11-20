@@ -21,6 +21,15 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   reruns (found by a reviewer; the listener/audit code is from the D-104 wave). Cause unknown.
 - **`network/TestWorkflowRoundRobinMaxTurns`** is flaky under load (found by a reviewer).
   Cause unknown.
+- **`agui/TestServerRetentionExpiresUnansweredQuestion` (risk 1×3 = 3, a test defect, not a
+  product one).** The test (`agui/server_test.go:383`) sets `Retention{TTL: 40 * time.Millisecond}`
+  and then checks after a fixed `time.Sleep(120 * time.Millisecond)`. Under load the expiry is
+  not reached in that window, so the gate gets noise that can hide real failures (seen in the
+  ticket-005 full run, green in isolation and in three package reruns). Cheap fix for a follow-up
+  ticket, without lengthening the window: drive the time instead. The server already has
+  `WithClock` (`agui/server.go:77`), and the held-turn timer reads the configured clock's
+  remaining share (`agui/interrupts.go:692`). Alternatively, poll `holds` until a deadline
+  instead of a single fixed sleep.
 
 ## Flakes already fixed (kept for the record)
 
@@ -59,6 +68,15 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   `TestForcedFinalToolEndsRunWithQueuedInput` (`agui/forced_turn_test.go:93`) assert the event
   sequence, the reply text and the model-call count; a mutant that drops the calls handed off to
   the client still passes them, and only the `agent` test above catches it.
+- **DecisionSet, error sentinel wording (D-128, ticket 003, risk 2×2 = 4).** D-128 says every
+  rejection is `ErrInvalidDecisionSet` (wrapping `ErrNotADecision`), but a score whose levels do
+  not start at 0 is reported by the OpenAI provider with `ErrNotADecision` only
+  (`config/openai/decisions.go:694`). `errors.Is(err, response.ErrNotADecision)` works for both;
+  a caller matching `ErrInvalidDecisionSet` misses that case. Fix either the wrapping or the record.
+- **DecisionSet, metadata of a struct field vs a scalar (D-128, ticket 003, risk 1×2 = 2).** The
+  Python test `test_metadata_is_each_answer_by_field` has no Go twin: nothing asserts that a
+  field's entry in a struct's metadata equals the metadata of the same question asked as a
+  scalar. The helper is shared, so it holds today; no test pins it.
 
 ## Behavior notes
 
