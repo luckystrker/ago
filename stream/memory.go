@@ -389,7 +389,12 @@ func (m *MemoryStream) Get(ctx context.Context, c events.Condition) (events.Even
 	}
 }
 
-// SpawnBackground runs fn on a goroutine tracked by the stream.
+// SpawnBackground runs fn on a goroutine tracked by the stream. Tasks deliver
+// their results through Enqueue: input enqueued while a turn is live feeds that
+// turn's next model call; input enqueued after the turn returned, or while a
+// turn ends without another model call (a final=true tool result or a
+// client-tool hand-off), stays in the inbox and is consumed by the next turn on
+// the same stream.
 func (m *MemoryStream) SpawnBackground(ctx context.Context, fn func(context.Context)) {
 	m.bgWG.Add(1)
 	go func() {

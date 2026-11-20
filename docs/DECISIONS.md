@@ -5356,3 +5356,31 @@ breakdown of that number, so a consumer never needs to know which provider repor
 Breaking: on a cached turn `prompt_tokens`, and therefore `TokenMonitor` totals, `UsageReport` sums, metric
 counters and span input attributes, all grow by the cache counts. `docs/MIGRATION.md` §11 carries the before/after
 numbers and the recipe for the old uncached figure. The next release is a minor bump (0.11.0).
+
+## D-127 — 2026-11-19 — agent: a forced response ends the turn before the inbox is flushed (AG2 v1.3.2 sync)
+
+**Invariant:** after a forced `ModelResponse` (`ResponseForce = true` — a `final=true` tool result, or calls handed to a
+client tool) the turn makes no further model call, and input still in the inbox is not lost: it stays queued and is
+consumed by the next turn on the same stream.
+
+`turnBody` used to skip the tool loop for a forced response but then drained the inbox like after any other reply.
+Input enqueued while the turn ran therefore caused one extra model call: its reply replaced the final tool result, or
+dropped the handed-off client calls, and the call went out with the handed-off tool call still unanswered in the
+history. The forced check now comes first in the loop (`agent/turn.go`) and returns before the drain. Upstream:
+ag2 `3bee17b3c6` (#3639, fixes #3638).
+
+Other places the invariant was checked, no code change needed:
+
+- **`llmTrigger` / `DrainedModelRequest`:** the trigger fires on `ModelRequest` and `ToolResultsEvent`. A final batch is
+  recorded into the history without publication and a client hand-off publishes no `ToolResultsEvent`, so neither can
+  start a model call. When the client resumes with its tool results, the trigger drains the queued input right behind
+  them (test `TestForcedClientHandoffWithQueuedInputWaitsForClientResult`).
+- **AG-UI (`agui/stream.go`):** the projector only translates events; it never drives the model. A hand-off run ends with
+  `RUN_FINISHED` after one model call (`agui/forced_turn_test.go`). AG-UI builds a fresh stream per request, so input
+  queued on the handed-off stream is not carried over by the protocol itself; only a caller that resumes on the same
+  stream (`RunOptions.Stream`) sees it, as in the Python test.
+- **HITL:** a refused, timed-out or failed prompt ends the turn with an error before any further model call and the
+  inbox is not drained (`executeTurn` only repairs the transcript), so the same queued input waits for the next turn.
+
+Doc comments of `AgentRun.Enqueue`, `Context.SpawnBackground` and `MemoryStream.SpawnBackground` now state the
+exception, as the Python docstrings do. Not a deviation from Python.

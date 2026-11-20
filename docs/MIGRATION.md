@@ -715,3 +715,9 @@ not move. Bedrock is not ported yet (`Create()` → `ErrNotImplemented`); its ma
 when the provider lands.
 
 **Release.** The next release is a minor bump, 0.11.0 — this is a breaking accounting change, not a patch.
+
+### Agent: forced response and queued input (D-127)
+
+| Python | Go | Differences |
+|---|---|---|
+| `_execute_turn` returns a `response_force` response before draining the inbox (ag2 `3bee17b3c6`) | `agent.turnBody` checks `ResponseForce` first in the tool loop and returns before the leftover-input flush | None. After a `final=true` tool result or a client-tool hand-off the turn makes no further model call; input enqueued meanwhile (`AgentRun.Enqueue`, `Context.Enqueue`, `SpawnBackground` results) waits for the next turn on the same stream, and reaches the model right after the client's tool results on a resume |

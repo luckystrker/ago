@@ -121,7 +121,11 @@ func (c *Context) EnqueueOrigin(origin events.RequestOrigin, parts ...events.Inp
 // (upstream Context.send calls InertEvent.as_local).
 func (c *Context) Send(ev events.Event) error { return c.Stream.Send(events.AsLocal(ev)) }
 
-// SpawnBackground runs fn on a stream-tracked goroutine.
+// SpawnBackground runs fn on a stream-tracked goroutine. Results go back through
+// Enqueue: input enqueued while a turn is live feeds its next model call; input
+// enqueued after the turn returned, or while a turn ends without another model
+// call (a final=true tool result or a client-tool hand-off), waits in the inbox
+// for the next turn on the same stream.
 func (c *Context) SpawnBackground(ctx stdcontext.Context, fn func(stdcontext.Context)) {
 	c.Stream.SpawnBackground(ctx, fn)
 }

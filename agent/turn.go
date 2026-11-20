@@ -78,7 +78,9 @@ func (r *AgentRun) runTurn() (*events.ModelResponse, error) {
 
 // turnBody is the innermost turn: send the initial request (triggering the LLM),
 // loop over tool-call rounds, then flush leftover enqueued input into one final
-// model call (Python parity: _execute_turn).
+// model call (Python parity: _execute_turn). A forced response (final=true tool
+// result, client-tool hand-off) ends the turn before that flush: no further
+// model call is made and queued input waits for the next turn.
 func (r *AgentRun) turnBody(initial *events.ModelRequest, _ *context.Context) (events.ModelResponse, error) {
 	seen := r.scanStart
 	if !r.isReentry() {
@@ -96,13 +98,23 @@ func (r *AgentRun) turnBody(initial *events.ModelRequest, _ *context.Context) (e
 		return events.ModelResponse{}, err
 	}
 
-	// Tool-call loop: ends when the model stops requesting tools or a final=true
-	// tool forced the response (Python parity: while tool_calls and not response_force).
+	// Tool-call loop: ends when the model stops requesting tools or a forced
+	// response closes the turn (Python parity: _execute_turn).
 	// WithMaxToolRounds (when > 0) stops the loop after that many executed
 	// rounds — an unbounded loop lets a hostile tool result spin paid LLM calls
 	// forever (AGO-DEVIATION: Python has no cap; audit H-11).
 	rounds := 0
-	for len(resp.ToolCalls.Calls) > 0 && !resp.ResponseForce {
+	for {
+		// A final=true tool result or calls handed to a client tool end the turn
+		// with this response; another model call would replace the final reply or
+		// drop the client calls. Input enqueued meanwhile stays in the inbox for
+		// the next turn on this stream (D-127).
+		if resp.ResponseForce {
+			return resp, nil
+		}
+		if len(resp.ToolCalls.Calls) == 0 {
+			break
+		}
 		rounds++
 		if r.maxToolRounds > 0 && rounds > r.maxToolRounds {
 			return events.ModelResponse{}, fmt.Errorf("%w (budget %d)", ErrMaxToolRounds, r.maxToolRounds)
@@ -121,7 +133,7 @@ func (r *AgentRun) turnBody(initial *events.ModelRequest, _ *context.Context) (e
 	}
 
 	// Leftover mid-turn input gets one extra model call (Python parity: the
-	// final drain in _execute_turn).
+	// final drain in _execute_turn). Only an unforced reply reaches this point.
 	if leftover := r.stream.Drain(); len(leftover) > 0 {
 		if err := r.stream.Send(mergeRequests(leftover)); err != nil {
 			return events.ModelResponse{}, err

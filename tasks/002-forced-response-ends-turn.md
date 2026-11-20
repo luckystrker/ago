@@ -1,7 +1,7 @@
 ---
 id: 002
 title: Forced-ответ завершает ход, отложенный ввод ждёт следующего хода
-status: open
+status: done
 priority: 1
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 3bee17b3c6
 decisions: D-127
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet-002
 ---
 ## Что сделать
 Upstream `3bee17b3c6`: финальный tool-результат (`final=true`) или вызовы, отданные клиентскому инструменту,

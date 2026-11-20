@@ -391,6 +391,12 @@ func (r *AgentRun) Result(ctx stdcontext.Context) (*AgentReply, error) {
 // Enqueue adds input to the mid-turn inbox as a user turn (Python parity:
 // AgentRun.enqueue origin="user"): input from the requesting side belongs to
 // the user interval.
+//
+// Input enqueued while the turn is driving is consumed by that turn's next or
+// final model call; input enqueued before Start merges into the first call; input
+// enqueued after the turn completed waits for the next turn on this stream. A
+// turn that ends without another model call — on a final=true tool result or
+// with calls handed to a client tool — leaves the input for the next turn too.
 func (r *AgentRun) Enqueue(parts ...events.Input) error {
 	return r.stream.EnqueueOrigin(events.OriginUser, parts...)
 }
