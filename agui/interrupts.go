@@ -247,6 +247,10 @@ type servedTurn struct {
 	deadline time.Time
 
 	releaseOnce sync.Once
+	// closed closes when the run's scope has wound down after a release. Nil
+	// until release has run, and for a turn with no run; read it only after
+	// release returns.
+	closed chan struct{}
 }
 
 func (t *servedTurn) outstanding() *question {
@@ -284,18 +288,37 @@ func (t *servedTurn) unpark(s *Server, q *question) {
 	s.turns.discard(t)
 }
 
-// release cancels the turn, wherever it is parked: the waiting question
-// surfaces its abandonment and the run scope winds down (Python parity:
-// release/aclose).
+// release cancels the turn, wherever it is parked, and returns without waiting
+// for it to wind down: the waiting question surfaces its abandonment and the
+// run scope closes on a goroutine of its own (Python parity: release is
+// task.cancel(), which does not wait). It is what the registry calls under its
+// own bookkeeping, and what a turn may call on itself: closing the run waits
+// for the turn, and a turn parked on its own question cannot wait for itself.
+// Safe to call more than once, and from any goroutine.
 func (t *servedTurn) release() {
 	t.releaseOnce.Do(func() {
 		if q := t.outstanding(); q != nil {
 			close(q.abandon)
 		}
 		if t.run != nil {
-			t.run.Close()
+			t.closed = make(chan struct{})
+			go func() {
+				defer close(t.closed)
+				t.run.Close()
+			}()
 		}
 	})
+}
+
+// aclose cancels the turn and waits for its run scope to wind down (Python
+// parity: aclose). The waiting kind belongs to callers that hold no registry
+// lock and are not the turn itself: shutting the server down, or closing a turn
+// whose resume was abandoned.
+func (t *servedTurn) aclose() {
+	t.release()
+	if t.closed != nil {
+		<-t.closed
+	}
 }
 
 // turnOutput routes a turn's events to the exchange currently carrying it, and
@@ -449,6 +472,18 @@ func (st *servedTurns) turnForStream(streamID string) *servedTurn {
 	return st.byStream[streamID]
 }
 
+// releaseAfterUnlock releases the turns a registry method evicted, once it has
+// let go of st.mu. The victims are already out of held, so none is released
+// twice or left registered. release does not wait for a turn to wind down, but
+// it takes the turn's own locks, and the winding-down turn takes st.mu
+// (discard): keeping the two apart is what keeps the registry's lock from ever
+// being waited on by a turn it is waiting for.
+func releaseAfterUnlock(victims []*servedTurn) {
+	for _, v := range victims {
+		v.release()
+	}
+}
+
 // hold holds the turn for its thread, evicting whatever that thread held before
 // and stamping the retention clock, so each new question buys a full bound
 // (Python parity: hold).
@@ -457,14 +492,14 @@ func (st *servedTurns) hold(t *servedTurn, deadline time.Time) {
 	t.deadline = deadline
 	t.mu.Unlock()
 
+	var victims []*servedTurn
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if previous := st.held[t.threadID]; previous != nil && previous != t {
 		slog.Info("agui: releasing a held AG-UI turn whose thread has been superseded", "thread", t.threadID)
-		previous.release()
+		victims = append(victims, previous)
 	}
 	st.held[t.threadID] = t
-	st.evictExpiredLocked()
+	victims = append(victims, st.evictExpiredLocked()...)
 	for len(st.held) > st.retention.MaxHeld {
 		// Nearest its deadline, rather than longest held: under one TTL the two
 		// are the same turn (Python parity: hold's eviction loop).
@@ -474,8 +509,10 @@ func (st *servedTurns) hold(t *servedTurn, deadline time.Time) {
 		}
 		slog.Warn("agui: releasing the held AG-UI turn nearest its deadline", "held", len(st.held))
 		delete(st.held, soonest.threadID)
-		soonest.release()
+		victims = append(victims, soonest)
 	}
+	st.mu.Unlock()
+	releaseAfterUnlock(victims)
 }
 
 // soonestLocked is the held turn nearest its deadline; nil when every held turn
@@ -506,10 +543,11 @@ func (st *servedTurns) soonestLocked() *servedTurn {
 // answer (Python parity: take).
 func (st *servedTurns) take(threadID string) *servedTurn {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	t := st.held[threadID]
 	delete(st.held, threadID)
-	st.evictExpiredLocked()
+	victims := st.evictExpiredLocked()
+	st.mu.Unlock()
+	releaseAfterUnlock(victims)
 	return t
 }
 
@@ -539,14 +577,16 @@ func (st *servedTurns) discard(t *servedTurn) {
 // holds reports whether the thread holds a question that can still be answered.
 func (st *servedTurns) holds(threadID string) bool {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.evictExpiredLocked()
+	victims := st.evictExpiredLocked()
 	_, ok := st.held[threadID]
+	st.mu.Unlock()
+	releaseAfterUnlock(victims)
 	return ok
 }
 
-// releaseAll cancels every turn this server is running (Python parity:
-// release_all). Call it on shutdown, so a turn still waiting is cancelled.
+// releaseAll cancels every turn this server is running and waits for them to
+// wind down (Python parity: release_all). Call it on shutdown, so a turn still
+// waiting is cancelled and its cleanup has run before the process goes.
 func (st *servedTurns) releaseAll() {
 	st.mu.Lock()
 	seen := map[*servedTurn]bool{}
@@ -566,15 +606,22 @@ func (st *servedTurns) releaseAll() {
 	st.held = map[string]*servedTurn{}
 	st.byStream = map[string]*servedTurn{}
 	st.mu.Unlock()
+	// Every turn is cancelled before the first is waited for, so the turns wind
+	// down together (Python parity: gather of aclose).
 	for _, t := range all {
 		t.release()
 	}
+	for _, t := range all {
+		t.aclose()
+	}
 }
 
-// evictExpiredLocked releases the turns whose questions can no longer be
-// answered (Python parity: _evict_expired). st.mu is held; t.mu covers the
-// deadlines.
-func (st *servedTurns) evictExpiredLocked() {
+// evictExpiredLocked stops holding the turns whose questions can no longer be
+// answered and returns them for the caller to release after it has dropped
+// st.mu (Python parity: _evict_expired; see releaseAfterUnlock). st.mu is held;
+// t.mu covers the deadlines.
+func (st *servedTurns) evictExpiredLocked() []*servedTurn {
+	var expired []*servedTurn
 	now := st.now()
 	for threadID, t := range st.held {
 		t.mu.Lock()
@@ -583,9 +630,10 @@ func (st *servedTurns) evictExpiredLocked() {
 		if !d.IsZero() && !d.After(now) {
 			slog.Info("agui: releasing an expired held AG-UI turn", "thread", threadID)
 			delete(st.held, threadID)
-			t.release()
+			expired = append(expired, t)
 		}
 	}
+	return expired
 }
 
 // expired reports whether the question the turn is held on can still be
@@ -658,14 +706,17 @@ func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (string
 	}
 	t.setQuestion(q, deadline)
 	defer t.unpark(s, q)
+	// Paused before the turn is held, and before the usage is read, so whatever
+	// the turn still sends — a sibling tool call finishing — belongs to the run
+	// that resumes it, on the wire and on the meter. Holding may release this
+	// very turn (the registry is full and its deadline is the nearest): its
+	// driver then finds the output paused and leaves the pause's interrupt to
+	// close the exchange.
+	t.out.hold()
 	// Held before the question is emitted, never after: the exchange ends on
 	// that very event, so a resume can be in flight the moment it lands (Python
 	// parity: _put holds before pausing).
 	s.turns.hold(t, deadline)
-	// Paused before the usage is read, so whatever the turn still sends — a
-	// sibling tool call finishing — belongs to the run that resumes it, on the
-	// wire and on the meter.
-	t.out.hold()
 
 	t.out.pause(RunFinishedEvent{
 		baseEvent: baseEvent{Type: EventRunFinished, Timestamp: TimestampMs()},

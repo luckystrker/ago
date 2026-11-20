@@ -215,8 +215,12 @@ func (s *Server) resume(ctx context.Context, input RunAgentInput, ex *exchange, 
 	if q == nil || s.turns.expired(t) {
 		// Unknown, already answered, or expired: which of them is timing or
 		// routing, and none is the client's error. What it sent answers nothing
-		// this server asked (Python parity: resume_held_turn's None path).
+		// this server asked, and the turn is stopped rather than left parked on
+		// a question nobody can answer in time (Python parity: resume_held_turn's
+		// None path releases it). The registry's lock is not held here, and
+		// release does not wait for the turn.
 		s.turns.discard(t)
+		t.release()
 		return false
 	}
 
@@ -285,7 +289,7 @@ func (s *Server) resume(ctx context.Context, input RunAgentInput, ex *exchange, 
 // as cancelled: first what the turn kept while paused, then an end for each
 // entity still open on the wire (Python parity: _cancel).
 func (s *Server) abandon(input RunAgentInput, ex *exchange, t *servedTurn) {
-	t.release()
+	t.aclose()
 	owed := t.out.abandon(t.proj.Closings())
 	for _, e := range owed {
 		ex.emit(e)

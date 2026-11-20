@@ -1,7 +1,7 @@
 ---
 id: 008
 title: agui — отпускать удержанные ходы вне блокировки реестра (дедлок при вытеснении и истечении)
-status: open
+status: done
 priority: 1
 mode: waterfall
 depends_on: [007]
@@ -11,6 +11,7 @@ upstream: none
 decisions: none
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet008
 ---
 ## Что сделать
 Дедлок найден исполнителем 007 и подтверждён по коду. `servedTurn.release()` (`agui/interrupts.go:290`)

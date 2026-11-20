@@ -35,8 +35,33 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   keeps the wire-level claim (a late answer does not resume the turn). 20/20 under `-p 1` in
   0.14 s, against 2.8 s before.
 
+## Defects fixed (kept for the record)
+
+- **`agui` held turns released under the registry lock (wave-E ticket 008, was risk 3 × 9 = 27;
+  a turn releasing itself, was 2 × 4 = 8).** `servedTurn.release()` closed the run and waited
+  for the turn to wind down, and the winding-down turn takes `servedTurns.mu` (`discard`). It was
+  called under that lock when a held turn was superseded or evicted at `MaxHeld` (`hold`) and
+  when a held turn expired (`evictExpiredLocked`, reached from `hold`, `take`, `holds`), so one
+  POST that parked a question or met an expired one wedged the whole endpoint. When the
+  eviction victim was the turn asking the question, the wait lasted until the question's own
+  timeout and the POST answered with `human input timed out` instead of the interrupt. Fixed:
+  `release()` is now what Python's `release()` is, a cancel that does not wait (the run closes on
+  its own goroutine); `aclose()` is the waiting kind and is kept for `releaseAll` and the
+  cancelled-resume path. Victims are removed from `held` under the lock and released after
+  `Unlock`. Tests: `agui/release_locking_test.go`.
+
 ## Test coverage gaps in new code
 
+- **`agui` `aclose` waits for the run scope, not for the driver (ticket 008, risk 1 × 2 = 2,
+  `agui/interrupts.go:317`).** Python's `aclose` gathers the whole task; ours waits for
+  `run.Close()`, and the driver's tail (`endTurn`, `discard`, closing `driverDone`) finishes just
+  after `Close` returns. Nothing reads that tail after shutdown or a cancelled resume, which
+  already take their closings from the stopped run; the tests wait for `driverDone` with a deadline.
+- **`agui` the order of `t.out.hold()` before `s.turns.hold` is not pinned by a test (ticket 008,
+  risk 2 × 2 = 4, `agui/interrupts.go:715`).** It keeps a turn that releases itself (registry full,
+  its own deadline the nearest) from writing a cancelled `RUN_FINISHED` into the exchange before its
+  pause. Reverting the order does not turn any test red in 500 runs: the window is a scheduling
+  race that the self-release test only rarely enters.
 - **Cron search horizon boundary (D-106).** No test pins the one-year horizon edge: with
   `now = 2026-11-10 10:00:30 UTC` and `1 16 10 11 WED` the code returns the `now+1h` fallback
   as Python does, but the mutant `i < N` → `i <= N` returns `2027-11-10 16:01` and survives.
@@ -158,6 +183,9 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   score stays above the threshold and the item is open: reproduce on an idle host before the
   0.11.0 release (`AGO_PROP_SEED=<seed> go test ./network -run TestRemoteRPCProperty`), and if it
   reproduces, treat it as a real hub defect next to D-124 instead of a flake.
+  A full `go test -count=1 ./...` on `7832f29` (tickets 006 and 007 merged) at load average ~9.5
+  gave 48 `ok`, `network` included. This supports the load-flake reading but does not prove it, so
+  the item stays open until the pre-release run.
 
 ## Cleanup follow-ups
 
