@@ -149,7 +149,9 @@ type Config struct {
 	FSRoot string
 	// DisableTerminal withholds the terminal capability.
 	DisableTerminal bool
-	// AdditionalDirectories are extra ACP workspace roots.
+	// AdditionalDirectories are extra ACP workspace roots. session/new takes
+	// absolute paths, so each is made absolute against the process's working
+	// directory (not CWD — Python parity: Path(d).resolve()) before it is sent.
 	AdditionalDirectories []string
 	// StartupTimeout bounds the agent's initialize handshake and session/new;
 	// 0 means 30s. A failed or hung start never leaves a subprocess behind.
@@ -360,16 +362,30 @@ func (c *Config) Close() error {
 	return errors.Join(errs...)
 }
 
-func (c *Config) cwd() string {
-	cwd := c.CWD
+// workspace resolves the working directory and the extra workspace roots to
+// the absolute paths session/new requires (Python parity: client.py resolves
+// both with Path(...).resolve()). The directory is "." when CWD is unset. A
+// path that cannot be made absolute is an error, never a relative path on the
+// wire.
+//
+// AGO-DEVIATION: filepath.Abs does not resolve symlinks, Path.resolve() does;
+// the path stays absolute either way (D-131).
+func (c *Config) workspace() (cwd string, dirs []string, err error) {
+	cwd = c.CWD
 	if cwd == "" {
 		cwd = "."
 	}
-	// ACP's session/new takes an absolute path.
-	if abs, err := filepath.Abs(cwd); err == nil {
-		return abs
+	if cwd, err = filepath.Abs(cwd); err != nil {
+		return "", nil, fmt.Errorf("%w: CWD %q: %w", ErrWorkspacePath, c.CWD, err)
 	}
-	return cwd
+	for _, d := range c.AdditionalDirectories {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: additional directory %q: %w", ErrWorkspacePath, d, err)
+		}
+		dirs = append(dirs, abs)
+	}
+	return cwd, dirs, nil
 }
 
 // launchSpec is the subprocess command line: executable, arguments and the
@@ -404,3 +420,7 @@ func (c *Config) agentLabel() string {
 	}
 	return "acp-agent"
 }
+
+// ErrWorkspacePath marks a Config path (CWD or AdditionalDirectories) that
+// cannot be made absolute.
+var ErrWorkspacePath = errors.New("acp: cannot resolve a workspace path")

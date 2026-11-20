@@ -5443,3 +5443,42 @@ unexported fields are skipped.
 
 Not a break: a scalar request is byte-for-byte what it was (checked against the previous tree, see
 `docs/acceptance/v1.3.2-003.md`); struct schemas were refused before. Upstream: ag2 `1c3e0c52f8` (#3656, closes #3648).
+
+## D-131 — 2026-11-20 — acp: parity with agent-client-protocol 1.0 — `env_var` auth removed, `TurnResult.Text` is the last message, serve capabilities stay `false` (AG2 v1.3.2 sync)
+
+Upstream `3b5bd7d122` (#3402, agent-client-protocol 1.0.0), audit `docs/audits/2026-11-19-v1.3.2-deferred.md` §1.
+Four divergences were closed in `acp/`; two of them leave a visible difference from the previous AGo, the third leaves
+one from Python.
+
+**1. `env_var` auth is gone (breaking).** The Python commit drops it explicitly (`git show 3b5bd7d122 --
+ag2/acp/auth.py`: `AuthMethod = schema.EnvVarAuthMethod | schema.TerminalAuthMethod | schema.AuthMethodAgent` →
+`schema.TerminalAuthMethod | schema.AuthMethodAgent`; commit message: "Drop EnvVarAuthMethod from AuthMethod"), and
+`v1.3.2:ag2/acp/auth.py` has no other path that declares it. The SDK schema 1.0.0 has no `EnvVarAuthMethod`,
+`env_var` or `AuthEnvVar` at all (`grep -rn` over `agent_client_protocol-1.0.0/src` is empty). A 1.0 client parses
+`"type":"env_var"` as an agent method and loses `vars` (audit §1d.3), so the method could not be used anyway. Removed:
+`AuthKindEnvVar`, `NewEnvVarAuthMethod`, the `AuthEnvVar` type and `AuthMethod.Vars`. The two kinds left are `agent`
+and `terminal`. This **supersedes the `env_var` half of D-116** ("acp auth kinds are modelled, not validated" — the
+rest of it, validation by the application, stands). `acp/guard_test.go` was the only caller in the repository.
+
+**2. `TurnResult.Text` means the last message of the turn.** `Bridge.PromptTurn` used to return every
+`agent_message_chunk` of the turn joined; Python keeps a list of messages (`BridgeState.turn_messages`) and replies
+with `texts[-1]` (`client.py`). `Text` now follows it; `TurnResult.Messages` (new, additive) holds every message in
+order. `Bridge.Prompt` returns the same last message. A chunk naming another `messageId` closes the previous message;
+chunks with no id are one message. The provider emits an `events.ModelMessage` for each closed message before the
+next one streams and answers with the last. The field is the same, its meaning is not: see MIGRATION §11.
+
+**3. Return to parity, no deviation.** Absolute `AdditionalDirectories` (and `CWD`) in `session/new` — a path that
+cannot be made absolute is `ErrWorkspacePath`, nothing is started; uri-only `image`, `resource` and `resource_link`
+blocks in an agent's reply (text rules of `mappers.block_text`, blob → `ModelResponse.Files`, default MIME type
+`application/octet-stream`); serve reads a `resource_link` prompt block as `[resource] <name> (<uri>)`.
+
+**What stays different from Python (not fixed here).**
+
+- **Serve prompt capabilities stay `image=false`, `audio=false`, `embeddedContext=false`** (Python v1.3.2: `image=true`,
+  `embedded_context=true`, `agent.py:92-94`). Raising them is a promise to accept those blocks, a separate decision;
+  D-052 (text-only serve) and D-105 stand. Only `resource_link` is read, because no capability gates it (audit §1c.1).
+  AGo joins prompt blocks into one text — a link goes on its own line — where Python keeps one input per block.
+- `filepath.Abs` does not resolve symlinks; Python's `Path.resolve()` does.
+- Tool-result parts are still joined into one text, Python keeps one part per content item (audit §1c.2).
+- `plan_update` (`AgentPlanContentUpdate`, Python since 1.3.0) is not mapped; only `plan` is.
+Both of the last two are in `docs/known-issues.md`.

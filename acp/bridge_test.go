@@ -103,6 +103,8 @@ func TestMain(m *testing.M) {
 		runProviderFake()
 	case roleProviderModel:
 		runProviderModelAgent(os.Stdin, os.Stdout)
+	case roleParity:
+		runParityAgent(os.Stdin, os.Stdout)
 	default:
 		os.Exit(m.Run())
 	}

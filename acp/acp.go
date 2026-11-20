@@ -150,10 +150,11 @@ func writeLine(w io.Writer, msg any) error {
 
 // --- content blocks -----------------------------------------------------------
 
-// contentBlock is one prompt content block. This subset carries text only;
-// image/audio/resource blocks in a prompt are ignored while their text
-// siblings are kept (Python parity: mappers.prompt_to_inputs skips blocks with
-// no representation rather than failing the turn).
+// contentBlock is one content block, in either direction. text, image, audio,
+// resource and resource_link are the shapes this package reads; a prompt
+// block of any other shape is ignored while its siblings are kept (Python
+// parity: mappers.prompt_to_inputs skips blocks with no representation rather
+// than failing the turn).
 type contentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
@@ -161,17 +162,127 @@ type contentBlock struct {
 	// message-chunk updates an agent streams back use them.
 	Data     string `json:"data,omitempty"`
 	MimeType string `json:"mimeType,omitempty"`
+	// URI is where an image that carries no bytes points, and the target of a
+	// resource_link; Name and Title label a resource_link.
+	URI   string `json:"uri,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Title string `json:"title,omitempty"`
+	// Resource is the payload of a "resource" block (embedded context): text
+	// or a base64 blob.
+	Resource *embeddedResource `json:"resource,omitempty"`
+}
+
+// embeddedResource is the resource of a "resource" block: Text for a text
+// resource, Blob (base64) for a binary one.
+type embeddedResource struct {
+	URI      string `json:"uri,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
 }
 
 func textBlock(s string) contentBlock { return contentBlock{Type: "text", Text: s} }
 
-// blocksText concatenates the text of text blocks, ignoring the rest (Python
-// parity: mappers.content_blocks_to_text).
+// linkText is how a resource_link reads as text: the link is named, never
+// fetched — a URI a peer names is context, not authorization to dereference it
+// (Python parity: mappers._textual_block_text). A link with no uri names
+// nothing and reads as no text.
+func (b contentBlock) linkText() string {
+	if b.Type != "resource_link" || b.URI == "" {
+		return ""
+	}
+	label := b.Name
+	if label == "" {
+		label = b.Title
+	}
+	if label == "" {
+		label = b.URI
+	}
+	return "[resource] " + label + " (" + b.URI + ")"
+}
+
+// readText is the text the block reads as (Python parity: mappers.block_text):
+// text, the text of an embedded text resource, a resource link, and an image
+// that only names a uri as "[image] <uri>". Media with bytes and blob
+// resources carry no text — see readFile.
+func (b contentBlock) readText() string {
+	switch b.Type {
+	case "resource":
+		if b.Resource != nil {
+			return b.Resource.Text
+		}
+		return ""
+	case "resource_link":
+		return b.linkText()
+	case "image":
+		if b.Data == "" && b.URI != "" {
+			return "[image] " + b.URI
+		}
+		return b.Text
+	}
+	return b.Text
+}
+
+// readFile decodes the block's bytes: an image or audio block with data, or an
+// embedded blob resource (Python parity: mappers.block_to_files). An image or
+// audio block with empty data is not a file. An undecodable payload is
+// dropped, not fatal: the update's kind and any siblings still reach the
+// caller.
+func (b contentBlock) readFile() (data []byte, mimeType string) {
+	raw, mime := "", b.MimeType
+	switch b.Type {
+	case "image", "audio":
+		raw = b.Data
+	case "resource":
+		if b.Resource == nil {
+			return nil, ""
+		}
+		raw = b.Resource.Blob
+		mime = b.Resource.MimeType
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+	}
+	if raw == "" {
+		return nil, ""
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(data) == 0 {
+		return nil, ""
+	}
+	return data, mime
+}
+
+// blocksText reads a prompt's blocks as one text: text blocks are
+// concatenated as they come, and a resource_link is read as its named link on
+// a line of its own. Image, audio and embedded resource blocks are ignored —
+// the server does not advertise them (Python parity:
+// mappers.content_blocks_to_text, which has no serve-side capability gate for
+// links).
+//
+// AGO-DEVIATION: Python keeps one input per block; Handle takes one text, so a
+// link is set off by a newline instead (D-131).
 func blocksText(blocks []contentBlock) string {
 	var b []byte
+	afterLink := false
 	for _, blk := range blocks {
-		if blk.Type == "text" {
+		switch blk.Type {
+		case "text":
+			if afterLink {
+				b = append(b, '\n')
+				afterLink = false
+			}
 			b = append(b, blk.Text...)
+		case "resource_link":
+			link := blk.linkText()
+			if link == "" {
+				continue
+			}
+			if len(b) > 0 && b[len(b)-1] != '\n' {
+				b = append(b, '\n')
+			}
+			b = append(b, link...)
+			afterLink = true
 		}
 	}
 	return string(b)
@@ -243,8 +354,9 @@ type Update struct {
 	// chunk kinds: user_message_chunk / agent_message_chunk / agent_thought_chunk
 	MessageID string `json:"messageId,omitempty"`
 	Text      string `json:"-"`
-	// Data and MimeType replace Text when the chunk carries an image or audio
-	// block (MimeType "image/..." or "audio/...").
+	// Data and MimeType carry the bytes of an image, audio or embedded blob
+	// resource block (MimeType "image/...", "audio/...", or the resource's own);
+	// Text is then the block's text, usually empty.
 	Data     []byte `json:"-"`
 	MimeType string `json:"-"`
 
@@ -386,14 +498,8 @@ func (u *Update) UnmarshalJSON(data []byte) error {
 			blk = w.ContentBlock
 		}
 		if blk != nil {
-			u.Text = blk.Text
-			if blk.Type == "image" || blk.Type == "audio" {
-				// An undecodable payload is dropped, not fatal: the update's
-				// kind and any siblings still reach the caller.
-				if data, err := base64.StdEncoding.DecodeString(blk.Data); err == nil && len(data) > 0 {
-					u.Data, u.MimeType = data, blk.MimeType
-				}
-			}
+			u.Text = blk.readText()
+			u.Data, u.MimeType = blk.readFile()
 		}
 	case u.Kind == "tool_call" || u.Kind == "tool_call_update":
 		u.ToolCallID, u.Title, u.ToolKind, u.Status = w.ToolCallID, w.Title, w.ToolKind, w.Status

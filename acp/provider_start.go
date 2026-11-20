@@ -16,7 +16,10 @@ import (
 func (c *Config) startSession(ctx context.Context, functions []tools.Schema, external []MCPServer) (_ *providerSession, err error) {
 	s := &providerSession{cfg: c}
 	name, args, env := c.launchSpec()
-	cwd := c.cwd()
+	cwd, additionalDirs, werr := c.workspace()
+	if werr != nil {
+		return nil, werr
+	}
 	fsRoot := c.FSRoot
 	if fsRoot == "" {
 		fsRoot = cwd
@@ -95,7 +98,7 @@ func (c *Config) startSession(ctx context.Context, functions []tools.Schema, ext
 				"the agent's tools to it; remove the tools or set DisableTools", ErrMCPCapability, agentName(b, c))
 		} else {
 			info, startErr = b.NewSession(SessionParams{
-				CWD: cwd, AdditionalDirectories: c.AdditionalDirectories, MCPServers: mcp,
+				CWD: cwd, AdditionalDirectories: additionalDirs, MCPServers: mcp,
 			})
 		}
 		if startErr == nil {

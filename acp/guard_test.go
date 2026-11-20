@@ -179,13 +179,13 @@ func TestCollidingMetaKeys(t *testing.T) {
 
 // --- auth method kinds -------------------------------------------------------
 
-// The three declared kinds travel on the wire with their own fields, and an
-// agent-kind method keeps the pre-existing shape (no type, no vars, no args).
+// The two declared kinds (ACP 1.0 union) travel on the wire with their own
+// fields, and an agent-kind method keeps the pre-existing shape (no type
+// beyond "agent", no args).
 func TestAuthMethodKindsOnTheWire(t *testing.T) {
 	auth := &DeclaredAuth{
 		Advertised: []AuthMethod{
 			NewAgentAuthMethod("token", "Shared token", "one secret"),
-			NewEnvVarAuthMethod("env", "API key in the environment", "", AuthEnvVar{Name: "OPENAI_API_KEY", Secret: true}),
 			NewTerminalAuthMethod("login", "Log in with the CLI", "", "auth", "login"),
 		},
 		Validate: func(methodID string, meta map[string]any) error { return nil },
@@ -205,36 +205,26 @@ func TestAuthMethodKindsOnTheWire(t *testing.T) {
 	if err := json.Unmarshal(res, &init); err != nil {
 		t.Fatal(err)
 	}
-	if len(init.AuthMethods) != 3 {
+	if len(init.AuthMethods) != 2 {
 		t.Fatalf("authMethods = %+v", init.AuthMethods)
 	}
 	if init.AuthMethods[0]["type"] != AuthKindAgent {
 		t.Fatalf("agent method type = %v", init.AuthMethods[0]["type"])
 	}
-	if _, has := init.AuthMethods[0]["vars"]; has {
-		t.Fatal("an agent method carries no vars")
+	if _, has := init.AuthMethods[0]["args"]; has {
+		t.Fatal("an agent method carries no args")
 	}
-	if init.AuthMethods[1]["type"] != AuthKindEnvVar {
-		t.Fatalf("env-var method type = %v", init.AuthMethods[1]["type"])
+	if init.AuthMethods[1]["type"] != AuthKindTerminal {
+		t.Fatalf("terminal method type = %v", init.AuthMethods[1]["type"])
 	}
-	vars, _ := init.AuthMethods[1]["vars"].([]any)
-	if len(vars) != 1 {
-		t.Fatalf("env-var vars = %v", init.AuthMethods[1]["vars"])
-	}
-	if v := vars[0].(map[string]any); v["name"] != "OPENAI_API_KEY" || v["secret"] != true {
-		t.Fatalf("env var = %v", v)
-	}
-	if init.AuthMethods[2]["type"] != AuthKindTerminal {
-		t.Fatalf("terminal method type = %v", init.AuthMethods[2]["type"])
-	}
-	args, _ := init.AuthMethods[2]["args"].([]any)
+	args, _ := init.AuthMethods[1]["args"].([]any)
 	if len(args) != 2 || args[0] != "auth" || args[1] != "login" {
-		t.Fatalf("terminal args = %v", init.AuthMethods[2]["args"])
+		t.Fatalf("terminal args = %v", init.AuthMethods[1]["args"])
 	}
 
 	// The declared kinds are advertised; the admission decision is still the
 	// provider's.
-	if _, rpcErr := fc.call("authenticate", map[string]any{"methodId": "env"}); rpcErr != nil {
+	if _, rpcErr := fc.call("authenticate", map[string]any{"methodId": "login"}); rpcErr != nil {
 		t.Fatalf("authenticate through DeclaredAuth: %v", rpcErr)
 	}
 	refusing := &DeclaredAuth{Advertised: auth.Advertised}
@@ -254,7 +244,7 @@ func TestStaticTokenAuthAdvertisesAgentKind(t *testing.T) {
 	if len(methods) != 1 || methods[0].Kind() != AuthKindAgent {
 		t.Fatalf("methods = %+v", methods)
 	}
-	if methods[0].Vars != nil || methods[0].Args != nil {
-		t.Fatalf("a token method carries neither vars nor args: %+v", methods[0])
+	if methods[0].Args != nil {
+		t.Fatalf("a token method carries no args: %+v", methods[0])
 	}
 }

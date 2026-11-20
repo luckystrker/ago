@@ -40,7 +40,7 @@ type turnState struct {
 	conv *agocontext.Context
 
 	mu       sync.Mutex
-	text     strings.Builder
+	msgs     messageLog
 	files    []events.BinaryResult
 	worked   bool
 	chanErr  error
@@ -72,7 +72,7 @@ func (t *turnState) failure() error {
 func (t *turnState) snapshot() (text string, files []events.BinaryResult, worked bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.text.String(), append([]events.BinaryResult(nil), t.files...), t.worked
+	return t.msgs.last(), append([]events.BinaryResult(nil), t.files...), t.worked
 }
 
 func (s *providerSession) current() *turnState {
@@ -108,7 +108,8 @@ func (s *providerSession) kill() {
 }
 
 // onUpdate maps one session/update onto the run's event stream (Python
-// parity: mappers.map_session_update via BridgeState.handle_update).
+// parity: mappers.map_session_update via BridgeState.handle_update). Message
+// chunks are grouped by messageId: see messageLog.
 func (s *providerSession) onUpdate(u Update) {
 	t := s.current()
 	if t == nil {
@@ -118,13 +119,20 @@ func (s *providerSession) onUpdate(u Update) {
 	switch u.Kind {
 	case "agent_message_chunk":
 		t.mu.Lock()
-		t.text.WriteString(u.Text)
+		closed, hasClosed := t.msgs.add(u.Text, u.MessageID)
 		if len(u.Data) > 0 {
 			// An image or audio block is a file of the reply (Python parity:
 			// block_to_files → ModelResponse.files), not message text.
 			t.files = append(t.files, events.BinaryResult{Data: u.Data, Metadata: map[string]any{"mimeType": u.MimeType}})
 		}
 		t.mu.Unlock()
+		if hasClosed {
+			// The previous message ends before its successor's chunks go out:
+			// consumers read a ModelMessage as the end of the chunks before it
+			// (Python parity: BridgeState.handle_update). The turn's last
+			// message is never closed here; it is the reply.
+			_ = t.conv.Send(events.ModelMessage{Content: closed})
+		}
 		if u.Text == "" {
 			return
 		}

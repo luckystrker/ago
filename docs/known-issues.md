@@ -176,3 +176,16 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   workflow (darwin/arm64 build job, attempt 1 of run 43057561603) while five identical runs passed; the failing
   test is unknown (job logs need an admin token) and two local full runs at GOMAXPROCS=2 were clean. Capture
   the log on the next occurrence.
+
+- **acp tool results join their parts (v1.3.2 sync, ticket 006, risk 1 × 3 = 3).** Python builds a tool result with one
+  part per content item (`mappers._tool_call_result`, `ag2/acp/mappers.py:138-151`); `Update.UnmarshalJSON` concatenates
+  the text of all items into `ContentText` and `providerSession.onUpdate` emits one `TextInput`. Two non-empty items
+  `a`, `b` give one part `ab` instead of `["a","b"]`; an empty text still falls back to the status, as in Python.
+  Audit §1c.2.
+- **acp `plan_update` is not mapped (v1.3.2 sync, ticket 006, risk 1 × 2 = 2).** Python maps `AgentPlanContentUpdate`
+  (since 1.3.0, `mappers.py:209`); AGo maps only `plan`, so the new kind reaches `OnUpdate` with no payload and gives no
+  event. Candidate for its own ticket if plan parity is wanted. Audit §1d, last paragraph.
+- **acp serve declares no image/embedded-context prompt support (v1.3.2 sync, ticket 006).** `image`, `audio` and
+  `embeddedContext` stay `false` (Python: `image=true`, `embedded_context=true`); a conforming client does not send
+  those blocks. A deliberate difference, D-131 (D-052, D-105); changing it is the audit's option (b) and needs a
+  decision.

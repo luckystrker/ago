@@ -22,12 +22,20 @@ type AgentInfo struct {
 	Version         string `json:"version"`
 }
 
-// TurnResult is one prompt turn's outcome: the agent_message_chunk text that
-// streamed while it ran, and the stop reason the agent answered with
-// ("end_turn", or "cancelled" after a session/cancel — Python parity:
-// PromptResponse.stop_reason accumulated by bridge.handle_update).
+// TurnResult is one prompt turn's outcome: the messages the agent streamed
+// while it ran, and the stop reason the agent answered with ("end_turn", or
+// "cancelled" after a session/cancel — Python parity: PromptResponse.stop_reason
+// accumulated by bridge.handle_update).
 type TurnResult struct {
-	Text       string
+	// Text is the last message of the turn — the reply (Python parity:
+	// client.py replies with turn_messages[-1]). A turn's earlier messages,
+	// the ones an agent closes by starting another message_id, are in
+	// Messages, not here.
+	Text string
+	// Messages is every message the agent sent in the turn, in order, each
+	// reassembled from its own chunks. Chunks without a messageId are one
+	// message.
+	Messages   []string
 	StopReason string
 	// Usage is the token accounting the agent attached to the prompt
 	// response; nil when it reported none.
@@ -415,9 +423,10 @@ func (b *Bridge) SetConfigOption(sessionID, configID, value string) error {
 }
 
 // Prompt sends one user turn (a single text block) and returns the agent's
-// answer: the agent_message_chunk text streamed while the turn ran (Python
-// parity: bridge.handle_update accumulating _turn_parts). A turn that streams
-// nothing returns "". The stop reason is discarded; use PromptTurn to see it.
+// answer: the last message the agent streamed while the turn ran (Python
+// parity: client.py replies with turn_messages[-1]). A turn that streams
+// nothing returns "". The stop reason and the earlier messages are discarded;
+// use PromptTurn to see them.
 func (b *Bridge) Prompt(sessionID, text string) (string, error) {
 	tr, err := b.PromptTurn(sessionID, text)
 	if err != nil {
@@ -437,11 +446,11 @@ func (b *Bridge) PromptTurn(sessionID, text string) (TurnResult, error) {
 		return TurnResult{}, ErrClosed
 	}
 	b.nextID++
-	var chunks []string
+	var msgs messageLog
 	res, err := b.exchange(b.nextID, "session/prompt", map[string]any{
 		"sessionId": sessionID,
 		"prompt":    []contentBlock{textBlock(text)},
-	}, &chunks)
+	}, &msgs)
 	if err != nil {
 		return TurnResult{}, err
 	}
@@ -455,7 +464,7 @@ func (b *Bridge) PromptTurn(sessionID, text string) (TurnResult, error) {
 	if parsed.StopReason == "" {
 		parsed.StopReason = StopEndTurn
 	}
-	return TurnResult{Text: strings.Join(chunks, ""), StopReason: parsed.StopReason, Usage: parsed.Usage}, nil
+	return TurnResult{Text: msgs.last(), Messages: msgs.all(), StopReason: parsed.StopReason, Usage: parsed.Usage}, nil
 }
 
 // Cancel asks the agent to stop sessionID's running turn and everything
@@ -545,7 +554,7 @@ func (b *Bridge) stop() {
 // ExchangeTimeout is set, the deadline kills the agent on expiry — the reply
 // wait blocks in the scanner's read, so the process dying is what unblocks
 // it — and the failure is reported as ErrTimeout.
-func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string) (json.RawMessage, error) {
+func (b *Bridge) exchange(id int64, method string, params any, msgs *messageLog) (json.RawMessage, error) {
 	b.writeMu.Lock()
 	err := writeLine(b.stdin, rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
 	b.writeMu.Unlock()
@@ -553,7 +562,7 @@ func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string)
 		return nil, err
 	}
 	if b.ExchangeTimeout <= 0 {
-		return b.readReply(id, chunks)
+		return b.readReply(id, msgs)
 	}
 	var timedOut atomic.Bool
 	timer := time.AfterFunc(b.ExchangeTimeout, func() {
@@ -563,7 +572,7 @@ func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string)
 		}
 	})
 	defer timer.Stop()
-	res, err := b.readReply(id, chunks)
+	res, err := b.readReply(id, msgs)
 	if err != nil && timedOut.Load() {
 		return nil, fmt.Errorf("%w: no reply to request %d (%s) within %s", ErrTimeout, id, method, b.ExchangeTimeout)
 	}
@@ -572,10 +581,10 @@ func (b *Bridge) exchange(id int64, method string, params any, chunks *[]string)
 
 // readReply scans until the reply with wantID arrives. Everything else the
 // agent sends while the reply is awaited is handled here: session/update
-// notifications reach OnUpdate (and accumulate into chunks during a prompt),
+// notifications reach OnUpdate (and, during a prompt, are filed into the turn's messages),
 // and an agent→client request is answered from the policies and the mediated
 // filesystem so the agent does not wait forever.
-func (b *Bridge) readReply(wantID int64, chunks *[]string) (json.RawMessage, error) {
+func (b *Bridge) readReply(wantID int64, msgs *messageLog) (json.RawMessage, error) {
 	for b.stdout.Scan() {
 		line := bytes.TrimSpace(b.stdout.Bytes())
 		if len(line) == 0 {
@@ -595,8 +604,8 @@ func (b *Bridge) readReply(wantID int64, chunks *[]string) (json.RawMessage, err
 					if b.OnUpdate != nil {
 						b.OnUpdate(u.Update)
 					}
-					if chunks != nil && u.Update.Kind == "agent_message_chunk" {
-						*chunks = append(*chunks, u.Update.text())
+					if msgs != nil && u.Update.Kind == "agent_message_chunk" {
+						msgs.add(u.Update.text(), u.Update.MessageID)
 					}
 				}
 			}

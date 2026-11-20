@@ -558,7 +558,7 @@ add them with `go get github.com/luckystrker/ago/contrib/<name>`.
 | `A2AServer(validate_input_modes=True)` | `ServerConfig.ValidateInputModes` + `ServerConfig.InputModesError()` | `NewServer` returns no error, so the card check is a separate method; media-type refusal on every message surface |
 | `A2ATaskAuthRequiredError` / `A2ATaskRejectedError` | `a2a.ErrTaskAuthRequired` / `a2a.ErrTaskRejected` (wrapped in the handler's error) | `auth-required` (non-terminal) and `rejected` (terminal); the answer is the Task record |
 | `guard.serve(agent, reader, writer)` / `guard_router` | built into `acp.Serve` (`acp/guard.go`) | No separate wrapper: a `_meta` collision → `-32602`, a notification is dropped |
-| `AuthMethodAgent` / `EnvVarAuthMethod` / `TerminalAuthMethod` | `acp.NewAgentAuthMethod` / `NewEnvVarAuthMethod` / `NewTerminalAuthMethod`, `acp.DeclaredAuth` | env-var/terminal validation is the application's (`Validate`); `StaticTokenAuth` is the `agent` kind |
+| `AuthMethodAgent` / `TerminalAuthMethod` (`EnvVarAuthMethod` left the union in ACP 1.0 — D-131) | `acp.NewAgentAuthMethod` / `NewTerminalAuthMethod`, `acp.DeclaredAuth` | terminal validation is the application's (`Validate`); `StaticTokenAuth` is the `agent` kind |
 | `encrypted_signature_of` / `signature_event` / `restore_tool_call` | `agui.EncryptedSignatureOf` / `agui.SignatureEvent` / `agui.RestoreToolCall` | The signature lives in `ToolCallEvent.VendorMetadata[agui.ThoughtSignatureKey]` |
 | `is_same_provider` / `provider_of` | internal to `agui` (`agui/provider.go`) | The vendor tag (`google`) and the API name (`gemini`/`vertexai`) count as the same provider |
 | `STTTranslationConfig(model, api_key=)` | `live.OpenAITranslator{APIKey, Model, BaseURL, Client, PCMSampleRate, PCMChannels}` | `POST /audio/translations`, `response_format=text`; implements `Transcriber` |
@@ -729,3 +729,32 @@ New, does not break anything: a scalar response schema is sent exactly as before
 | Python | Go | Differences |
 |---|---|---|
 | a flat class as `response_schema` is one question per field, one request (ag2 `1c3e0c52f8`, ADR 0038); `DecisionSet` | `response.NewDecisionSet(schema)` → `*DecisionSet`; `openai.DecisionsClient` sends a flat struct from `response.NewSchema[T]` as one request | The question is the `question:"..."` tag (fallback `agschema:"description=..."`) instead of `Question(...)`/`Field(description=)`/`Enum` docstring; the key is the `json` name; field types: `bool`, string `agschema:"enum=a\|b"`, integer `agschema:"enum=0\|1\|2"`, float `agschema:"min=0,max=1"`. Refused before the request (`response.ErrInvalidDecisionSet`, wraps `ErrNotADecision`): nested struct, pointer, slice/array/map, empty struct, shared `json` key, field without a question, a description on the schema, more than 400 fields. A refusal of any field is `*openai.DecisionRefusedError{Name: <field>}`; `metadata` is `{field: answer}`; `Descriptions` stay scalar-only. Python-only features (defaults, `AliasPath`, option docstrings) have no Go analogue — table in D-128 |
+
+### ACP: parity with agent-client-protocol 1.0 (D-131)
+
+Upstream `3b5bd7d122` (#3402). Details and the list of what stays different: D-131.
+
+**Breaking: `env_var` auth methods are removed.** ACP 1.0 dropped `EnvVarAuthMethod` from the method union, and AG2
+v1.3.2 with it. `acp.AuthKindEnvVar`, `acp.NewEnvVarAuthMethod`, `acp.AuthEnvVar` and the field `AuthMethod.Vars`
+no longer exist. A 1.0 client read `"type":"env_var"` as a plain agent method without its `vars`, so nothing that
+worked is lost. If you advertised one, either use `NewAgentAuthMethod` (the agent validates a credential) or
+`NewTerminalAuthMethod` (the client runs a login command), and tell your users which environment variables to set
+in your own docs.
+
+**Behavior change: `TurnResult.Text` is the last message, not the join.** Same field, new meaning (Python parity:
+`client.py` replies with `turn_messages[-1]`). An agent that says "Let me check." in one message and "Done: it works."
+in another used to give `Text = "Let me check.Done: it works."`; now `Text = "Done: it works."` and the earlier
+messages are in the new `TurnResult.Messages`. `Bridge.Prompt` returns the same last message, and an
+`acp.Config`-backed agent replies with it, after an `events.ModelMessage` for each earlier message. An agent that
+sends no `messageId` is unaffected: all its chunks are one message. Code that needs the whole turn's text joins
+`Messages`.
+
+| Python | AGo | Note |
+|---|---|---|
+| `BridgeState.turn_messages` | `TurnResult.Messages` | every message of the turn, in order |
+| `client.py` `ModelMessage(texts[-1])` | `TurnResult.Text`, the provider's reply | the last message |
+| `Path(d).resolve()` for `additional_directories` | `Config.AdditionalDirectories`, made absolute before `session/new` | relative to the process's working directory; symlinks are not resolved; failure is `ErrWorkspacePath` |
+| `block_text` / `block_to_files` | decoded in `Update` (`Text`, `Data`, `MimeType`) | `"[image] <uri>"`, text resources, `"[resource] <label> (<uri>)"`; blob resources → `ModelResponse.Files` |
+
+Serve: a `resource_link` block in a prompt now reaches `Handle` as `[resource] <name> (<uri>)` on its own line.
+`image`/`audio`/`embeddedContext` stay `false` in `initialize` (D-131).
