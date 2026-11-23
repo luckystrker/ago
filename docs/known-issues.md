@@ -21,16 +21,19 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   reruns (found by a reviewer; the listener/audit code is from the D-104 wave). Cause unknown.
 - **`network/TestWorkflowRoundRobinMaxTurns`** is flaky under load (found by a reviewer).
   Cause unknown.
-- **`acp/TestProviderStartupFailures/exits_during_the_handshake`** — the fake ACP agent exits during the
-  handshake, the client's `initialize` write lands in the already-closed pipe and surfaces as
-  `acp: write: write |1: broken pipe` instead of a transport error wrapping `ErrAgentExited` (found by the
-  ticket-013 reviewer, 2 of 200 runs under `-count=200`; the executor hit it once in a full `go test ./...`
-  and got green on two reruns). Risk 2 × 3 = 6, so it is queued for its own ticket rather than left open by
-  choice: a caller receives a raw write error where the contract promises `ErrAgentExited`. Expected fix —
-  map `EPIPE` on a write during the handshake onto `ErrAgentExited`.
 
 ## Flakes already fixed (kept for the record)
 
+- **`acp/TestProviderStartupFailures/exits_during_the_handshake`** (was risking 2 × 3 = 6): the fake ACP agent
+  exits during the handshake, the client's `initialize` write lands in the already-closed pipe and surfaces as
+  `acp: write: write |1: broken pipe` instead of a transport error wrapping `ErrAgentExited` (found by the
+  ticket-013 reviewer, 2 of 200 runs). That was a product-code race, not only a test flake: a caller received a
+  raw write error where the contract promises `ErrAgentExited`. Fixed in the wave-G ticket 016 — a write that
+  finds the agent's stdin gone waits (bounded, 500 ms) for the process to end and wraps the failure in
+  `ErrAgentExited`; the write error itself stays reachable through `errors.Is`. 26 of 500 runs of
+  `TestProviderStartupFailures` failed before the change, 0 of 500 after; the added deterministic test
+  `acp/TestBridgeAgentGoneBeforeHandshake` failed 500 of 500 on the old code. Evidence:
+  [acceptance/v1.3.4-016.md](acceptance/v1.3.4-016.md).
 - `tools/TestExecutorHitlFailureAbandonsBatchAndPropagates` ("call events sent = 1, want 2"
   under full-run load): fixed in W1-E3, commit `0d0b11a` (D-100).
 - `acp/TestServeAgentStreamsAndContinues` (`chunks=[Hey] want [He y]` under load): fixed in

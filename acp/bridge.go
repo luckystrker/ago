@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -156,6 +158,11 @@ type Bridge struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Scanner
+	// exited is closed once the agent process has ended. A write that finds its
+	// pipe gone waits on it to tell "the agent is gone" from "the agent closed
+	// its stdin": the process ending is the fact the caller acts on, while a
+	// raw EPIPE says only that the pipe broke.
+	exited chan struct{}
 	// closed is atomic so Cancel can check it without b.mu: the whole point
 	// of Cancel is to write while Prompt holds b.mu parked on the reply.
 	closed atomic.Bool
@@ -211,7 +218,16 @@ func (b *Bridge) start(cmdName string, args []string, env []string) error {
 	}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), scanBuffer)
-	b.cmd, b.stdin, b.stdout = cmd, stdin, sc
+	exited := make(chan struct{})
+	b.cmd, b.stdin, b.stdout, b.exited = cmd, stdin, sc, exited
+	// Collect the exit as soon as it happens, and not with cmd.Wait: that one
+	// closes the pipes, and a reply the agent wrote just before exiting still
+	// has to be readable. Process.Wait only reaps, so stdout keeps draining to
+	// EOF.
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(exited)
+	}()
 	if b.afterStart != nil {
 		b.afterStart()
 	}
@@ -491,9 +507,7 @@ func (b *Bridge) Cancel(sessionID string) error {
 	if b.closed.Load() {
 		return ErrClosed
 	}
-	b.writeMu.Lock()
-	defer b.writeMu.Unlock()
-	return writeLine(b.stdin, rpcNotification{JSONRPC: "2.0", Method: "session/cancel",
+	return b.writeRequest(rpcNotification{JSONRPC: "2.0", Method: "session/cancel",
 		Params: map[string]any{"sessionId": sessionID}})
 }
 
@@ -560,14 +574,52 @@ func (b *Bridge) stop() {
 	}
 }
 
+// writeRequest sends one message to the agent's stdin. A write that fails
+// because the pipe is gone is reported as the agent's exit: the process ending
+// is what the caller acts on, where the raw EPIPE says only that the pipe
+// broke and would surface to a user as "broken pipe". The wait for the exit is
+// bounded, so an agent that closed its stdin but still runs keeps its own write
+// error instead of being called gone.
+func (b *Bridge) writeRequest(msg any) error {
+	b.writeMu.Lock()
+	err := writeLine(b.stdin, msg)
+	b.writeMu.Unlock()
+	if err == nil || !pipeGone(err) {
+		return err
+	}
+	if b.waitExited(exitGrace) {
+		return fmt.Errorf("%w: %w", ErrAgentExited, err)
+	}
+	return err
+}
+
+// pipeGone reports whether err is the agent's stdin closed under the writer.
+func pipeGone(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE)
+}
+
+// waitExited waits at most d for the agent process to end, reporting whether it
+// did.
+func (b *Bridge) waitExited(d time.Duration) bool {
+	if b.exited == nil {
+		return false
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-b.exited:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // exchange writes one request and reads its reply. Caller holds b.mu. When
 // ExchangeTimeout is set, the deadline kills the agent on expiry — the reply
 // wait blocks in the scanner's read, so the process dying is what unblocks
 // it — and the failure is reported as ErrTimeout.
 func (b *Bridge) exchange(id int64, method string, params any, msgs *messageLog) (json.RawMessage, error) {
-	b.writeMu.Lock()
-	err := writeLine(b.stdin, rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
-	b.writeMu.Unlock()
+	err := b.writeRequest(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
 	if err != nil {
 		return nil, err
 	}

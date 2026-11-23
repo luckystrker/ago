@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -34,6 +35,8 @@ const (
 	roleMCPServe  = "acp-fake-mcp-server"
 	roleServeMode = "acp-serve-mode-agent"
 	rolePermOpts  = "acp-permission-options-agent"
+	// Gone before the handshake: closes stdin, announces it, exits.
+	roleLeavesAtOnce = "acp-leaves-at-once"
 
 	// Provider tests (provider_test.go): a Serve-based fake agent whose
 	// behavior the env selects, and a raw agent with a model picker.
@@ -104,6 +107,14 @@ func TestMain(m *testing.M) {
 		runPermOptionsAgent(os.Stdin, os.Stdout)
 	case roleProvider:
 		runProviderFake()
+	case roleLeavesAtOnce:
+		// An agent that is gone before the handshake: its stdin is closed, so
+		// the client's initialize write has no reader. The announcement on
+		// stdout orders the exit before that write (see
+		// TestBridgeAgentGoneBeforeHandshake).
+		_ = os.Stdin.Close()
+		fmt.Fprintln(os.Stdout, "ready")
+		os.Exit(0)
 	case roleProviderModel:
 		runProviderModelAgent(os.Stdin, os.Stdout)
 	case roleParity:
@@ -382,6 +393,50 @@ func TestBridgeRoundTrip(t *testing.T) {
 	}
 	if err := b.Close(); err != nil {
 		t.Errorf("second Close = %v, want nil", err)
+	}
+}
+
+// TestBridgeAgentGoneBeforeHandshake: an agent that closed its stdin and exited
+// before the handshake leaves the initialize write with no reader, so the write
+// fails with EPIPE. That error must name the agent's exit — a bare "broken
+// pipe" hides the fact the caller acts on. The fake agent announces on stdout
+// only after closing stdin and exits right after, and the test reads stdout to
+// EOF before the write happens: the order is carried by the pipes, not by
+// timing, so the case is the same on every run.
+func TestBridgeAgentGoneBeforeHandshake(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	b := &Bridge{}
+	b.afterStart = func() {
+		if !b.stdout.Scan() {
+			t.Fatalf("no announcement from the agent: %v", b.stdout.Err())
+		}
+		if got := b.stdout.Text(); got != "ready" {
+			t.Fatalf("first line = %q, want the announcement", got)
+		}
+		for b.stdout.Scan() {
+		}
+		if err := b.stdout.Err(); err != nil {
+			t.Fatalf("drain stdout: %v", err)
+		}
+	}
+	err = b.start(exe, nil, append(os.Environ(), roleEnv+"="+roleLeavesAtOnce))
+	if !errors.Is(err, ErrAgentExited) {
+		t.Fatalf("err = %v, want an error wrapping ErrAgentExited", err)
+	}
+	if !isTransportErr(err) {
+		t.Errorf("err = %v is not classified as a transport error", err)
+	}
+	// What the caller shows the user must name the exit, not the pipe.
+	if !strings.Contains(err.Error(), "agent exited") {
+		t.Errorf("err = %v does not name the agent's exit", err)
+	}
+	// The cause stays reachable: EPIPE on a pipe whose reader is gone, or the
+	// platform's spelling of the same closed pipe.
+	if !errors.Is(err, syscall.EPIPE) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, os.ErrClosed) {
+		t.Errorf("err = %v does not carry the write failure", err)
 	}
 }
 

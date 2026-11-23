@@ -76,14 +76,21 @@ var (
 	// Bridge.ExchangeTimeout; the agent subprocess was killed to unblock the
 	// wait, so the Bridge is no longer usable for further exchanges.
 	ErrTimeout = errors.New("acp: exchange timed out")
-	// ErrAgentExited reports an agent subprocess that ended while a reply was
-	// still owed (it also wraps ErrProtocol, which it always did).
+	// ErrAgentExited reports an agent subprocess that ended under an exchange.
+	// Its read side also wraps ErrProtocol, as it always did; a write that finds
+	// the pipe gone does not, since the request never reached the agent.
 	ErrAgentExited = errors.New("acp: agent exited")
 )
 
 // killAfter bounds a subprocess shutdown: closing stdin lets a well-behaved
 // agent exit; past this deadline it is killed (same teardown as mcp stdio).
 const killAfter = 5 * time.Second
+
+// exitGrace bounds how long a failed write waits for the agent process to end.
+// The process is normally gone by the time its stdin's reader disappears, so
+// the wait is a few scheduler hops in practice; the bound keeps an agent that
+// closed its stdin and kept running from stalling the caller.
+const exitGrace = 500 * time.Millisecond
 
 // scanBuffer caps one incoming line. A prompt may inline base64 content, and
 // an ACP frame is one line of JSON, so the cap matches the mcp stdio client.
