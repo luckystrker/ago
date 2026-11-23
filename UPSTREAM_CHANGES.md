@@ -25,14 +25,35 @@
 
 ## Актуальная версия (бейслайн)
 
-**v1.3.2** — <https://github.com/ag2ai/ag2/releases/tag/v1.3.2> (релиз 2026-11-15,
-тег = `bf76b9cb6607936a7c240b1efc1811d8bd422de6`).
-Последняя проверка: **2026-11-16**.
-Последний просмотренный SHA main: `bf76b9cb6607936a7c240b1efc1811d8bd422de6`
-(тег v1.3.2 совпадает с верхушкой main — коммитов после релиза нет).
-Предыдущий бейслайн: v1.3.0 (`1229064a23`, 2026-11-04).
+**v1.3.4** — <https://github.com/ag2ai/ag2/releases/tag/v1.3.4> (релиз 2026-11-22,
+тег = `db7194e8e26705381d9d23c402ba2bc5cadc67fa`).
+Последняя проверка: **2026-11-23**.
+Последний просмотренный SHA main: `db7194e8e26705381d9d23c402ba2bc5cadc67fa`
+(тег v1.3.4 совпадает с верхушкой main — коммитов после релиза нет).
+Предыдущий бейслайн: v1.3.2 (`bf76b9cb66`, 2026-11-15).
+
+> Уточнение к прошлому синку: релиз v1.3.1 **есть**, но его тег называется
+> `v.1.3.1` (точка после `v`; опубликован 2026-11-10). Проверку это не меняет:
+> бейслайн был и остаётся v1.3.2, v1.3.4 закрывает всё после него.
 
 ## Новые версии
+
+**v1.3.4** (2026-11-22) — 20 коммитов после v1.3.3. Почти всё — две волны
+безопасности, шедшие в main уже после релиза 1.3.3: права ACP больше не
+расширяют «да» до сессионного разрешения (GHSA-3r6w-7pcg-c4x2, ADR 0039), а
+shell-`ignore` теперь обходит каталоги-операнды `grep`/`diff`, отказывает
+fail-closed и считает единый бюджет файлов. Плюс GHSA-whf5-5qcj-v9m8
+(недоверенные ключи словарей больше не читаются как маркеры типа),
+`turn_within` для workflow/discussion в network, фикс опроса knowledge после
+закрытия подписки и `ACPConfig` как `ModelConfig` (ADR 0040). В `What's Changed`
+релиза попали только 5 PR — остальные коммиты пришли merge'ами из форка и в
+списке не перечислены.
+
+**v1.3.3** (2026-11-19) — 12 коммитов: поддержка google-genai 3.x (с новым
+`api_version` в `GeminiConfig`/`VertexAIConfig`) и deprecation 2.x, завершение
+input-транскрипции Gemini Live, чтение обоих полей reasoning в
+chat-completions (`reasoning` и `reasoning_content`), фикс ограждений A2UI,
+и волна «строгий mypy на весь пакет `ag2`» (allow-list снят).
 
 **v1.3.2** (2026-11-15) — очередной релиз, накрывающий 46 коммитов после v1.3.0
 (из них 12 разобраны в синке v1.3.0, 34 новых — ниже). Две главные темы: единая
@@ -41,8 +62,9 @@
 (`DecisionSet`, ADR 0038). Плюс: миграция ACP на SDK 1.0.0, ответ хода на forced-
 ответе больше не «съедается» очередью ввода, отдача upstream ext-apps документов
 как есть в MCP Apps, строгий mypy по 5 крупным подсистемам, две новые песочницы
-в `extensions/` (E2B, boxd). Тега v1.3.1 в релизах нет — версия в `pyproject.toml`
-бампалась (80c4de8f9c), но опубликован сразу v1.3.2.
+в `extensions/` (E2B, boxd). Тега v1.3.1 в релизах не было **на момент релиза
+v1.3.2** — версия в `pyproject.toml` бампалась (80c4de8f9c), а опубликован сразу
+v1.3.2; позже появился релиз с тегом `v.1.3.1` (см. шапку).
 
 **v1.3.0** (2026-11-04) — новый релиз, первый после бейслайна v1.2.2. Крупный:
 наблюдение за деревом делегирования (`ChildEvent`, `origin`), явные области
@@ -54,6 +76,391 @@
 
 Затем main ушёл на 12 коммитов вперёд (до `5125cb5dfc`, 2026-11-09) — они разобраны
 в разделе «main после v1.3.0».
+
+## Синк v1.3.4 (2026-11-23)
+
+**Дата проверки:** 2026-11-23. **Диапазон:** `v1.3.2...v1.3.4` — **32 коммита**:
+12 в v1.3.3 (`10bd89e9`…`6d2dd8ba`) и 20 в v1.3.4 (`364c0ce5`…`db7194e8`). Тег
+v1.3.4 = `db7194e8e2` = верхушка main, коммитов после релиза нет. Источник:
+`curl` + GitHub REST (`/releases?per_page=10`, `/releases/tags/v1.3.3`,
+`/releases/tags/v1.3.4`, `/compare/bf76b9cb66...main`), детали диффов — из
+локального клона `ag2/` (git-ignored, только чтение).
+
+Две волны безопасности идут в самом конце диапазона и это главное, что стоит
+взять: права ACP и `ignore` в shell. Обе задеты у нас, обе воспроизведены
+прогоном (временные тесты созданы и удалены, в коммит не попали).
+
+### Безопасность: права ACP — структурированное согласование (ADR 0039)
+
+**`364c0ce5`** — [`fix(acp): let the human pick the agent's permission option, never widen a yes`](https://github.com/ag2ai/ag2/commit/364c0ce5)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности + правка контракта.
+- **Что изменено:** под `permission_policy="ask"` запрос `session/request_permission`
+  показывался человеку как yes/no, а любой «да» отвечал **первой** allow-опцией
+  агента. Gemini CLI ставит `allow_always` первой, поэтому одно «да» на
+  `git status` разрешало все последующие `git`-команды на сессию
+  (GHSA-3r6w-7pcg-c4x2). Теперь запрос уходит в `hitl_hook` как
+  `ACPPermissionRequest(ToolApprovalRequest)` с опциями агента (`option_id`,
+  `name`, `kind`, плюс `kind`/`locations`/`raw_input` самого вызова), а ответ —
+  `option_id` выбранной опции, включая отказы. Простые слова не расширяются:
+  `yes`/`y`/`1` → one-time allow (или отказ, если такого нет), `always` →
+  remembered, всё прочее → отказ; слова читаются **раньше** id, чтобы агент не
+  сделал `y` синонимом `allow_always`. `auto`/`deny` предпочитают one-time
+  опцию независимо от порядка агента. `ToolApprovalRequest` получил `choices`
+  (`ApprovalChoice(value, label)`) — транспортно-нейтральный способ предложить
+  больше двух вариантов. Затронуты `acp/permissions.py`, `acp/events.py`,
+  `events/types.py`, `ag_ui/interrupts.py`, `context.py`.
+- **Утягивать:** **ДА**, дефект у нас тот же. `acp/bridge.go` (`permissionAnswer`):
+  политика `Permission func(toolCall, input string) bool` → true, дальше берётся
+  первая опция из `allow_once|allow_always` **в порядке агента** — то есть
+  `allow_always`, если агент её поставил первой, ровно сценарий Gemini CLI.
+  Serve-роль (`acp/serve.go`) этим не больна: она сама синтезирует пару
+  `allow_once`/`reject_once`, расширять нечего; дырка — в роли bridge, которая
+  отвечает на опции чужого агента. Заодно: `Decision.Allowed()` считает
+  разрешением любой выбранный id кроме `"reject"` (значит и `reject_once`);
+  сейчас метод живёт только в тестах, но при порте решение надо выводить из
+  `kind`, а не из «выбрано и не reject». Объём волны: `Choices` в
+  `events.ToolApprovalRequest`, тип `ApprovalChoice`, тип ответа-выбора,
+  отрисовка `choices` в схеме ответа `agui`, разбор ответа «слово vs выбор»,
+  тесты на оба столкновения (`"y"` как id reject-опции, `"n"` как id
+  allow-опции) и запись-аналог ADR 0039 в `docs/DECISIONS.md`.
+
+**`d115d14d`** — [`fix(acp): keep a picked option and a yes/no apart across AG-UI`](https://github.com/ag2ai/ag2/commit/d115d14d)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (ревью-раунд той же GHSA).
+- **Что изменено:** AG-UI теперь отдаёт ожидающему ходу сырой payload резюма:
+  bool → слова `y`/`n` (кнопки approve/refuse), строка, совпавшая со значением
+  одной из `choices`, → новый `ApprovalChoiceMessage`. Спрашивающая сторона
+  сопоставляет выбор только с id опций, а простое слово — только со словами,
+  поэтому кнопка «отказать» не может выбрать allow-опцию с id `"n"`, а выбор
+  reject-опции с id `"y"` выбирает именно её. В документации клиента пример
+  валидирует номер опции (1..len) вместо `0`, который индексировал последнюю.
+- **Утягивать:** **ДА** — часть той же волны и та же слепая зона у нас: в
+  `agui/interrupts.go` булев payload превращается в строку и дальше неотличим
+  от текста ответа, а `events` не имеет типа «выбор» вообще.
+
+**`47af7402`** — [`Address review on GHSA-3r6w-7pcg-c4x2: the server inferred a pick from a string matching a choice value`](https://github.com/ag2ai/ag2/commit/47af7402)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (форма провода).
+- **Что изменено:** выбор приходит своим объектом `{"choice": value}`
+  (`ChoicePayload`, экспортируется из `ag_ui`); в `responseSchema` это третья
+  ветка рядом со `["string","boolean"]`. Строки и bool сохраняют смысл, даже
+  если строка равна значению одного из выборов. Невалидный выбор или значение,
+  которого не предлагали, отклоняются с `PAYLOAD_REFUSED`. Payload типизирован
+  сквозняком: `ResumePayload` (JSON провода) → `ResumeAnswer` (str|bool|Choice).
+- **Утягивать:** **ДА** — брать именно в этой форме: `{"choice": ...}` не даёт
+  угадывать намерение по строке. У нас `approvalSchema` в `agui/interrupts.go`
+  — только string|boolean, а `answerFrom` принимает bool/строку.
+
+**`df85d499`** — [`docs: ADR 0039`](https://github.com/ag2ai/ag2/commit/df85d499)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** документы (правка ADR, 9 строк).
+- **Утягивать:** **НЕ ПРИМЕНИМО** — контракт переносим в `docs/DECISIONS.md`
+  вместе с кодом волны.
+
+`88bb788d` — «Merge commit from fork»: merge той же волны (16 файлов, +936/−148),
+содержимое уже разобрано выше.
+
+### Безопасность: `ignore` в shell — обход дерева, fail-closed, бюджет
+
+**`92e84270`** — [`fix(shell): check files inside grep/diff directory operands against ignore`](https://github.com/ag2ai/ag2/commit/92e84270)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (GHSA-3r6w-7pcg-c4x2).
+- **Что изменено:** `ignore` сопоставлялся только с литеральными словами
+  команды, поэтому в readonly-режиме `grep -r`, `grep` без пути и `diff` по
+  каталогам (даже без `-r`) печатали файлы, которые патерны должны скрывать.
+  Теперь для `grep|egrep|fgrep|diff` проверяется каждый файл под
+  каталогом-операндом (а для grep без файлового операнда — весь workdir), с
+  переходом по симлинкам; на удалённых бэкендах, где дерево с хоста не обойти,
+  эти программы с `ignore` отклоняются целиком. Разбор опций grep (`-e/-f`,
+  длинные имена по префиксу) намеренно ошибается в сторону «меньше
+  операндов» — тогда проверяется весь каталог.
+- **Утягивать:** **ДА**, дефект воспроизведён. Временный тест в `toolpacks`
+  (создан и удалён) на `NewShellTool(WithShellWorkdir(dir), WithShellReadonly(),
+  WithShellIgnore(".env"))` дал:
+  `grep -r SECRET .` → `./sub/.env:SECRET=2` и `./.env:SECRET=1`;
+  `diff -r . sub` → сравнил `.env` и показал секреты. В
+  `toolpacks/shellfilter.go` понятия «команда, читающая каталог» нет:
+  `checkIgnore` проверяет слова и glob-совпадения одного токена, `checkIgnorePosix`
+  — только лексику; блоков `_DIRECTORY_READERS` / `_check_directory_operands`
+  нет.
+
+**`c362c5ff`** — [`fix(shell): keep symlink aliases and wildcard directories in the ignore walk`](https://github.com/ag2ai/ag2/commit/c362c5ff)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (второй раунд).
+- **Что изменено:** каталоги обходятся и под тем именем, которым их назвали
+  (у алиаса-симлинка может быть своё правило), и по реальному пути; glob-токен
+  раскрывается в неразрешённые пути, чтобы алиас не потерялся; неудачный
+  `resolve()` — отказ. Введён единый бюджет `max_entries` (20 000): прогулка
+  длиннее — отказ «name a smaller directory». Симлинк-петля в предка не
+  раскрывается повторно. В адаптере проверка ушла в worker-thread
+  (`asyncio.to_thread`), чтобы обход не блокировал event loop.
+- **Утягивать:** **ДА** — в Go блокировка горутины на время обхода приемлема, но
+  бюджет, обход «под алиасом и по реальному пути» и отказ при неудачном
+  разрешении нужны.
+
+**`3c39c522`** — [`fix(shell): fail closed and bound all work in the ignore check`](https://github.com/ag2ai/ag2/commit/3c39c522)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (третий раунд).
+- **Что изменено:** всё, что фильтр не может проверить, теперь **отклоняется**:
+  путь не разрешается, каталог не листается, встретился `**`, бюджет исчерпан.
+  Раньше ошибка `resolve`/`glob` означала «пропустить». Абсолютные wildcard
+  внутри workdir проверяются (а не игнорируются), каждый wildcard раскрывается
+  один раз, совпадения wildcard и обойдённые записи тратят **один** бюджет.
+- **Утягивать:** **ДА** — у нас ошибки как раз проглатываются: `checkIgnore`
+  на неудачном `filepath.Abs` возвращает `""` (пропуск), а `ignoreCandidates`
+  на ошибке `filepath.Glob` просто не даёт совпадений. Для проверки границы
+  безопасности это неверное направление отказа.
+
+**`0c9710c7`** — [`fix(shell): charge every entry a wildcard expansion reads to the ignore budget`](https://github.com/ag2ai/ag2/commit/0c9710c7)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (четвёртый раунд).
+- **Что изменено:** `Path.glob` читает несовпавшие записи бесплатно, поэтому
+  `src/*/*/nothing` мог просканировать всё дерево вне бюджета. Раскрытие идёт
+  по сегментам через `scandir`, и **каждая** прочитанная запись тратится из
+  бюджета; каталог на пути, который не листается, — отказ.
+- **Утягивать:** **ДА** — тот же бюджет, та же поштучная трата; в Go это
+  `filepath.Glob` → ручной обход сегментов с `os.ReadDir` и счётчиком.
+
+**`b14405f5`** — [`test(shell): cover the unlistable wildcard directory without patching os.scandir`](https://github.com/ag2ai/ag2/commit/b14405f5)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** тесты.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — тест upstream; сценарий (нелистуемый каталог
+  на пути wildcard) стоит взять в наши тесты вместе с волной.
+
+**`db7194e8`** — [`docs(tools): stop pairing interpreters with ignore in shell examples`](https://github.com/ag2ai/ag2/commit/db7194e8)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** документы.
+- **Что изменено:** из примеров `SandboxShellTool`/`AnthropicBashTool` убраны
+  `python`/`uv run` рядом с `ignore`: `ignore` проверяет только литеральные слова
+  пути, поэтому `python -c "open('.env')"` проходит. Добавлено предупреждение,
+  что `ignore` не защищает от программ, исполняющих код, и поправлено описание
+  `blocked` (не остановит `sh -c`/`env`/`xargs`).
+- **Утягивать:** **НЕ ПРИМЕНИМО** как код, но у нас та же формулировка в
+  описании `WithShellIgnore` («Glob patterns of paths that may not appear in a
+  command») — оговорку про интерпретаторы стоит добавить при следующей правке
+  доков/описания инструмента (`toolpacks/shell.go`).
+
+`c1d943df` — «Merge commit from fork»: merge волны shell-ignore (6 файлов,
++482/−33), содержимое разобрано выше.
+
+### События: недоверенные ключи словарей больше не читаются как маркеры типа
+
+**`8e8459e4`** — [`fix(events): keep untrusted dict keys from being read as type markers`](https://github.com/ag2ai/ag2/commit/8e8459e4)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (GHSA-whf5-5qcj-v9m8).
+- **Что изменено:** JSON-формат помечает спецзначения ключами `__dataclass__`/
+  `__pydantic__` и доверял этим ключам где угодно. Обычный dict в tool-результате
+  с вложенным `__dataclass__` персистился `RedisStream`, и при чтении истории
+  загрузчик импортировал названный класс и вызывал его (например `Popen`).
+  Теперь: dict с такими ключами заворачивается в `__ag2_dict__` и возвращается
+  словарём; `__dataclass__`/`__pydantic__` восстанавливают только dataclass и
+  pydantic-модель, иначе `TypeError` **до** вызова; вложенные события и
+  `from_dict` отбрасывают неизвестные поля до десериализации.
+- **Утягивать:** **НЕТ** — поверхности нет. На проводе AGo один маркер — `@type`
+  у события (`events/marshal.go`); вложенные значения десериализуются в
+  `map[string]any`/конкретные структуры, `encoding/json` не создаёт типы по
+  строке из данных, а неизвестные поля в известном событии игнорируются — это
+  ровно вторая половина фикса. `UnknownEvent` хранит сырой map и ничего не
+  инстанцирует. Правило на будущее (в DECISIONS при появлении второго маркера):
+  полиморфный декодер не доверяет ключам, пришедшим от модели или пира.
+
+**`fd1ece25`** — [`test(stream): drop advisory id from Redis regression test`](https://github.com/ag2ai/ag2/commit/fd1ece25)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** тесты. **Утягивать:** **НЕ ПРИМЕНИМО**.
+
+`e512433d` — «Merge commit from fork»: merge волны сериализации (4 файла,
++121/−18).
+
+### Провайдеры: reasoning в chat-completions
+
+**`7a65080d`** — [`fix(openai): read both reasoning_content and reasoning in completions`](https://github.com/ag2ai/ag2/commit/7a65080d)
+- **Автор:** Yibo Liu (@yibol9768-alt). **Вид:** багфикс (OpenAI-совместимые провайдеры).
+- **Что изменено:** серверы расходятся в имени поля: DeepSeek, SGLang, xAI,
+  DashScope шлют `reasoning_content`; vLLM, OpenRouter, Ollama — `reasoning`.
+  Клиент читал `reasoning` только в не-стриме и `reasoning_content` только в
+  стриме, поэтому reasoning терялся то там, то там. Добавлен `extract_reasoning`
+  (сначала `reasoning_content`, потом `reasoning`), `ModelReasoning` отдаётся
+  один раз, даже если сервер заполнил оба поля. Затронуты
+  `config/openai/mappers.py`, `openai_client.py`.
+- **Утягивать:** **ДА** — та же асимметрия в нашем общем движке
+  `config/openaicompat.go`: не-стрим читает `wireChoice.Message.Reasoning`
+  (`json:"reasoning"`, стр. 889) и не смотрит `reasoning_content`; стрим читает
+  `Delta.ReasoningContent` (`json:"reasoning_content"`, стр. 1069) и не смотрит
+  `reasoning`. Правка: один `extractReasoning` для message и delta с приоритетом
+  `reasoning_content`, один `ModelReasoning` на ответ, тест на оба диалекта в
+  обоих режимах (стрим-тест на `reasoning_content` уже есть).
+
+### Gemini
+
+**`920e6ead`** — [`feat(gemini): support google-genai 3.x and deprecate 2.x`](https://github.com/ag2ai/ag2/commit/920e6ead)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** фича + зависимости (мажор SDK).
+- **Что изменено:** диапазон `google-genai` расширен до `>=1.68.0,<4`; 1.4.0
+  потребует `>=3`. В 3.x Developer API по умолчанию ходит на `v1`, а не `v1beta`,
+  поэтому добавляется `GeminiConfig.api_version` (`"v1"|"v1beta"`, применяется и
+  к generation, и к Files API) и `VertexAIConfig.api_version`
+  (`"v1"|"v1beta1"`); `http_client` принимает `httpx2.AsyncClient`; на 2.x
+  `create()`/`create_files_client()` печатают `DeprecationWarning`; в CI
+  отдельная job на `google-genai<3`.
+- **Утягивать:** **ПОЗЖЕ (по сути неприменимо сейчас)** — у нас нет SDK:
+  `config/gemini` — REST на stdlib, `DefaultBaseURL = .../v1beta`. Наш дефолт
+  `v1beta` — надмножество (`v1` не отдаёт `-latest` и часть preview), так что
+  ломаться нечему, а версию можно сменить через `WithBaseURL`. Действие только
+  на будущее: если появится модель, доступная лишь на `v1`, добавить
+  `WithAPIVersion` вместо ручной склейки URL.
+
+**`abb54897`** — [`fix(live): complete Gemini Live input transcription with the whole utterance`](https://github.com/ag2ai/ag2/commit/abb54897)
+- **Автор:** Yang Hao (@Assertive-xxh). **Вид:** багфикс (Gemini Live).
+- **Что изменено:** при `InputConfig(transcribe=True)` Gemini API не присылает
+  `finished`, которого ждал AG2, поэтому `TranscriptionCompletedEvent` для речи
+  пользователя не уходил вовсе. Теперь: 3.x-модели присылают финальную
+  транскрипцию на высказывание — она завершается как пришла; старые модели шлют
+  фрагменты — они склеиваются и завершаются на `finished` либо на конце хода
+  модели (`generation_complete`/`interrupted`/`turn_complete`).
+- **Утягивать:** **НЕТ** — Gemini Live в AGo не портирован (`live/` — только
+  HTTP-каскад OpenAI, D-057), править нечего.
+
+**`f3943efb`** — [`fix(live): complete Gemini 3.5 Live translate input transcriptions as they arrive`](https://github.com/ag2ai/ag2/commit/f3943efb)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс (Gemini Live).
+- **Что изменено:** для `gemini-3.5-live-translate-preview` финальная
+  транскрипция приходит на каждое высказывание — она завершается сразу, не
+  дожидаясь `generation_complete`; тесты переведены на реальную раскладку
+  событий.
+- **Утягивать:** **НЕТ** — той же причины (Live не портирован).
+
+### A2UI: ограждения вокруг полезной нагрузки
+
+**`e7139c1f`** — [`fix(a2ui): keep single-line fenced JSON payload with a standalone closing fence`](https://github.com/ag2ai/ag2/commit/e7139c1f)
+- **Автор:** AILICute (@lkuko). **Вид:** багфикс (парсер A2UI).
+- **Что изменено:** `strip_markdown_fences` выбрасывал первую строку всякий раз,
+  когда в тексте есть перевод строки, считая её инфо-строкой. Для
+  ```` ```json [{"version": "v0.9"}]\n``` ```` полезная нагрузка уходила вместе
+  с первой строкой, оставался закрывающий забор, получалась пустая строка,
+  `has_a2ui=False` — интерфейс молча не рисовался. Теперь снимается только
+  открывающее ограждение (до конца строки или до `{`/`[`) и закрывающее в конце;
+  код переписан на две якорные регулярки.
+- **Утягивать:** **ДА**, баг есть. `a2ui/parser.go` `StripMarkdownFences`
+  (стр. 90) повторяет ту же ветку («есть `\n` → берём всё после первого
+  перевода строки»). Проверено временным тестом (создан и удалён):
+  ``StripMarkdownFences("```json [{\"a\": 1}]\n```")`` → `""` (нагрузка
+  потеряна), а ``"```json\n[{\"a\": 1}]\n```"`` → `[{"a": 1}]`. Правка: снимать
+  открывающее ограждение, снимать инфо-строку **только** если остаток —
+  закрывающее ограждение (или две якорные регулярки, как upstream), снимать
+  закрывающее в конце; в `TestStripMarkdownFences` и `a2ui/golden_test.go`
+  добавить оба варианта — с закрывающим забором и без.
+
+### Знания и сеть
+
+**`e3e5c9da`** — [`fix(knowledge): stop polling callbacks after subscription close`](https://github.com/ag2ai/ag2/commit/e3e5c9da)
+- **Автор:** Wei Chen (@cw-jlu). **Вид:** багфикс (гонка при закрытии).
+- **Что изменено:** `_safe_fire` не проверял закрытость, поэтому колбэк мог
+  сработать после `close()` из другой задачи (закрытие во время разноса
+  изменений). Добавлен ранний выход при `_closed`. Тест — 147 строк, включая
+  закрытие из другой задачи.
+- **Утягивать:** **ДА** (низкий приоритет): `knowledge/polling.go` — `safeFire`
+  не смотрит `closed`, а `loop` проверяет флаг только перед опросом. При
+  `Close()` между опросом и разносом колбэки ещё срабатывают. 3 строки
+  (`if w.isClosed() { return }` в `safeFire`) + тест «Close во время разноса не
+  вызывает onChange».
+
+**`2aa5bfaf`** — [`fix(network): evaluate turn_within expectations on workflow and discussion channels`](https://github.com/ag2ai/ag2/commit/2aa5bfaf)
+- **Автор:** Junxian Lyken Lin (@LykenL). **Вид:** багфикс (ожидания канала).
+- **Что изменено:** `WorkflowAdapter`/`DiscussionAdapter` объявляли
+  `turn_within`, но в `default_evaluators()` такого оценщика не было — sweeper
+  молча пропускал их, и зависший workflow никогда не закрывался; обработчик
+  `warn` тоже не был зарегистрирован. Добавлены `TurnWithinEvaluator` (окно от
+  конверта, передавшего ход; для первого хода — от `EV_CHANNEL_OPENED`),
+  `WarnHandler` (шлёт `EV_EXPECTATION_VIOLATED` только нарушителю),
+  `expected_turn` из адаптера в контекст, чтение состояния и WAL под одним
+  локом канала, дедуп нарушений с учётом хода (`Violation.turn_key` — один
+  участник может сработать на разных ходах) и аудит нарушений, чей
+  `on_violation` не имеет обработчика (discussion `hide` — пока только видно).
+- **Утягивать:** **ДА** — у нас это выброшено сознательно и зафиксировано
+  комментарием, который теперь устарел: `network/adapters.go:485` («Python also
+  declares two turn_within expectations; no evaluator exists for that kind»), а
+  `WorkflowAdapter` без ожиданий. Что уже есть: `ExpectedTurn` и
+  `ExpectedNext()` (`network/turns.go`), три оценщика
+  (`acks_within`/`reply_within`/`max_silence`), снимок состояния и WAL под
+  локом хаба (`sweepChannel`) — то есть чтение «под одним локом» у нас уже
+  сделано. Чего нет: `TurnWithinEvaluator`, `warn`-обработчик, `expectedTurn` в
+  `ExpectationContext`, дедуп по `(expectation, violator, turn)` (сейчас ключ
+  `idx|kind|violator`, то есть один участник сработает один раз на всю жизнь
+  канала). После порта убрать оба `AGO-DEVIATION`-комментария из манифестов.
+
+### Скиллы: токен GitHub в поиске
+
+**`9bdd9d49`** — [`Merge commit from fork: keep the GitHub token out of skill search`](https://github.com/ag2ai/ag2/commit/9bdd9d49)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** багфикс безопасности (утечка креденшела).
+- **Что изменено:** `SkillsClient` складывал `Authorization: Bearer <GITHUB_TOKEN>`
+  в общие заголовки, поэтому `search()` отправлял токен на
+  `https://skills.sh/api/search`. Токен и `Accept: application/vnd.github+json`
+  вынесены в отдельный набор, который применяется только `download_skill()`;
+  явно заданные `SkillsClientConfig.headers` по-прежнему действуют везде и
+  побеждают.
+- **Утягивать:** **НЕТ** — поверхности нет: клиента skill-search
+  (`tools/skills/skill_search/client.py`) в AGo не портировано, `skills.sh` в
+  Go-коде не встречается. Правило на будущее: заголовки аутентификации
+  привязаны к хосту, которому они предназначены.
+
+### ACP: `ACPConfig` как `ModelConfig`
+
+**`7a47f7b3`** — [`fix(acp): make ACPConfig a ModelConfig`](https://github.com/ag2ai/ag2/commit/7a47f7b3)
+- **Автор:** Semen Frolov (@vvlrff). **Вид:** типы + правка контракта (ADR 0040).
+- **Что изменено:** `ACPConfig` не удовлетворял протоколу `ModelConfig`: не было
+  `provider` и `create_files_client`, а `model: str | None` конфликтовал с
+  `model -> str`. Решение ADR 0040: `ModelConfig.model` теперь `str | None`
+  (`None` — «модель выбирает бэкенд», как у ACP-агента), `ACPConfig` —
+  наследник `ModelConfig`, `provider` бросает `NotImplementedError`,
+  `create_files_client` — `FilesAPIUnsupportedError`, MCP-ответчик сообщает
+  `"unknown"` для `None`.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — это про несоответствие статическому протоколу
+  в mypy: наш `acp.Config` уже реализует `config.ModelConfig`
+  (`acp/provider.go`), а «модели нет» в Go выражается пустой строкой без
+  конфликта типов. Смысловая часть (читатели имени модели переживают пустое имя)
+  у нас выполняется естественно. Запись-аналог ADR 0040 не нужна; в DECISIONS
+  достаточно одной строки при случае: «пустая модель у конфига значит, что
+  модель выбирает бэкенд».
+
+### Строгий mypy по всему пакету (служебное)
+
+`c81e43f2` (`ag2/network` + тесты моста и ContextVar), `477de5ab` (весь `ag2`,
+allow-list снят), `052fb842` (корневые тесты под расслабленным профилем),
+`e9a812d3` (`ag_ui`/`events`/`mcp_ui`/observers/policies тесты), `722d1a5b`
+(`response` и `eval` тесты). Автор — Semen Frolov (@vvlrff), вид — типы/CI.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — это Python-типизация, переносить нечего.
+  Полезное побочно: в `c81e43f2` добавлены сценарные тесты
+  `test_bridge_drives_workflow.py`, `test_context_vars.py`,
+  `test_hub_client_wire_results.py` — их можно взять как идеи для наших
+  `network/*_test.go`, когда будем править `turn_within`.
+
+### CI, зависимости, релизы
+
+- `10bd89e9` — dependabot: `github/codeql-action/upload-sarif` 4.39.1→4.39.3.
+- `6d2dd8ba` — bump версии до 1.3.3 (+ `uv.lock`).
+- `ea7154a5` — bump до 1.3.4 (+ `uv.lock`); это тег v1.3.4.
+- **Утягивать:** **НЕ ПРИМЕНИМО** — Go-репозиторий без внешних зависимостей,
+  GitHub Actions и Python-версии upstream не используются.
+
+### Итог синка v1.3.4
+
+- Разобрано **32** коммита (12 в v1.3.3 + 20 в v1.3.4), диапазон
+  `v1.3.2...v1.3.4`, тег v1.3.4 = верхушка main.
+- **Утянуть: 11** — `364c0ce5`, `d115d14d`, `47af7402` (права ACP:
+  структурированный выбор опции, выбор отдельно от «да/нет»); `92e84270`,
+  `c362c5ff`, `3c39c522`, `0c9710c7` (shell-`ignore`: обход `grep`/`diff`,
+  алиасы и wildcard-каталоги, fail-closed, единый бюджет); `7a65080d`
+  (reasoning: оба поля в обоих режимах); `e7139c1f` (A2UI: ограждения);
+  `2aa5bfaf` (`turn_within` + `warn` в network); `e3e5c9da` (knowledge polling
+  после закрытия).
+- **Отложено: 1** — `920e6ead` (Gemini `api_version`: у нас нет SDK, `v1beta`
+  остаётся надмножеством; вернуться, если появится модель только на `v1`).
+- **Не тянем: 4** — `8e8459e4` (маркеров типов на проводе нет, `encoding/json`
+  не инстанцирует типы), `9bdd9d49` (клиента skill-search нет), `abb54897` и
+  `f3943efb` (Gemini Live не портирован).
+- **Неприменимо: 16** — mypy ×5, CI/зависимости/бампы ×3, документы ×2
+  (`df85d499`, `db7194e8`), тесты ×2 (`fd1ece25`, `b14405f5`), merge ×3
+  (`c1d943df`, `88bb788d`, `e512433d`), типы `ACPConfig` ×1 (`7a47f7b3`).
+
+Приоритет по «вред × вероятность»: (1) **права ACP** — «да» расширяется до
+сессионного разрешения, это необратимое действие на машине пользователя;
+(2) **shell-`ignore`** — секреты утекают в контекст модели одной командой
+`grep -r`; обе волны компактны и уже имеют готовый набор тестов-сценариев в
+upstream; (3) `7a65080d` — 10 строк, лечит потерю reasoning; (4) `e7139c1f` —
+20 строк, лечит молчащую A2UI; (5) `2aa5bfaf` — средняя волна, но убирает два
+устаревших `AGO-DEVIATION`; (6) `e3e5c9da` — три строки, можно брать попутно
+с любой волной.
+
+Проверки, снятые при разборе (временные тесты, удалены, в коммит не попали):
+`grep -r`/`diff -r` при `WithShellIgnore(".env")` печатают содержимое `.env`;
+``StripMarkdownFences("```json [...]\n```")`` возвращает пустую строку.
 
 ## Синк v1.3.2 (2026-11-16)
 
