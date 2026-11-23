@@ -1,7 +1,7 @@
 ---
 id: 012
 title: A2UI — StripMarkdownFences не теряет однострочный JSON с закрывающим забором на своей строке
-status: open
+status: done
 priority: 2
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: e7139c1f
 decisions: none
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek-012
 ---
 ## Что сделать
 Upstream `e7139c1f` (`git -C <ag2> show e7139c1f`). `a2ui/parser.go` `StripMarkdownFences` (~стр. 90): если после

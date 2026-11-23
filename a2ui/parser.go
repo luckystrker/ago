@@ -3,7 +3,7 @@ package a2ui
 import (
 	"encoding/json"
 	"fmt"
-
+	"regexp"
 	"strings"
 )
 
@@ -49,55 +49,22 @@ func (p *Parser) VersionString() string { return p.wireVersion }
 // ProtocolVersion reports the protocol selector ("v1.0").
 func (p *Parser) ProtocolVersion() string { return VersionV1 }
 
-// stripSingleLineFenceInfo removes the info string of a single-line fence,
-// reproducing Python's `^[A-Za-z][A-Za-z0-9_-]*(?=\s|[{[])` substitution (Go's
-// regexp has no lookahead): an alphabetic run is removed only when the next
-// character is whitespace, "{" or "[".
-func stripSingleLineFenceInfo(rest string) string {
-	if rest == "" {
-		return rest
-	}
-	c := rest[0]
-	if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
-		return rest
-	}
-	i := 1
-	for i < len(rest) {
-		b := rest[i]
-		if b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_' || b == '-' {
-			i++
-			continue
-		}
-		break
-	}
-	if i < len(rest) && (isSpaceByte(rest[i]) || rest[i] == '{' || rest[i] == '[') {
-		return rest[i:]
-	}
-	return rest
-}
-
-func isSpaceByte(b byte) bool {
-	switch b {
-	case ' ', '\t', '\n', '\r', '\v', '\f':
-		return true
-	}
-	return false
-}
+// The opening info string runs to the end of its line or to the start of a JSON
+// payload written on the fence's own line, whichever comes first; the closing
+// fence is recognised only at the end of the text.
+var (
+	openingFenceRe = regexp.MustCompile("\\A`{3,}[^\\n{[]*\\n?")
+	closingFenceRe = regexp.MustCompile("\\s*`{3,}\\z")
+)
 
 // StripMarkdownFences removes markdown code fences (```json ... ```) wrapping
-// JSON content: multi-line fences (info string on the opening line) and
-// single-line fences with an optional info string.
+// JSON content: the payload may start on the opening fence's line or on the
+// next one, and the closing fence may share the payload's last line or stand on
+// its own.
 func StripMarkdownFences(text string) string {
-	text = strings.TrimSpace(text)
-	if strings.HasPrefix(text, "```") {
-		rest := text[3:]
-		if strings.Contains(rest, "\n") {
-			text = rest[strings.Index(rest, "\n")+1:]
-		} else {
-			text = stripSingleLineFenceInfo(rest)
-		}
-	}
-	text = strings.TrimSuffix(text, "```")
+	// Both regexes are anchored, so at most one match each is possible.
+	text = openingFenceRe.ReplaceAllString(strings.TrimSpace(text), "")
+	text = closingFenceRe.ReplaceAllString(text, "")
 	return strings.TrimSpace(text)
 }
 

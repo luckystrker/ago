@@ -162,10 +162,60 @@ func TestStripMarkdownFences(t *testing.T) {
 		// the Python regex).
 		{"```jsonx{\"a\": 1}```", `{"a": 1}`},
 		{"```json\n{}\n```\n  ", "{}"},
+		// A payload on the opening fence's line followed by a closing fence on
+		// its own line must not be mistaken for an info-string-only first line.
+		{"```json [{\"a\": 1}]\n```", `[{"a": 1}]`},
+		{"```[{\"a\": 1}]\n```", `[{"a": 1}]`},
+		// The same payload with no newline at all, and one with the payload on
+		// the line after the info string.
+		{"```json [{\"a\": 1}]```", `[{"a": 1}]`},
+		{"```json\n[{\"a\": 1}]\n```", `[{"a": 1}]`},
+		// A multi-line payload that starts on the opening fence's line.
+		{"```json [\n  {\"a\": 1}\n]\n```", "[\n  {\"a\": 1}\n]"},
+		// An info string with attributes before an empty block is not payload.
+		{"```json title=x\n```", ""},
+		// A fence inside the payload (a markdown code span in a JSON string) is
+		// not the closing fence: only the fence at the very end is stripped.
+		{"```json\n{\"md\": \"a ``` b\"}\n```", "{\"md\": \"a ``` b\"}"},
+		{"```json\n{\"md\": \"a ``` b\"}", "{\"md\": \"a ``` b\"}"},
+		{"```json\n{\"md\": \"x ```\"}\n```", "{\"md\": \"x ```\"}"},
+		{"```json {\"md\": \"```\"}\n```", "{\"md\": \"```\"}"},
+		// CRLF responses: the \r ends the opening line and precedes the fence.
+		{"```json\r\n[{\"a\": 1}]\r\n```\r\n", `[{"a": 1}]`},
+		{"```JSON {\"a\": 1}\r\n```", `{"a": 1}`},
 	}
 	for _, tc := range cases {
 		if got := StripMarkdownFences(tc.in); got != tc.want {
 			t.Errorf("StripMarkdownFences(%q): want %q, got %q", tc.in, tc.want, got)
+		}
+	}
+}
+
+// TestParseSingleLineFenceWithStandaloneClosingFence covers the response shape
+// a model emits when it writes the payload on the fence's opening line and
+// closes the fence on the next one: the block must reach the JSON parser, not
+// be swallowed as an info-string line.
+func TestParseSingleLineFenceWithStandaloneClosingFence(t *testing.T) {
+	parser := NewParser(nil)
+	payload := `[{"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}]`
+	for _, opening := range []string{"```json ", "```"} {
+		response := "Here is your UI.\n<a2ui-json>\n" + opening + payload + "\n```\n</a2ui-json>"
+		r := parser.Parse(response)
+		if !r.HasA2UI {
+			t.Errorf("opening %q: HasA2UI is false, the block was dropped", opening)
+			continue
+		}
+		if r.ParseError != "" {
+			t.Errorf("opening %q: unexpected parse error %q", opening, r.ParseError)
+		}
+		if len(r.Operations) != 1 {
+			t.Errorf("opening %q: want 1 operation, got %d", opening, len(r.Operations))
+		}
+		if r.RawJSON != payload {
+			t.Errorf("opening %q: raw_json want %q, got %q", opening, payload, r.RawJSON)
+		}
+		if r.Text != "Here is your UI." {
+			t.Errorf("opening %q: text want %q, got %q", opening, "Here is your UI.", r.Text)
 		}
 	}
 }

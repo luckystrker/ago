@@ -275,6 +275,26 @@ func TestGoldenParser(t *testing.T) {
 		t.Errorf("single_line_fence text: want %q, got %q", c["text"], r.Text)
 	}
 
+	r = parser.Parse("<a2ui-json>```json [{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}]\n```</a2ui-json>")
+	c = asMap(cases["single_line_fence_standalone_close"])
+	if r.Text != c["text"].(string) || !r.HasA2UI || r.ParseError != "" {
+		t.Errorf("single_line_fence_standalone_close: text=%q hasA2UI=%v err=%q",
+			r.Text, r.HasA2UI, r.ParseError)
+	}
+	requireJSONEqual(t, "single_line_fence_standalone_close raw_json", c["raw_json"], r.RawJSON)
+	requireJSONEqual(t, "single_line_fence_standalone_close operations", c["operations"], opsToAny(r.Operations))
+
+	// A fence inside the payload string is not the closing fence: only the
+	// fence at the very end of the response is stripped.
+	r = parser.Parse("<a2ui-json>```json\n[{\"version\": \"1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": \"a ``` b\"}}]\n```</a2ui-json>")
+	c = asMap(cases["single_line_fence_inner_fence"])
+	if r.Text != c["text"].(string) || !r.HasA2UI || r.ParseError != "" {
+		t.Errorf("single_line_fence_inner_fence: text=%q hasA2UI=%v err=%q",
+			r.Text, r.HasA2UI, r.ParseError)
+	}
+	requireJSONEqual(t, "single_line_fence_inner_fence raw_json", c["raw_json"], r.RawJSON)
+	requireJSONEqual(t, "single_line_fence_inner_fence operations", c["operations"], opsToAny(r.Operations))
+
 	jsonlBlock := "<a2ui-json>\n{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}\n" +
 		"{\"version\": \"1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": 1}}\n</a2ui-json>"
 	r = parser.Parse(jsonlBlock)
