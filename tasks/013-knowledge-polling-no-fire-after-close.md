@@ -1,7 +1,7 @@
 ---
 id: 013
 title: knowledge — PollingWatcher не вызывает onChange после Close
-status: open
+status: done
 priority: 3
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: e3e5c9da
 decisions: none
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek-013
 ---
 ## Что сделать
 Upstream `e3e5c9da` (`git -C <ag2> show e3e5c9da`): `_safe_fire` не проверял закрытость, колбэк срабатывал после

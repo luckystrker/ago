@@ -21,6 +21,13 @@ the `(W4-...)` and `(D-117..D-123)` entries come from the wave-4 reviews (2026-1
   reruns (found by a reviewer; the listener/audit code is from the D-104 wave). Cause unknown.
 - **`network/TestWorkflowRoundRobinMaxTurns`** is flaky under load (found by a reviewer).
   Cause unknown.
+- **`acp/TestProviderStartupFailures/exits_during_the_handshake`** — the fake ACP agent exits during the
+  handshake, the client's `initialize` write lands in the already-closed pipe and surfaces as
+  `acp: write: write |1: broken pipe` instead of a transport error wrapping `ErrAgentExited` (found by the
+  ticket-013 reviewer, 2 of 200 runs under `-count=200`; the executor hit it once in a full `go test ./...`
+  and got green on two reruns). Risk 2 × 3 = 6, so it is queued for its own ticket rather than left open by
+  choice: a caller receives a raw write error where the contract promises `ErrAgentExited`. Expected fix —
+  map `EPIPE` on a write during the handshake onto `ErrAgentExited`.
 
 ## Flakes already fixed (kept for the record)
 
