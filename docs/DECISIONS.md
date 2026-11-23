@@ -5483,6 +5483,71 @@ blocks in an agent's reply (text rules of `mappers.block_text`, blob → `ModelR
 - `plan_update` (`AgentPlanContentUpdate`, Python since 1.3.0) is not mapped; only `plan` is.
 Both of the last two are in `docs/known-issues.md`.
 
+## D-132 — 2026-11-23 — acp/agui: a person's "yes" is never widened to `allow_always`; a pick is selected by option id only (AG2 v1.3.4 sync, GHSA-3r6w-7pcg-c4x2)
+
+Upstream `364c0ce5`, `d115d14d`, `47af7402` (ADR 0039). **The defect.** `Bridge.permissionAnswer` selected the *first*
+`allow_once|allow_always` option **in the agent's order** when the policy said yes. Gemini CLI lists `allow_always`
+first, so one yes on `git status` granted every later `git` command of the session. The serve role was never affected
+(it synthesises `allow_once`/`reject_once` itself) and is untouched.
+
+**Contract (ADR 0039, as it lands in Go).**
+
+1. **Words are not widened.** A permission request goes to the human with the agent's options as choices. An answer in
+   words is read against approval words only, never against option ids: `yes`/`y`/`1`/`ok`/`allow`/`approve`/
+   `allow_once` select the **one-time** allow option, or refuse when the agent offered none; `always`/`allow_always`
+   select the remembered option (this call only when none is offered: less than asked, never more); anything else
+   refuses. The agent's option order decides nothing between a one-time and a remembered option.
+2. **A pick is selected by id only.** `events.HumanMessage.Choice == true` (`NewApprovalChoiceMessage`) carries an
+   option id and is matched against the offered ids only, never read as words. An id that was not offered refuses.
+   So a reject option called `"y"` is chosen by a pick and not by the word `y`, and the refuse button (`"n"`) never
+   selects an allow option called `"n"`.
+3. **`{"choice": value}` on the AG-UI wire.** The interrupt's `responseSchema` of a question that offers choices is
+   `anyOf: [{"type": ["string","boolean"]}, {"type":"object", "properties":{"choice":{"type":"string","oneOf":[{"const":
+   value,"title":label}...]}}, "required":["choice"], "additionalProperties": false}]`, and the interrupt's reason is
+   `tool_call`. A string and a boolean keep their meaning as words even when they equal a choice's value (the approve
+   and refuse buttons are `"y"`/`"n"`); only the object is a pick. A malformed pick, a value that was not offered, or
+   a pick for a question that offered no choices is refused with `INTERRUPT_PAYLOAD_REFUSED`, and the held turn
+   survives. Old clients sending a string or a bool work as before; D-065 (a bool is translated for any interrupt)
+   stands.
+4. **`Decision.Allowed()` follows the selected option's kind.** It used to count every selected id except `"reject"`,
+   so a selected `reject_once` option counted as allowed. `Decision` gains `Kind` (`json:"-"`: the protocol answers with
+   the id alone), filled by the bridge's resolver; `reject_once`/`reject_always` are refusals whatever their id. A
+   `Decision` with no known kind (hand-built, or decoded from the wire by the serve role) keeps the old reading by id.
+   **Breaking by meaning** — MIGRATION §12.
+
+**How it fits the boolean policy.** `Bridge.Permission func(toolCall, input string) bool` stays and means *this call
+once*: true selects `allow_once` wherever the agent put it, false selects `reject_once` (or `reject_always`); with no
+fitting option the answer is `cancelled`. New, additive: `Bridge.Choose func(PermissionRequest) PermissionReply`, which
+when set answers `session/request_permission` with the agent's options in hand (`PermissionRequest` carries title,
+kind, locations, raw input and the options; `PermissionReply{Text, Choice}` is words or a pick). `Permission` still
+gates the mediated `fs/write_text_file` and `terminal/create`, which carry no options. `Config` with
+`PermissionAsk` (the default) sets `Choose`; `PermissionAuto` and `PermissionDeny` stay boolean.
+
+**Deviations from Python (`// AGO-DEVIATION` in code).**
+
+- **`Choices` sits on `events.HumanInputRequest`, not on `ToolApprovalRequest`.** `Context.Ask` hands hooks and
+  middleware the embedded `*HumanInputRequest` (D-065), so a field on the outer type would never reach the AG-UI
+  layer. The field is promoted through the embedding, so `req.Choices` and the JSON key `choices` are the same; the one
+  visible difference is that a composite literal must set it inside `HumanInputRequest: events.HumanInputRequest{...}`.
+- **The pick is a marker on `HumanMessage`, not a subclass.** Python's `ApprovalChoiceMessage` is a `HumanMessage`
+  subclass. `hitl.HumanHook` and the middleware chain return `*events.HumanMessage`; changing that type breaks every
+  hook. `HumanMessage.Choice` (`json:"choice,omitempty"`, `IsChoice()`, `NewApprovalChoiceMessage`) keeps the two kinds
+  apart without it. `Context.AskMessage` returns the whole reply (Python `ask_message`); `Context.Ask` returns an empty
+  string for a pick, so a caller reading words (the approval middleware) can never take a pick for one.
+- **`PermissionAuto` is stricter than Python.** Python's `"auto"` selects `allow_once`, then `allow_always`. Here the
+  boolean policy never selects `allow_always`: an agent offering only `allow_always` is refused under `PermissionAuto`
+  (the answer is `cancelled`, or its reject option). An auto user who wants a remembered grant answers `always`
+  through `PermissionAsk`.
+- The prompt a hook sees (`HumanInputRequest.Content`) lists the options with their kind, the tool call's kind,
+  locations and raw input (indented, so its lines cannot pass for the question's), because AGo has no
+  `ACPPermissionRequest` event type that survives the stripping above; the options as `Choices` carry id and label only.
+
+**Behaviour change.** A person's or a policy's yes no longer approves a whole session of commands: a user who relied
+on "one yes per session" is asked on every command (and can answer `always`, or pick the remembered option, on purpose).
+
+Tests: `acp/permission_choice_test.go`, `acp/agui_permission_test.go` (AG-UI client → ACP agent, both id collisions),
+`agui/choice_test.go`, `events/approval_choice_test.go`.
+
 ## D-133 — 2026-11-23 — shell `ignore`: grep/diff directory walk, fail closed, one 20 000-entry budget (AG2 v1.3.4 sync, GHSA-3r6w-7pcg-c4x2)
 
 Upstream `92e84270`, `c362c5ff`, `3c39c522`, `0c9710c7` (four review rounds of one fix) and the docs commit

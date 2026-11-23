@@ -48,23 +48,77 @@ const proofBytes = 32
 // boolean in hand and should not have to know which words this server accepts
 // (Python parity: ANSWER_SCHEMA / APPROVAL_SCHEMA).
 //
-// approvalSchema is what a tool-call-reason interrupt would carry. It is kept
-// for the protocol vocabulary, but nothing refers to it: AGo's Context.Ask
-// strips the ToolApprovalRequest wrapper before this layer sees the question
-// (see answerFrom), so every interrupt this server issues reads
-// input_required and carries answerSchema.
+// A question that offers choices (HumanInputRequest.Choices — an ACP agent's
+// permission options) is described by approvalSchema(choices) instead: the
+// string|boolean branch with a third one beside it, an object {"choice": value}
+// naming one offered choice. A pick has a shape of its own on the wire, so it is
+// never inferred from a string.
 var (
 	answerSchema = map[string]any{
 		"type":        "string",
 		"title":       "Answer",
 		"description": "Your answer to the agent's question.",
 	}
-	approvalSchema = map[string]any{
+	approvalSchemaPlain = map[string]any{
 		"type":        []string{"string", "boolean"},
 		"title":       "Approval",
 		"description": "true to let the tool call go ahead, false to refuse it.",
 	}
 )
+
+// approvalSchema is the response schema of an approval offering choices (Python
+// parity: approval_schema). Without choices it is the plain approval schema.
+func approvalSchema(choices []events.ApprovalChoice) map[string]any {
+	if len(choices) == 0 {
+		return approvalSchemaPlain
+	}
+	oneOf := make([]any, len(choices))
+	for i, c := range choices {
+		oneOf[i] = map[string]any{"const": c.Value, "title": c.Label}
+	}
+	return map[string]any{
+		"title": "Approval",
+		"description": `true to let the tool call go ahead, false to refuse it, ` +
+			`or {"choice": <value>} to pick one of the choices.`,
+		"anyOf": []any{
+			map[string]any{"type": []string{"string", "boolean"}},
+			map[string]any{
+				"type":        "object",
+				"title":       "Choice",
+				"description": "Picks one of the approval's choices by its value.",
+				"properties": map[string]any{
+					"choice": map[string]any{"type": "string", "oneOf": oneOf},
+				},
+				"required":             []string{"choice"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+// offeredChoices reads back the choice values approvalSchema put in an
+// interrupt's response schema (Python parity: _offered_choices).
+func offeredChoices(in Interrupt) map[string]bool {
+	offered := map[string]bool{}
+	branches, _ := in.ResponseSchema["anyOf"].([]any)
+	for _, b := range branches {
+		branch, _ := b.(map[string]any)
+		if branch["type"] != "object" {
+			continue
+		}
+		props, _ := branch["properties"].(map[string]any)
+		choice, _ := props["choice"].(map[string]any)
+		oneOf, _ := choice["oneOf"].([]any)
+		for _, o := range oneOf {
+			if c, ok := o.(map[string]any); ok {
+				if v, ok := c["const"].(string); ok {
+					offered[v] = true
+				}
+			}
+		}
+	}
+	return offered
+}
 
 // errTurnAbandoned is what a released turn's waiting question surfaces as: the
 // client gave up on the answer, so the turn stops (Python parity: release()
@@ -150,31 +204,50 @@ func proofIn(metadata map[string]any) (string, bool) {
 	return p, true
 }
 
-// answerFrom reads the answer a resume entry carries, as the string the waiting
-// call will read (Python parity: answer_from).
+// resumeAnswer is what a resume hands the waiting call: words, or a pick of one
+// of the question's choices. The approve and refuse buttons are words ("y",
+// "n"); only the {"choice": value} object is a pick (Python parity:
+// ResumeAnswer).
+type resumeAnswer struct {
+	text   string
+	picked bool
+}
+
+// answerFrom reads the answer a resume entry carries (Python parity:
+// answer_from). A string is words, whatever it says — a string equal to a
+// choice's value included. A boolean is the words a human typing "true" or
+// "false" would send. {"choice": value} is accepted only when the interrupt
+// offered value, and is handed on as a pick; anything else, a malformed pick
+// included, is refused.
 //
 // AGO-DEVIATION: Python refuses a boolean payload for every interrupt that is
 // not a tool approval. AGo's Context.Ask hands middleware a request stripped of
 // its ToolApprovalRequest wrapper (middleware/approval.go), so this layer
 // cannot tell an approval from a plain question; a boolean is translated for
-// any interrupt — the words a human typing "true" would send. See
-// docs/DECISIONS.md D-065.
-func answerFrom(entry ResumeEntry, interrupt Interrupt) (string, error) {
+// any interrupt. See docs/DECISIONS.md D-065.
+func answerFrom(entry ResumeEntry, interrupt Interrupt) (resumeAnswer, error) {
 	switch p := entry.Payload.(type) {
 	case string:
-		return p, nil
+		return resumeAnswer{text: p}, nil
 	case bool:
 		if p {
-			return "y", nil
+			return resumeAnswer{text: "y"}, nil
 		}
-		return "n", nil
-	default:
-		kind := fmt.Sprintf("%T", entry.Payload)
-		if entry.Payload == nil {
-			kind = "null"
+		return resumeAnswer{text: "n"}, nil
+	case map[string]any:
+		value, isString := p["choice"].(string)
+		if len(p) == 1 && isString {
+			if !offeredChoices(interrupt)[value] {
+				return resumeAnswer{}, fmt.Errorf("%w: interrupt %s offered no choice %q", errPayloadRefused, interrupt.ID, value)
+			}
+			return resumeAnswer{text: value, picked: true}, nil
 		}
-		return "", fmt.Errorf("%w: interrupt %s asked for a string answer, got %s", errPayloadRefused, interrupt.ID, kind)
 	}
+	kind := fmt.Sprintf("%T", entry.Payload)
+	if entry.Payload == nil {
+		kind = "null"
+	}
+	return resumeAnswer{}, fmt.Errorf("%w: interrupt %s asked for a string answer, got %s", errPayloadRefused, interrupt.ID, kind)
 }
 
 // uncoveredMessage is the refusal text for a run that does not answer what its
@@ -213,7 +286,7 @@ func (r Retention) validate() error {
 // channel its answer travels back on.
 type question struct {
 	interrupt Interrupt
-	answer    chan string
+	answer    chan resumeAnswer
 	abandon   chan struct{}
 }
 
@@ -276,7 +349,7 @@ func (t *servedTurn) clearQuestion(q *question) {
 // deliver hands the answer to the waiting call (Python parity: deliver — the
 // question is forgotten synchronously, so a resume landing the next instant
 // reads the turn as no longer waiting).
-func (t *servedTurn) deliver(q *question, answer string) {
+func (t *servedTurn) deliver(q *question, answer resumeAnswer) {
 	t.clearQuestion(q)
 	q.answer <- answer
 }
@@ -685,14 +758,14 @@ func (in interrupter) OnHumanInput(next middleware.HumanInputFunc, ev *events.Hu
 	if err != nil {
 		return nil, err
 	}
-	return &events.HumanMessage{ParentID: ev.ID, Content: answer}, nil
+	return &events.HumanMessage{ParentID: ev.ID, Content: answer.text, Choice: answer.picked}, nil
 }
 
 // askClient puts a question to the client, holds the turn, and returns the
 // answer (Python parity: ServedTurns.ask + _put). Concurrent askers on one turn
 // are put one at a time: each next question is the outcome of the run that
 // answers the one before.
-func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (string, error) {
+func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (resumeAnswer, error) {
 	t.askMu.Lock()
 	defer t.askMu.Unlock()
 
@@ -701,7 +774,7 @@ func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (string
 	interrupt := s.interruptFor(t, req, deadline)
 	q := &question{
 		interrupt: interrupt,
-		answer:    make(chan string, 1),
+		answer:    make(chan resumeAnswer, 1),
 		abandon:   make(chan struct{}),
 	}
 	t.setQuestion(q, deadline)
@@ -731,7 +804,7 @@ func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (string
 		case answer := <-q.answer:
 			return answer, nil
 		case <-q.abandon:
-			return "", &hitl.FailedError{Cause: errTurnAbandoned}
+			return resumeAnswer{}, &hitl.FailedError{Cause: errTurnAbandoned}
 		}
 	}
 	// The deadline the client was shown is kept here, by the call that
@@ -746,9 +819,9 @@ func (s *Server) askClient(t *servedTurn, req *events.HumanInputRequest) (string
 	case answer := <-q.answer:
 		return answer, nil
 	case <-q.abandon:
-		return "", &hitl.FailedError{Cause: errTurnAbandoned}
+		return resumeAnswer{}, &hitl.FailedError{Cause: errTurnAbandoned}
 	case <-timer.C:
-		return "", &hitl.TimeoutError{Timeout: deadline.Sub(since).Seconds()}
+		return resumeAnswer{}, &hitl.TimeoutError{Timeout: deadline.Sub(since).Seconds()}
 	}
 }
 
@@ -762,6 +835,12 @@ func (s *Server) interruptFor(t *servedTurn, req *events.HumanInputRequest, dead
 		Reason:         ReasonInputRequired,
 		Message:        req.Content,
 		ResponseSchema: answerSchema,
+	}
+	if len(req.Choices) > 0 {
+		// Offering choices is what an approval looks like from here: a client
+		// draws a button each, beside the approve and refuse pair.
+		in.Reason = ReasonToolCall
+		in.ResponseSchema = approvalSchema(req.Choices)
 	}
 	if req.TaskID != "" && t.proj.OpenSubagent(req.TaskID) {
 		in.SubagentRunID = req.TaskID

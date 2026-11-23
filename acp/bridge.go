@@ -84,9 +84,11 @@ type AgentCaps struct {
 // brief pins the signatures); they run on context.Background().
 type Bridge struct {
 	// Permission decides the agent's session/request_permission requests.
-	// A nil policy — or a false answer — denies. An allowed request selects
-	// the agent's first allow_once/allow_always option (Python parity:
-	// permissions.resolve_permission_option_id). The same policy also gates
+	// A nil policy — or a false answer — denies. An allowed request means this
+	// one call: it selects the agent's allow_once option wherever the agent put
+	// it, never an allow_always one (a yes must not outlive the call —
+	// GHSA-3r6w-7pcg-c4x2); with no allow_once on offer it is refused. The same
+	// policy also gates
 	// the mediated fs/write_text_file and terminal/create requests: they
 	// modify the client's disk and spawn local processes, so they take the
 	// same consent as any other consequential action.
@@ -95,6 +97,14 @@ type Bridge struct {
 	// without a policy gate; routing them through Permission is the fix for
 	// enabling FS silently enabling terminals.
 	Permission func(toolCall, input string) bool
+
+	// Choose, when set, answers session/request_permission instead of
+	// Permission, with the agent's own options in hand, so a person can pick
+	// one. See PermissionReply for how an answer in words and a pick differ.
+	// Permission still gates the mediated fs/terminal requests, which carry no
+	// options. It is called under the bridge's lock: it must not call back into
+	// the Bridge.
+	Choose func(PermissionRequest) PermissionReply
 
 	// Elicit decides the agent's elicitation/create questions: the answer text
 	// and whether the question is taken. A nil policy — or ok=false — declines;
@@ -766,26 +776,20 @@ func terminalTitle(p createTerminalParams) string {
 
 // permissionAnswer resolves the agent's request (Python parity:
 // permissions.resolve_permission_option_id wrapped by bridge.py into an
-// AllowedOutcome/DeniedOutcome — allow picks the first allow_once/allow_always
-// option, deny picks a reject_once/reject_always one the agent actually
-// offered, no fitting option cancels). The answer goes on the wire nested
-// (Decision.MarshalJSON), so a standard ACP agent accepts it.
+// AllowedOutcome/DeniedOutcome). The Choose hook, when set, answers with the
+// agent's own options on offer; otherwise the Permission policy does, and its
+// yes means this call once. Either way the answer is resolved by resolvePermission
+// — never to an allow_always option the human did not ask for. The answer goes on
+// the wire nested (Decision.MarshalJSON), so a standard ACP agent accepts it.
 func (b *Bridge) permissionAnswer(p requestPermissionParams) Decision {
+	if b.Choose != nil {
+		return resolvePermission(p.Options, b.Choose(permissionRequestOf(p)))
+	}
+	reply := PermissionReply{Text: "no"}
 	if b.Permission != nil && b.Permission(p.ToolCall.Title, p.ToolCall.inputString()) {
-		for _, o := range p.Options {
-			if o.Kind == kindAllowOnce || o.Kind == kindAllowAlways {
-				return Decision{Outcome: OutcomeSelected, OptionID: o.OptionID}
-			}
-		}
-		// Allowed by policy but the agent offered nothing selectable.
-		return Decision{Outcome: OutcomeCancelled}
+		reply = PermissionReply{Text: "yes"}
 	}
-	for _, o := range p.Options {
-		if o.Kind == kindRejectOnce || o.Kind == kindRejectAlways {
-			return Decision{Outcome: OutcomeSelected, OptionID: o.OptionID}
-		}
-	}
-	return Decision{Outcome: OutcomeCancelled}
+	return resolvePermission(p.Options, reply)
 }
 
 // elicitationAnswer resolves the agent's question (Python parity:

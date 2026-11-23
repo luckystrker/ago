@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -194,6 +195,10 @@ var affirmative = map[string]bool{
 func (s *providerSession) permission(toolCall, input string) bool {
 	switch s.cfg.PermissionPolicy {
 	case PermissionAuto:
+		// AGO-DEVIATION: Python's "auto" selects allow_once, then allow_always. A
+		// true answer here means this call once (resolvePermission never selects
+		// allow_always for it), so an agent offering only allow_always is refused
+		// under PermissionAuto. docs/DECISIONS.md D-132.
 		return true
 	case PermissionDeny:
 		return false
@@ -212,6 +217,72 @@ func (s *providerSession) permission(toolCall, input string) bool {
 		return false
 	}
 	return affirmative[strings.ToLower(strings.TrimSpace(answer))]
+}
+
+// choose puts an agent's session/request_permission to the run's human with the
+// agent's own options as choices. A failing channel fails the turn and refuses
+// the request. The answer is handed back as it came: words stay words and a pick
+// stays a pick, which is what keeps a yes from ever selecting allow_always.
+func (s *providerSession) choose(req PermissionRequest) PermissionReply {
+	t := s.current()
+	if t == nil {
+		return PermissionReply{}
+	}
+	ask := events.NewHumanInputRequest(permissionPrompt(req), 0)
+	for _, o := range req.Options {
+		ask.Choices = append(ask.Choices, events.ApprovalChoice{Value: o.OptionID, Label: o.Name})
+	}
+	msg, err := t.conv.AskMessage(t.ctx, &ask)
+	if err != nil {
+		t.fail(err)
+		return PermissionReply{}
+	}
+	return PermissionReply{Text: msg.Content, Choice: msg.Choice}
+}
+
+// permissionPrompt renders what a human needs to answer in words: the action,
+// what the agent says it is and touches, and the options the agent offers. The
+// raw input is indented so that its own lines cannot pass for the question's.
+//
+// AGO-DEVIATION: Python's ACPPermissionRequest carries options, kind, locations
+// and raw_input as typed fields. The hook receives a stripped
+// *events.HumanInputRequest (D-065), so only option id and name travel as
+// Choices; kind, locations, raw input and each option's kind are rendered into
+// Content instead. docs/DECISIONS.md D-132.
+func permissionPrompt(req PermissionRequest) string {
+	title := req.Title
+	if title == "" {
+		title = "an action"
+	}
+	var b strings.Builder
+	b.WriteString("Agent requests permission for: " + title + "\n")
+	if req.Kind != "" {
+		b.WriteString("  kind: " + req.Kind + "\n")
+	}
+	for _, l := range req.Locations {
+		b.WriteString("  location: " + l.Path)
+		if l.Line > 0 {
+			b.WriteString(":" + strconv.Itoa(l.Line))
+		}
+		b.WriteString("\n")
+	}
+	if req.RawInput != "" {
+		b.WriteString("  input:\n")
+		for _, line := range strings.Split(req.RawInput, "\n") {
+			b.WriteString("    " + line + "\n")
+		}
+	}
+	hasAlways := false
+	for _, o := range req.Options {
+		b.WriteString("  option " + o.OptionID + ": " + o.Name + " (" + o.Kind + ")\n")
+		hasAlways = hasAlways || o.Kind == kindAllowAlways
+	}
+	if hasAlways {
+		b.WriteString("Allow? (yes = this call only / always = remembered / no)")
+	} else {
+		b.WriteString("Allow? (yes/no)")
+	}
+	return b.String()
 }
 
 // elicit answers an elicitation/create per ElicitationPolicy.

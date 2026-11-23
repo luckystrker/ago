@@ -784,3 +784,36 @@ What to do: name the directory you mean (`grep -r foo src`), keep the ignored fi
 search, or drop `WithShellIgnore` for a backend that is itself isolated. The filter checks paths, not code: do not
 allow `python`, `sh -c`, `env`, `xargs` next to `ignore`; they open an ignored file without naming it.
 The 20 000-entry budget is a constant (`shellIgnoreMaxEntries`), not an option.
+
+### Breaking: a yes is one-time, and `Decision.Allowed()` follows the option's kind (D-132, GHSA-3r6w-7pcg-c4x2)
+
+Upstream `364c0ce5`, `d115d14d`, `47af7402` (ADR 0039). An ACP agent's `session/request_permission` used to be answered
+with the agent's **first** allow option in the agent's own order; Gemini CLI puts `allow_always` first, so one yes
+approved every later command with the same root for the session.
+
+| | before | after |
+|---|---|---|
+| `Bridge.Permission` returns true | the first `allow_once`/`allow_always` option in the agent's order | the `allow_once` option wherever it is; none offered → refused (reject option, else `cancelled`); never `allow_always` |
+| `PermissionAsk`, human answers `yes`/`y`/`1` | first allow option in the agent's order | the one-time option, or a refusal |
+| `PermissionAsk`, human answers `always` | same as yes | the remembered option (this call only when none is offered) |
+| `PermissionAuto` | first allow option | the one-time option only (Python: `allow_once`, then `allow_always`; AGo does not widen) |
+| `Decision.Allowed()` of a selected `reject_once` / `reject_always` | **true** (any id but `"reject"`) | **false** — read from the option's kind (`Decision.Kind`); a `Decision` with no kind keeps the by-id reading |
+
+**What users see.** An agent that offers `allow_always` first now asks again on every command. That is the point; to
+grant a session, answer `always` (or pick the remembered option, from a UI) deliberately.
+
+**Additive.**
+
+- `events.HumanInputRequest.Choices []ApprovalChoice{Value, Label}` (JSON `choices`, omitted when empty; also reachable
+  as `ToolApprovalRequest.Choices`, but a composite literal sets it inside `HumanInputRequest:`).
+- `events.HumanMessage.Choice` / `IsChoice()` / `NewApprovalChoiceMessage(parentID, value)` — an answer that picks a
+  choice by `Value`; an unmarked message is words even when it spells a `Value`. `Context.AskMessage` returns the whole
+  reply; `Context.Ask` returns `""` for a pick.
+- `acp.Bridge.Choose func(PermissionRequest) PermissionReply`, `PermissionRequest`, `PermissionOption`, `PermissionReply`,
+  `ToolLocation`, `Decision.Kind`. A `Config` with `PermissionAsk` (the default) puts every agent permission request to the
+  run's human hook with the agent's options as `Choices`; a hook that draws buttons answers with
+  `events.NewApprovalChoiceMessage`, a hook that reads words answers `yes`/`always`/`no`.
+- AG-UI: an interrupt for a question with choices has reason `tool_call` and a response schema with a third branch
+  `{"choice": value}` beside `string|boolean`. Resume `{"choice": "<offered value>"}` to pick; a string or a boolean is still
+  words (the approve and refuse buttons are `"y"`/`"n"`); an unoffered or malformed pick is refused with
+  `INTERRUPT_PAYLOAD_REFUSED`. Clients that send a string or a boolean work unchanged.

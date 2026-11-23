@@ -24,16 +24,29 @@ import (
 // ProviderACP names this provider on ModelResponse.Provider and usage events.
 const ProviderACP config.Provider = "acp"
 
-// PermissionPolicy decides how session/request_permission is answered.
+// PermissionPolicy decides how session/request_permission is answered. No
+// policy ever selects an allow_always option on its own: a yes is this call
+// only (D-132, GHSA-3r6w-7pcg-c4x2). The same policy consents the mediated fs
+// writes and terminal launches, which carry no options.
 type PermissionPolicy string
 
 const (
-	// PermissionAsk (the default) routes the question to the run's human
-	// input hook (Context.Input).
+	// PermissionAsk (the default) puts each request to the run's human input
+	// hook through Context.AskMessage, with the agent's own options as
+	// events.HumanInputRequest.Choices and the tool call's kind, locations and
+	// raw input in the prompt text. A pick (events.NewApprovalChoiceMessage)
+	// selects exactly that option; an answer in words is read as words only:
+	// yes/y/1 select the one-time allow option (a refusal when the agent
+	// offered none), always the remembered one, anything else refuses. A hook
+	// that is missing or fails ends the turn with ErrChannelFailed.
 	PermissionAsk PermissionPolicy = "ask"
-	// PermissionAuto allows every request.
+	// PermissionAuto says yes to every request, and a yes means this call once:
+	// it selects the agent's allow_once option wherever the agent lists it. An
+	// agent that offers no allow_once option is refused (its reject option, or
+	// a cancelled outcome), never granted allow_always.
 	PermissionAuto PermissionPolicy = "auto"
-	// PermissionDeny rejects every request.
+	// PermissionDeny rejects every request: the agent's reject_once option, else
+	// reject_always, else a cancelled outcome.
 	PermissionDeny PermissionPolicy = "deny"
 )
 

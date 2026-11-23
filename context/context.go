@@ -314,6 +314,22 @@ func (c *Context) Hook() hitl.HumanHook {
 // NotProvidedError, hook failure → FailedError (even at the deadline — Python:
 // only the wait can produce a timeout), deadline → TimeoutError.
 func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (string, error) {
+	msg, err := c.AskMessage(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if msg.Choice {
+		// A pick is a Value, not words: a caller that reads words (the approval
+		// middleware's "y"/"always") must never take it for one.
+		return "", nil
+	}
+	return msg.Content, nil
+}
+
+// AskMessage is Ask returning the whole reply rather than its text, for an
+// asker that tells a pick of one of req.Choices (HumanMessage.IsChoice) from an
+// answer in words. Errors are Ask's.
+func (c *Context) AskMessage(ctx stdcontext.Context, req *events.HumanInputRequest) (*events.HumanMessage, error) {
 	// The timeout travels inside an event that untrusted participants can
 	// construct; NaN/Inf/negative values must not reach the deadline
 	// arithmetic below (audit L-19).
@@ -325,7 +341,7 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 	}
 	hook := c.Hook()
 	if hook == nil {
-		return "", &hitl.NotProvidedError{Detail: "request: " + req.Content}
+		return nil, &hitl.NotProvidedError{Detail: "request: " + req.Content}
 	}
 	if req.Timeout > 0 {
 		// A finite but huge value can still overflow the float→Duration
@@ -405,37 +421,37 @@ func (c *Context) Ask(ctx stdcontext.Context, req *events.HumanInputRequest) (st
 		// ErrHandled is consumed inside Send; anything else is the channel
 		// failing before the hook could run (Python parity: a send failure is
 		// the channel failing → HumanInputFailedError).
-		return "", &hitl.FailedError{Cause: err}
+		return nil, &hitl.FailedError{Cause: err}
 	}
 	for {
 		select {
 		case msg := <-got:
-			return msg.Content, nil
+			return msg, nil
 		case msg := <-answer:
-			return msg.Content, nil
+			return msg, nil
 		case err := <-hookErr:
 			if errors.Is(err, hitl.ErrNotProvided) {
-				return "", &hitl.NotProvidedError{Detail: err.Error()}
+				return nil, &hitl.NotProvidedError{Detail: err.Error()}
 			}
 			// A hook surfacing the Ask-imposed cancellation is the deadline
 			// firing, not the channel failing (Python parity: wait_for cancels
 			// the in-flight hook and reports the timeout). Any other hook
 			// failure stays a failure even at the deadline.
 			if errors.Is(err, stdcontext.DeadlineExceeded) && errors.Is(ctx.Err(), stdcontext.DeadlineExceeded) {
-				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+				return nil, &hitl.TimeoutError{Timeout: req.Timeout}
 			}
-			return "", &hitl.FailedError{Cause: err}
+			return nil, &hitl.FailedError{Cause: err}
 		case err := <-getErr:
 			// Get only errors on cancellation of its context.
 			if errors.Is(err, stdcontext.DeadlineExceeded) {
-				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+				return nil, &hitl.TimeoutError{Timeout: req.Timeout}
 			}
-			return "", &hitl.FailedError{Cause: err}
+			return nil, &hitl.FailedError{Cause: err}
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), stdcontext.DeadlineExceeded) {
-				return "", &hitl.TimeoutError{Timeout: req.Timeout}
+				return nil, &hitl.TimeoutError{Timeout: req.Timeout}
 			}
-			return "", &hitl.FailedError{Cause: ctx.Err()}
+			return nil, &hitl.FailedError{Cause: ctx.Err()}
 		}
 	}
 }

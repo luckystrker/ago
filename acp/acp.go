@@ -639,6 +639,10 @@ const (
 type Decision struct {
 	Outcome  string `json:"outcome"`
 	OptionID string `json:"optionId,omitempty"`
+	// Kind is the ACP kind (allow_once, allow_always, reject_once, reject_always)
+	// of the selected option, when the side that offered the options knows it.
+	// It never goes on the wire: the protocol answers with the option id alone.
+	Kind string `json:"-"`
 }
 
 // decisionOutcome is the inner outcome object of the nested wire answer.
@@ -680,11 +684,23 @@ func (d *Decision) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Allowed reports whether the decision selects an allow option. "reject" is
-// the optionId the subset synthesizes when a policy denies (see
-// ServeConfig.Permission); anything else selected counts as allowed.
+// Allowed reports whether the decision selects an allow option. With the
+// selected option's Kind known, the kind decides: a reject_once or reject_always
+// option is a refusal whatever its id. Without a Kind (a hand-built Decision)
+// the id is all there is: "reject" is the optionId the subset synthesizes when
+// a policy denies (see ServeConfig.Permission) and anything else selected
+// counts as allowed.
 func (d Decision) Allowed() bool {
-	return d.Outcome == OutcomeSelected && d.OptionID != "" && d.OptionID != "reject"
+	if d.Outcome != OutcomeSelected || d.OptionID == "" {
+		return false
+	}
+	switch d.Kind {
+	case kindAllowOnce, kindAllowAlways:
+		return true
+	case "":
+		return d.OptionID != "reject"
+	}
+	return false
 }
 
 // rejectDecision is the deny the serve role synthesizes from its policy so a
@@ -700,7 +716,15 @@ type permissionOption struct {
 type permToolCall struct {
 	ToolCallID string          `json:"toolCallId,omitempty"`
 	Title      string          `json:"title"`
+	Kind       string          `json:"kind,omitempty"`
+	Locations  []ToolLocation  `json:"locations,omitempty"`
 	RawInput   json.RawMessage `json:"rawInput,omitempty"`
+}
+
+// ToolLocation is a file a tool call touches, as the agent reported it.
+type ToolLocation struct {
+	Path string `json:"path"`
+	Line int    `json:"line,omitempty"`
 }
 
 // inputString renders the tool call's raw input for a policy: a JSON string

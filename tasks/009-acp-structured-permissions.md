@@ -1,7 +1,7 @@
 ---
 id: 009
 title: ACP — структурированные права — человек выбирает опцию агента, «да» не расширяется до allow_always (GHSA-3r6w-7pcg-c4x2)
-status: open
+status: review
 priority: 1
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 364c0ce5, d115d14d, 47af7402
 decisions: D-132
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet9
 ---
 > **human: required** — тикет меняет границу безопасности: что именно разрешает чужому ACP-агенту одно «да» человека
 > (разовое действие или разрешение на всю сессию). В `done` переводит только владелец.

@@ -32,6 +32,9 @@ func (c *Config) startSession(ctx context.Context, functions []tools.Schema, ext
 		advertiseTerminal: !c.DisableTerminal,
 	}
 	b.Elicit = s.elicit
+	if c.PermissionPolicy == PermissionAsk || c.PermissionPolicy == "" {
+		b.Choose = s.choose
+	}
 	s.b = b
 
 	defer func() {

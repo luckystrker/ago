@@ -33,6 +33,7 @@ const (
 	roleSilent    = "acp-silent-agent"
 	roleMCPServe  = "acp-fake-mcp-server"
 	roleServeMode = "acp-serve-mode-agent"
+	rolePermOpts  = "acp-permission-options-agent"
 
 	// Provider tests (provider_test.go): a Serve-based fake agent whose
 	// behavior the env selects, and a raw agent with a model picker.
@@ -99,6 +100,8 @@ func TestMain(m *testing.M) {
 		runFakeMCPServer(os.Stdin, os.Stdout)
 	case roleServeMode:
 		runServeModeAgent()
+	case rolePermOpts:
+		runPermOptionsAgent(os.Stdin, os.Stdout)
 	case roleProvider:
 		runProviderFake()
 	case roleProviderModel:
