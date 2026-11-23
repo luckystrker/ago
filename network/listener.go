@@ -34,7 +34,9 @@ type HubListener interface {
 	// AgentEventResumeSet, AgentEventRuleSet or AgentEventObservationRecorded.
 	OnAgentEvent(agentID, kind string, payload map[string]any)
 	// OnExpectationFired: an expectation evaluator emitted a violation, once
-	// per (channel, expectation, violator).
+	// per (channel, expectation, violator, turn) — also when its on_violation
+	// names no registered handler. The dedup is in-memory: a restarted hub
+	// fires the violations still standing again.
 	OnExpectationFired(channelID string, exp Expectation, v Violation)
 	// OnTurnFailed: a client's turn handler failed on an inbound envelope
 	// (Hub.ReportTurnFailure). The channel stays alive.

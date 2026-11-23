@@ -5601,3 +5601,46 @@ both files and `diff -r . sub` printed both values — `checkIgnore` only looked
 **Behaviour change (breaking).** Commands that used to run are refused: `grep`/`diff` over a directory containing an
 ignored file; `grep`/`diff` with `ignore` on a remote backend; any `**` token; directories or wildcards over 20 000
 entries; paths that cannot be resolved. Signatures are unchanged. Examples in `docs/MIGRATION.md` §12.
+
+## D-134 — 2026-11-23 — network: `turn_within` is evaluated on workflow and discussion channels; `warn`, turn-aware dedup, unhandled violations audited (AG2 v1.3.4 sync)
+
+Upstream `2aa5bfaf` (#3703); ticket `tasks/014-network-turn-within.md`. **Supersedes** the clause of D-101 that said the
+discussion and workflow manifests do not carry Python's `turn_within` defaults because no evaluator exists (D-101 is
+not edited). In Python the two adapters declared `turn_within` and the sweeper skipped the kind, so a stalled workflow
+never closed; here the clause was a deliberate omission, and with an evaluator there is nothing left to omit.
+
+- **`TurnWithinEvaluator`.** Fires for the adapter's expected next speaker (`ExpectationContext.ExpectedTurn`, filled
+  from `ExpectedNext` under the same hub lock as the channel snapshot and the log) once `params["seconds"]` (default
+  600) have passed since the envelope that handed the turn over; for the opening turn since `EnvChannelOpened`, so
+  invite-ack time is not charged to the first speaker. Active channels only. A handing-over envelope missing from the
+  log produces a `slog` warning and no fire. Registered in `DefaultExpectationEvaluators`.
+- **`WarnViolationHandler`** (`on_violation: "warn"`): `EnvExpectationViolated` addressed to the violator alone. A
+  violator that is not a participant, and a channel-wide violation, go to the whole channel like `notify_channel`.
+  `NotifyChannelHandler` and `WarnViolationHandler` share one posting helper.
+- **Dedup per turn.** The fired-violation key is `(expectation index, violator, turn)` — `Violation.TurnKey` is the
+  handing-over envelope id, `""` for the opening turn and for evaluators that are not turn-scoped. The expectation
+  *kind* left the key: the manifest is fixed for the channel's life, so the position already names it. The same
+  participant may fire on turn 1 and again on turn 3; a repeat sweep within one turn fires nothing. The cache is
+  in-memory only (never in the WAL or the audit), so no stored key form exists to stay compatible with; a restarted hub
+  re-fires the violations still standing, as before.
+- **A violation without a handler is audited.** Python now fans the fire out to listeners (the `AuditLog`) before it
+  looks for a handler; so does AGo. This reverses the "silently ignored (Python parity)" behaviour: `on_violation`
+  values nobody registered (the discussion default's `hide`) leave an audit entry and act on nothing. A hub no longer
+  needs a registered handler for sweeps to run.
+- **Manifests.** `DiscussionAdapter.DefaultManifest`: `turn_within(120, warn)` + `turn_within(600, hide)`;
+  `WorkflowAdapter.DefaultManifest`: `turn_within(120, warn)` + `turn_within(600, auto_close)`. Both
+  `AGO-DEVIATION` comments are gone. `hide` has no built-in handler (Python neither).
+- **Deviation — one handler call per fired violator.** The sweeper still calls a handler once per newly fired violator
+  with the whole `Violation` (as Python does); AGo's `Audience` is a single id, so `warn` learns which violator the
+  call answers for from an unexported `Violation.firedFor`. Python's audience list is replaced by one envelope per
+  violator.
+
+**Invariants (property test `TestTurnWithinInvariantsRandomised`, no TLA+: no new concurrency, everything runs under
+the existing `sweepChannel` lock and neither WAL order nor delivery changes).** (I1) a (violator, turn) pair fires at
+most once; (I2) nothing fires before the turn's window has run out (and a sweep past it does fire); (I3) a `warn` is
+addressed to the violator alone.
+
+**Behaviour change.** Workflow and discussion channels created without their own `Expectations` now get `turn_within`:
+a stalled workflow warns after 120 s and closes after 600 s (`expectation_violated:turn_within`), a stalled discussion
+warns after 120 s; a participant can be flagged once per turn. Unhandled violations appear in the audit. Opt out with an
+explicit empty `Expectations`. Examples in `docs/MIGRATION.md` §12.
