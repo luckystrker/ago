@@ -885,10 +885,25 @@ type wireChoice struct {
 	Message      struct {
 		// Content is a plain string in most dialects and a chunk array when
 		// Mistral answers with reasoning (ThinkChunk) or prompt-mode chunks.
-		Content   json.RawMessage `json:"content"`
-		Reasoning string          `json:"reasoning"`
-		ToolCalls []wireToolCall  `json:"tool_calls"`
+		Content          json.RawMessage `json:"content"`
+		ReasoningContent string          `json:"reasoning_content"`
+		Reasoning        string          `json:"reasoning"`
+		ToolCalls        []wireToolCall  `json:"tool_calls"`
 	} `json:"message"`
+}
+
+// extractReasoning returns the reasoning text of one completion message or
+// stream delta (Python parity: openai/mappers.py extract_reasoning).
+//
+// OpenAI-compatible servers disagree on the field name: DeepSeek, SGLang, xAI
+// and DashScope send reasoning_content; vLLM, OpenRouter and Ollama send
+// reasoning. reasoning_content wins when a server fills both, so one message
+// or delta yields one reasoning text, not two.
+func extractReasoning(reasoningContent, reasoning string) string {
+	if reasoningContent != "" {
+		return reasoningContent
+	}
+	return reasoning
 }
 
 // splitWireContent separates a message content value into answer text and
@@ -1008,7 +1023,7 @@ func runChatOnce(ctx context.Context, client *httpx.Client, url string, headers 
 		// that way. The turn still spent tokens and still returns a response.
 		choice := raw.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		if r := choice.Message.Reasoning; r != "" {
+		if r := extractReasoning(choice.Message.ReasoningContent, choice.Message.Reasoning); r != "" {
 			if err := sendEvent(conv, &events.ModelReasoning{Content: r}); err != nil {
 				return nil, err
 			}
@@ -1067,6 +1082,7 @@ type wireChunk struct {
 		Delta        struct {
 			Content          json.RawMessage `json:"content"`
 			ReasoningContent string          `json:"reasoning_content"`
+			Reasoning        string          `json:"reasoning"`
 			ToolCalls        []wireToolDelta `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
@@ -1123,7 +1139,7 @@ func runChatStream(ctx context.Context, client *httpx.Client, url string, header
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finishReason = *choice.FinishReason
 			}
-			if r := choice.Delta.ReasoningContent; r != "" {
+			if r := extractReasoning(choice.Delta.ReasoningContent, choice.Delta.Reasoning); r != "" {
 				if err := sendEvent(conv, &events.ModelReasoning{Content: r}); err != nil {
 					return err
 				}
