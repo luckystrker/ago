@@ -817,3 +817,24 @@ grant a session, answer `always` (or pick the remembered option, from a UI) deli
   `{"choice": value}` beside `string|boolean`. Resume `{"choice": "<offered value>"}` to pick; a string or a boolean is still
   words (the approve and refuse buttons are `"y"`/`"n"`); an unoffered or malformed pick is refused with
   `INTERRUPT_PAYLOAD_REFUSED`. Clients that send a string or a boolean work unchanged.
+
+### Behaviour: reasoning arrives from both field names, in both modes
+
+Upstream `7a65080d`. OpenAI-compatible servers disagree on the field that carries reasoning: DeepSeek, SGLang,
+xAI and DashScope send `reasoning_content`; vLLM, OpenRouter and Ollama send `reasoning`. The shared engine
+read `reasoning` only in the non-streaming path and `reasoning_content` only in the streaming path, so
+reasoning was lost on one side of every dialect. It now reads both, with `reasoning_content` winning when a
+server fills both, and emits one `ModelReasoning` per answer (in a stream, one per delta, never two for the
+same delta).
+
+| Provider dialect | Mode | `ModelReasoning` before | after |
+|---|---|---|---|
+| DeepSeek / SGLang / xAI / DashScope (`reasoning_content`) | non-stream | none | one |
+| vLLM / OpenRouter / Ollama (`reasoning`) | stream | none | one |
+| a server that fills both | both | one — `reasoning` in non-stream, `reasoning_content` in stream | one, always the `reasoning_content` text |
+
+Changing consumers: with streaming from vLLM/OpenRouter/Ollama and non-streaming from DeepSeek/xAI, the
+history now carries `ModelReasoning` events it did not carry before — the same rules that send reasoning back
+to a provider apply to them. Public API is unchanged. Mistral answers that carry reasoning as `thinking`
+content chunks are unaffected: that split still produces its own `ModelReasoning`, and the field lookup does
+not change how often a Mistral answer carries one.

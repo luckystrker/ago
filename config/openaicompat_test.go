@@ -1310,3 +1310,95 @@ func TestRunChatStreamArrayContentReasoning(t *testing.T) {
 		t.Fatalf("message chunks = %v, want [done]", chunks)
 	}
 }
+
+// --- reasoning field dialects ------------------------------------------------------
+
+// reasoningEvents returns the reasoning texts published on the conversation, in
+// order.
+func reasoningEvents(sent *[]events.Event) []string {
+	var got []string
+	for _, ev := range *sent {
+		if r, ok := ev.(*events.ModelReasoning); ok {
+			got = append(got, r.Content)
+		}
+	}
+	return got
+}
+
+// TestRunChatCompatReasoningFields pins both field names in both modes:
+// OpenAI-compatible servers disagree (DeepSeek, SGLang, xAI and DashScope send
+// reasoning_content; vLLM, OpenRouter and Ollama send reasoning) and either
+// must surface as ModelReasoning.
+func TestRunChatCompatReasoningFields(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		field  string
+		stream bool
+	}{
+		{"non-stream reasoning_content", "reasoning_content", false},
+		{"non-stream reasoning", "reasoning", false},
+		{"stream reasoning_content", "reasoning_content", true},
+		{"stream reasoning", "reasoning", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprint(w, streamOf(
+						fmt.Sprintf(`{"%s":"thinking it through"}`, tc.field),
+						`{"content":"done"}`,
+					))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"choices":[{"finish_reason":"stop","message":{"content":"done","%s":"thinking it through"}}]}`, tc.field)
+			}))
+			defer srv.Close()
+
+			conv, sent := newCaptureConv()
+			p := CompatParams{
+				APIKey: "k", BaseURL: srv.URL, Model: "m",
+				Provider: ProviderOpenAI, Streaming: tc.stream,
+			}
+			if _, err := RunChatCompat(context.Background(), p, nil, conv, CallOptions{}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := reasoningEvents(sent); len(got) != 1 || got[0] != "thinking it through" {
+				t.Fatalf("reasoning events = %v, want [thinking it through]", got)
+			}
+		})
+	}
+}
+
+// TestRunChatCompatBothReasoningFieldsOneEvent: a server or proxy that fills
+// both fields must yield one reasoning text per answer, not two, in both modes.
+// reasoning_content wins, matching Python parity (extract_reasoning).
+func TestRunChatCompatBothReasoningFieldsOneEvent(t *testing.T) {
+	t.Run("non-stream", func(t *testing.T) {
+		srv, _ := captureServer(t, 200, `{"choices":[{"finish_reason":"stop","message":`+
+			`{"content":"done","reasoning_content":"first","reasoning":"second"}}]}`)
+		conv, sent := newCaptureConv()
+		p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m"}
+		if _, err := RunChatCompat(context.Background(), p, nil, conv, CallOptions{}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := reasoningEvents(sent); len(got) != 1 || got[0] != "first" {
+			t.Fatalf("reasoning events = %v, want [first] (reasoning_content wins)", got)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, streamOf(`{"content":"done","reasoning_content":"first","reasoning":"second"}`))
+		}))
+		defer srv.Close()
+		conv, sent := newCaptureConv()
+		p := CompatParams{APIKey: "k", BaseURL: srv.URL, Model: "m", Streaming: true}
+		if _, err := RunChatCompat(context.Background(), p, nil, conv, CallOptions{}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := reasoningEvents(sent); len(got) != 1 || got[0] != "first" {
+			t.Fatalf("reasoning events = %v, want [first] (reasoning_content wins)", got)
+		}
+	})
+}

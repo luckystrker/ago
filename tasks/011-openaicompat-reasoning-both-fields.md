@@ -1,7 +1,7 @@
 ---
 id: 011
 title: OpenAI-совместимые провайдеры — reasoning из reasoning_content и reasoning в стриме и не-стриме, один ModelReasoning
-status: open
+status: done
 priority: 2
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 7a65080d
 decisions: none
 executor_model: opencode-go/deepseek-v4.1-flash
 verifier_model: claude-sonnet-5-5
+owner: exec-deepseek011
 ---
 ## Что сделать
 Upstream `7a65080d` (`git -C <ag2> show 7a65080d -- ag2/config/openai/`): серверы расходятся в имени поля —
