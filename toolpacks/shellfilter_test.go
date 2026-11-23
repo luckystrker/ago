@@ -516,7 +516,7 @@ func TestUnquoteShell(t *testing.T) {
 	}
 }
 
-// TestResolvePhysical: a relative path gains the working directory without a
+// TestResolvePhysical (resolveReal): a relative path gains the working directory without a
 // lexical clean, and an existing symlinked prefix plus ".." resolves
 // physically.
 func TestResolvePhysical(t *testing.T) {
@@ -524,9 +524,12 @@ func TestResolvePhysical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := resolvePhysical("relative.txt")
+	got, err := resolveReal("relative.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := filepath.Join(wd, "relative.txt"); got != want {
-		t.Fatalf("resolvePhysical(relative.txt) = %q, want %q", got, want)
+		t.Fatalf("resolveReal(relative.txt) = %q, want %q", got, want)
 	}
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "target", "sub"), 0o755); err != nil {
@@ -535,10 +538,13 @@ func TestResolvePhysical(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "target", "sub"), filepath.Join(root, "link")); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
-	got = resolvePhysical(root + string(filepath.Separator) + "link/../new.txt")
+	got, err = resolveReal(root + string(filepath.Separator) + "link/../new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := filepath.Join(root, "target", "new.txt")
 	if got != want {
-		t.Fatalf("resolvePhysical(link/../new.txt) = %q, want %q", got, want)
+		t.Fatalf("resolveReal(link/../new.txt) = %q, want %q", got, want)
 	}
 }
 

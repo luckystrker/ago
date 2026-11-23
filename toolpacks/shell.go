@@ -175,6 +175,11 @@ func WithShellMaxOutput(n int) ShellOption {
 	}
 }
 
+// shellIgnoreNote is appended to a default tool description when an ignore list
+// is set, so the model and the integrator read the limit of the filter.
+const shellIgnoreNote = " Paths on the ignore list are refused, also inside directories that grep and diff read; " +
+	"the list does not stop a program that runs code (python -c, sh -c, env, xargs)."
+
 // WithShellBlockPatterns refuses commands containing any of the patterns,
 // case-insensitive substring match. Python matches its blocked list word by word
 // against the argv in restricted mode, which only exists because the restricted
@@ -186,8 +191,8 @@ func WithShellMaxOutput(n int) ShellOption {
 // name, exactly as Python does.
 // Like Python's own caveat says, this is an advisory filter, not a security
 // boundary — use an isolated container for that. It is bypassable by design
-// (a program that runs another program, an encoding trick, a substring that
-// never appears literally). The real limiter is WithShellAllowed (restricted
+// (a program that runs another program — sh -c, env, xargs, python -c — an
+// encoding trick, a substring that never appears literally). The real limiter is WithShellAllowed (restricted
 // mode, checked argv executed without a shell); use it, not this list, when
 // the command must be constrained.
 // See docs/DECISIONS.md.
@@ -240,6 +245,23 @@ func WithShellReadonly() ShellOption {
 // checked argv is exactly what runs. Tokens are read with POSIX quoting and
 // resolved through symlinks, so "cat ../secret", "cat .env" (with ".env"
 // ignored) and "prog --output=.env" are all refused before execution.
+//
+// grep, egrep, fgrep and diff open files under a directory operand on their own
+// (grep -r, diff -r, diff dir1 dir2, grep with no file operand), so for them
+// every file under the directory is checked too, symlinks followed. The filter
+// fails closed: a path it cannot resolve, a directory it cannot list, a "**"
+// wildcard, or more than 20 000 wildcard matches and walked entries in one
+// command is refused ("name a smaller directory"). On a remote or container
+// backend the tree cannot be walked from the host, so grep and diff are refused
+// outright while an ignore list is set.
+//
+// ignore checks the paths a command names and the files grep and diff reach. It
+// is not a security boundary against a program that runs code: "python -c
+// \"open('.env')\"", "sh -c", "env" and "xargs" carry no path word to check. Do
+// not allow interpreters or runners next to it; to keep a secret from an agent
+// that can run code, keep it out of the environment (an isolated backend that
+// does not mount it). WithShellBlockPatterns has the same limit: it cannot stop
+// a program that starts another one.
 func WithShellIgnore(patterns ...string) ShellOption {
 	return func(s *ShellTool) error {
 		if len(patterns) == 0 {
@@ -329,6 +351,9 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
 				"chaining, globs and variables are not available."
 		}
+		if s.ignore != nil {
+			description += shellIgnoreNote
+		}
 	}
 	if description == "" {
 		// AGO-DEVIATION: Python's default description names only the workdir;
@@ -342,6 +367,9 @@ func NewShellTool(opts ...ShellOption) (*ShellTool, error) {
 		if s.restricted {
 			description += " Restricted mode: the command runs without a shell, so pipes, redirects, " +
 				"chaining, globs and variables are not available."
+		}
+		if s.ignore != nil {
+			description += shellIgnoreNote
 		}
 	}
 	type shellArgs struct {

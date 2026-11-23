@@ -5482,3 +5482,57 @@ blocks in an agent's reply (text rules of `mappers.block_text`, blob → `ModelR
 - Tool-result parts are still joined into one text, Python keeps one part per content item (audit §1c.2).
 - `plan_update` (`AgentPlanContentUpdate`, Python since 1.3.0) is not mapped; only `plan` is.
 Both of the last two are in `docs/known-issues.md`.
+
+## D-133 — 2026-11-23 — shell `ignore`: grep/diff directory walk, fail closed, one 20 000-entry budget (AG2 v1.3.4 sync, GHSA-3r6w-7pcg-c4x2)
+
+Upstream `92e84270`, `c362c5ff`, `3c39c522`, `0c9710c7` (four review rounds of one fix) and the docs commit
+`db7194e8`; ticket `tasks/010-shell-ignore-directory-walk.md`. Reproduced on AGo before the change: with
+`WithShellReadonly()` + `WithShellIgnore(".env")` and `.env` / `sub/.env` in the workdir, `grep -r SECRET .` printed
+both files and `diff -r . sub` printed both values — `checkIgnore` only looked at the literal words of the command.
+
+**Contract of the filter (`toolpacks/shellfilter.go`, `toolpacks/shellignore.go`).**
+
+1. *Directory readers.* For `grep`, `egrep`, `fgrep` and `diff` (matched by base name) every file under a directory
+   operand is checked against `ignore`; for `diff` even without `-r` (`diff dir1 dir2` compares files inside).
+   A `grep` with no file operand searches the whole workdir. The operand parser (`grepFileOperands`: `-e/-f`,
+   long options by prefix, `--`) errs towards fewer operands, which widens the check to the whole workdir.
+2. *Alias and real path.* A directory is walked under the name it was given (a symlink alias has its own rule, e.g.
+   `alias/*.txt`) and under its real path; every entry is checked by both, symlinks are followed as `grep -R` and
+   `diff -r` follow them, and a link back into one of its own ancestors is not entered again. A glob token is
+   expanded into unresolved paths that are checked and, for a directory operand, walked. An absolute wildcard inside
+   the workdir is expanded; one outside is refused as a path.
+3. *Fail closed.* A path that cannot be resolved (symlink loop, unreadable component, unknown working directory for a
+   relative workdir), a directory that cannot be listed, a `**` token and an exhausted budget refuse the command
+   (`Access denied: <reason>`). The previous code skipped the check when `filepath.Abs` failed and ignored the error
+   of `filepath.Glob`; both are gone.
+4. *One budget.* `shellIgnoreMaxEntries = 20_000`: wildcard matches **and every entry read** while expanding a
+   wildcard (matching or not) and every walked entry spend one counter per command; over it the command is refused
+   with "name a smaller directory". `src/*/*/nothing` therefore cannot scan a tree for free. Each wildcard is
+   expanded once and the result is reused by the word check and the directory walk.
+5. *Remote backend.* `checkIgnorePosix` cannot walk a tree that lives in the sandbox, so `grep|egrep|fgrep|diff` with
+   a non-empty `ignore` is refused whole (after the lexical word check).
+6. *Documented limit.* `ignore` (and the blocked patterns) check the paths a command names and the files grep/diff
+   reach; they do not stop a program that runs code (`python -c "open('.env')"`, `sh -c`, `env`, `xargs`). Said in
+   the `WithShellIgnore` / `WithShellBlockPatterns` doc comments and in the default tool description when an ignore
+   list is set.
+
+**Where Go differs from Python.**
+
+- *The budget is a constant, not an option.* Python's `max_entries` is a keyword of `check_ignore` that the adapter
+  never sets; AGo keeps an unexported constant (`shellIgnoreMaxEntries`) and an unexported `checkIgnoreLimit` for
+  tests. Exporting it would only add a way to switch the bound off; adding an option later is additive.
+- *Synchronous walk — `// AGO-DEVIATION`.* Python moved `check_ignore` into `asyncio.to_thread` (`3c39c522`). A Go tool
+  call already runs on its own goroutine and the budget bounds the work, so no worker is started.
+- *`os.File.ReadDir(128)` instead of `os.ReadDir`/`scandir`.* `os.ReadDir` lists the whole directory first, which
+  would defeat the budget on a huge directory; reading in batches of 128 and spending per entry stops at the
+  boundary. Every entry read is charged either way.
+- *Own `resolveReal` instead of `filepath.EvalSymlinks`.* It resolves symlinks component by component like
+  `Path.resolve()`, keeps a not-yet-existing tail (a write target) and a dangling link's target, treats `..` after a
+  link physically, and returns an error on a loop (more than 255 hops) or an unreadable component. `EvalSymlinks`
+  failed on a dangling link and the old fallback used the unresolved path. `resolvePhysical` was replaced by it;
+  its test was updated to the `(string, error)` signature only.
+- *Not covered by a test:* a directory that is listable but becomes unreadable mid-walk (a race with the command).
+
+**Behaviour change (breaking).** Commands that used to run are refused: `grep`/`diff` over a directory containing an
+ignored file; `grep`/`diff` with `ignore` on a remote backend; any `**` token; directories or wildcards over 20 000
+entries; paths that cannot be resolved. Signatures are unchanged. Examples in `docs/MIGRATION.md` §12.

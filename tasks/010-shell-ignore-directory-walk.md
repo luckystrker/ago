@@ -1,7 +1,7 @@
 ---
 id: 010
 title: shell ignore — обход каталогов grep/diff, fail-closed, единый бюджет 20 000 (GHSA-3r6w-7pcg-c4x2)
-status: open
+status: review
 priority: 1
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 92e84270, c362c5ff, 3c39c522, 0c9710c7, db7194e8
 decisions: D-133
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet010
 ---
 > **human: required** — тикет меняет границу безопасности: какие файлы shell-инструмент может прочитать при
 > `WithShellIgnore`, и превращает «пропуск при ошибке» в отказ. В `done` переводит только владелец.

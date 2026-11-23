@@ -2,7 +2,6 @@ package toolpacks
 
 import (
 	"errors"
-	"os"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -176,8 +175,18 @@ func matchesArgv(pattern string, argv []string) bool {
 // filter.py check_ignore). Tokens are extracted with POSIX quoting, resolved
 // against the real filesystem (symlinks included) and checked both as written
 // and as the paths a program may read out of a word (after "=" and glued to a
-// short option).
+// short option); a glob token is checked against the files it matches.
+//
+// For grep and diff every file under a directory operand is checked as well.
+// Anything the filter cannot inspect is refused, never skipped: a path that does
+// not resolve, a directory that cannot be listed, a "**" wildcard, or more than
+// shellIgnoreMaxEntries wildcard matches and walked entries in total.
 func checkIgnore(command, workdir string, patterns []string) string {
+	return checkIgnoreLimit(command, workdir, patterns, shellIgnoreMaxEntries)
+}
+
+// checkIgnoreLimit is checkIgnore with an explicit entry budget.
+func checkIgnoreLimit(command, workdir string, patterns []string, limit int) string {
 	if len(patterns) == 0 {
 		return ""
 	}
@@ -185,27 +194,7 @@ func checkIgnore(command, workdir string, patterns []string) string {
 	if err != nil {
 		tokens = strings.Fields(command)
 	}
-	root, err := filepath.Abs(workdir)
-	if err != nil {
-		return ""
-	}
-	if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil {
-		root = resolved
-	}
-	for _, token := range tokens {
-		for _, candidate := range embeddedPaths(token) {
-			if candidate == "" {
-				continue
-			}
-			resolved, matches := ignoreCandidates(root, candidate)
-			for _, p := range append([]string{resolved}, matches...) {
-				if denied := deniedPath(p, root, patterns); denied != "" {
-					return denied
-				}
-			}
-		}
-	}
-	return ""
+	return checkIgnoreHost(tokens, workdir, patterns, limit)
 }
 
 // embeddedPaths returns token plus the paths a program may read out of it: the
@@ -226,78 +215,6 @@ func embeddedPaths(token string) []string {
 		}
 	}
 	return found
-}
-
-// ignoreCandidates resolves token relative to root and, for a glob token,
-// returns the files it matches on the host path.
-func ignoreCandidates(root, token string) (string, []string) {
-	// Concatenate instead of filepath.Join: Join cleans lexically, which would
-	// erase a symlink followed by ".." ("link/../x") before it can be resolved
-	// physically.
-	joined := token
-	if !filepath.IsAbs(joined) {
-		joined = root + string(filepath.Separator) + token
-	}
-	resolved := resolvePhysical(joined)
-	var matches []string
-	if strings.ContainsAny(token, "*?[") {
-		if found, err := filepath.Glob(joined); err == nil {
-			for _, m := range found {
-				matches = append(matches, resolvePhysical(m))
-			}
-		}
-	}
-	return resolved, matches
-}
-
-// resolvePhysical resolves path through the filesystem the way realpath /
-// Python Path.resolve() does. It must not clean lexically first: "link/../x"
-// where link is a symlink to another directory escapes through the link, and
-// EvalSymlinks on the whole path fails when the tail does not exist yet (a
-// write target). So resolve the longest existing prefix, append the remaining
-// segments, and clean only at the end.
-func resolvePhysical(path string) string {
-	// Do not use filepath.Abs/filepath.Clean here: both clean lexically, which
-	// would erase a symlink followed by ".." before Lstat can see it.
-	abs := path
-	if !filepath.IsAbs(abs) {
-		if wd, err := os.Getwd(); err == nil {
-			abs = wd + string(filepath.Separator) + path
-		} else {
-			return filepath.Clean(path)
-		}
-	}
-	existing := abs
-	var tail []string
-	for {
-		if _, err := os.Lstat(existing); err == nil {
-			break
-		}
-		i := strings.LastIndex(existing, string(filepath.Separator))
-		if i < 0 {
-			break
-		}
-		base := existing[i+1:]
-		existing = existing[:i]
-		if existing == "" {
-			existing = string(filepath.Separator)
-		}
-		tail = append([]string{base}, tail...)
-	}
-	resolved := existing
-	if real, err := filepath.EvalSymlinks(existing); err == nil {
-		resolved = real
-	}
-	for _, seg := range tail {
-		if seg == "" {
-			continue
-		}
-		resolved = filepath.Join(resolved, seg)
-	}
-	if abs, err := filepath.Abs(resolved); err == nil {
-		resolved = abs
-	}
-	return filepath.Clean(resolved)
 }
 
 // deniedPath applies patterns to one resolved path (Python parity:
@@ -363,6 +280,11 @@ func checkIgnorePosix(command, workdir string, patterns []string) string {
 				return denied
 			}
 		}
+	}
+	if len(tokens) > 0 && isDirectoryReader(tokens[0]) {
+		// The tree lives in the sandbox and cannot be walked from the host, so the
+		// files grep and diff would open under a directory cannot be checked.
+		return "Access denied: " + tokens[0] + " can read files inside a directory, which cannot be checked on this backend"
 	}
 	return ""
 }

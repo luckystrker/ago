@@ -758,3 +758,29 @@ sends no `messageId` is unaffected: all its chunks are one message. Code that ne
 
 Serve: a `resource_link` block in a prompt now reaches `Handle` as `[resource] <name> (<uri>)` on its own line.
 `image`/`audio`/`embeddedContext` stay `false` in `initialize` (D-131).
+
+## 12. AG2 v1.3.4 sync
+
+### Breaking (behaviour): shell `ignore` walks the directories `grep` and `diff` read
+
+Upstream `92e84270`, `c362c5ff`, `3c39c522`, `0c9710c7` (GHSA-3r6w-7pcg-c4x2), carried as D-133. Signatures do not
+change; commands that used to run are now refused. `WithShellIgnore` used to look only at the literal words of a
+command, so with `.env` ignored `grep -r SECRET .` and `diff -r . sub` printed the secret from `.env` and `sub/.env`.
+Now every file under a directory operand of `grep`, `egrep`, `fgrep` and `diff` is checked, and the filter refuses
+what it cannot check.
+
+| Command (ignore `".env"`, `.env` and `sub/.env` in the workdir) | before | after |
+|---|---|---|
+| `grep -r SECRET .` | `./sub/.env:SECRET=2` and `./.env:SECRET=1` | `Access denied: <workdir>/sub/.env` |
+| `grep SECRET` / `grep -r -e SECRET` (no file operand: the workdir) | the same lines | refused |
+| `diff -r . sub` and `diff . sub` | the `.env` diff with both values | refused |
+| `grep -r foo src` (no ignored file under `src`) | matches | matches (unchanged) |
+| `cat **/x`, `grep -r foo a/**` | passed | `Access denied: cannot check recursive wildcard` |
+| `grep -r x big` over more than 20 000 entries, or `ls big/*/nothing` | passed | `Access denied: more than 20000 files to check against ignore; name a smaller directory` |
+| `cat locked/*/x` through a directory that cannot be listed | passed | `Access denied: cannot list <dir>` |
+| `grep ...` / `diff ...` on a remote or container sandbox (`WithShellSandbox` over a factory without a host view) | passed | `Access denied: grep can read files inside a directory, which cannot be checked on this backend` |
+
+What to do: name the directory you mean (`grep -r foo src`), keep the ignored file out of the tree the model may
+search, or drop `WithShellIgnore` for a backend that is itself isolated. The filter checks paths, not code: do not
+allow `python`, `sh -c`, `env`, `xargs` next to `ignore`; they open an ignored file without naming it.
+The 20 000-entry budget is a constant (`shellIgnoreMaxEntries`), not an option.
