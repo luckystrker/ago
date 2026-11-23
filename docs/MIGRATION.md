@@ -838,3 +838,25 @@ history now carries `ModelReasoning` events it did not carry before — the same
 to a provider apply to them. Public API is unchanged. Mistral answers that carry reasoning as `thinking`
 content chunks are unaffected: that split still produces its own `ModelReasoning`, and the field lookup does
 not change how often a Mistral answer carries one.
+
+### Behaviour: a stalled workflow or discussion is now noticed (`turn_within`, D-134)
+
+Upstream `2aa5bfaf`. `WorkflowAdapter` and `DiscussionAdapter` now declare `turn_within` expectations in their default
+manifests and the hub evaluates them. Before, a workflow that handed the turn to an agent which never answered stayed
+open until its TTL.
+
+| Channel created without its own `Expectations` | before | after |
+|---|---|---|
+| workflow, the expected speaker is silent for 120 s | nothing | `EnvExpectationViolated` to that speaker only (`warn`), one audit entry |
+| workflow, silent for 600 s | nothing | the channel closes, reason `expectation_violated:turn_within` |
+| discussion, silent for 120 s | nothing | `warn` to that speaker |
+| discussion, silent for 600 s | nothing | one audit entry (`hide` has no handler) |
+| the same agent is slow on turn 1 and again on turn 3 | — | two violations (one per turn), not one per channel |
+| `OnViolation` names no registered handler | ignored, no audit | one audit entry, no other action |
+
+New: `TurnWithinEvaluator`, `WarnViolationHandler`, `HandlerWarn`, `ExpectationContext.ExpectedTurn`, `Violation.TurnKey`
+(all additive). The window of a turn runs from the envelope that handed it over; for the first turn from
+`EnvChannelOpened`. What to do: a client that must not be closed after 600 s of silence creates the channel with an
+explicit empty `Expectations: []Expectation{}` (or its own list); a `HubListener.OnExpectationFired` consumer now sees
+fires for every violation, also for unregistered handlers, and may see the same participant more than once per channel.
+

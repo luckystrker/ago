@@ -2,6 +2,7 @@ package network
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,9 @@ const (
 	HandlerAutoClose     = "auto_close"
 )
 
+// HandlerWarn is the on_violation value that tells only the violator.
+const HandlerWarn = "warn"
+
 // Violation is an evaluator's verdict: which expectation fired, whom it
 // applies to (an empty list = channel-wide, e.g. max_silence) and the
 // free-form detail payload riding the violation envelope / audit record.
@@ -33,6 +37,20 @@ type Violation struct {
 	Expectation Expectation
 	ViolatorIDs []string
 	Detail      map[string]any
+	// TurnKey names the turn a turn-scoped violation belongs to: the id of
+	// the envelope that handed the turn over, "" for a channel's opening turn
+	// and for evaluators that are not turn-scoped. The same participant can
+	// fire again on a later turn; within one turn it fires once.
+	TurnKey string
+
+	// firedFor is the violator this call of a handler answers for ("" =
+	// channel-wide). The sweeper calls a handler once per newly fired
+	// violator with the whole violation; warn uses it to address that one.
+	// AGO-DEVIATION: Python's warn posts one envelope whose audience lists
+	// every violator that is a participant; Envelope.Audience here is a single
+	// id, so warn posts one envelope per fired violator and learns the
+	// addressee from this field (D-134).
+	firedFor string
 }
 
 // ExpectationContext bundles the per-tick inputs handed to every
@@ -41,6 +59,10 @@ type ExpectationContext struct {
 	Channel *ChannelHandle
 	WAL     []Envelope
 	Now     time.Time
+	// ExpectedTurn is who the channel's adapter expects to act next, read
+	// under the same lock as Channel and WAL; nil when the adapter expects
+	// nobody or has no turn order.
+	ExpectedTurn *ExpectedTurn
 }
 
 // ExpectationEvaluator is a pure predicate over the context. It must be
@@ -204,6 +226,64 @@ func (MaxSilenceEvaluator) Evaluate(exp Expectation, ctx ExpectationContext) *Vi
 	}
 }
 
+// TurnWithinEvaluator fires when the adapter's expected next speaker has not
+// acted within params["seconds"] (default 600) of the envelope that handed
+// them the turn — or of EnvChannelOpened for the opening turn, so time spent
+// waiting for invite acks does not count against the first speaker. Active
+// channels only; the violation carries the turn so it fires once per turn.
+type TurnWithinEvaluator struct{}
+
+// Name implements ExpectationEvaluator.
+func (TurnWithinEvaluator) Name() string { return "turn_within" }
+
+// Evaluate implements ExpectationEvaluator.
+func (TurnWithinEvaluator) Evaluate(exp Expectation, ctx ExpectationContext) *Violation {
+	if ctx.Channel.State != ChannelActive || ctx.ExpectedTurn == nil {
+		return nil
+	}
+	started, ok := turnStartedAt(ctx, *ctx.ExpectedTurn)
+	if !ok {
+		return nil
+	}
+	seconds := expectationParamSeconds(exp, 600)
+	elapsed := ctx.Now.Sub(started).Seconds()
+	if elapsed < seconds {
+		return nil
+	}
+	return &Violation{
+		Expectation: exp,
+		ViolatorIDs: []string{ctx.ExpectedTurn.AgentID},
+		Detail: map[string]any{
+			"elapsed_seconds":   elapsed,
+			"threshold_seconds": seconds,
+		},
+		TurnKey: ctx.ExpectedTurn.TriggeringEnvelopeID,
+	}
+}
+
+// turnStartedAt is when the turn of expected began. The hub appends to the
+// log before folding state, so a handing-over envelope that is not in the log
+// means the inputs disagree and there is nothing sound to measure from; the
+// turn then never times out, which is logged instead of skipped silently.
+func turnStartedAt(ctx ExpectationContext, expected ExpectedTurn) (time.Time, bool) {
+	if expected.TriggeringEnvelopeID == "" {
+		for _, env := range ctx.WAL {
+			if env.EventType == EnvChannelOpened {
+				return env.CreatedAt, true
+			}
+		}
+		return ctx.Channel.CreatedAt, true
+	}
+	for _, env := range ctx.WAL {
+		if env.ID == expected.TriggeringEnvelopeID {
+			return env.CreatedAt, true
+		}
+	}
+	slog.Warn("turn_within cannot find the envelope that handed over the turn; the turn will not time out",
+		"channel", ctx.Channel.ID, "envelope", expected.TriggeringEnvelopeID)
+	return time.Time{}, false
+}
+
 // isContentEvent reports a substantive (non-protocol, non-task, non-
 // violation) envelope — the silence anchor set.
 func isContentEvent(eventType string) bool {
@@ -238,14 +318,21 @@ func (NotifyChannelHandler) Name() string { return HandlerNotifyChannel }
 
 // Handle implements ViolationHandler.
 func (NotifyChannelHandler) Handle(h *Hub, channelID string, violation Violation) {
+	postViolation(h, channelID, violation, "")
+}
+
+// postViolation sends EnvExpectationViolated from the channel's creator;
+// audience "" broadcasts. A closed or unknown channel is skipped.
+func postViolation(h *Hub, channelID string, violation Violation, audience string) {
 	h.mu.Lock()
 	ch, ok := h.channels[channelID]
 	var creator string
+	terminal := true
 	if ok {
-		creator = ch.CreatorID
+		creator, terminal = ch.CreatorID, ch.State.Terminal()
 	}
 	h.mu.Unlock()
-	if !ok || ch.State.Terminal() {
+	if terminal {
 		return
 	}
 	payload := mustJSON(map[string]any{
@@ -253,13 +340,45 @@ func (NotifyChannelHandler) Handle(h *Hub, channelID string, violation Violation
 		"violators":   violation.ViolatorIDs,
 		"detail":      violation.Detail,
 	})
-	env := Envelope{
+	_, _ = h.Send(Envelope{
 		ChannelID: channelID,
 		SenderID:  creator,
+		Audience:  audience,
 		EventType: EnvExpectationViolated,
 		Payload:   payload,
+	})
+}
+
+// WarnViolationHandler sends EnvExpectationViolated to the violator alone
+// (sender = creator), so the agent that missed its turn learns of it without
+// the rest of the channel seeing a protocol notice. A violator outside the
+// channel is never addressed; when no violator is a participant, or the
+// violation is channel-wide, the notice goes to the whole channel like
+// notify_channel. Best-effort, like notify_channel.
+//
+// AGO-DEVIATION: one envelope per fired violator instead of Python's single
+// envelope with an audience list (Envelope.Audience is one id); see
+// Violation.firedFor and D-134.
+type WarnViolationHandler struct{}
+
+// Name implements ViolationHandler.
+func (WarnViolationHandler) Name() string { return HandlerWarn }
+
+// Handle implements ViolationHandler.
+func (WarnViolationHandler) Handle(h *Hub, channelID string, violation Violation) {
+	target := violation.firedFor
+	if target == "" && len(violation.ViolatorIDs) == 1 {
+		target = violation.ViolatorIDs[0] // called outside the sweeper
 	}
-	_, _ = h.Send(env)
+	audience := ""
+	if target != "" {
+		h.mu.Lock()
+		if ch, ok := h.channels[channelID]; ok && ch.hasParticipant(target) {
+			audience = target
+		}
+		h.mu.Unlock()
+	}
+	postViolation(h, channelID, violation, audience)
 }
 
 // AutoCloseViolationHandler transitions the channel to closed with reason
@@ -279,6 +398,7 @@ func DefaultExpectationEvaluators() []ExpectationEvaluator {
 	return []ExpectationEvaluator{
 		AcksWithinEvaluator{},
 		ReplyWithinEvaluator{},
+		TurnWithinEvaluator{},
 		MaxSilenceEvaluator{},
 	}
 }
@@ -288,6 +408,7 @@ func DefaultViolationHandlers() []ViolationHandler {
 	return []ViolationHandler{
 		AuditViolationHandler{},
 		NotifyChannelHandler{},
+		WarnViolationHandler{},
 		AutoCloseViolationHandler{},
 	}
 }
@@ -373,10 +494,20 @@ func (h *Hub) SweepExpectations() {
 	}
 }
 
-// expectationsArmed reports whether evaluator/handler registries are
-// populated (a hub with no expectations wired skips ticks entirely).
+// expectationsArmed reports whether any evaluator is registered (a hub with
+// none wired skips ticks entirely). Handlers are not required: a violation
+// with no handler is still audited.
 func (h *Hub) expectationsArmed() bool {
-	return len(h.expectEvaluators) > 0 && len(h.expectHandlers) > 0
+	return len(h.expectEvaluators) > 0
+}
+
+// firedKey identifies one fire for dedup: the expectation (its manifest
+// position, which also tells same-kind entries apart), the violator ("" =
+// channel-wide) and the turn (Violation.TurnKey).
+type firedKey struct {
+	index    int
+	violator string
+	turn     string
 }
 
 // sweepChannel evaluates one channel's expectations at instant now.
@@ -394,14 +525,14 @@ func (h *Hub) sweepChannel(channelID string, now time.Time) {
 	snap.PendingAcks = append([]string(nil), ch.PendingAcks...)
 	wal := append([]Envelope(nil), h.logs[channelID]...)
 	expectations := append([]Expectation(nil), ch.Manifest.Expectations...)
-	ctx := ExpectationContext{Channel: &snap, WAL: wal, Now: now}
+	// Channel state, log and turn are read under this one lock so a send
+	// landing mid-sweep cannot pair a fresh log with a stale turn.
+	ctx := ExpectationContext{Channel: &snap, WAL: wal, Now: now, ExpectedTurn: expectedNextLocked(ch)}
 
 	type pendingFire struct {
-		idx    int
-		key    string
 		exp    Expectation
 		v      *Violation
-		action ViolationHandler
+		action ViolationHandler // nil: no handler registered, audit only
 	}
 	var fires []pendingFire
 	for idx, exp := range expectations {
@@ -413,25 +544,26 @@ func (h *Hub) sweepChannel(channelID string, now time.Time) {
 		if v == nil {
 			continue
 		}
-		handler, ok := h.expectHandlers[exp.OnViolation]
-		if !ok {
-			continue // unknown on_violation: silently ignored (Python parity)
-		}
+		// A violation naming no registered handler is still audited; it just
+		// triggers no action.
+		handler := h.expectHandlers[exp.OnViolation]
 		fired := h.firedViolations[channelID]
 		for _, vid := range orEmpty(v.ViolatorIDs) {
-			key := fmt.Sprintf("%d|%s|%s", idx, exp.Kind, vid)
+			key := firedKey{index: idx, violator: vid, turn: v.TurnKey}
 			if fired[key] {
 				continue
 			}
 			if fired == nil {
-				fired = map[string]bool{}
+				fired = map[firedKey]bool{}
 				h.firedViolations[channelID] = fired
 			}
 			fired[key] = true
 			// Every fire reaches the listeners (the audit log among them)
 			// before the handler — Python fans on_expectation_fired out
 			// the same way. They run after the hub lock is released.
-			fires = append(fires, pendingFire{idx: idx, key: key, exp: exp, v: v, action: handler})
+			fv := *v
+			fv.firedFor = vid
+			fires = append(fires, pendingFire{exp: exp, v: &fv, action: handler})
 		}
 	}
 	h.mu.Unlock()
@@ -441,6 +573,9 @@ func (h *Hub) sweepChannel(channelID string, now time.Time) {
 		h.fanOut(func(l HubListener) { l.OnExpectationFired(channelID, f.exp, *f.v) })
 	}
 	for _, f := range fires {
+		if f.action == nil {
+			continue
+		}
 		func() {
 			// A panicking handler must not kill the sweeper (Python
 			// suppresses handler exceptions; the violation stays marked

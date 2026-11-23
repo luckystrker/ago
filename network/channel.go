@@ -157,10 +157,11 @@ type ManifestProvider interface {
 }
 
 // Expectation is a protocol-shape contract (Python: acks_within /
-// reply_within / max_silence). Kind selects a built-in evaluator;
-// OnViolation selects a built-in violation handler ("audit" |
-// "notify_channel" | "auto_close" — unknown values are silently ignored,
-// Python parity). Evaluated by the hub's expectation sweeper
+// reply_within / turn_within / max_silence). Kind selects a built-in
+// evaluator; OnViolation selects a built-in violation handler ("audit" |
+// "notify_channel" | "warn" | "auto_close"). A value naming no registered
+// handler (the discussion default's "hide") is audited and acts on nothing.
+// Evaluated by the hub's expectation sweeper
 // (Hub.SweepExpectations / ExpectationSweeper), not by the send path.
 type Expectation struct {
 	Kind        string         `json:"kind"`

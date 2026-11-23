@@ -481,27 +481,35 @@ func (ConversationAdapter) DefaultManifest() ChannelManifest {
 }
 
 // DefaultManifest implements ManifestProvider: two or more participants,
-// named windowed summary view. AGO-DEVIATION: Python also declares two
-// turn_within expectations; no evaluator exists for that kind (in Python
-// either), so they are not carried.
+// named windowed summary view; the expected speaker is warned after 120s and
+// flagged again after 600s (no built-in hide handler: that violation is
+// audited and nothing more).
 func (DiscussionAdapter) DefaultManifest() ChannelManifest {
 	return ChannelManifest{
 		Type:              TypeDiscussion,
 		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
 		KnobsSchema:       map[string]string{"ordering": "str"},
 		DefaultViewPolicy: ViewNamedWindowedSummary,
+		Expectations: []Expectation{
+			{Kind: "turn_within", OnViolation: "warn", Params: map[string]any{"seconds": 120}},
+			{Kind: "turn_within", OnViolation: "hide", Params: map[string]any{"seconds": 600}},
+		},
 	}
 }
 
 // DefaultManifest implements ManifestProvider: two or more participants and
-// a required transition graph in knobs["graph"]. AGO-DEVIATION: Python's
-// turn_within expectations are not carried (see DiscussionAdapter).
+// a required transition graph in knobs["graph"]; the expected speaker is
+// warned after 120s and the channel closes after 600s.
 func (WorkflowAdapter) DefaultManifest() ChannelManifest {
 	return ChannelManifest{
 		Type:              TypeWorkflow,
 		ParticipantSchema: &ParticipantSchema{Min: 2, Roles: []string{string(RoleInitiator), string(RoleParticipant)}},
 		KnobsSchema:       map[string]string{"graph": "TransitionGraph"},
 		DefaultViewPolicy: ViewNamedWindowedSummary,
+		Expectations: []Expectation{
+			{Kind: "turn_within", OnViolation: "warn", Params: map[string]any{"seconds": 120}},
+			{Kind: "turn_within", OnViolation: "auto_close", Params: map[string]any{"seconds": 600}},
+		},
 	}
 }
 

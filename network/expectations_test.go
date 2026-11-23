@@ -274,7 +274,8 @@ func TestMaxSilenceAutoClose(t *testing.T) {
 	}
 }
 
-func TestUnknownOnViolationIgnored(t *testing.T) {
+// An on_violation naming no handler is audited but acts on nothing.
+func TestUnknownOnViolationAuditedNotActed(t *testing.T) {
 	clock := newFakeClock()
 	h, audit := sweepHub(t, clock)
 	hc := NewHubClient(h)
@@ -297,15 +298,14 @@ func TestUnknownOnViolationIgnored(t *testing.T) {
 	clock.Advance(2 * time.Hour)
 	h.SweepExpectations()
 	if n := sweepCount(h, ch.ID, EnvExpectationViolated); n != 0 {
-		t.Fatalf("unknown on_violation must be silently ignored, got %d envelopes", n)
+		t.Fatalf("unknown on_violation must send nothing, got %d envelopes", n)
 	}
 	if got, _ := h.Channel(ch.ID); got.State != ChannelActive {
 		t.Fatalf("unknown on_violation must not close the channel (state=%s)", got.State)
 	}
-	if entries := audit.Entries(); len(entries) != 0 {
-		// Python parity: the handler lookup happens before the listener
-		// fan-out, so an unknown on_violation value produces no audit fire.
-		t.Fatalf("unknown on_violation must not reach audit: %v", entries)
+	entries := audit.Entries()
+	if len(entries) != 1 || entries[0].Expectation != "max_silence" || entries[0].OnViolation != "shout_into_the_void" {
+		t.Fatalf("unknown on_violation must be audited once: %v", entries)
 	}
 }
 

@@ -312,7 +312,7 @@ type Hub struct {
 	tasks            map[string]task.Metadata // observed tasks (task_mirror forwards agent-side Task* events)
 	expectEvaluators map[string]ExpectationEvaluator
 	expectHandlers   map[string]ViolationHandler
-	firedViolations  map[string]map[string]bool // channel → "(idx|kind|violator)" fires (in-memory dedup)
+	firedViolations  map[string]map[firedKey]bool // channel → fires by (expectation index, violator, turn); in-memory dedup
 	wal              WAL
 	store            knowledge.Store // durable registry (WithHubStore); nil = in-memory only
 	now              func() time.Time
@@ -369,7 +369,7 @@ func NewHub(opts ...HubOption) *Hub {
 		tasks:            make(map[string]task.Metadata),
 		expectEvaluators: make(map[string]ExpectationEvaluator),
 		expectHandlers:   make(map[string]ViolationHandler),
-		firedViolations:  make(map[string]map[string]bool),
+		firedViolations:  make(map[string]map[firedKey]bool),
 		now:              time.Now,
 		ids:              &idMinter{},
 		ackWait:          30 * time.Second,

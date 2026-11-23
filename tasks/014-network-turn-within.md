@@ -1,7 +1,7 @@
 ---
 id: 014
 title: network — ожидание turn_within у workflow и discussion — оценщик, warn-обработчик, expectedTurn, дедуп по ходу
-status: open
+status: done
 priority: 3
 mode: parallel
 depends_on: []
@@ -11,6 +11,7 @@ upstream: 2aa5bfaf
 decisions: D-134
 executor_model: claude-sonnet-5-5
 verifier_model: opencode-go/deepseek-v4.1-flash
+owner: exec-sonnet-014
 ---
 ## Что сделать
 Upstream `2aa5bfaf` (`git -C <ag2> show 2aa5bfaf`; идеи сценарных тестов — `test_bridge_drives_workflow.py`,
