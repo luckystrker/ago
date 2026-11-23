@@ -205,6 +205,35 @@
         }
       ]
     },
+    "single_line_fence_standalone_close": {
+      "text": "",
+      "raw_json": "[{\"version\": \"1.0\", \"deleteSurface\": {\"surfaceId\": \"s1\"}}]",
+      "has_a2ui": true,
+      "parse_error": null,
+      "operations": [
+        {
+          "version": "1.0",
+          "deleteSurface": {
+            "surfaceId": "s1"
+          }
+        }
+      ]
+    },
+    "single_line_fence_inner_fence": {
+      "text": "",
+      "raw_json": "[{\"version\": \"1.0\", \"updateDataModel\": {\"surfaceId\": \"s1\", \"value\": \"a ``` b\"}}]",
+      "has_a2ui": true,
+      "parse_error": null,
+      "operations": [
+        {
+          "version": "1.0",
+          "updateDataModel": {
+            "surfaceId": "s1",
+            "value": "a ``` b"
+          }
+        }
+      ]
+    },
     "jsonl_block": {
       "text": "",
       "has_a2ui": true,

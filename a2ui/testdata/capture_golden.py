@@ -167,6 +167,30 @@ cases["single_line_fence"] = {
     "operations": json.loads(json.dumps(r.operations)),
 }
 
+single_line_standalone = (
+    '<a2ui-json>```json [{"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}]\n```</a2ui-json>'
+)
+r = parser.parse(single_line_standalone)
+cases["single_line_fence_standalone_close"] = {
+    "text": r.text,
+    "raw_json": r.raw_json,
+    "has_a2ui": r.has_a2ui,
+    "parse_error": r.parse_error,
+    "operations": json.loads(json.dumps(r.operations)),
+}
+
+single_line_inner_fence = (
+    '<a2ui-json>```json\n[{"version": "1.0", "updateDataModel": {"surfaceId": "s1", "value": "a ``` b"}}]\n```</a2ui-json>'
+)
+r = parser.parse(single_line_inner_fence)
+cases["single_line_fence_inner_fence"] = {
+    "text": r.text,
+    "raw_json": r.raw_json,
+    "has_a2ui": r.has_a2ui,
+    "parse_error": r.parse_error,
+    "operations": json.loads(json.dumps(r.operations)),
+}
+
 jsonl_block = (
     '<a2ui-json>\n{"version": "1.0", "deleteSurface": {"surfaceId": "s1"}}\n'
     '{"version": "1.0", "updateDataModel": {"surfaceId": "s1", "value": 1}}\n</a2ui-json>'
