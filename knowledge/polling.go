@@ -1,8 +1,11 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
+	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -51,6 +54,7 @@ type PollingWatcher struct {
 	closed  bool
 	cancel  context.CancelFunc
 	done    chan struct{}
+	loopID  int64 // goroutine running loop; 0 until Start launches it
 }
 
 // NewPollingWatcher returns a watcher firing onChange for every path changed
@@ -100,6 +104,9 @@ func (w *PollingWatcher) Start(ctx context.Context) error {
 // as the caller's scope: cancelling Start's context stops polling, as does
 // Close.
 func (w *PollingWatcher) loop(ctx context.Context) {
+	w.mu.Lock()
+	w.loopID = goroutineID()
+	w.mu.Unlock()
 	defer close(w.done)
 	for {
 		select {
@@ -129,7 +136,12 @@ func (w *PollingWatcher) loop(ctx context.Context) {
 }
 
 // Close stops the watcher and waits for the polling goroutine to exit.
-// Idempotent; safe before Start (no-op).
+// Idempotent; safe before Start (no-op). A callback may Close its own watcher:
+// then Close returns without joining the polling goroutine, because that
+// goroutine is the caller and would be waiting for a frame inside this very
+// call. Delivery still stops with that callback and the goroutine exits right
+// after the callback returns (Python parity: close() cancels the task it runs
+// on and never awaits that task to completion).
 func (w *PollingWatcher) Close() {
 	w.mu.Lock()
 	if w.closed {
@@ -138,11 +150,12 @@ func (w *PollingWatcher) Close() {
 	}
 	w.closed = true
 	cancel, done := w.cancel, w.done
+	self := w.loopID != 0 && w.loopID == goroutineID()
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if done != nil {
+	if done != nil && !self {
 		<-done
 	}
 }
@@ -151,6 +164,31 @@ func (w *PollingWatcher) isClosed() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.closed
+}
+
+// goroutineID returns the calling goroutine's id. Stdlib exposes no such API,
+// so the id is parsed from the "goroutine N [running]:" header of the
+// goroutine's own stack — a runtime-internal format. Close depends on it for
+// one thing: recognising the polling goroutine closing the watcher from inside
+// a callback, where joining itself would hang.
+//
+// If that header ever stops parsing, goroutineID returns 0, which equals no
+// live goroutine: Close then joins as usual, so a callback closing its own
+// watcher blocks on itself again, and so does a Close from another goroutine
+// that the callback is waiting for. The failure mode is a hang at shutdown,
+// never a crash, a wrong callback, or a silent miss.
+func goroutineID() int64 {
+	var buf [128]byte
+	n := runtime.Stack(buf[:], false)
+	fields := bytes.Fields(buf[:n])
+	if len(fields) < 2 {
+		return 0
+	}
+	id, err := strconv.ParseInt(string(fields[1]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 func (w *PollingWatcher) snapshot() map[string]string {
@@ -167,7 +205,15 @@ func (w *PollingWatcher) setSnapshot(s map[string]string) {
 
 // safeFire invokes onChange, recovering a panic so callbacks never crash the
 // watcher (Python parity: _safe_fire swallows callback exceptions).
+//
+// The closed check must sit here, not only at the top of the poll: Close can
+// land while a batch is being dispatched, and the rest of that batch must stay
+// undelivered. isClosed takes only w.mu, which dispatch never holds while a
+// callback runs, so this cannot deadlock against Close's own locking.
 func (w *PollingWatcher) safeFire(path string) {
+	if w.isClosed() {
+		return
+	}
 	defer func() { _ = recover() }()
 	w.onChange(path)
 }
